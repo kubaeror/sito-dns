@@ -3,8 +3,6 @@
 //! DNS rewrite tables and local record overrides:
 //! - Exact and wildcard domain-to-IP/CNAME mappings
 //! - Automated reverse DNS PTR record generation (auto-PTR)
-//! - Local `/etc/hosts` file parsing and synchronization
-//! - Upstream rewrite exception lists
 
 pub mod config;
 pub mod table;

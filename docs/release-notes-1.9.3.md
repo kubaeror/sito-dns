@@ -54,8 +54,9 @@ python3 contrib/tests/test_adguard_to_sito.py
 
 > The `cargo check --manifest-path fuzz/Cargo.toml --locked` step in the
 > original 1.9.3 validation list applied only while the fuzz harness existed.
-> It was removed after v1.9.3; current trees have no `fuzz/` directory. See
-> [docs/ci.md](ci.md#scheduled-fuzzing-was-intentionally-removed).
+> It was removed after v1.9.3 and the 1.9.x trees have no `fuzz/` directory.
+> The 2.0 branch restored it as a nightly/release mechanism; see
+> [docs/ci.md](ci.md#fuzzing-is-nightlyrelease-not-a-pr-gate).
 
 The release workflow additionally verifies the tag/version, artifact checksums,
 cosign signatures, multi-arch image platforms, and SLSA/SPDX attestations.

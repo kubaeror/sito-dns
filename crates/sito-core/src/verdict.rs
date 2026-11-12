@@ -60,7 +60,6 @@ pub enum BlockReason {
 /// Action to perform when rewriting a DNS query or response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RewriteAction {
-    SynthesizeAnswer,
     DnsRewrite {
         rcode: String,
         rtype: Option<String>,

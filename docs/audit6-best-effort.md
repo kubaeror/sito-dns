@@ -1,11 +1,13 @@
 # Audit 6 — reviewed best-effort error handling (D14)
 
 `scripts/check-error-swallowing.sh` flags `let _ =`/`.ok()` around calls that
-mutate durable state: `sync_all`, `rename`, `remove_file`, `set_permissions`,
-secret writes, ACME pair metadata, config persistence/publication, filter
-flushes and transport reloads. Every remaining flagged site is listed in
-`scripts/error-swallowing-allowlist.txt` with the exact source text, and each
-category below explains why discarding the error is safe.
+mutate durable state or report health: `sync_all`, `rename`, `remove_file`,
+`set_permissions`, secret writes, ACME pair metadata, config persistence/
+publication, filter flushes/reloads, listener/TLS readiness, shutdown, lease/
+bootstrap paths, and `lock`/`unlock`, plus `read`/`load` paths. Every remaining
+flagged production site is listed in `scripts/error-swallowing-allowlist.txt`
+with the exact source text, and each category below explains why discarding the
+error is safe.
 
 Run it with:
 
@@ -13,12 +15,21 @@ Run it with:
 bash scripts/check-error-swallowing.sh
 ```
 
-The check is intentionally narrower than a blanket ban on `let _ =`/`.ok()`.
-The repository has hundreds of probe/cleanup sites (cache lookups, optional
-header parsing, test fixture teardown) where an error is expected control flow;
-making those fatal would be wrong and would bury the signal. The script covers
-the paths where a swallowed error could lose data, publish an unpersisted
-configuration, or leave a partially written secret/certificate.
+The scanner (`scripts/find-error-swallowing.py`) is deliberately narrower than
+a blanket ban on `let _ =`/`.ok()`. It joins a statement until its parentheses/
+brackets balance and the terminating `;` (or block) is reached, so a multi-line
+swallow is still caught. It skips inline `#[cfg(test)]` items and `tests/`
+targets because those intentionally exercise failure cleanup, and it only flags
+call names that match the reviewed keyword list. Formatting macros
+(`writeln!`/`write!`/`format!`) are excluded: their arguments often contain
+benign atomic `load()`/`store()` calls. `scripts/test-error-swallowing.py` pins
+the multi-line, `cfg(test)`-range and formatting-macro fixtures and runs as part
+of the checker. The repository still has hundreds of probe/cleanup sites (cache
+lookups, optional header parsing, test fixture teardown) where an error is
+expected control flow; making those fatal would be wrong and would bury the
+signal. The script covers the paths where a swallowed error could lose data,
+publish an unpersisted configuration, leave a partially written
+secret/certificate, or hide a dead listener.
 
 ## Reviewed categories
 
@@ -56,14 +67,60 @@ The DoH upstream flushes a diagnostic/body stream after the response has been
 delivered. The transport error path reports delivery failures separately;
 failing a query because a best-effort flush failed would discard a valid answer.
 
-### Test-only cleanup
+### Response write/shutdown after delivery (`shutdown`)
 
-`sito-ha`'s unit-test module removes a temporary directory. It is compiled only
-under `#[cfg(test)]` and cannot affect production.
+The DoT listener shuts down its write half after the response and the close
+path either delivered the answer or already returned the transport error to the
+connection task. Failing the connection again because the FIN failed cannot
+change the client-visible result.
+
+### Service lease release (`unlock`)
+
+`ServiceLease::drop` removes the lock file and releases the advisory lock. The
+process is exiting the lease; a failed `unlock` cannot be retried meaningfully
+and the path is removed in the same `Drop` implementation. The next startup
+treats a stale file as harmless because the lock, not the file, is
+authoritative.
+
+### Optional diagnostic/read paths (`read`, `load`)
+
+These reads are not the commit point of a security or configuration operation,
+and their failure has an explicit fail-safe fallback:
+
+- The `healthcheck` CLI reads `config.toml` only to discover probe targets; an
+  unreadable file falls back to conventional loopback targets. Server startup
+  reads the config explicitly and fails closed.
+- The service-status PID read only enriches `Running { pid }`; the advisory lock
+  is authoritative and the PID is diagnostic.
+- DNSSEC chain-cache restore (`load_with_stats`) logs a path-only warning and
+  keeps the default policy; a failed restore is retried by the next flush.
+- Filter list metadata is optional: an unreadable/corrupt metadata file only
+  disables conditional refresh and the list is re-fetched.
+- ACME pair-metadata digests treat a read error as a metadata mismatch, which
+  forces renewal rather than trusting an unverifiable pair.
+
+## Poison recovery is not a swallow
+
+`std::sync::Mutex` poisoning (P3-4) is handled by
+`sito_core::sync::lock_or_recover`, not by the allowlist. Production
+readiness, HA coordinator/slave state, filter reload/list rules and API config
+state use the helper, which logs the recovery once per process and returns the
+last-good value instead of panicking. Security/apply/persistence paths must not
+use `.lock().unwrap()`.
+
+The only remaining production `.lock().unwrap()` sites are in
+`sito-test-support`'s port-reservation registry. That crate is a test-only
+harness (it is excluded from the production size metric and never linked into
+the server binary), so a poison panic there fails a test and cannot abort a
+release.
 
 ## Not allowed
 
 New `let _ =`/`.ok()` around `write_secret_file`, `reload_all`, pair metadata,
-config persistence/publication, `set_permissions`, `rename`, or a successful
-`flush` in production code fails the script until either the error is handled
-or an explicit allowlist entry plus rationale is added here.
+config persistence/publication, `readiness`, `health`, `publish`, `persist`,
+`save`, `write`, `read`, `load`, `reload`, `shutdown`, `lease`, `bootstrap`,
+`set_permissions`, `rename`, or a successful `flush` in production code fails
+the script until either the error is handled or an explicit allowlist entry plus
+rationale is added here. `lock`/`unlock` swallows in production must use
+`sito_core::sync::lock_or_recover`/`read_or_recover`/`write_or_recover` instead,
+so the allowlist is only for best-effort release paths.

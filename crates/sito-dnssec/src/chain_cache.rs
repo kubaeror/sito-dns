@@ -200,10 +200,7 @@ impl ChainCache {
     ) -> PolicyChange {
         let anchors = normalize_policy_names(anchors);
         let ntas = normalize_policy_names(ntas);
-        let mut policy = self
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut policy = sito_core::sync::lock_or_recover(&self.policy);
 
         let Some(previous) = policy.clone() else {
             // A legacy file can contain entries with no policy at all. Those
@@ -351,10 +348,7 @@ impl ChainCache {
         // never wait for an in-progress disk write. A flush snapshots entries
         // under the same lock, so it observes either the pre- or post-clear
         // view consistently with the policy metadata.
-        let _policy_guard = self
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _policy_guard = sito_core::sync::lock_or_recover(&self.policy);
         let removed = self.remove_unsigned_at_or_above_locked(anchor);
         if removed > 0 {
             self.dirty.store(true, Ordering::Release);
@@ -458,10 +452,7 @@ impl ChainCache {
 
         if let Some(fingerprint) = policy {
             let metadata_known = policy_anchors.is_some() && policy_ntas.is_some();
-            *self
-                .policy
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PolicyRecord {
+            *sito_core::sync::lock_or_recover(&self.policy) = Some(PolicyRecord {
                 state: PolicyState {
                     fingerprint,
                     anchors: normalize_policy_names(policy_anchors.unwrap_or_default()),
@@ -542,9 +533,7 @@ impl ChainCache {
     /// [`Self::ensure_policy`]).
     #[must_use]
     pub fn policy_generation(&self) -> u64 {
-        self.policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        sito_core::sync::lock_or_recover(&self.policy)
             .as_ref()
             .map_or(0, |record| record.generation)
     }
@@ -555,10 +544,7 @@ impl ChainCache {
     /// Production validation uses [`Self::insert_for_generation`] so an
     /// in-flight query built under an older policy cannot write after a reload.
     pub fn insert(&self, name: LowerName, status: ZoneStatus, expires_at: u32, now: u32) {
-        let _policy_guard = self
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _policy_guard = sito_core::sync::lock_or_recover(&self.policy);
         self.insert_locked(name, status, expires_at, now);
     }
 
@@ -577,10 +563,7 @@ impl ChainCache {
         // `ensure_policy` takes the same lock, so an in-flight insert either
         // completes before the flush or observes the new generation and is
         // rejected. It can never land between the flush and the metadata swap.
-        let policy = self
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let policy = sito_core::sync::lock_or_recover(&self.policy);
         let current = policy.as_ref().map_or(0, |record| record.generation);
         if current != generation {
             return false;
@@ -704,16 +687,10 @@ impl ChainCache {
         // A shutdown flush can race the periodic flush task. Serialize the
         // whole flush so an older snapshot can never overwrite a newer one.
         // Policy operations never take this lock.
-        let _flush_guard = self
-            .flush_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _flush_guard = sito_core::sync::lock_or_recover(&self.flush_lock);
         let now = system_now();
         let persisted = {
-            let policy = self
-                .policy
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let policy = sito_core::sync::lock_or_recover(&self.policy);
             if !self.dirty.swap(false, Ordering::AcqRel) {
                 return Ok(());
             }
@@ -757,10 +734,7 @@ impl ChainCache {
 
         #[cfg(test)]
         {
-            let hook = self
-                .flush_hook
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let hook = sito_core::sync::lock_or_recover(&self.flush_hook);
             if let Some(hook) = hook.as_ref() {
                 hook();
             }
@@ -791,10 +765,7 @@ impl ChainCache {
 
     #[cfg(test)]
     fn set_flush_hook(&self, hook: Option<Box<dyn Fn() + Send + Sync>>) {
-        *self
-            .flush_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+        *sito_core::sync::lock_or_recover(&self.flush_hook) = hook;
     }
 }
 

@@ -366,7 +366,7 @@ fn test_m9_check_config_rejects_invalid_typed_sections() {
     let bad_clients = temp_dir.join("bad_clients.toml");
     fs::write(
         &bad_clients,
-        "config_version = 1\n[server]\nrole = \"master\"\n[clients]\n[[clients.entries]]\nname = \"x\"\nids = \"not-a-list\"\n",
+        "config_version = 2\n[server]\nrole = \"master\"\n[clients]\n[[clients.entries]]\nname = \"x\"\nids = \"not-a-list\"\n",
     )
     .unwrap();
     let err = sito::cli::run_check_config(&bad_clients).expect_err("invalid clients must fail");
@@ -379,7 +379,7 @@ fn test_m9_check_config_rejects_invalid_typed_sections() {
     let bad_web = temp_dir.join("bad_web.toml");
     fs::write(
         &bad_web,
-        "config_version = 1\n[server]\nrole = \"master\"\n[web]\nbind = [\"127.0.0.1\"]\n",
+        "config_version = 2\n[server]\nrole = \"master\"\n[web]\nbind = [\"127.0.0.1\"]\n",
     )
     .unwrap();
     let err = sito::cli::run_check_config(&bad_web).expect_err("invalid web must fail");
@@ -614,7 +614,7 @@ fn test_m9_network_exposure_guidance_is_lan_only() {
         "sudo ufw allow OpenSSH",
         "do not open 8080",
         "ssh -L 8080:127.0.0.1:8080",
-        "1.10.0",
+        "loopback admin default is already in the **2.0**",
         "web.bind",
         "dns.bind",
     ] {

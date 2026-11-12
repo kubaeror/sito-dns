@@ -16,6 +16,7 @@ pub mod handlers;
 pub mod models;
 pub mod openapi;
 pub mod probe;
+pub mod readiness;
 pub mod router;
 pub mod security;
 pub mod state;
@@ -30,8 +31,13 @@ pub mod ui;
 pub use auth::*;
 pub use error::ProblemDetails;
 pub use openapi::ApiDoc;
+pub use readiness::{
+    ComponentReadiness, ReadinessInputs, ReadinessReason, ReadinessReport, ReadinessState,
+};
 pub use router::{create_router, create_router_with_hooks};
-pub use state::{ServerContext, publish_bundle};
+pub use state::{
+    ServerContext, publish_bundle, refresh_tls_certificate_readiness, tls_certificate_readiness,
+};
 
 #[cfg(test)]
 mod tests {

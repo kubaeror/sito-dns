@@ -12,11 +12,12 @@ feature-depth = 1
 
 [advisories]
 version = 2
-ignore = [
-    # Build-time-only via askama_macros (template config parsing); not linked
-    # into the runtime binary. Askama has not dropped basic-toml yet.
-    "RUSTSEC-2026-0374",
-]
+# RUSTSEC-2026-0374: `basic-toml` 0.1.10 is unmaintained. It is a build-time
+# dependency of `askama_derive` 0.16 (pulled in by `askama`); it is not linked
+# into the shipped binary and has no safe upgrade. `cargo-deny`'s advisory DB
+# detects it in CI even though a stale local DB may not. Remove this entry once
+# askama moves off basic-toml.
+ignore = ["RUSTSEC-2026-0374"]
 
 [licenses]
 allow = [

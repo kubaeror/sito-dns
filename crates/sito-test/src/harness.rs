@@ -9,6 +9,11 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+/// Bound for one listener to accept connections after the server task starts.
+const LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Poll interval while waiting for a listener.
+const LISTENER_READY_POLL: Duration = Duration::from_millis(20);
+
 /// Optional overrides for [`TestServerInstance::spawn_with_options`].
 #[derive(Clone, Default)]
 pub struct HarnessOptions {
@@ -31,15 +36,12 @@ pub struct TestServerInstance {
     reserved_ports: Vec<u16>,
 }
 
-/// Serializes probe-then-bind across parallel tests in one binary: without it,
-/// two tests can probe the same free port before either server binds it. The
-/// lock is held from port probing until the instance reports ready, then
-/// released so tests run concurrently.
-static SPAWN_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+// Port allocation is atomic through `PortReservations`, so instances may
+// start concurrently; there is deliberately no process-wide spawn lock.
 
 pub use sito_test_support::{
     PortReservations, ReservedPort, ReservedUdpPort, reserve_port, reserve_port_number,
-    reserve_udp_port, reserve_udp_port_number, wait_until,
+    reserve_udp_port, reserve_udp_port_number, wait_for, wait_until,
 };
 
 impl TestServerInstance {
@@ -55,9 +57,6 @@ impl TestServerInstance {
         config: Config,
         options: HarnessOptions,
     ) -> Result<Self, anyhow::Error> {
-        let spawn_lock = SPAWN_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
-        let _guard = spawn_lock.lock().await;
-
         let mut last_err = anyhow::anyhow!("Failed to spawn test server instance");
         for attempt in 0..5 {
             match Self::try_spawn(config.clone(), options.clone()).await {
@@ -98,7 +97,8 @@ impl TestServerInstance {
         // Allocate ephemeral ports through the broker so no two instances in
         // this binary can pick the same port.
         let mut reservations = PortReservations::new();
-        let (probe_dns, port) = reservations.reserve_tcp()?;
+        // The DNS listener binds UDP and TCP on the same number.
+        let (probe_dns_tcp, probe_dns_udp, port) = reservations.reserve_tcp_udp()?;
 
         let mut dot_port = config.dns.dot_port;
         let mut doh_port = config.dns.doh_port;
@@ -151,7 +151,7 @@ impl TestServerInstance {
         }
 
         // Release all probes simultaneously right before starting the server
-        drop(probe_dns);
+        drop((probe_dns_tcp, probe_dns_udp));
         drop(probe_dot);
         drop(probe_doh);
         drop(probe_doq);
@@ -186,10 +186,13 @@ impl TestServerInstance {
         let mut server_task =
             tokio::spawn(async move { run_server_with_shutdown(config, Some(shutdown_rx)).await });
 
-        // Wait until standard server listener is ready (up to 3s for busy CI runners)
+        // Wait until the standard DNS listener is ready. The bound includes
+        // debug-build Argon2 bootstrap hashing and is also used by the DoT/DoH
+        // readiness probes below.
+        let attempts = LISTENER_READY_TIMEOUT.as_millis() / LISTENER_READY_POLL.as_millis();
         let mut ready = false;
-        for _ in 0..150 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        for _ in 0..attempts {
+            tokio::time::sleep(LISTENER_READY_POLL).await;
             if server_task.is_finished() {
                 break;
             }
@@ -216,7 +219,7 @@ impl TestServerInstance {
         if has_tls && dot_port > 0 {
             let dot_addr = SocketAddr::new(addr.ip(), dot_port);
             let mut dot_ready = false;
-            for _ in 0..150 {
+            for _ in 0..attempts {
                 if server_task.is_finished() {
                     break;
                 }
@@ -224,7 +227,7 @@ impl TestServerInstance {
                     dot_ready = true;
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                tokio::time::sleep(LISTENER_READY_POLL).await;
             }
             if server_task.is_finished() {
                 (&mut server_task).await??;
@@ -243,7 +246,7 @@ impl TestServerInstance {
         if has_tls && doh_port > 0 {
             let doh_addr = SocketAddr::new(addr.ip(), doh_port);
             let mut doh_ready = false;
-            for _ in 0..150 {
+            for _ in 0..attempts {
                 if server_task.is_finished() {
                     break;
                 }
@@ -251,7 +254,7 @@ impl TestServerInstance {
                     doh_ready = true;
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                tokio::time::sleep(LISTENER_READY_POLL).await;
             }
             if server_task.is_finished() {
                 (&mut server_task).await??;
@@ -266,7 +269,11 @@ impl TestServerInstance {
             }
         }
 
-        // Brief grace period for UDP and listener tasks to enter event loop
+        // Semantic grace: TCP readiness above proves the server bound, but the
+        // UDP worker tasks are scheduled independently and need one event-loop
+        // turn before the first datagram is consumed. This is a bounded
+        // startup barrier, not a wait for an assertion (see
+        // docs/test-harness.md#semantic-sleeps-that-remain).
         tokio::time::sleep(Duration::from_millis(50)).await;
         if server_task.is_finished() {
             (&mut server_task).await??;
@@ -362,45 +369,16 @@ impl TestServerInstance {
     }
 }
 
-/// Generates a valid self-signed certificate and private key in PEM format using rcgen.
+/// Generates a valid self-signed certificate and private key in PEM format.
+#[must_use]
 pub fn generate_test_cert(san_domains: &[&str]) -> (String, String) {
-    let key_pair = rcgen::KeyPair::generate().expect("key pair generation");
-    let mut params = rcgen::CertificateParams::default();
-    let mut dn = rcgen::DistinguishedName::new();
-    dn.push(rcgen::DnType::CommonName, "sito-test.local");
-    params.distinguished_name = dn;
-    for san in san_domains {
-        params.subject_alt_names.push(rcgen::SanType::DnsName(
-            (*san).to_string().try_into().unwrap(),
-        ));
-    }
-
-    let cert = params.self_signed(&key_pair).expect("self signed cert");
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-    (cert_pem, key_pem)
+    crate::fixtures::tls::test_certificate(san_domains).into_pair()
 }
 
-/// Generates an expired self-signed certificate and private key in PEM format using rcgen.
+/// Generates an expired self-signed certificate and private key in PEM format.
+#[must_use]
 pub fn generate_expired_test_cert(san_domains: &[&str]) -> (String, String) {
-    let key_pair = rcgen::KeyPair::generate().expect("key pair generation");
-    let mut params = rcgen::CertificateParams::default();
-    let mut dn = rcgen::DistinguishedName::new();
-    dn.push(rcgen::DnType::CommonName, "sito-expired.local");
-    params.distinguished_name = dn;
-    for san in san_domains {
-        params.subject_alt_names.push(rcgen::SanType::DnsName(
-            (*san).to_string().try_into().unwrap(),
-        ));
-    }
-    // Set validity in the past (year 2020)
-    params.not_before = time::OffsetDateTime::from_unix_timestamp(1_577_836_800).unwrap(); // 2020-01-01
-    params.not_after = time::OffsetDateTime::from_unix_timestamp(1_577_923_200).unwrap(); // 2020-01-02
-
-    let cert = params.self_signed(&key_pair).expect("self signed cert");
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-    (cert_pem, key_pem)
+    crate::fixtures::tls::expired_certificate(san_domains).into_pair()
 }
 
 impl Drop for TestServerInstance {

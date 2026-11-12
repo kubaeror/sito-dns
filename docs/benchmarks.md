@@ -3,13 +3,28 @@
 This document records the benchmarking results, throughput analysis, and
 resource consumption profile from the original reference-hardware run against
 the performance contracts in **ADR-0008 (Performance Budget)**. The absolute
-numbers below were captured on that hardware at **v1.0.0** and are **not**
-re-measured for every 1.9.x release. The weekly `cargo bench` job uploads
-estimates and the weekly release-mode tests run the opt-in `SITO_BENCH_TESTS`
-perf test, but **there is no threshold or regression check**: a slower result
-does not fail CI. Re-run
-`cargo bench -p sito-test --bench pipeline_bench` on your own hardware before
-comparing.
+numbers below were captured on that hardware at **v1.0.0** and are historical:
+they are **not** re-measured for every 1.9.x or 2.0 alpha change and are not a
+claim about the current development line.
+
+Current performance gates:
+
+- Pull requests only compile every Criterion target:
+  `cargo bench --workspace --all-features --locked --no-run`.
+- The nightly `bench.yml` workflow runs the Criterion suite and compares it with
+  `benches/baseline.json`; more than 10% slower fails. It refuses to run unless
+  `BENCH_RUNNER_LABEL` names a dedicated/self-hosted runner and
+  `BENCH_ENVIRONMENT` matches the baseline. The committed baseline was generated
+  on the WP-1.9 development host (`local-dev-x86_64-20cpu`), so the nightly gate
+  is **inactive until that runner is provisioned and the baseline regenerated
+  there**. This is an explicit residual, not a hidden threshold. See
+  [docs/ci.md](ci.md#benchmark-baseline).
+- The 24-hour fuzz run and a green benchmark comparison are release-checklist
+  items, not PR gates; see
+  [docs/release-verification.md](release-verification.md#fuzz-evidence-24-hour-release-checklist).
+
+Re-run `cargo bench -p sito-test --bench pipeline_bench` (or the relevant
+package bench) on your own hardware before comparing.
 
 ---
 
@@ -111,10 +126,26 @@ Under sustained 24-hour query churn with frequent cache expirations and hot filt
 
 ---
 
-## 5. Verification Command
+## 5. Current benchmark and fuzz commands
 
-To reproduce the micro-benchmarks on your own system:
+The v1.0 numbers above are historical. To reproduce a current measurement on
+your own system:
 
 ```bash
+# Compile every Criterion target (what a PR runs)
+cargo bench --workspace --all-features --locked --no-run
+
+# Run the pipeline and focused benches
 cargo bench -p sito-test --bench pipeline_bench
+cargo bench -p sito-filter --bench lookup
+cargo bench -p sito-cache --bench cache_bench
+cargo bench -p sito-stats --bench stats_bench
+cargo bench -p sito-stats --bench metrics_bench
+
+# Regenerate the environment-specific baseline on the dedicated runner
+scripts/save-bench-baseline.sh
 ```
+
+The thresholded nightly gate is documented in
+[docs/ci.md](ci.md#benchmark-baseline); the 24-hour fuzz release checklist is in
+[docs/release-verification.md](release-verification.md#fuzz-evidence-24-hour-release-checklist).

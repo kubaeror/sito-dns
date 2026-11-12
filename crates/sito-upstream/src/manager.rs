@@ -205,6 +205,19 @@ pub struct UpstreamManager {
     rr_counter: AtomicUsize,
 }
 
+/// A validated replacement upstream set that is not live yet.
+pub struct PreparedUpstream {
+    inner: UpstreamInner,
+}
+
+impl std::fmt::Debug for PreparedUpstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedUpstream")
+            .field("entries", &self.inner.entries.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// How often a multi-address upstream re-resolves its hostname.
 const UPSTREAM_RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -684,15 +697,17 @@ impl UpstreamManager {
         })
     }
 
-    /// Hot-reloads upstream manager dynamically with updated servers, strategy, and domain rules.
+    /// Builds a replacement upstream set without publishing it.
     ///
-    /// Health state is carried over for upstreams that keep the same name so a
-    /// reload does not resurrect a known-down server as Healthy.
-    pub async fn reload(
+    /// Every configured server (including per-domain scopes) is constructed
+    /// and validated here, so a bad candidate is an [`UpstreamError`] before
+    /// any live component changes. Health state is carried over from this
+    /// manager for entries that keep the same name.
+    pub async fn prepare(
         &self,
         config: &UpstreamConfig,
         bootstrap: &BootstrapResolver,
-    ) -> Result<(), UpstreamError> {
+    ) -> Result<PreparedUpstream, UpstreamError> {
         let new_inner = UpstreamInner::from_config(config, bootstrap).await?;
         let old = self.inner.load();
 
@@ -718,13 +733,34 @@ impl UpstreamManager {
             }
         }
 
-        self.inner.store(Arc::new(UpstreamInner {
-            entries,
-            per_domain_rules,
-            strategy: new_inner.strategy,
-            timeout_duration: new_inner.timeout_duration,
-            probe_domain: new_inner.probe_domain,
-        }));
+        Ok(PreparedUpstream {
+            inner: UpstreamInner {
+                entries,
+                per_domain_rules,
+                strategy: new_inner.strategy,
+                timeout_duration: new_inner.timeout_duration,
+                probe_domain: new_inner.probe_domain,
+            },
+        })
+    }
+
+    /// Installs a prepared upstream set. Infallible: all fallible construction
+    /// and validation happened in [`Self::prepare`].
+    pub fn publish(&self, prepared: PreparedUpstream) {
+        self.inner.store(Arc::new(prepared.inner));
+    }
+
+    /// Hot-reloads upstream manager dynamically with updated servers, strategy, and domain rules.
+    ///
+    /// Health state is carried over for upstreams that keep the same name so a
+    /// reload does not resurrect a known-down server as Healthy.
+    pub async fn reload(
+        &self,
+        config: &UpstreamConfig,
+        bootstrap: &BootstrapResolver,
+    ) -> Result<(), UpstreamError> {
+        let prepared = self.prepare(config, bootstrap).await?;
+        self.publish(prepared);
         info!(
             servers = ?config.servers,
             strategy = ?config.strategy,
@@ -848,9 +884,7 @@ impl UpstreamManager {
             let qname_clean = qname_str.trim_end_matches('.');
             for (domains, group) in &inner.per_domain_rules {
                 for d in domains {
-                    if let Some(prefix) = qname_clean.strip_suffix(d.as_str())
-                        && (prefix.is_empty() || prefix.ends_with('.'))
-                    {
+                    if sito_core::matches_domain_suffix(qname_clean, d) {
                         debug!(
                             "Routing query for {} to per-domain upstreams {:?}",
                             qname_str, domains

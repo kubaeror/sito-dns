@@ -8,22 +8,6 @@ use sito_core::config::Config;
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
-/// Atomically persists configuration to disk and guarantees durability.
-pub async fn save_config_atomic(path: &Path, config: &Config) -> Result<(), ProblemDetails> {
-    // 1. Pre-commit validation
-    if let Err(e) = config.validate() {
-        return Err(ProblemDetails::bad_request(format!(
-            "Configuration validation failed: {e}"
-        )));
-    }
-
-    // 2. Serialize to TOML
-    let toml_str = toml::to_string_pretty(config)
-        .map_err(|e| ProblemDetails::internal_error(format!("Serialization failed: {e}")))?;
-
-    write_config_document_atomic(path, &toml_str).await
-}
-
 /// Atomically persists an already-rendered configuration document.
 ///
 /// Used by the HA slave apply path, which must keep the exact document built
@@ -31,12 +15,12 @@ pub async fn save_config_atomic(path: &Path, config: &Config) -> Result<(), Prob
 /// RouterOS credentials) instead of re-serializing the typed config. The
 /// document is still validated before it is committed so a restart cannot
 /// observe an unloadable file.
-pub async fn save_config_document_atomic(
+pub(crate) async fn save_config_document_atomic(
     path: &Path,
     document: &str,
     config: &Config,
 ) -> Result<(), ProblemDetails> {
-    if let Err(e) = config.validate() {
+    if let Err(e) = config.validate_full() {
         return Err(ProblemDetails::bad_request(format!(
             "Configuration validation failed: {e}"
         )));

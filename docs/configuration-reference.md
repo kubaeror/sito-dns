@@ -1,13 +1,20 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v1.9.5**.
+This document is the exhaustive configuration reference for **sito v2.0.0-alpha.1**.
+
+> **Config v2 is frozen at WP-1.3.** `config_version = 2` is the default and
+> the only version accepted by startup, `check-config`, API writes, restore and
+> HA apply. A `config_version = 1` document is rejected with a migration hint;
+> run `sito config migrate --from v1 --to v2 --backup`. Unknown keys/tables are
+> errors. See [`docs/config-v2.md`](config-v2.md) for the schema freeze,
+> unknown-key policy, restart-only matrix and migration report.
 
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the `DNSD_SECRET_<name>` environment variable, then a bare `<name>` environment variable; there is no on-disk local secret store, and a placeholder that cannot be resolved rejects the whole pushed configuration.
 
 > [!NOTE]
-> The tables below are validated against the Rust config structs in CI (`scripts/check_config_reference.py`); adding a setting without documenting it fails the build.
+> The tables below are validated against the Rust config structs in CI (`scripts/check_config_reference.py`): top-level and nested array/map structs, types, defaults, required fields, the legacy raw-section key allowlists and the checked-in v1→v2 map. Adding a setting without documenting it, or documenting a default/type that drifts from the struct, fails the build. Regression fixtures for the checker live in `scripts/test_check_config_reference.py`.
 >
-> Configuration persistence round-trips modeled fields via the `Config` schema. Unrecognized or unmodeled keys and comments are omitted when the configuration is saved back to disk by the web console or API.
+> Configuration persistence round-trips modeled fields via the `Config` schema. Unknown keys are rejected at load time (startup, `check-config`, API writes, restore and HA apply); comments are not preserved when the web console or API saves the file. The upgrade path and unknown-key migration flag are in [`docs/2.0-migration.md`](2.0-migration.md) and [`docs/config-v2.md`](config-v2.md).
 
 ---
 
@@ -15,7 +22,7 @@ This document is the exhaustive configuration reference for **sito v1.9.5**.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `config_version` | integer | `1` | Configuration schema version. Only version `1` is accepted; there are **no automatic configuration migrations** in 1.9.x. The 2.0 line adds an explicit migration path. |
+| `config_version` | integer | `2` | Configuration schema version. A file must set `2` explicitly; an omitted key was valid in 1.9 and is treated as v1. Only version `2` is accepted; a v1/unversioned document is rejected with a pointer to `sito config migrate --from v1 --to v2 --backup`. The v2 schema is frozen at WP-1.3: later additions must be optional fields with defaults or a v2.1 migration. |
 
 ---
 
@@ -75,19 +82,19 @@ allow_plaintext_doh = false
 | `doh3_port` | integer | `443` | DNS-over-HTTP/3 (DoH3) UDP port. `0` disables DoH3. |
 | `doh_dedicated_hostname` | string | `""` | When set, DoH/DoH3 requests whose Host/authority does not match are rejected with `421 Misdirected Request`. Empty allows any hostname. |
 | `dot_padding` | boolean | `false` | RFC 7830/8467 padding on DoT responses to mitigate traffic analysis. |
-| `tls` | table | `None` | `[dns.tls]` is the effective TLS table and takes precedence over the top-level `[tls]` alias when both exist (same `cert`, `key`, `sni_certs` fields). Prefer `[dns.tls]` for new configuration; changing either table requires a restart. |
+| `tls` | table | `None` | Top-level `[tls]` is the canonical config v2 table. `[dns.tls]` is a deprecated v1 alias that still takes precedence when both are present (v1 behavior); migration moves it to `[tls]`. Changing either table requires a restart. |
 | `edns_udp_size` | integer | `1232` | Maximum EDNS0 UDP buffer size (1232 bytes prevents IPv6 fragmentation). |
 | `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual source prefix (`0` disables rate limiting; maximum `1000000`). IPv4 budgets are keyed per `/24` and IPv6 per `/64`. |
 | `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, and DoH client connections. |
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
 > [!WARNING]
-> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 1.9.5 has **no DNS client allow-list**.
+> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 2.0 has **no DNS client allow-list**.
 > `rate_limit_per_ip` only limits rate; it does not authorize clients. A wildcard bind therefore accepts recursive queries from any source
 > that can reach the host. Restrict the DNS ports to your LAN with a host
 > firewall, or bind specific LAN addresses. The server emits a startup warning
 > when a wildcard DNS bind is combined with an enabled DNS port. A
-> default-deny DNS client ACL is planned for 1.10.0.
+> default-deny DNS client ACL is not part of the Phase 1 config work package.
 
 ---
 
@@ -159,7 +166,7 @@ allow_bootstrap_cert = false
 |---|---|---|---|
 | `tls.cert` | string | `None` | Path to PEM-encoded certificate chain for DoT, DoH, DoQ and DoH3. It does **not** secure the admin Web UI, which is plain HTTP behind your reverse proxy/SSH tunnel. |
 | `tls.key` | string | `None` | Path to PEM-encoded unencrypted PKCS#8 or RSA/EC private key. |
-| `tls.sni_certs` | array of tables | `[]` | Additional certificate/key pairs mapped to specific SNI hostnames. |
+| `tls.sni_certs` | array of tables | `[]` | Additional certificate/key pairs mapped to specific SNI hostnames. `sni_certs[].domain` is normalized and must be unique. |
 | `acme.enabled` | boolean | `false` | Enables automated certificate issuance via Let's Encrypt / ACME. |
 | `acme.email` | string | `None` | Contact email address for ACME registration. |
 | `acme.domains` | array of strings | `[]` | Domain names for ACME TLS-ALPN-01 / HTTP-01 certificates. TLS-ALPN-01 is selected only when a DoH listener is actually bound on TCP 443; otherwise HTTP-01 is used when its listener binds. |
@@ -167,6 +174,21 @@ allow_bootstrap_cert = false
 | `acme.cache_dir` | string | `None` | Directory used to persist ACME account keys and certificates (defaults to `<data_dir>/acme`). |
 | `acme.http_port` | integer | `80` | Port for the dedicated ACME HTTP-01 challenge listener. |
 | `acme.allow_bootstrap_cert` | boolean | `false` | Serve a short-lived self-signed certificate on encrypted listeners while the first ACME certificate is being issued. When `false` (default), DoT/DoH/DoQ/DoH3 stay disabled until a trusted certificate exists. |
+
+### `[[tls.sni_certs]]` entries
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `sni_certs.domain` | string | required | SNI hostname this certificate pair serves. Normalized and required to be unique across the array. |
+| `sni_certs.cert` | string | required | Path to the PEM certificate chain for this SNI hostname. |
+| `sni_certs.key` | string | required | Path to the PEM private key for this SNI hostname. |
+
+> [!NOTE]
+> `[dns.tls]` (cert/key/sni_certs) and the legacy `[web] acme_enabled`,
+> `acme_email`, `acme_domains`, `acme_staging`, `acme_cache_dir` keys are
+> accepted as **deprecated aliases** for one 2.0 alpha. They take precedence
+> exactly as they did in 1.9; `sito config migrate` rewrites them to typed
+> `[tls]`/`[acme]`. New configuration must use the typed sections.
 
 ---
 
@@ -205,6 +227,13 @@ servers = ["udp://192.168.1.1:53"]
 | `pool_size` | integer | `4` | Number of persistent TCP/TLS connections maintained per upstream endpoint. |
 | `allow_private_targets` | boolean | `false` | Allow hostname-configured upstreams to resolve to private/loopback/link-local/reserved addresses. Disabled by default so a compromised or spoofed bootstrap cannot redirect an upstream into the local network or cloud metadata. IP literals in `servers` are always accepted as an explicit operator choice. This is a config-file-only key: the REST/UI upstream update preserves the current value rather than accepting it in the DTO. |
 | `per_domain` | array of tables | `[]` | Domain-specific upstream forwarder rules (e.g., routing LAN domains to internal router). |
+
+### `[[upstream.per_domain]]` entries
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `per_domain.domains` | array of strings | required | Domain suffixes served by this rule. Values are normalized as domains. |
+| `per_domain.servers` | array of strings | required | Upstream targets for the matching domains. Same syntax and SSRF rules as `upstream.servers`. |
 
 ---
 
@@ -298,6 +327,42 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `trust_routeros_lease_names` | boolean | `false` | Trust RouterOS DHCP lease host names/comments for client identification. Off by default because lease data is client-controlled. |
 | `timezone` | string | `"local"` | Timezone used to evaluate client schedules and time-of-day rules. `"local"`/`"system"` uses the host zone (DST-aware); `"UTC"` and fixed offsets (`"+02:00"`, `"-05:30"`, `"+0530"`, `"UTC+2"`) are also accepted. IANA names are not supported (no tzdb dependency); schedules in UTC-only deployments should set this explicitly. |
 
+### `[[clients.entries]]` entries
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `entries.name` | string | required | Unique display name for the client; also the key used by `client_id_secrets`. |
+| `entries.ids` | array of strings | `[]` | IP addresses, CIDRs, MAC addresses and shared-secret DoH path/DoT SNI labels that identify this client. A display name never authenticates a client. |
+| `entries.group` | string | `"default"` | Policy group name the client belongs to. |
+| `entries.ignore_query_log` | boolean | `false` | Exclude this client's queries from the detailed query log. |
+| `entries.ignore_stats` | boolean | `false` | Exclude this client from Prometheus counters. |
+| `entries.use_global_upstreams` | boolean | `true` | Resolve through `upstream.servers`. Set to `false` to use the per-client `upstreams` list only. |
+| `entries.upstreams` | array of strings | `None` | Per-client upstream targets. Mandatory and non-empty when `use_global_upstreams = false`; config validation rejects a missing/empty list instead of falling back to the global upstreams. Answers bypass the shared cache. |
+| `entries.trusted` | boolean | `false` | Mark the client as trusted for policy decisions that distinguish trusted clients. |
+
+### `[clients.groups.<name>]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `groups.description` | string | `None` | Optional operator note for the group. |
+| `groups.filtering` | boolean | `true` | Apply filtering rules to members of this group. |
+| `groups.lists` | array of strings | `[]` | Filter list names applied to this group in addition to global lists. |
+| `groups.custom_rules` | array of strings | `[]` | Inline ABP/AdGuard rules applied only to this group. |
+| `groups.safe_search` | boolean | `false` | Force safe-search resolution for group members. |
+| `groups.safe_search_youtube` | string | `None` | YouTube safe-search mode when `safe_search` is enabled (`"off"`, `"moderate"` or `"strict"`). |
+| `groups.parental` | boolean | `false` | Enable parental-category blocking for group members. |
+| `groups.parental_categories` | array of strings | `[]` | Parental categories to block (for example `"adult"`, `"gambling"`). |
+| `groups.schedule_enabled` | boolean | `false` | Enable the group's time-of-day schedule. |
+| `groups.schedule` | string | `None` | Cron-style schedule used when `schedule_enabled = true`, evaluated in `clients.timezone`. |
+| `groups.blocked_services` | array of tables | `[]` | Service-specific block rules for members of this group. |
+
+### `[[clients.groups.<name>.blocked_services]]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `groups.blocked_services.service` | string | required | Service identifier (`tiktok`, `youtube`, …) to block. |
+| `groups.blocked_services.schedule` | string | `None` | Optional cron-style schedule that limits when the service is blocked. |
+
 ---
 
 ## 10. `[rewrites]` — Local DNS Records & Overrides
@@ -320,6 +385,16 @@ exception_clients = ["admin-laptop"]
 | `ttl` | integer | `60` | TTL for synthesized rewrite records. |
 | `entries` | array of tables | `[]` | Local record rewrites (`domain`, `type` (`A`/`AAAA`/`CNAME`/`PTR`/`TXT`), `answer`, and optional `exception_clients`). |
 
+### `[[rewrites.entries]]` entries
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `entries.domain` | string | required | Domain or wildcard pattern to answer locally (`*.home.arpa`). Normalized as a domain. |
+| `entries.type` | string | required | Record type: `"A"`, `"AAAA"`, `"CNAME"`, `"PTR"` or `"TXT"`. |
+| `entries.answer` | string | required | Answer value for the record. |
+| `entries.exception_clients` | array of strings | `[]` | Client names/groups/MACs that bypass the rewrite. Matching requires an authenticated identity; IP/CIDR matching still uses the query source. |
+| `entries.id` | string | `None` | Stable rewrite identifier preserved by the admin rewrite API and returned by `/api/v1/rewrites`. The DNS rewrite loader does not use it. If it is absent, the API synthesizes `legacy-<index>`; removing an existing id changes the identifier clients see. |
+
 ---
 
 ## 11. `[web]` & `[auth]` — Administration API and Web Interface
@@ -328,7 +403,7 @@ exception_clients = ["admin-laptop"]
 [web]
 enabled = true
 port = 8080
-bind = "0.0.0.0"          # single IP address, not an array
+bind = "127.0.0.1"        # single IP address, not an array
 metrics_auth = true
 trusted_proxies = ["10.0.0.1", "192.168.1.10"]   # individual proxy IPs
 
@@ -343,23 +418,34 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 |---|---|---|---|
 | `web.enabled` | boolean | `true` | Enable the web dashboard and REST API. |
 | `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`; must be ≥ 1). |
-| `web.bind` | string (IP address) | `"0.0.0.0"` | Bind address for the web server. The admin UI is served over plain HTTP; see the exposure warning below. |
+| `web.bind` | string (IP address) | `"127.0.0.1"` | Bind address for the web server. The admin UI is served over plain HTTP; see the exposure warning below. Migrated v1 documents keep their previous bind unless `--adopt-safe-defaults` is used. |
 | `web.metrics_auth` | boolean | `true` | Require authentication (token or session) for `/metrics`. |
 | `web.trusted_proxies`| array of IP addresses | `[]` | Individual proxy IPs trusted to supply `X-Forwarded-For`/`X-Forwarded-Proto` (CIDR is **not** supported here). |
+| `web.public_url` | string | `None` | Explicit external admin URL. The scheme (`http://` or `https://`) decides Secure cookies/HSTS and whether a declared TLS reverse proxy suppresses the plaintext warning. |
+| `web.tls_terminated_by_proxy` | boolean | `false` | Declare that a trusted reverse proxy terminates TLS in front of the admin UI. Used only for the exposure warning when `public_url` is unset. |
+| `web.acme_enabled` | boolean | `false` | Deprecated v1 alias for `acme.enabled`; migrated to `[acme]`. |
+| `web.acme_email` | string | `None` | Deprecated v1 alias for `acme.email`. |
+| `web.acme_domains` | array of strings | `[]` | Deprecated v1 alias for `acme.domains`. |
+| `web.acme_staging` | boolean | `false` | Deprecated v1 alias for `acme.staging`. |
+| `web.acme_cache_dir` | string | `None` | Deprecated v1 alias for `acme.cache_dir`. |
 | `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required (must be ≥ 1). |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL, but are revalidated against `users.toml` on load and on every request (account exists, role and credential epoch match); entries written before credential epochs existed are rejected once, so users re-login and API tokens are re-issued after upgrading. Corrupt stores are backed up and start empty. Stop the service before `sito reset-sessions`; the reset refuses to run against a live server unless `--force` is given. |
 | `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
 
+`[web]` and `[auth]` are parsed into typed structs (`WebConfig`, `AuthConfig`)
+with `deny_unknown_fields`; the single validator (`Config::validate_full()`)
+checks port, URL scheme, ACME alias consistency and auth TTL/lockout bounds at
+startup, `check-config`, API writes, restore and HA apply.
+
 > [!WARNING]
-> `web.bind` defaults to `0.0.0.0` and the admin UI is served over plain HTTP
-> by axum (the DNS `[tls]` certificate never protects the admin scheme). Do not
-> expose port `8080` to the internet. The server emits a startup warning when
-> the UI is reachable beyond loopback unless an `https://` `web.public_url` (or
-> `web.tls_terminated_by_proxy = true` with no public URL) declares a TLS
-> reverse proxy. For remote access, bind `web.bind = "127.0.0.1"` and use an SSH
-> tunnel or reverse proxy. The loopback default is planned for 1.10.0; 1.9.5
-> keeps the historical default so existing configurations keep working.
+> `web.bind` defaults to `127.0.0.1` in config v2 and the admin UI is served
+> over plain HTTP by axum (the DNS `[tls]` certificate never protects the admin
+> scheme). Do not expose port `8080` to the internet. The server emits a
+> startup warning when the UI is reachable beyond loopback unless an
+> `https://` `web.public_url` (or `web.tls_terminated_by_proxy = true` with no
+> public URL) declares a TLS reverse proxy. For remote access, use an SSH
+> tunnel or a TLS reverse proxy.
 
 
 The running server holds an exclusive advisory lease on `<data_dir>/sito.pid`
@@ -426,6 +512,12 @@ anonymize_querylog = false
 | `stats.rollup_retention_days` | integer | `365` | Days to keep hourly rollups (aggregate totals, top domains and keyed-hash client identifiers) before deleting them (must be ≥ 1). |
 | `stats.rollup_client_names` | boolean | `false` | Include client display names in hourly rollups. Off by default; raw client IPs are never stored in rollups (keyed BLAKE3 hashes are used). |
 | `privacy.anonymize_querylog` | boolean | `false` | Mask client IPs (/24 for IPv4, /56 for IPv6) before persisting to database and before live-tail broadcast. |
+
+`[stats]` and `[privacy]` are typed sections parsed with `deny_unknown_fields`;
+`retention_days` and `rollup_retention_days` must be at least 1, so a zero
+cannot silently delete every row while query logging is advertised as enabled.
+The one-validator pipeline rejects an unknown or removed `[stats]`/`[privacy]`
+key before any retention task starts.
 
 > Clearing the query log (`DELETE /api/v1/querylog`, `sito clear-query-log`, or
 > the UI “Clear Logs” button) deletes both `query_log` and `stats_hourly` by
@@ -571,7 +663,15 @@ cannot overwrite newer configuration even if its version counter is higher.
 
 ---
 
-## 14. `[integrations.mikrotik]` — RouterOS Integration
+## 14. `[integrations.mikrotik]` — RouterOS Integration (optional, experimental)
+
+> **Not in the default build.** RouterOS DHCP lease synchronization lives in
+> the optional `sito-routeros` crate. Build it with
+> `cargo build -p sito --features routeros` (or
+> `cargo install --path crates/sito --features routeros`). A build without the
+> feature rejects `enabled = true` at startup, in `check-config`, and on API
+> writes with an error naming the missing feature; it never silently ignores
+> the setting.
 
 ```toml
 [integrations.mikrotik]
@@ -584,12 +684,12 @@ interval_s = 300
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Enable automated client discovery from RouterOS DHCP server. |
-| `url` | string | `"https://192.168.1.1"` | Base URL of RouterOS REST API (`https://router.lan`). |
-| `token_env` | string | `None` | Environment variable containing the RouterOS API token. When unset, no bearer-token authentication is attempted (use `username`/`password_env` instead). |
+| `url` | string | `"https://192.168.1.1"` | Base URL of the RouterOS REST API (`https://router.lan`). Only `https://` with certificate verification grants client identity; a plaintext `http://` URL is a lab opt-out whose leases are display-only. Non-HTTP(S) schemes are rejected when `enabled = true`. |
+| `token_env` | string | `None` | Environment variable containing the RouterOS API token. When unset, no bearer-token authentication is attempted (use `username`/`password_env` instead). If set but unresolved or empty, sync fails instead of silently falling back to basic authentication. |
 | `username` | string | `None` | Username for HTTP basic authentication when no token is used. |
 | `password` | string | `None` | Password for HTTP basic authentication (prefer `password_env` to keep secrets out of the config). |
 | `password_env` | string | `None` | Environment variable containing the RouterOS password. |
-| `allow_invalid_certs` | boolean | `false` | Accept untrusted/self-signed RouterOS TLS certificates (insecure; lab use only). |
+| `allow_invalid_certs` | boolean | `false` | Accept untrusted/self-signed RouterOS TLS certificates (insecure; lab use only). Leases fetched this way are marked unverified: they are display-only and never grant a client entry's group, trusted flag, or MAC identity. |
 | `interval_s` | integer | `300` | Polling interval in seconds to refresh active DHCP lease table. |
 
 ---
@@ -620,6 +720,14 @@ url = "https://lists.example.com/services.json"
 | `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be ≥ 1). |
 | `categories` | table (map of category → source) | `{}` | Sources keyed by category id (`adult`, `gambling`, `services`, or any custom parental category). Each entry has a required `url` (`https://`, `http://` or `file://`), an optional `refresh_hours` override and an optional `license` string for operator reference. Refreshed domain lists replace the bundled content of that category; `services` expects service JSON. |
 
+### `[integrations.lists.categories.<name>]` entries
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `categories.url` | string | required | Source URL for the category (`https://`, `http://` or `file://`). |
+| `categories.refresh_hours` | integer | `None` | Per-category refresh interval in hours. When unset, `integrations.lists.refresh_hours` is used; must be greater than 0 when set. |
+| `categories.license` | string | `None` | SPDX license identifier of the upstream data, for operator reference. |
+
 ---
 
 ## 16. Hot Reload Matrix
@@ -629,9 +737,11 @@ flag an existing `./config.toml` is preferred, then `/etc/sito/config.toml`
 (the systemd unit and container image pass `/etc/sito/config.toml` explicitly)
 and re-applies the settings below in-process. A
 configuration that cannot be parsed or validated is rejected as a whole: the
-previous settings stay active and the error is logged. The REST API reports
-restart-only changes in the `restart_required` field of `PUT /api/v1/config`
-and `POST /api/v1/config/reload`.
+previous settings stay active and the error is logged. `PUT /api/v1/config`
+returns **409 Conflict** with `restart_required` and persists nothing when a
+restart-only field changes; `GET /api/v1/config/restart-required` previews the
+matrix. `POST /api/v1/config/reload` re-reads an operator-edited file, so it
+applies the hot settings and reports the restart-only fields that remain.
 
 > [!NOTE]
 > The watcher compares the parsed file with the running configuration before
@@ -695,5 +805,27 @@ and `POST /api/v1/config/reload`.
 > UDP) must differ, as must any of them with `dns.port`. `dot_port` and
 > `doq_port` may share a number (different protocols).
 >
-> `config_version` is evaluated whenever the file is loaded; only version `1`
-> is accepted.
+> `config_version` is evaluated whenever the file is loaded; only version `2`
+> is accepted, and unknown keys/tables are rejected before any component is
+> touched. See [`docs/config-v2.md`](config-v2.md).
+
+---
+
+## 17. Health and status endpoints
+
+The config-to-runtime contract includes two readiness endpoints. They are not
+configuration keys, but the hot-reload and restart rules above determine what
+they report after a change.
+
+| Endpoint | Auth | Contract |
+|---|---|---|
+| `GET /health` | None | `200 {"status":"ok"}` when every blocking component is ready; `503 {"status":"unavailable"}` otherwise. It exposes no component names, reason codes, setup state, paths or configuration values. During first-boot setup-pending it is unavailable until setup completes; `sito healthcheck --setup-fallback` accepts that window. |
+| `GET /api/v1/status` | Viewer or higher | Keeps `version`, `uptime_seconds`, `role`, `listeners`, `acme`; adds `ready` and `reasons[]` (`component`, stable `code`, `message`, optional `since_unix_ms`). The stats probe is bounded to 750 ms and is advisory. |
+| `GET /api/v1/ha/status` | Admin | Detailed HA `ready`, `readiness_reason`, `diverged`/`diverged_reason`, role/version and master public key. |
+| `GET /api/v1/config/restart-required` | Admin | Read-only preview of the restart-only field matrix used by the 409 response. |
+
+A restart-only change returns **409 Conflict** with `restart_required` and is
+not persisted; hot fields report their new state after the next config apply.
+The full component readiness matrix, D12 certificate ladder and HA publish
+semantics are in [`docs/runbook-ha.md`](runbook-ha.md#health-and-status-endpoint-semantics-wp-17).
+The operator upgrade path is in [`docs/2.0-migration.md`](2.0-migration.md).

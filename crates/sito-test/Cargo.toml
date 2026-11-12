@@ -20,7 +20,6 @@ sito-clients.workspace = true
 sito-rewrites.workspace = true
 sito-ha.workspace = true
 sito-test-support.workspace = true
-blake3.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -30,7 +29,7 @@ http.workspace = true
 quinn.workspace = true
 toml.workspace = true
 hickory-proto.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "fs", "net", "io-util"] }
 tracing.workspace = true
 anyhow.workspace = true
 dashmap.workspace = true
@@ -40,7 +39,6 @@ reqwest.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
-webpki-roots.workspace = true
 base64.workspace = true
 time.workspace = true
 axum.workspace = true

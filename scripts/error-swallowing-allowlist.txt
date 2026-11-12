@@ -5,18 +5,18 @@
 # docs/audit6-best-effort.md for the rationale behind each category.
 crates/sito/src/cli.rs	let _ = dir.sync_all();	Parent-directory fsync after a successful rename: best effort, the rename already happened.
 crates/sito/src/service_lock.rs	let _ = std::fs::remove_file(&self.path);	Drop-time lock cleanup; a leftover lock is reported by the next startup, not actionable here.
-crates/sito/src/server.rs	let _ = tokio::task::spawn_blocking(move || cache.flush()).await;	Periodic DNSSEC chain-cache flush is best effort; the cache stays in memory and is retried next interval.
+crates/sito/src/service_lock.rs	let _ = self.file.unlock();	Drop-time lease release; a failed unlock cannot be acted on and the lock file is removed by Drop.
+crates/sito-transport/src/dot.rs	let _ = writer.shutdown().await;	Best-effort FIN after the DoT response/close path; the answer or transport error was already reported.
+crates/sito/src/server/startup.rs	let _ = tokio::task::spawn_blocking(move || cache.flush()).await;	Periodic DNSSEC chain-cache flush is best effort; the cache stays in memory and is retried next interval.
 crates/sito-dnssec/src/chain_cache.rs	let _ = std::fs::remove_file(&tmp);	Cleanup of a partially written temporary cache file after a failed atomic write.
 crates/sito-api/src/config_writer.rs	let _ = tokio::fs::remove_file(&tmp_path).await;	Cleanup of the temporary file after a failed atomic config write; the original file is untouched.
 crates/sito-api/src/config_writer.rs	let _ = dir.sync_all().await;	Post-rename directory fsync is best effort; data was already written and renamed.
-crates/sito-api/src/auth/manager.rs	let _ = std::fs::remove_file(&tmp_path);	Cleanup of a temporary users-file write after a failed atomic replace.
-crates/sito-api/src/auth/manager.rs	let _ = std::fs::remove_file(backup_path);	Cleanup of a rollback copy after the restore already succeeded.
+crates/sito-api/src/auth/manager/mod.rs	let _ = std::fs::remove_file(&tmp_path);	Cleanup of a temporary users-file write after a failed atomic replace.
+crates/sito-api/src/auth/manager/mod.rs	let _ = std::fs::remove_file(backup_path);	Cleanup of a rollback copy after the restore already succeeded.
 crates/sito-api/src/updater.rs	let _ = std::fs::remove_file(&self.path);	Best-effort removal of the temporary updater artifact; no state depends on it.
 crates/sito-api/src/updater.rs	let _ = tokio::fs::remove_file(dest).await;	Best-effort removal of an installation staging path before a retry.
-crates/sito-filter/src/subscription.rs	let _ = tokio::fs::remove_file(&escape).await;	Removes a traversal-test fixture outside the data dir; failure only leaves a temp file.
 crates/sito-filter/src/downloader.rs	let _ = tokio::fs::remove_file(&tmp).await;	Cleanup of a partial list download after a failed write; the previous cache entry stays.
 crates/sito-filter/src/downloader.rs	let _ = tokio::fs::remove_file(&tmp).await;	Cleanup of a partial list download after a failed write; the previous cache entry stays.
-crates/sito-ha/src/slave/worker.rs	let _ = tokio::fs::remove_file(&dir).await;	Test-only cleanup of a temporary directory inside the unit-test module.
 crates/sito-upstream/src/doh.rs	let _ = stream.flush().await;	Best-effort flush of diagnostics/body after the DNS response was already delivered; a transport error is reported separately.
 crates/sito-upstream/src/doh.rs	let _ = stream.flush().await;	Best-effort flush of diagnostics/body after the DNS response was already delivered; a transport error is reported separately.
 crates/sito-upstream/src/lib.rs	let _ = stream.flush().await;	Best-effort flush of diagnostics/body after the DNS response was already delivered; a transport error is reported separately.
@@ -25,3 +25,8 @@ crates/sito-transport/src/acme.rs	let _ = dir_file.sync_all();	Post-rename ACME 
 crates/sito-transport/src/acme.rs	let _ = std::fs::remove_file(&cert_path);	Rollback: remove a partially issued certificate so the next renewal retries cleanly.
 crates/sito-transport/src/acme.rs	let _ = std::fs::remove_file(&cert_path);	Rollback: remove a certificate whose key/pair metadata could not be persisted.
 crates/sito-transport/src/acme.rs	let _ = std::fs::remove_file(&cert_path);	Rollback: remove a certificate after a failed transport reload so it is re-issued.
+crates/sito/src/main.rs	let config_file = std::fs::read_to_string(&default_config_path).ok();	Healthcheck target discovery only: an unreadable config falls back to conventional loopback targets; server startup reads the config explicitly and fails closed.
+crates/sito/src/service_lock.rs	.and_then(|_| file.read_to_string(&mut raw))	The PID in `sito.pid` is diagnostic only; the advisory lock (not the file contents) is authoritative for service status.
+crates/sito-dnssec/src/chain_cache.rs	let _ = self.load_with_stats(now);	Cache restore logs a path-only warning and keeps the default policy on unreadable/corrupt material; queries never trust an unverified restored policy as a result of this swallow.
+crates/sito-filter/src/subscription.rs	limited.read_to_string(&mut content).await.ok()?;	Optional list-cache metadata; an unreadable metadata file only disables conditional refresh and the list is re-fetched.
+crates/sito-transport/src/acme.rs	let bytes = std::fs::read(path).ok()?;	Pair-metadata digest: a read error yields `None`, which is treated as a metadata mismatch and forces renewal (fail-safe).

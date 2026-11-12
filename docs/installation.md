@@ -2,21 +2,29 @@
 
 This guide covers deploying **sito** on Linux hosts using the automated one-line installer, manual systemd service configuration, Docker, or Docker Compose.
 
+> **Development status:** the `main` line is currently **2.0.0-alpha.1**
+> (Phase 1 refactor foundations). The published stable release remains
+> **1.9.5**, and the pinned examples below intentionally target it. Alpha
+> builds are not published as stable artifacts.
+
 ---
 
 ## Network Exposure and Firewall
 
-**Read this before the host is reachable from an untrusted network.** The
-1.9.5 defaults are deliberately unchanged for compatibility, so they are
-LAN defaults, not internet-safe defaults:
+**Read this before the host is reachable from an untrusted network.** These are
+LAN defaults, not internet-safe defaults. The stable 1.9.5 line and the 2.0
+alpha line differ in the admin default:
 
-* `web.bind` defaults to `0.0.0.0`, the admin UI is served over plain HTTP, and
-  port `8080` accepts setup and login requests from every reachable source.
-  There is no TLS in the admin listener itself.
-* `dns.bind` defaults to `["0.0.0.0", "::"]` and 1.9.5 has no DNS client
-  allow-list. `dns.rate_limit_per_ip` limits request rate; it is **not** an
-  access control. Any host that can reach the DNS ports can recurse through
-  this server.
+* **1.9.5 (stable):** `web.bind` defaults to `0.0.0.0`, the admin UI is served
+  over plain HTTP, and port `8080` accepts setup and login requests from every
+  reachable source. There is no TLS in the admin listener itself.
+* **2.0.0-alpha.1 (development):** `web.bind` defaults to `127.0.0.1` (the
+  config v2 safe default). Existing v1 configurations migrated without
+  `--adopt-safe-defaults` keep their old bind, including `0.0.0.0`.
+* **Both lines:** `dns.bind` defaults to `["0.0.0.0", "::"]` and there is no
+  DNS client allow-list. `dns.rate_limit_per_ip` limits request rate; it is
+  **not** an access control. Any host that can reach the DNS ports can recurse
+  through this server.
 
 Sito logs a startup warning for each exposed listener. Reach the panel through
 an SSH tunnel or a TLS reverse proxy. The firewall examples below allow SSH
@@ -81,10 +89,12 @@ DNS only to the interface your clients use. The compose file documents this
 choice without changing the historical mapping.
 
 > [!NOTE]
-> Changing the default to loopback (`web.bind = "127.0.0.1"`) and adding a
-> default-deny DNS client ACL is planned for **1.10.0**. 1.9.5 keeps existing
-> configurations working; the startup warning and this firewall guidance are
-> the patch-release mitigation.
+> The loopback admin default is already in the **2.0** config v2 schema. A
+> default-deny DNS client ACL is not part of Phase 1 and remains future work;
+> the startup warning and this firewall guidance are the mitigation on both
+> lines. 1.9.5 keeps its historical `0.0.0.0` admin default so existing
+> configurations continue to work. See the
+> [2.0 migration guide](2.0-migration.md) before moving an existing install.
 
 ---
 
@@ -114,6 +124,30 @@ The installer automatically:
    and prints LAN-only firewall guidance. The advice allows SSH first, does not
    open 8080, and points at the SSH tunnel or a temporary LAN-scoped rule for
    first-time setup.
+
+### 1.1 The 2.0 alpha line
+
+The one-line installer and published container tags above install the **stable
+1.9.5** release. The `2.0.0-alpha.1` development line is built from source
+(or from a prerelease image when one is published):
+
+```bash
+cargo build --release --locked --features "embed-ui,mimalloc"
+sudo install -m 0755 target/release/sito /usr/local/bin/sito
+```
+
+2.0 uses config v2. A new install starts from the [safe defaults](2.0-migration.md#44-safe-defaults-vs-behavior-preserving-upgrade);
+an existing 1.9.x config must be migrated before the 2.0 binary will start:
+
+```bash
+sudo systemctl stop sito
+sudo sito config migrate --from v1 --to v2 --backup --config /etc/sito/config.toml
+sudo systemctl start sito
+```
+
+Do not mix a 2.0 binary with an unmigrated v1 file, and do not point an old
+1.9.5 binary at a migrated v2 file. The [2.0 migration guide](2.0-migration.md)
+covers the report, unknown-key policy, restart-only matrix and rollback.
 
 ---
 
@@ -154,12 +188,30 @@ sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito
 
 ### 2.4 Configuration Skeleton (Optional)
 > [!NOTE]
-> On a clean boot without an existing `config.toml`, **sito** starts in **setup-pending mode** serving only the web panel on port 8080. You can open `http://<server-ip>:8080` from the LAN to generate your configuration via the web wizard, or pass `--no-setup` to boot immediately with a generated administrator password (printed once) and the panel bound to loopback. If the LAN-only firewall from this guide is enabled, it does not open 8080: use the SSH tunnel (`ssh -L 8080:127.0.0.1:8080 user@server`) or the temporary LAN-scoped rule instead.
+> On a clean boot without an existing `config.toml`, **sito** starts in
+> **setup-pending mode** serving only the web panel on port 8080. The reachable
+> address depends on the line:
+>
+> * **1.9.5 (stable):** the setup-pending panel binds the historical
+>   `0.0.0.0:8080`, so `http://<server-ip>:8080` is reachable from the LAN. The
+>   LAN-only firewall in this guide does not open 8080; use the SSH tunnel
+>   (`ssh -L 8080:127.0.0.1:8080 user@server`) or the temporary LAN-scoped rule
+>   while completing setup.
+> * **2.0 alpha (config v2):** the safe default is
+>   `web.bind = "127.0.0.1"`, so the setup-pending wizard is **loopback-only too**.
+>   Use an SSH tunnel/port-forward (`ssh -L 8080:127.0.0.1:8080 user@server`),
+>   or explicitly configure a non-loopback `web.bind` for the setup window if
+>   you accept the LAN exposure.
+>
+> `--no-setup` boots immediately with a generated administrator password
+> (printed once) and the panel bound to loopback on both lines.
 >
 > If you prefer to supply configuration up-front, create `/etc/sito/config.toml`:
 
 ```toml
-config_version = 1
+# Current 2.0 alpha / config v2. A 1.9.x file is v1 and must be migrated:
+#   sito config migrate --from v1 --to v2 --backup
+config_version = 2
 
 [server]
 role = "master"
@@ -168,6 +220,8 @@ data_dir = "/var/lib/sito"
 log_level = "info"
 
 [dns]
+# No default-deny DNS client ACL yet: restrict these ports at the firewall, or
+# bind specific LAN addresses.
 bind = ["0.0.0.0", "::"]
 port = 53
 dot_port = 853
@@ -190,7 +244,9 @@ enabled = true
 
 [web]
 port = 8080
-bind = "0.0.0.0"
+# 2.0 safe default. Use an SSH tunnel or TLS reverse proxy; only set 0.0.0.0
+# if the host firewall/network restricts access to the admin port.
+bind = "127.0.0.1"
 ```
 
 ### 2.5 Install Systemd Unit
@@ -436,7 +492,9 @@ services:
 > writable by uid/gid 65532 once:
 > `sudo chown -R 65532:65532 ./master-config ./slave-config`. The full macvlan
 > reference deployment, including certificate handling and the RouterOS DHCP
-> hints, is in `docker-compose.ha.yml`.
+> hints, is in `docker-compose.ha.yml`. RouterOS lease sync is an optional,
+> experimental integration: the default binary does not include it. Build with
+> `cargo build -p sito --features routeros` to enable it.
 
 ---
 
@@ -481,7 +539,7 @@ have bound with its mTLS key, and a slave must have reached `Synced`. A healthy
 DNS response alone no longer masks an HA failure. See `docs/runbook-ha.md`
 (certificate ownership) if the probe reports an unreadable key.
 
-Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard (or use the SSH tunnel above when the LAN-only firewall is enabled). While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
+Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard (or use the SSH tunnel above when the LAN-only firewall is enabled). **On 2.0 alpha the default `web.bind` is `127.0.0.1`, so the setup-pending wizard is loopback-only**: open `http://127.0.0.1:8080` through the SSH tunnel above, or explicitly configure a non-loopback `web.bind` for the setup window. See the setup-pending reachability note above. While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
 
 If the wizard is skipped with `--no-setup` **on a first boot with no `config.toml`**, a random administrator password is generated and printed once, and the panel binds to loopback. When a config file already exists, `--no-setup` neither creates nor rotates credentials. If credentials are lost later, stop the service so the running process cannot keep serving the old credentials, reset the account, then start it again:
 

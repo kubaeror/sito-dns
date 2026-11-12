@@ -61,19 +61,19 @@ impl HaReadinessState {
     }
 
     pub fn mark_ready(&self) {
-        *self.reason.lock().unwrap() = None;
+        *sito_core::sync::lock_or_recover(&self.reason) = None;
         self.ready.store(true, Ordering::SeqCst);
     }
 
     /// Marks the role ready while keeping an explanatory note (for example an
     /// intentionally disabled replication listener).
     pub fn mark_ready_with_reason(&self, reason: impl Into<String>) {
-        *self.reason.lock().unwrap() = Some(reason.into());
+        *sito_core::sync::lock_or_recover(&self.reason) = Some(reason.into());
         self.ready.store(true, Ordering::SeqCst);
     }
 
     pub fn mark_failed(&self, reason: impl Into<String>) {
-        *self.reason.lock().unwrap() = Some(reason.into());
+        *sito_core::sync::lock_or_recover(&self.reason) = Some(reason.into());
         // Store the flag last so a reader that observes `ready == false`
         // always finds the reason that belongs to it.
         self.ready.store(false, Ordering::SeqCst);
@@ -83,7 +83,7 @@ impl HaReadinessState {
     pub fn snapshot(&self) -> HaReadiness {
         HaReadiness {
             ready: self.ready.load(Ordering::SeqCst),
-            reason: self.reason.lock().unwrap().clone(),
+            reason: sito_core::sync::lock_or_recover(&self.reason).clone(),
         }
     }
 }

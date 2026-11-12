@@ -129,12 +129,9 @@ pub async fn get_ha_status(
                 (
                     tracker.get_version(),
                     tracker.get_state().to_string(),
-                    tracker
-                        .last_synced_at
-                        .lock()
-                        .unwrap()
+                    sito_core::sync::lock_or_recover(&tracker.last_synced_at)
                         .map(|t| t.to_rfc3339()),
-                    tracker.degraded_reason.lock().unwrap().clone(),
+                    sito_core::sync::lock_or_recover(&tracker.degraded_reason).clone(),
                     tracker.master_url.clone(),
                 )
             } else {
@@ -248,7 +245,7 @@ mod tests {
             version,
             term: 0,
             timestamp: 1,
-            config_toml: "config_version = 1\n[server]\nrole = \"slave\"\n".to_string(),
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
             custom_rules: vec![],
             rewrites: None,
             clients: None,

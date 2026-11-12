@@ -10,6 +10,11 @@ pub struct StatusResponse {
     pub uptime_seconds: u64,
     pub role: String,
     pub listeners: Vec<String>,
+    /// Aggregate readiness verdict shared with `/health`.
+    pub ready: bool,
+    /// Per-component readiness reasons (blocking and advisory), in component
+    /// order. Empty when every component is ready.
+    pub reasons: Vec<crate::readiness::ReadinessReason>,
     /// ACME challenge/issuance readiness (D12). Omitted when ACME is disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acme: Option<AcmeStatus>,
@@ -383,6 +388,21 @@ pub struct HaPublishStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConfigResponse {
     pub config_toml: String,
+}
+
+/// Restart-only field preview (D11).
+///
+/// Read-only: it lists the settings that only take effect after a process
+/// restart. An admin write that changes one of these returns `409 Conflict`
+/// with the same field names in `restart_required` and is not persisted.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RestartRequiredResponse {
+    /// Settings that require a process restart, in matrix order.
+    pub restart_required_fields: Vec<String>,
+    /// Operator-facing guidance.
+    pub message: String,
+    /// Where to send changes that do not require a restart.
+    pub apply_endpoint: String,
 }
 
 /// Request to replace full configuration.

@@ -158,6 +158,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: HaCommands,
     },
+    /// Configuration schema management
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
     /// Check for and install software updates
     Update {
         /// Optional path to configuration file (defaults to main --config; the
@@ -214,6 +219,36 @@ pub enum Commands {
         /// keeps its SQLite connections; stop the service when possible.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommands {
+    /// Migrate a v1 configuration document to config v2
+    Migrate {
+        /// Optional path to configuration file (defaults to the main --config)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Source schema version (only `v1` is supported)
+        #[arg(long)]
+        from: String,
+        /// Destination schema version (only `v2` is supported)
+        #[arg(long)]
+        to: String,
+        /// Write a 0600 backup of the original document next to it
+        /// (`<config>.v1.bak`) before replacing the file
+        #[arg(long)]
+        backup: bool,
+        /// Replace the safe 2.0 defaults instead of preserving v1 behavior
+        #[arg(long = "adopt-safe-defaults")]
+        adopt_safe_defaults: bool,
+        /// Drop unknown keys (reported in the migration report) instead of
+        /// failing. Only this explicit flag accepts unknown keys.
+        #[arg(long = "ignore-unknown-keys")]
+        ignore_unknown_keys: bool,
+        /// Print the machine-readable migration report as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -342,6 +377,122 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Options for `sito config migrate`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConfigMigrateOptions {
+    /// Write `<config>.v1.bak` (mode 0600) before replacing the file.
+    pub backup: bool,
+    /// Adopt the documented 2.0 safe defaults.
+    pub adopt_safe_defaults: bool,
+    /// Drop unknown keys (reported) instead of failing.
+    pub ignore_unknown_keys: bool,
+    /// Print the machine-readable report as JSON.
+    pub json: bool,
+}
+
+/// Executes the `config migrate` subcommand (D4).
+///
+/// Behavior-preserving by default: every known v1 value is copied. The
+/// original document is backed up with mode 0600 when `--backup` is passed,
+/// and the migrated document is written atomically (0600, fsync, rename).
+pub fn run_config_migrate(
+    config_path: &Path,
+    from: &str,
+    to: &str,
+    options: ConfigMigrateOptions,
+) -> Result<(), anyhow::Error> {
+    if from != "v1" || to != "v2" {
+        anyhow::bail!(
+            "Unsupported migration '{from}' -> '{to}'; this build supports `sito config migrate --from v1 --to v2 --backup`"
+        );
+    }
+
+    let source = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read configuration file '{}': {e}",
+            config_path.display()
+        )
+    })?;
+
+    let migration_options = sito_core::config::MigrationOptions {
+        adopt_safe_defaults: options.adopt_safe_defaults,
+        ignore_unknown_keys: options.ignore_unknown_keys,
+    };
+    let outcome = Config::migrate_v1_to_v2(&source, &migration_options)
+        .map_err(|e| anyhow::anyhow!("Migration of '{}' failed: {e}", config_path.display()))?;
+
+    let backup_path = if options.backup {
+        let mut backup_name = config_path.as_os_str().to_os_string();
+        backup_name.push(".v1.bak");
+        let backup_path = PathBuf::from(backup_name);
+        write_file_atomic_private(&backup_path, source.as_bytes()).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write the 0600 backup '{}': {e}",
+                backup_path.display()
+            )
+        })?;
+        Some(backup_path)
+    } else {
+        None
+    };
+
+    // Atomic replace: private sibling, fsync, rename, fsync the directory.
+    write_file_atomic_private(config_path, outcome.document.as_bytes()).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to replace '{}' with the migrated document: {e}",
+            config_path.display()
+        )
+    })?;
+
+    if options.json {
+        let rendered = serde_json::to_string_pretty(&outcome.report)
+            .map_err(|e| anyhow::anyhow!("Failed to render the migration report: {e}"))?;
+        println!("{rendered}");
+        return Ok(());
+    }
+
+    println!(
+        "Migrated '{}' from config v{} to v{} ({} moved, {} removed, {} unknown dropped, {} v1 defaults materialized, {} safe defaults adopted).",
+        config_path.display(),
+        outcome.report.from_version,
+        outcome.report.to_version,
+        outcome.report.moved.len(),
+        outcome.report.removed.len(),
+        outcome.report.unknown_dropped.len(),
+        outcome.report.defaults_materialized.len(),
+        outcome.report.safe_defaults_applied.len()
+    );
+    for change in &outcome.report.moved {
+        match &change.to {
+            Some(to) => println!("  moved   {} -> {to}", change.from),
+            None => println!("  moved   {}", change.from),
+        }
+    }
+    for change in &outcome.report.removed {
+        println!("  removed {}", change.from);
+    }
+    for key in &outcome.report.unknown_dropped {
+        println!("  dropped {key} (--ignore-unknown-keys)");
+    }
+    for field in &outcome.report.defaults_materialized {
+        println!("  kept    {field} = v1 default (config v2 default differs)");
+    }
+    for field in &outcome.report.safe_defaults_applied {
+        println!("  default {field} = 2.0 safe default (--adopt-safe-defaults)");
+    }
+    for warning in &outcome.report.warnings {
+        println!("  warning {warning}");
+    }
+    match backup_path {
+        Some(path) => println!(
+            "Backup written to '{}' (mode 0600). Restore it and the binary to roll back.",
+            path.display()
+        ),
+        None => println!("No backup written; pass --backup to keep the v1 document."),
+    }
+    Ok(())
+}
+
 /// Executes the `clear-query-log` subcommand.
 ///
 /// Takes the service lease and refuses a live server unless `--force` is
@@ -394,11 +545,6 @@ pub async fn run_clear_query_log(
     Ok(deleted)
 }
 
-/// Executes the `healthcheck` subcommand by sending a test DNS query.
-pub async fn run_healthcheck(addr: SocketAddr, timeout_ms: u64) -> Result<(), anyhow::Error> {
-    probe_dns(addr, timeout_ms).await
-}
-
 /// Whether the configuration makes HA replication part of this node's role.
 ///
 /// Mirrors the server's readiness gate so the healthcheck fails closed only
@@ -416,10 +562,13 @@ pub fn ha_readiness_required(config: &Config) -> bool {
 /// completed (or when the API cannot confirm setup-pending), a failing DNS
 /// probe stays a healthcheck failure so a broken DNS listener is never masked.
 ///
-/// When `ha_required` is set, a successful DNS probe is not sufficient: the
-/// `/health` endpoint must also report the HA role as ready. This keeps a
-/// failed mTLS listener or a slave that never completed its handshake from
-/// looking healthy just because DNS still answers.
+/// When the admin web listener is available, a successful DNS probe is not
+/// sufficient: the generic `/health` endpoint must also return `200
+/// {"status":"ok"}`. This keeps a failed mTLS listener, an unready TLS/ACME
+/// listener, a broken filter engine or a slave that never completed its
+/// handshake from looking healthy just because DNS still answers. When HA is
+/// configured (`ha_required`), an unreachable web listener is itself a failure;
+/// on a DNS-only node an unreachable admin listener is ignored.
 pub async fn run_healthcheck_or_web(
     dns_addr: Option<SocketAddr>,
     web_addr: SocketAddr,
@@ -456,83 +605,65 @@ pub async fn run_healthcheck_or_web(
         }
     }
 
-    if ha_required {
-        probe_ha_readiness(web_addr, timeout_ms).await?;
-    }
     if let Some(note) = setup_pending_note {
+        // During setup-pending the DNS listeners are intentionally not bound
+        // and `/health` is expected to be unavailable; the setup fallback is
+        // the operator's explicit opt-in for that window.
         println!("{note}");
-    }
-    Ok(())
-}
-
-/// Verifies the HA readiness reported by the public `/health` endpoint.
-///
-/// Any inability to obtain a definitive answer fails closed: an unreachable
-/// web API or a payload without the `ha` object is an error, not a pass.
-async fn probe_ha_readiness(web_addr: SocketAddr, timeout_ms: u64) -> Result<(), anyhow::Error> {
-    let (status, body) = http_get(web_addr, "/health", timeout_ms)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot verify HA readiness from {web_addr}/health: {e}"))?;
-    if status != 200 {
-        return Err(anyhow::anyhow!(
-            "cannot verify HA readiness: {web_addr}/health returned HTTP {status}"
-        ));
-    }
-    let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-        anyhow::anyhow!("invalid HA readiness response from {web_addr}/health: {e}")
-    })?;
-    let ha = value.get("ha").ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot verify HA readiness: {web_addr}/health does not expose the HA readiness signal"
-        )
-    })?;
-    if !ha
-        .get("required")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(anyhow::anyhow!(
-            "cannot verify HA readiness: {web_addr}/health does not report the configured HA role as required"
-        ));
-    }
-    let ready = ha
-        .get("ready")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot verify HA readiness: {web_addr}/health has no boolean `ha.ready` field"
-            )
-        })?;
-    if ready {
         return Ok(());
     }
-    // Deliberately ignore any server-provided detail: this message is printed
-    // into container logs from a public probe. Operators get the detailed
-    // cause from the authenticated `/api/v1/ha/status` endpoint or the logs.
-    Err(anyhow::anyhow!(
-        "Healthcheck failed: HA replication is not ready (see /api/v1/ha/status or the server logs for the reason)"
-    ))
+
+    // Probe `/health` whenever the admin listener answers. On a DNS-only node
+    // an unreachable web listener is not a failure; with HA configured it is.
+    probe_readiness(web_addr, timeout_ms, ha_required).await
+}
+
+/// Verifies the readiness reported by the public `/health` endpoint.
+///
+/// `/health` is intentionally generic (P2-89): it returns `200 {"status":"ok"}`
+/// only when every blocking component is ready, and `503
+/// {"status":"unavailable"}` otherwise. A reachable endpoint that returns
+/// anything else, or a 200 body without `status: ok`, fails closed. When
+/// `required` is false (a DNS-only node) an unreachable admin listener is
+/// ignored; when HA is configured it is an error.
+async fn probe_readiness(
+    web_addr: SocketAddr,
+    timeout_ms: u64,
+    required: bool,
+) -> Result<(), anyhow::Error> {
+    match http_get(web_addr, "/health", timeout_ms).await {
+        Ok((200, body)) => {
+            let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                anyhow::anyhow!("invalid readiness response from {web_addr}/health: {e}")
+            })?;
+            if value.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "cannot verify readiness: {web_addr}/health did not report `status: ok`"
+                ))
+            }
+        }
+        Ok((503, _)) => Err(anyhow::anyhow!(
+            "Healthcheck failed: the server reports it is not ready (see /api/v1/status or the server logs for the reason)"
+        )),
+        Ok((other, _)) => Err(anyhow::anyhow!(
+            "cannot verify readiness: {web_addr}/health returned HTTP {other}"
+        )),
+        Err(e) if required => Err(anyhow::anyhow!(
+            "cannot verify readiness from {web_addr}/health: {e}"
+        )),
+        Err(_) => Ok(()),
+    }
 }
 
 /// Reports whether the admin API is in first-boot setup-pending mode.
 ///
-/// `/health` and `/status` are preferred when they expose a JSON
-/// `setup_pending` boolean. Otherwise the setup-gating middleware signal is
-/// used: while setup is pending, `/api/v1/*` is short-circuited with
-/// `503 Setup not completed`; once an admin account exists the normal auth
+/// `/health` is generic and no longer carries a `setup_pending` field. While
+/// setup is pending, the setup-gating middleware short-circuits `/api/v1/*`
+/// with `503 Setup not completed`; once an admin account exists the normal auth
 /// layer answers instead (typically `401`).
 async fn probe_setup_pending(web_addr: SocketAddr, timeout_ms: u64) -> Result<bool, anyhow::Error> {
-    for path in ["/health", "/status"] {
-        if let Ok((200, body)) = http_get(web_addr, path, timeout_ms).await
-            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
-            && let Some(pending) = value
-                .get("setup_pending")
-                .and_then(serde_json::Value::as_bool)
-        {
-            return Ok(pending);
-        }
-    }
-
     match http_get(web_addr, "/api/v1/status", timeout_ms).await {
         Ok((503, body)) if body.contains("Setup not completed") => Ok(true),
         Ok(_) => Ok(false),
@@ -672,6 +803,38 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), anyhow::Error>
     Ok(())
 }
 
+/// Writes `contents` to a unique 0600 sibling, fsyncs it, atomically renames
+/// it over `path`, and fsyncs the parent directory (best effort, matching the
+/// other atomic writers).
+fn write_file_atomic_private(path: &Path, contents: &[u8]) -> Result<(), anyhow::Error> {
+    let file_name = path.file_name().map_or_else(
+        || "config.toml".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let tmp_path = path.with_file_name(format!(
+        "{file_name}.{}.{:016x}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    write_private_file(&tmp_path, contents)?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        if let Err(cleanup) = std::fs::remove_file(&tmp_path)
+            && cleanup.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "warning: failed to remove temporary file '{}': {cleanup}",
+                tmp_path.display()
+            );
+        }
+        return Err(anyhow::anyhow!(
+            "Failed to replace '{}': {e}",
+            path.display()
+        ));
+    }
+    fsync_parent_dir(path);
+    Ok(())
+}
+
 /// fsyncs the parent directory so a rename is durable.
 fn fsync_parent_dir(path: &Path) {
     if let Some(parent) = path.parent()
@@ -761,8 +924,13 @@ pub fn run_restore(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ =
-            std::fs::set_permissions(target_config_path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(target_config_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Restored '{}' but failed to set mode 0600: {e}. Fix the permissions before starting the server.",
+                    target_config_path.display()
+                )
+            })?;
     }
     fsync_parent_dir(target_config_path);
 
@@ -875,7 +1043,8 @@ pub fn prepare_no_setup_bootstrap(
     rand::rng().fill(&mut bytes);
     let mut password = String::with_capacity(48);
     for byte in &bytes {
-        let _ = std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"));
+        std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"))
+            .expect("writing a hex digit into a String cannot fail");
     }
     sito_api::AuthManager::reset_admin_credentials(&config.server.data_dir, &password).map_err(
         |e| {
@@ -1130,7 +1299,8 @@ fn generate_reset_admin_password() -> String {
     rand::rng().fill(&mut bytes);
     let mut password = String::with_capacity(48);
     for byte in &bytes {
-        let _ = std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"));
+        std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"))
+            .expect("writing a hex digit into a String cannot fail");
     }
     password
 }
@@ -1343,6 +1513,161 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_config_migrate_flags() {
+        let cli = Cli::try_parse_from([
+            "sito",
+            "config",
+            "migrate",
+            "--from",
+            "v1",
+            "--to",
+            "v2",
+            "--backup",
+            "--adopt-safe-defaults",
+            "--ignore-unknown-keys",
+            "--json",
+        ])
+        .expect("parse config migrate");
+        match cli.command {
+            Some(Commands::Config {
+                command:
+                    ConfigCommands::Migrate {
+                        from,
+                        to,
+                        backup,
+                        adopt_safe_defaults,
+                        ignore_unknown_keys,
+                        json,
+                        ..
+                    },
+            }) => {
+                assert_eq!(from, "v1");
+                assert_eq!(to, "v2");
+                assert!(backup);
+                assert!(adopt_safe_defaults);
+                assert!(ignore_unknown_keys);
+                assert!(json);
+            }
+            other => panic!("expected config migrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_config_uses_the_single_v2_validator() {
+        let dir = temp_config_dir("check_config_v2");
+        let path = dir.join("config.toml");
+
+        std::fs::write(
+            &path,
+            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+        )
+        .unwrap();
+        let err = run_check_config(&path).expect_err("check-config must reject v1");
+        assert!(
+            err.to_string()
+                .contains("sito config migrate --from v1 --to v2 --backup"),
+            "got: {err}"
+        );
+
+        std::fs::write(
+            &path,
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\nbogus = 1\n",
+        )
+        .unwrap();
+        let err = run_check_config(&path).expect_err("check-config must reject unknown keys");
+        assert!(err.to_string().contains("bogus"), "got: {err}");
+
+        std::fs::write(
+            &path,
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+        )
+        .unwrap();
+        run_check_config(&path).expect("a valid v2 document passes check-config");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_config_migrate_writes_v2_and_0600_backup() {
+        let dir = temp_config_dir("migrate");
+        let path = dir.join("config.toml");
+        let v1 = "config_version = 1\n[server]\nrole = \"master\"\n[upstream]\nservers = [\"1.1.1.1\"]\n[web]\nbind = \"0.0.0.0\"\nport = 8080\n";
+        std::fs::write(&path, v1).unwrap();
+
+        run_config_migrate(
+            &path,
+            "v1",
+            "v2",
+            ConfigMigrateOptions {
+                backup: true,
+                ..ConfigMigrateOptions::default()
+            },
+        )
+        .expect("migration succeeds");
+
+        let migrated = std::fs::read_to_string(&path).expect("migrated file exists");
+        let parsed = Config::from_toml_str(&migrated).expect("migrated document is v2");
+        assert_eq!(parsed.config_version, 2);
+        assert_eq!(
+            parsed.get_web_config().bind.to_string(),
+            "0.0.0.0",
+            "migration preserves the v1 effective behavior by default"
+        );
+
+        let backup = PathBuf::from(format!("{}.v1.bak", path.display()));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), v1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the backup must be mode 0600");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_config_migrate_requires_unknown_key_flag() {
+        let dir = temp_config_dir("migrate_unknown");
+        let path = dir.join("config.toml");
+        let v1 = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\nbogus = 1\n";
+        std::fs::write(&path, v1).unwrap();
+
+        let err = run_config_migrate(
+            &path,
+            "v1",
+            "v2",
+            ConfigMigrateOptions {
+                json: true,
+                ..ConfigMigrateOptions::default()
+            },
+        )
+        .expect_err("unknown keys fail closed by default");
+        assert!(err.to_string().contains("bogus"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            v1,
+            "a failed migration must not overwrite the source"
+        );
+
+        run_config_migrate(
+            &path,
+            "v1",
+            "v2",
+            ConfigMigrateOptions {
+                ignore_unknown_keys: true,
+                ..ConfigMigrateOptions::default()
+            },
+        )
+        .expect("--ignore-unknown-keys drops the key");
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(!migrated.contains("bogus"));
+        Config::from_toml_str(&migrated).expect("migrated document is valid");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_cli_update_accepts_config_before_and_after_subcommand() {
         // The documented/error text says `--config <path>`; it must work after
         // the subcommand as well as in the historical global position.
@@ -1394,12 +1719,12 @@ mod tests {
         assert_eq!(resolve_config_path_from(None, &local, &system), local);
 
         // A local config takes precedence over the system path.
-        std::fs::write(&local, "config_version = 1\n").unwrap();
+        std::fs::write(&local, "config_version = 2\n").unwrap();
         assert_eq!(resolve_config_path_from(None, &local, &system), local);
 
         // Without a local config, the system path is used.
         std::fs::remove_file(&local).unwrap();
-        std::fs::write(&system, "config_version = 1\n").unwrap();
+        std::fs::write(&system, "config_version = 2\n").unwrap();
         assert_eq!(resolve_config_path_from(None, &local, &system), system);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1431,7 +1756,7 @@ mod tests {
         assert!(err.contains("--config"), "unexpected error: {err}");
 
         // A local config is used when the system path does not exist.
-        std::fs::write(&local, "config_version = 1\n").unwrap();
+        std::fs::write(&local, "config_version = 2\n").unwrap();
         assert_eq!(
             resolve_update_config_path_from(None, &local, &system).unwrap(),
             local
@@ -1439,7 +1764,7 @@ mod tests {
 
         // The system config wins when both exist, so a stray ./config.toml
         // cannot change the signature policy of a system install.
-        std::fs::write(&system, "config_version = 1\n").unwrap();
+        std::fs::write(&system, "config_version = 2\n").unwrap();
         assert_eq!(
             resolve_update_config_path_from(None, &local, &system).unwrap(),
             system
@@ -1458,7 +1783,7 @@ mod tests {
     fn test_update_preflight_requires_cosign_when_signatures_required() {
         let dir = temp_config_dir("preflight");
         let cfg = dir.join("config.toml");
-        std::fs::write(&cfg, "config_version = 1\n").unwrap();
+        std::fs::write(&cfg, "config_version = 2\n").unwrap();
 
         // Default policy requires signatures; without cosign the update must
         // be refused before downloading anything.
@@ -1473,7 +1798,7 @@ mod tests {
         // Explicit opt-out allows checksum-only verification without cosign.
         std::fs::write(
             &cfg,
-            "config_version = 1\n[server]\nupdate_require_signature = false\n",
+            "config_version = 2\n[server]\nupdate_require_signature = false\n",
         )
         .unwrap();
         assert!(!update_preflight(&cfg, false).unwrap());
@@ -1497,14 +1822,14 @@ mod tests {
 
         // Default config enables the requirement.
         let default_cfg = dir.join("default.toml");
-        std::fs::write(&default_cfg, "config_version = 1\n").unwrap();
+        std::fs::write(&default_cfg, "config_version = 2\n").unwrap();
         assert!(update_signature_policy(&default_cfg).unwrap());
 
         // Explicit opt-out is honored.
         let opt_out = dir.join("opt_out.toml");
         std::fs::write(
             &opt_out,
-            "config_version = 1\n[server]\nupdate_require_signature = false\n",
+            "config_version = 2\n[server]\nupdate_require_signature = false\n",
         )
         .unwrap();
         assert!(!update_signature_policy(&opt_out).unwrap());
@@ -1670,7 +1995,7 @@ mod tests {
         ));
 
         // Existing config: the credential must not be rotated again.
-        std::fs::write(&config_path, "config_version = 1\n").unwrap();
+        std::fs::write(&config_path, "config_version = 2\n").unwrap();
         assert_eq!(
             prepare_no_setup_bootstrap(&config_path, &mut config).unwrap(),
             NoSetupBootstrap::NotNeeded
@@ -1826,20 +2151,16 @@ mod tests {
     #[tokio::test]
     async fn test_healthcheck_fails_when_ha_is_not_ready() {
         let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
-        let web_addr = spawn_http_router(vec![(
-            "/health",
-            200,
-            r#"{"status":"ok","setup_pending":false,"ha":{"required":true,"ready":false,"reason":"master mTLS initialization failed: Permission denied"}}"#,
-        )])
-        .await;
+        let web_addr =
+            spawn_http_router(vec![("/health", 503, r#"{"status":"unavailable"}"#)]).await;
 
         let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
             .await
-            .expect_err("a healthy DNS probe must not mask an unready HA node");
+            .expect_err("a healthy DNS probe must not mask an unready node");
         let message = err.to_string();
         assert!(
-            message.contains("HA replication is not ready"),
-            "the healthcheck must report the unready HA role: {message}"
+            message.contains("not ready"),
+            "the healthcheck must report the unready node: {message}"
         );
         // `/health` is public; the healthcheck must not echo internal paths or
         // OS errors from the server's detailed readiness reason into logs.
@@ -1852,33 +2173,41 @@ mod tests {
     #[tokio::test]
     async fn test_healthcheck_passes_when_ha_is_ready() {
         let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
-        let web_addr = spawn_http_router(vec![(
-            "/health",
-            200,
-            r#"{"status":"ok","setup_pending":false,"ha":{"required":true,"ready":true,"reason":null}}"#,
-        )])
-        .await;
+        let web_addr = spawn_http_router(vec![("/health", 200, r#"{"status":"ok"}"#)]).await;
 
         run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
             .await
-            .expect("a ready HA node must satisfy the healthcheck");
+            .expect("a ready node must satisfy the healthcheck");
+    }
+
+    /// A DNS-only deployment must not ignore a reachable `/health` that says
+    /// the node is not ready (for example a broken filter or TLS listener).
+    #[tokio::test]
+    async fn test_healthcheck_fails_when_reachable_health_is_not_ready_without_ha() {
+        let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
+        let web_addr =
+            spawn_http_router(vec![("/health", 503, r#"{"status":"unavailable"}"#)]).await;
+
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, false)
+            .await
+            .expect_err("a reachable not-ready node must fail the healthcheck");
+        assert!(
+            err.to_string().contains("not ready"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
     async fn test_healthcheck_ha_required_without_signal_fails_closed() {
         let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
-        let web_addr = spawn_http_router(vec![(
-            "/health",
-            200,
-            r#"{"status":"ok","setup_pending":false}"#,
-        )])
-        .await;
+        let web_addr =
+            spawn_http_router(vec![("/health", 200, r#"{"setup_pending":false}"#)]).await;
 
         let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
             .await
-            .expect_err("a missing HA readiness signal must fail closed");
+            .expect_err("a missing generic status field must fail closed");
         assert!(
-            err.to_string().contains("HA readiness"),
+            err.to_string().contains("readiness") || err.to_string().contains("status: ok"),
             "unexpected error: {err}"
         );
     }
@@ -1920,12 +2249,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_healthcheck_setup_fallback_accepts_pending_health_json() {
+    async fn test_healthcheck_setup_fallback_requires_the_middleware_signal() {
         let (dns_addr, _silent) = spawn_silent_udp().await;
-        let web_addr = spawn_http_router(vec![("/health", 200, "{\"setup_pending\": true}")]).await;
-        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
+        // `/health` is generic and no longer carries `setup_pending`; a generic
+        // 200 must not be mistaken for a pending wizard.
+        let web_addr = spawn_http_router(vec![
+            ("/health", 200, r#"{"status":"ok"}"#),
+            ("/api/v1/status", 401, "Unauthorized"),
+        ])
+        .await;
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
             .await
-            .expect("setup-pending web interface must satisfy the setup fallback");
+            .expect_err("a generic health response must not satisfy the setup fallback");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1960,7 +2299,7 @@ mod tests {
         let config_path = dir.join("config.toml");
         std::fs::write(
             &config_path,
-            "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n",
         )
         .unwrap();
 
@@ -2004,7 +2343,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "config_version = 1\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+                "config_version = 2\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
                 dir.display()
             ),
         )
@@ -2185,7 +2524,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "config_version = 1\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+                "config_version = 2\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
                 dir.display()
             ),
         )
@@ -2206,6 +2545,57 @@ mod tests {
         let generation = std::fs::read_to_string(dir.join("auth_generation")).unwrap();
         assert_eq!(generation.trim(), "2");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_lease_tests {
+    use super::prepare_no_setup_bootstrap;
+    use crate::service_lock::{ServiceLease, with_service_lease};
+    use sito_core::config::Config;
+
+    /// P2-90: the real `--no-setup` bootstrap must refuse to write
+    /// `users.toml` while another process owns the service lease. This is a
+    /// deterministic regression: the contender is rejected before the
+    /// bootstrap closure runs, so no timing window exists.
+    #[test]
+    fn test_no_setup_bootstrap_requires_the_service_lease() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_bootstrap_lease_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let mut config = Config::default();
+        config.server.data_dir = dir.clone();
+
+        let held = ServiceLease::acquire(&dir).expect("first lease");
+        let err = with_service_lease(&dir, || {
+            prepare_no_setup_bootstrap(&config_path, &mut config)
+        })
+        .expect_err("a held lease must refuse the bootstrap");
+        assert!(
+            err.to_string().contains("already running"),
+            "unexpected lease error: {err}"
+        );
+        assert!(
+            !config_path.exists() && !dir.join("users.toml").exists(),
+            "a losing process must not write bootstrap state"
+        );
+
+        drop(held);
+        let (outcome, lease) = with_service_lease(&dir, || {
+            prepare_no_setup_bootstrap(&config_path, &mut config)
+        })
+        .expect("the bootstrap must run after the lease is released");
+        assert!(matches!(
+            outcome,
+            super::NoSetupBootstrap::GeneratedPassword(_)
+        ));
+        assert!(dir.join("users.toml").exists());
+        drop(lease);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

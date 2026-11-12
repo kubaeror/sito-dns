@@ -5,6 +5,34 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [2.0.0-alpha.1] - Unreleased
+
+Phase 1 refactor foundations. This is **not a published release**: the
+workspace version advances so the 2.0 line can be built, tested and released
+as a prerelease. Phase 1 work packages land as separate commits on
+`feat/2.0-phase1-foundations`.
+
+### Changed
+- Workspace version is now `2.0.0-alpha.1`. The stable `1.9.5` release remains
+  the published install.
+- The release workflow treats tags containing `-` as prereleases: it marks the
+  GitHub release as a prerelease and never moves the `latest` release or image
+  tag (verified in `.github/workflows/release.yml`).
+- WP-1.1: RouterOS DHCP lease synchronization moved to the optional
+  `sito-routeros` crate (`cargo build -p sito --features routeros`); the
+  default build excludes it and rejects `[integrations.mikrotik] enabled = true`
+  at startup. Removed dead/test-only APIs, unused dependencies and unreachable
+  non-Unix fallbacks, and narrowed Tokio features per crate. See
+  `docs/2.0-public-api-diff.md`.
+- WP-1.3 (breaking): configuration schema v2. `config_version = 2` is the
+  default and the only accepted version; v1 documents must be migrated with
+  `sito config migrate --from v1 --to v2 --backup`. Unknown keys are errors,
+  `[dns.tls]` and `[web] acme_*` are deprecated aliases for typed
+  `[tls]`/`[acme]`, and the admin UI binds loopback by default. Restart-only
+  admin writes return 409 with `restart_required` and are not persisted;
+  `GET /api/v1/config/restart-required` previews the matrix. See
+  `docs/config-v2.md` and `docs/2.0-public-api-diff.md`.
+
 ## [1.9.5] - 2026-11-10
 
 Release-engineering patch. There are no runtime, configuration, API, database,

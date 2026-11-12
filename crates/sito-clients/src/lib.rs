@@ -4,7 +4,8 @@
 //! - Multi-method identification (IP, CIDR subnet, MAC address, DoH path, DoT SNI)
 //! - Client groups with customized filtering profiles
 //! - Scheduled access policies and category-based blocking
-//! - Router integration (e.g. MikroTik RouterOS DHCP lease synchronization)
+//! - Router configuration data (`RouterOsConfig`); the optional RouterOS DHCP
+//!   snapshot sync lives in the separate `sito-routeros` crate.
 
 pub mod bundled;
 pub mod config;
@@ -30,7 +31,7 @@ pub use registry::{
     ClientRegistry, MAX_UNIDENTIFIED_CLIENTS, RouterOsLease, UNIDENTIFIED_CLIENT_TTL_HOURS,
     UnidentifiedClient,
 };
-pub use routeros::{RouterOsConfig, RouterOsError, fetch_routeros_leases, spawn_routeros_sync};
+pub use routeros::RouterOsConfig;
 pub use runtime_lists::{ListCategoriesConfig, ListSourceConfig, RuntimeListStatus, RuntimeLists};
 pub use safe_search::{YouTubeSafeSearchMode, match_safe_search};
 pub use schedule::{Schedule, ScheduleError};

@@ -9,6 +9,8 @@ RELEASE="${ROOT}/.github/workflows/release.yml"
 ARTIFACT_E2E="${ROOT}/.github/workflows/artifact-e2e.yml"
 CI="${ROOT}/.github/workflows/ci.yml"
 SECURITY="${ROOT}/.github/workflows/security.yml"
+FUZZ="${ROOT}/.github/workflows/fuzz.yml"
+BENCH="${ROOT}/.github/workflows/bench.yml"
 INSTALLER="${ROOT}/contrib/install.sh"
 
 failures=0
@@ -104,6 +106,25 @@ expect_match "${CI}" 'branches: \[main, release/1\.9\.x\]' "CI runs on the relea
 expect_match "${SECURITY}" 'branches: \[main, release/1\.9\.x\]' "security runs on the release branch"
 expect_match "${CI}" 'bash contrib/tests/test-installer\.sh' "CI runs the installer E2E"
 expect_match "${CI}" "needs.changes.outputs.workflows == 'true'" "contrib job runs when workflows change"
+
+# WP-1.9: the long fuzz/benchmark runs stay out of PR CI, but their structural
+# gates and the aggregate check must exist.
+expect_match "${CI}" '^  bench-build:' "CI has a benchmark compile job"
+expect_match "${CI}" '^  fuzz-build:' "CI has a fuzz target build job"
+expect_match "${CI}" '^  hygiene:' "CI has a machete/udeps job"
+expect_match "${CI}" '^  coverage:' "CI has a coverage job"
+expect_match "${CI}" 'needs: \[changes, fmt, clippy, test, build, openapi, contrib, docs-check, container-check, security-check, bench-build, fuzz-build, hygiene, coverage\]' "ci-gate requires the new jobs"
+expect_match "${CI}" 'cargo bench --workspace --all-features --locked --no-run' "CI compiles the benches"
+expect_absent "${FUZZ}" 'pull_request' "fuzzing is not a pull-request trigger"
+expect_absent "${BENCH}" 'pull_request' "the thresholded benchmark gate is not a pull-request trigger"
+expect_match "${FUZZ}" 'fuzz_seconds' "the fuzz workflow accepts a manual duration"
+expect_match "${FUZZ}" '86400' "the fuzz workflow documents the 24-hour release run"
+expect_match "${BENCH}" 'scripts/check-bench-regression\.py' "the bench workflow runs the regression gate"
+expect_match "${BENCH}" 'BENCH_RUNNER_LABEL' "the bench workflow supports a dedicated runner label"
+expect_match "${BENCH}" 'BENCH_TOLERANCE' "the bench tolerance is configurable"
+expect_match "${BENCH}" 'BENCH_RUNNER_LABEL is not set' "the bench workflow refuses an unconfigured runner"
+expect_match "${BENCH}" 'ubuntu-\*\|windows-\*\|macos-\*' "the bench workflow rejects GitHub-hosted labels"
+expect_match "${FUZZ}" 'ubuntu-\*\|windows-\*\|macos-\*' "the 24-hour fuzz guard rejects GitHub-hosted labels"
 
 expect_match "${INSTALLER}" 'SITO_REQUIRE_SIGNATURE:-1' "release signatures are required by default"
 expect_match "${INSTALLER}" 'must be 0 or 1' "signature policy values are validated"

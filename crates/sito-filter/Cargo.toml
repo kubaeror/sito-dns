@@ -10,7 +10,7 @@ description = "DNS filtering engine with ABP syntax and multi-pattern matching f
 sito-core.workspace = true
 sito-proto.workspace = true
 hickory-proto.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "time", "sync", "fs", "net", "io-util"] }
 reqwest.workspace = true
 arc-swap.workspace = true
 fnv.workspace = true
@@ -23,6 +23,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "lookup"

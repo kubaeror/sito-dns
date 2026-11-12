@@ -11,8 +11,14 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --workspace --all-features --locked
 cargo deny check
 python3 scripts/check_config_reference.py --github
+python3 scripts/test_check_config_reference.py
+python3 scripts/check_migration_guide.py --github
+python3 scripts/test_check_migration_guide.py
 python3 scripts/check_markdown_links.py
 bash scripts/check-error-swallowing.sh
+bash scripts/check-file-size.sh
+bash scripts/check-function-size.sh
+python3 scripts/test_rust_size.py
 ```
 
 Blank/deferred rows are explained in `docs/release-notes-1.9.4.md` and
@@ -35,7 +41,7 @@ named by the command.
 | P1-10 | `test_doq_quic_windows_and_stream_caps_are_bounded`, `test_doq_rate_check_before_body_read`, `test_doq_global_stream_semaphore_rejects_excess_streams` | `cargo test -p sito-transport test_doq_quic_windows_and_stream_caps_are_bounded` |
 | P1-11 | `test_doh_rate_check_before_body_read`, `test_doh_global_request_cap_returns_503`, `test_doh_truncates_oversized_response` | `cargo test -p sito-transport test_doh_rate_check_before_body_read` |
 | P1-12 | `test_acme_without_443_listener_falls_back_to_http01`, `test_failed_post_issuance_reload_is_reported`, `test_acme_bootstrap_issuance_all_transports_and_renewal` | `cargo test -p sito-test --test m11_acme test_acme_without_443_listener_falls_back_to_http01` |
-| P1-13 | `test_response_shaping_strips_upstream_edns_and_opt_for_non_edns_clients`, `test_response_shaping_copies_question_flags_and_do`, `test_cache_hit_copies_current_question_and_flags` | `cargo test -p sito test_response_shaping_` |
+| P1-13 | `test_response_shaper_flag_matrix`, `test_response_shaper_keeps_ad_for_client_that_requests_ad_without_do`, `test_response_shaper_uses_configured_payload_size`, `test_response_shaper_preserves_truncation`, `test_synthesized_rewrite_and_safe_search_responses_are_shaped_for_client`, `test_safe_search_cname_response_is_shaped_for_client`, `test_cache_hit_copies_current_question_and_flags`, `test_upstream_response_is_shaped_for_client`, `test_stale_response_is_shaped_for_client`, `test_rewrite_response_is_shaped_for_client` | `cargo test -p sito-proto shaping`; `cargo test -p sito --lib shaped_for_client`; `cargo test -p sito --lib test_cache_hit_copies_current_question_and_flags` |
 | P1-14 | `test_doh_truncates_oversized_response`, `test_doh3_truncates_oversized_response` | `cargo test -p sito-transport truncates_oversized_response` |
 | P1-15 | `test_totp_setup_and_enable_require_reauth_token`, `test_existing_totp_cannot_be_replaced_without_reauth`, `test_disable_totp_requires_reauth_token` | `cargo test -p sito-api test_totp_setup_and_enable_require_reauth_token` |
 | P1-16 | `test_wizard_forbidden_after_setup_even_for_admin`, `test_wizard_completion_requires_setup_token_when_provisioned` | `cargo test -p sito-api test_wizard_forbidden_after_setup_even_for_admin` |
@@ -48,8 +54,25 @@ named by the command.
 | P1-23 | `test_query_logs_include_total_is_optional`, `test_dashboard_cache_serves_within_ttl_and_clear_invalidates`, `test_stats_rate_limiter_blocks_after_budget` | `cargo test -p sito-stats include_total`; `cargo test -p sito-api stats_rate_limiter` |
 | P1-24 | `test_retention_uses_bounded_chunks_and_records_success`, `test_retention_concurrent_insert_does_not_drop_batches`, `test_large_single_hour_is_row_bounded`, `test_large_same_timestamp_hour_is_row_bounded`, `test_retention_hour_discovery_uses_ts_index`, `test_retention_chunk_queries_use_ts_id_index`, `test_rollup_top_n_preserves_heavy_hitter_across_chunks`, `test_retention_startup_delay_schedules_recent_success`, `test_retention_metrics_record_success_and_failure` | `cargo test -p sito-stats retention_uses_bounded_chunks`; `cargo test -p sito-stats retention_concurrent_insert`; `cargo test -p sito-stats large_single_hour`; `cargo test -p sito-stats same_timestamp`; `cargo test -p sito-stats retention_hour_discovery`; `cargo test -p sito-stats retention_chunk_queries`; `cargo test -p sito-stats rollup_top_n`; `cargo test -p sito test_retention_startup_delay`; `cargo test -p sito-stats retention_metrics` |
 | P1-25 | `test_health_probe_sets_recursion_desired`, `test_forced_refresh_picks_up_rotated_address`, `test_formerr_triggers_one_no_edns_retry` | `cargo test -p sito-upstream test_health_probe_sets_recursion_desired` |
-| P1-26 | `test_runtime_snapshot_is_published_before_filter_reload`, `test_failed_hook_leaves_old_config_and_filter` | `cargo test -p sito-api test_runtime_snapshot_is_published_before_filter_reload` |
-| P1-27 | `test_dnssec_policy_change_flushes_response_cache`, `test_policy_epoch_rejects_in_flight_insert_and_hides_old_entries`, `test_m11_policy_change_rejects_in_flight_cache_insert` | `cargo test -p sito-api test_dnssec_policy_change_flushes_response_cache`; `cargo test -p sito-cache test_policy_epoch_rejects_in_flight_insert_and_hides_old_entries`; `cargo test -p sito-test --test m11_dnssec_security test_m11_policy_change_rejects_in_flight_cache_insert` |
+| P1-26 | `test_apply_publishes_config_and_filter_together_after_staging`, `test_failed_hook_leaves_old_config_and_filter`, `test_query_during_apply_sees_old_or_new_never_torn` | `cargo test -p sito-api test_apply_publishes_config_and_filter_together_after_staging`; `cargo test -p sito-runtime test_query_during_apply` |
+| P1-27 | `test_dnssec_policy_change_flushes_response_cache`, `test_dnssec_policy_change_rejects_in_flight_old_epoch_insert`, `test_pipeline_uses_snapshot_generation_for_dnssec_cache_insert`, `test_policy_epoch_rejects_in_flight_insert_and_hides_old_entries`, `test_m11_policy_change_rejects_in_flight_cache_insert` | `cargo test -p sito-api test_dnssec_policy_change_flushes_response_cache`; `cargo test -p sito-runtime test_dnssec_policy_change_rejects_in_flight_old_epoch_insert`; `cargo test -p sito --lib test_pipeline_uses_snapshot_generation_for_dnssec_cache_insert`; `cargo test -p sito-cache test_policy_epoch_rejects_in_flight_insert_and_hides_old_entries`; `cargo test -p sito-test --test m11_dnssec_security test_m11_policy_change_rejects_in_flight_cache_insert` |
+
+## Structural budget checks (WP-1.5)
+
+The monolith split is enforced by two checked scripts and their regression
+lane. They count production lines/functions only: `#[cfg(test)]` items and the
+test-only crates (`sito-test`, `sito-test-support`) are excluded, as are Cargo
+`tests/`/`benches/`/`examples/` targets and parent-gated `src/tests/` modules.
+
+| Finding | Named check | Focused command |
+|---|---|---|
+| P3-1 | No production Rust file exceeds 2,000 lines | `bash scripts/check-file-size.sh` |
+| P3-2 | No production function exceeds 200 lines without a documented exception | `bash scripts/check-function-size.sh` |
+| P3-6 | Size budgets run in the CI `test` lane and the baseline command list | `docs/ci.md`, `.github/workflows/ci.yml` |
+| P3-6 | Checker regression fixtures cover cfg(test) lookalikes, real test modules, `src/tests` gating, and both thresholds | `python3 scripts/test_rust_size.py` |
+
+`docs/large-functions.md` is the reviewed exception list. An undocumented
+function over 200 lines fails the checker.
 
 ## 1.9.4 final-review additions
 
@@ -106,3 +129,155 @@ named by the command.
 | Pending TOTP enrollment hides enrollment-start forms (starter and replace) | `test_account_template_suppresses_starter_form_during_pending_enrollment`, `test_account_template_suppresses_replace_form_during_pending_enrollment`, `test_account_template_shows_enrollment_forms_without_pending_setup`, `test_self_service_totp_enrollment_for_all_roles` | `cargo test -p sito-api --all-features test_account_template_`; `cargo test -p sito-api --all-features test_self_service_totp_enrollment_for_all_roles` |
 | Response shaping aligns ID/opcode/AA with the current query | `test_response_shaping_copies_question_flags_and_do`, `test_cache_hit_copies_current_question_and_flags` | `cargo test -p sito --lib test_response_shaping_`; `cargo test -p sito --lib test_cache_hit_copies_current_question_and_flags` |
 | DNSSEC sync outcome recorded exactly once | `test_sync_validate_response_fails_closed_without_key_fetcher` | `cargo test -p sito-dnssec test_sync_validate_response_fails_closed_without_key_fetcher` |
+
+## WP-1.2 — normalized domain and client identity
+
+| Finding | Named test / check | Focused command |
+|---|---|---|
+| IDN/punycode, trailing dot, uppercase, wildcard labels (P2-31..P2-35) | `test_normalized_domain_table`, `test_normalized_domain_root_is_representable`, `test_normalized_domain_serde_roundtrip_and_normalizes_on_deserialize`, `test_normalized_domain_suffix_matching` | `cargo test -p sito-core normalized_domain` |
+| Invalid labels, punycode and length limits | `test_normalized_domain_invalid_inputs`, `test_normalized_domain_label_and_name_length_limits`, `test_normalized_domain_ascii_constructor_keeps_wire_semantics`, `test_normalized_domain_idna_wire_constructor` | `cargo test -p sito-core normalized_domain` |
+| IDN gap in filter lists and `$denyallow` | `test_filter_patterns_and_denyallow_normalize_idn`, `test_wildcard_and_prefix_patterns_normalize_idn`, `test_exact_patterns_reject_wildcard_labels` | `cargo test -p sito-filter test_filter_patterns_and_denyallow_normalize_idn`; `cargo test -p sito-filter test_wildcard_and_prefix_patterns_normalize_idn` |
+| IDN cache invalidation | `test_invalidate_domain_evicts_idn_punycode_entries` | `cargo test -p sito-cache test_invalidate_domain_evicts_idn_punycode_entries` |
+| IDN/trailing-dot rewrite domains | `test_idn_and_trailing_dot_rewrite_domains_match_punycode_queries`, `test_idn_rewrite_entries_match_punycode_queries` | `cargo test -p sito-rewrites test_idn_` |
+| Shared CIDR v4/v6 matcher (P2-97..P2-99) | `test_ipv4_prefix_zero_and_host_prefix`, `test_ipv4_network_boundaries_and_host_bits`, `test_ipv6_prefix_zero_and_full_prefix`, `test_mixed_address_families_never_match`, `test_prefix_bounds_are_validated`, `test_cidr_parse_rejects_invalid_input`, `test_from_str_and_new_constructor` | `cargo test -p sito-core net::tests` |
+| D10 identity trust table | `test_identity_trust_table`, `test_unauthenticated_identity_never_matches_policy`, `test_context_identity_preserves_provenance`, `test_untrusted_context_provenance_cannot_match_policy`, `test_identity_source_serde_names_match_as_str` | `cargo test -p sito-core identity_tests` |
+| Registry provenance (P1-9) | `test_identity_source_is_recorded_for_authenticated_matches`, `test_identity_source_is_untrusted_for_wire_claims_and_unverified_leases`, `test_trusted_routeros_hostname_without_entry_keeps_routeros_provenance` | `cargo test -p sito-clients test_identity_source`; `cargo test -p sito-clients test_trusted_routeros_hostname_without_entry_keeps_routeros_provenance` |
+| `$client` policy gate (P1-9) | `test_client_name_requires_authenticated_identity`, `test_guessable_sni_label_does_not_grant_identity` | `cargo test -p sito-filter test_client_name_requires_authenticated_identity`; `cargo test -p sito-filter test_guessable_sni_label_does_not_grant_identity` |
+| Rewrite exception policy gate (P1-9) | `test_exception_requires_authenticated_identity`, `test_ip_identified_client_cannot_spoof_exception_with_untrusted_id`, `test_unidentified_client_id_does_not_bypass_exception` | `cargo test -p sito-rewrites test_exception_requires_authenticated_identity`; `cargo test -p sito-rewrites test_ip_identified_client_cannot_spoof_exception_with_untrusted_id` |
+| Serde/backwards compatibility of `ClientContext` | `test_client_context_serde_defaults_are_backwards_compatible` | `cargo test -p sito-core test_client_context_serde_defaults_are_backwards_compatible` |
+
+## WP-1.3 — config v2 schema and one validator
+
+| Finding | Named test / check | Focused command |
+|---|---|---|
+| Config v2 default, v1 rejection with migration command | `test_config_v2_is_the_default_and_only_accepted_version`, `test_v1_document_is_rejected_with_a_clear_migration_command` | `cargo test -p sito-core --test config_v2 test_config_v2_is_the_default_and_only_accepted_version`; `cargo test -p sito-core --test config_v2 test_v1_document_is_rejected` |
+| Unknown keys/tables rejected (D5) | `test_unknown_keys_are_rejected_everywhere` | `cargo test -p sito-core --test config_v2 test_unknown_keys_are_rejected_everywhere` |
+| Duplicate binds and listener port conflicts | `test_duplicate_dns_bind_addresses_are_rejected`, `test_web_listener_port_conflict_is_rejected` | `cargo test -p sito-core --test config_v2 test_duplicate_dns_bind`; `cargo test -p sito-core --test config_v2 test_web_listener_port_conflict` |
+| Empty `data_dir`, bad upstream targets, bad `[integrations.lists]` | `test_empty_data_dir_is_rejected`, `test_bad_upstream_targets_are_rejected_in_every_scope`, `test_bad_integrations_lists_are_rejected` | `cargo test -p sito-core --test config_v2 test_empty_data_dir`; `cargo test -p sito-core --test config_v2 test_bad_upstream`; `cargo test -p sito-core --test config_v2 test_bad_integrations_lists` |
+| Invalid ACME domains | `test_invalid_acme_domains_are_rejected` | `cargo test -p sito-core --test config_v2 test_invalid_acme_domains` |
+| Invalid client CIDR ids | `test_invalid_client_cidr_ids_are_rejected` | `cargo test -p sito-core --test config_v2 test_invalid_client_cidr_ids_are_rejected` |
+| Deprecated aliases accepted for one alpha | `test_legacy_aliases_still_parse_in_v2` | `cargo test -p sito-core --test config_v2 test_legacy_aliases_still_parse_in_v2` |
+| Map/schema drift | `test_map_is_well_formed`, `test_config_map_covers_every_serde_field` | `cargo test -p sito-core config_schema`; `cargo test -p sito-core test_config_map_covers_every_serde_field` |
+| Migration behavior-preserving, aliases moved, removed keys reported | `test_migration_is_behavior_preserving_and_moves_aliases` | `cargo test -p sito-core --test config_v2 test_migration_is_behavior_preserving` |
+| Migration unknown-key policy | `test_migration_rejects_unknown_keys_unless_explicitly_allowed` | `cargo test -p sito-core --test config_v2 test_migration_rejects_unknown_keys` |
+| Migration safe defaults | `test_migration_adopt_safe_defaults_opts_into_v2_defaults` | `cargo test -p sito-core --test config_v2 test_migration_adopt_safe_defaults` |
+| Migration rejects v2/future sources | `test_migration_rejects_a_v2_or_future_document` | `cargo test -p sito-core --test config_v2 test_migration_rejects_a_v2` |
+| Migration alias conflict precedence | `test_migration_alias_conflict_precedence_matches_v1_effective_values` | `cargo test -p sito-core --test config_v2 test_migration_alias_conflict` |
+| Table-level v1 ACME/TLS precedence | `test_migration_partial_acme_section_ignores_every_web_alias`, `test_migration_dns_tls_replaces_the_whole_top_level_tls_table` | `cargo test -p sito-core --test config_v2 test_migration_partial_acme`; `cargo test -p sito-core --test config_v2 test_migration_dns_tls` |
+| v1 admin bind default materialized | `test_migration_materializes_the_v1_web_bind_default` | `cargo test -p sito-core --test config_v2 test_migration_materializes` |
+| Unversioned v1 file rejected | `test_config_v2_is_the_default_and_only_accepted_version` | `cargo test -p sito-core --test config_v2 test_config_v2_is_the_default` |
+| `--ignore-unknown-keys` in table arrays / nested SNI | `test_migration_ignore_unknown_keys_handles_table_arrays_and_nested_sni_fields` | `cargo test -p sito-core --test config_v2 test_migration_ignore_unknown_keys` |
+| Listener overlap: wildcard, ACME, dual-stack | `test_listener_conflicts_cover_wildcards_acme_and_dual_stack` | `cargo test -p sito-core --test config_v2 test_listener_conflicts_cover` |
+| Sanitized HA bundle parses as v2 | `test_migrated_config_reparses_after_ha_sanitization`, `test_persisted_config_preserves_node_local_listener_tls_and_web`, `test_persisted_config_preserves_node_local_web_identity` | `cargo test -p sito-core --test config_v2 test_migrated_config_reparses`; `cargo test -p sito-ha test_persisted_config_preserves_node_local` |
+| CLI migration, 0600 backup, atomic write | `test_cli_config_migrate_flags`, `test_config_migrate_writes_v2_and_0600_backup`, `test_config_migrate_requires_unknown_key_flag` | `cargo test -p sito test_config_migrate` |
+| Restart-only matrix truthful and reachable | `test_restart_matrix_names_are_all_reachable` | `cargo test -p sito-api test_restart_matrix_names_are_all_reachable` |
+| Admin write 409/no-persist | `test_restart_only_write_is_conflict_and_not_persisted`, `test_update_config_restart_only_is_conflict_and_not_persisted` | `cargo test -p sito-api test_restart_only_write_is_conflict_and_not_persisted`; `cargo test -p sito-api test_update_config_restart_only` |
+| HA parity for restart-only rejection | `test_ha_restart_only_push_is_conflict_and_not_persisted` | `cargo test -p sito-api test_ha_restart_only_push` |
+| Restart-only preview endpoint | `test_restart_required_preview_lists_the_matrix` | `cargo test -p sito-api test_restart_required_preview_lists_the_matrix` |
+| Restore/restore-archive uses the single validator | `test_restore_archive_rejects_typed_section_errors` | `cargo test -p sito-api test_restore_archive_rejects_typed_section_errors` |
+
+## WP-1.4 — staged runtime generation and atomic apply
+
+| Acceptance criterion | Named test / check | Focused command |
+|---|---|---|
+| A reader sees old+old or new+new, never a torn config/filter pair | `test_query_during_apply_sees_old_or_new_never_torn` | `cargo test -p sito-runtime test_query_during_apply_sees_old_or_new_never_torn` |
+| A failed validation/filter stage publishes nothing | `test_failed_stage_leaves_old_generation_and_components` | `cargo test -p sito-runtime test_failed_stage_leaves_old_generation_and_components` |
+| Generation increments once per apply; stale expected generations conflict | `test_generation_increments_and_conflicts_are_reported` | `cargo test -p sito-runtime test_generation_increments_and_conflicts_are_reported` |
+| A DNSSEC policy change rejects an in-flight old-epoch insert | `test_dnssec_policy_change_rejects_in_flight_old_epoch_insert`, `test_pipeline_uses_snapshot_generation_for_dnssec_cache_insert` | `cargo test -p sito-runtime test_dnssec_policy_change_rejects_in_flight_old_epoch_insert`; `cargo test -p sito --lib test_pipeline_uses_snapshot_generation_for_dnssec_cache_insert` |
+| Filter-only refresh does not advance the config generation | `test_filter_refresh_does_not_advance_config_generation` | `cargo test -p sito-runtime test_filter_refresh_does_not_advance_config_generation` |
+| A filter refresh cannot swap a component during an apply commit | `test_filter_refresh_racing_apply_cannot_swap_components` | `cargo test -p sito-runtime test_filter_refresh_racing_apply_cannot_swap_components` |
+| A stale refresh cannot overwrite a newer config generation | `test_stale_filter_refresh_cannot_overwrite_newer_generation` | `cargo test -p sito-api test_stale_filter_refresh_cannot_overwrite_newer_generation` |
+| A hook/commit failure leaves every component on the old generation | `test_commit_failure_leaves_every_component_on_the_old_generation`, `test_commit_stage_failure_publishes_nothing` | `cargo test -p sito-api test_commit_failure_leaves_every_component_on_the_old_generation`; `cargo test -p sito-runtime test_commit_stage_failure_publishes_nothing` |
+| Deferred applies rebuild client-group snapshots immediately | `test_deferred_apply_rebuilds_group_snapshots` | `cargo test -p sito-api test_deferred_apply_rebuilds_group_snapshots` |
+| End-to-end reader never observes a torn config/filter pair | `test_end_to_end_reader_never_sees_torn_config_and_filter` | `cargo test -p sito-api test_end_to_end_reader_never_sees_torn_config_and_filter` |
+| Config and filter publish together after staging (P1-26) | `test_apply_publishes_config_and_filter_together_after_staging`, `test_failed_hook_leaves_old_config_and_filter` | `cargo test -p sito-api test_apply_publishes_config_and_filter_together_after_staging` |
+| Admin API, HA push and watcher execute the same apply function | `test_api_ha_and_watcher_share_one_apply_function` | `cargo test -p sito-api test_api_ha_and_watcher_share_one_apply_function` |
+| No entry point publishes runtime components directly | `test_no_entry_point_publishes_runtime_components_directly` | `cargo test -p sito-api test_no_entry_point_publishes_runtime_components_directly` |
+| WP-1.3 restart/HA behavior stays green | `test_restart_only_write_is_conflict_and_not_persisted`, `test_ha_restart_only_push_is_conflict_and_not_persisted`, `test_m8_push_restart_only_field_is_not_acked_as_applied` | `cargo test -p sito-api test_restart_only`; `cargo test -p sito-test --test m8_acceptance test_m8_push_restart_only_field_is_not_acked_as_applied` |
+
+## WP-1.6 — shared response shaping and cache keys
+
+| Finding | Named test / check | Focused command |
+|---|---|---|
+| P1-13 | `test_response_shaper_flag_matrix` (DO/EDNS/CD/AD matrix), `test_response_shaper_keeps_ad_for_client_that_requests_ad_without_do`, `test_response_shaper_uses_configured_payload_size`, `test_response_shaper_preserves_truncation`, `test_strip_dnssec_records_removes_all_dnssec_types_and_do_only_options`, `test_safe_search_cname_response_is_shaped_for_client` | `cargo test -p sito-proto shaping` |
+| P1-13 / P2-84 (every path) | `test_cache_hit_copies_current_question_and_flags`, `test_upstream_response_is_shaped_for_client`, `test_stale_response_is_shaped_for_client`, `test_rewrite_response_is_shaped_for_client` | `cargo test -p sito --lib shaped_for_client`; `cargo test -p sito --lib test_cache_hit_copies_current_question_and_flags` |
+| P2-22 (TTL re-clamp) | `test_update_config_reclamps_lowered_max_ttl`, `test_update_config_reclamps_raised_min_ttl`, `test_update_config_does_not_raise_secure_ttl_to_min_ttl`, `test_update_config_reclamps_negative_ttl_max`, `test_update_config_does_not_resurrect_fully_expired_entries` | `cargo test -p sito-cache reclamp` |
+| P2-23 (key coherence) | `test_key_for_query_keys_edns_presence`, `test_key_for_query_ignores_non_answer_affecting_edns_options`, `test_key_for_query_separates_do_cd_and_ecs`, `test_key_for_query_is_the_canonical_from_query_alias`, `test_validation_status_round_trips_through_cache` | `cargo test -p sito-cache key_for_query`; `cargo test -p sito-cache test_validation_status_round_trips_through_cache` |
+| P2-23 (unvalidated insert never Secure) | `test_validation_status_round_trips_through_cache` (AD-forged `insert` stays `Unchecked`) | `cargo test -p sito-cache test_validation_status_round_trips_through_cache` |
+| P-5 (one epoch) | `test_cache_policy_epoch_is_policy_epoch` | `cargo test -p sito-cache test_cache_policy_epoch_is_policy_epoch` |
+| P1-14 (no regression) | `test_doh_truncates_oversized_response`, `test_doh3_truncates_oversized_response` | `cargo test -p sito-transport truncates_oversized_response` |
+
+## WP-1.7 — error, health and readiness policy
+
+| Finding | Named test / check | Focused command |
+|---|---|---|
+| P2-89 | `test_health_is_generic_and_opaque_when_ready`, `test_health_unavailable_when_listeners_are_broken`, `test_health_unavailable_when_ha_is_broken`, `test_status_includes_ready_and_component_reasons`, `test_status_reports_ready_without_reasons` | `cargo test -p sito-api router::tests`; `cargo test -p sito-api handlers::status::tests` |
+| P2-89 | `test_readiness_*` (listener/TLS/ACME/HA/filter/stats aggregate), `test_readiness_stats_outage_is_advisory_not_a_dns_outage`, `test_readiness_failed_filter_with_retained_snapshot_is_advisory`, `test_readiness_loading_filter_with_snapshot_is_advisory`, `test_readiness_ready_filter_with_last_error_is_advisory`, `test_health_report_skips_the_stats_probe`, `test_readiness_state_defaults_to_not_ready_until_startup_publishes` | `cargo test -p sito-api readiness`; `cargo test -p sito-api readiness_tests` |
+| P2-87 | `test_readiness_tls_failure_blocks`, `test_publish_tls_readiness_marks_configured_material_without_acceptor_unavailable`, `test_publish_tls_readiness_allows_acme_without_static_material` | `cargo test -p sito-api readiness::tests::test_readiness_tls_failure_blocks`; `cargo test -p sito --lib server::tests::test_publish_tls_readiness` |
+| D12 (TLS/ACME ladder) | `test_certificate_validity_ladder` (valid/expiring/expired/missing), `test_static_tls_certificate_readiness_ladder`, `test_valid_certificate_with_renewal_error_is_degraded`, `test_expiring_certificate_is_degraded`, `test_expired_certificate_is_not_ready`, `test_missing_certificate_is_pending_or_failed`, `test_bootstrap_certificate_is_advisory` | `cargo test -p sito-transport certificate_validity`; `cargo test -p sito --lib test_static_tls_certificate_readiness_ladder`; `cargo test -p sito-api acme_readiness` |
+| P1-6 | `test_readiness_ha_failure_blocks`, `test_health_unavailable_when_ha_is_broken`; existing `test_publish_bundle_with_retry_reports_only_new_loop_delay` | `cargo test -p sito-api test_readiness_ha_failure_blocks`; `cargo test -p sito-api test_publish_bundle_with_retry_reports_only_new_loop_delay` |
+| P2-90 | `test_held_lease_prevents_bootstrap_mutation`, `test_no_setup_bootstrap_requires_the_service_lease` | `cargo test -p sito service_lock::tests::test_held_lease_prevents_bootstrap_mutation`; `cargo test -p sito bootstrap_lease` |
+| P3-4 | `test_lock_or_recover_returns_last_good_value_after_poison`, `test_poisoned_readiness_mutex_keeps_last_good_value_and_does_not_panic` | `cargo test -p sito-core sync::tests`; `cargo test -p sito-api test_poisoned_readiness_mutex` |
+| P3-3 | `scripts/find-error-swallowing.py` (statement-aware production scan), `scripts/test-error-swallowing.py` fixtures, reviewed allowlist and `docs/audit6-best-effort.md` | `python3 scripts/test-error-swallowing.py`; `bash scripts/check-error-swallowing.sh` |
+| Healthcheck split | `test_healthcheck_fails_when_ha_is_not_ready`, `test_healthcheck_passes_when_ha_is_ready`, `test_healthcheck_ha_required_without_signal_fails_closed`, `test_healthcheck_fails_when_reachable_health_is_not_ready_without_ha`, `test_healthcheck_setup_fallback_requires_the_middleware_signal` | `cargo test -p sito --lib cli::tests::test_healthcheck` |
+
+## WP-1.8 — test harness, mocks and deterministic timing
+
+WP-1.8 closes the P3-11/P3-12 test-fidelity findings. The 20-run stability
+evidence and the exact commands are recorded in
+`docs/test-harness.md` and the WP-1.8 report.
+
+| Acceptance criterion | Named test / check | Focused command |
+|---|---|---|
+| Parallel tests spawn harness instances without port collisions | `concurrent_harness_instances_get_distinct_ports_and_serve_queries` | `cargo test -p sito-test --test harness_parallel` |
+| Concurrent reservations never share a port; a released probe stays reserved | `concurrent_leases_never_return_the_same_port`, `released_probe_socket_stays_reserved_for_concurrent_tests`, `dropped_lease_returns_the_port_and_live_leases_stay_exclusive` | `cargo test -p sito-test-support --test port_broker_contract` |
+| DNS reserves one number for TCP and UDP | `udp_and_tcp_numbers_can_be_reserved_together_without_collision`; harness uses `reserve_tcp_udp`; `sito` startup tests use `reserve_tcp_udp_port` | `cargo test -p sito-test-support --test port_broker_contract udp_and_tcp`; `cargo test -p sito --lib graceful_shutdown` |
+| Deterministic clock: advance/waiters/notify, no real-time drift | `manual_clock_now_only_moves_when_advanced`, `manual_clock_sleep_only_completes_after_advance`, `manual_clock_notify_wakes_waiters_without_advancing` | `cargo test -p sito-test-support --test clock_contract` |
+| Bounded waits name the condition and budget | `wait_for_reports_label_and_timeout_on_failure`, `wait_for_succeeds_after_the_condition_becomes_true` | `cargo test -p sito-test-support --test wait_contract` |
+| Clock-driven mock upstream and HA heartbeat fixtures | `manual_clock_drives_a_deterministic_mock_upstream_delay`, `fake_master_heartbeat_is_driven_by_the_manual_clock` | `cargo test -p sito-test --test fixtures_contract` |
+| TLS valid/expired/soon-to-expire fixtures with SANs | `tls_fixtures_cover_valid_expired_and_soon_to_expire_certificates` | `cargo test -p sito-test --test fixtures_contract tls_fixtures` |
+| ACME mock CA and HTTP-01 challenge server | `test_acme_bootstrap_issuance_all_transports_and_renewal`, `http01_fixture_serves_registered_tokens_only` | `cargo test -p sito-test --test m11_acme`; `cargo test -p sito-test --test fixtures_contract http01` |
+| HA fake master frames/heartbeats/partition | `test_slave_goes_not_ready_when_master_stops_sending_frames`, `test_delayed_same_version_fork_ack_after_newer_publish_is_divergence` | `cargo test -p sito-test --test m11_ha_partition` |
+| DNSSEC signed-zone/key/denial fixtures | `signed_zone_fixture_exposes_anchor_keys_and_denial_records`, `test_m11_policy_change_rejects_in_flight_cache_insert` | `cargo test -p sito-test --test fixtures_contract signed_zone`; `cargo test -p sito-test --test m11_dnssec_security` |
+| Domain normalization property tests | `normalization_is_idempotent_and_never_panics`, `lowercase_and_one_trailing_dot_are_equivalent`, `idn_labels_round_trip_through_punycode`, `wildcard_labels_are_preserved_exactly`, `suffix_matching_is_reflexive_transitive_and_strict_only_for_children` | `cargo test -p sito-core --test domain_properties` |
+| ABP parser property tests | `arbitrary_lines_never_panic`, `parsed_canonical_matches_recomputed_canonical`, `modifier_order_does_not_change_the_canonical_form`, `badfilter_suffix_is_recognised_and_excluded_from_the_canonical_form`, `long_lines_are_skipped_without_materialising_a_rule`, `byte_budget_rejects_without_returning_partial_rules` | `cargo test -p sito-filter --test parser_properties` |
+| 20-run parallel stability | harness/m11/HA/cache plus the changed `sito --lib` and `sito-transport` suites, 20 consecutive runs, no port collisions or timing flakes | see `docs/test-harness.md#stability-evidence` |
+
+## WP-1.9 — fuzz, benchmarks and CI gates
+
+WP-1.9 restores the fuzz harness (P2-64) and adds the structural PR gates,
+coverage, dependency hygiene, Prometheus exposition parsing and the thresholded
+benchmark gate. The long runs are intentionally nightly/release evidence (D14);
+the named checks below prove the mechanism and the fast gates.
+
+| Finding / acceptance | Named test / check | Focused command |
+|---|---|---|
+| P2-64 — fuzz harness exists with five targets | `scripts/check-fuzz-targets.py` (manifest, target sources, seed corpus, gitignore); `cargo fuzz build` in the `fuzz-build` job | `python3 scripts/check-fuzz-targets.py`; `python3 scripts/test_check_fuzz_targets.py`; `cargo fuzz build` |
+| P2-64 — nightly fuzz with corpus and timeout | `.github/workflows/fuzz.yml` (nightly 600 s/target, `-timeout=10`, dictionary, crash artifacts); 24 h manual `fuzz_seconds=86400` documented in `docs/release-verification.md` | dispatch `fuzz.yml`; see `fuzz/README.md` |
+| P2-64 — target behavior is covered locally | `dns_wire`, `abp_parser`, `dnssec_response`, `ha_bundle`, `config_toml` targets and `fuzz/corpus/*/seed-*` | `cargo fuzz run <target> -- -max_total_time=60` |
+| Benchmark gate fails on >10% regression | `scripts/test_check_bench_regression.py` (within/exact/above tolerance, missing, save/round-trip, CLI exit codes); `scripts/check-bench-regression.py`; `bench.yml` | `python3 scripts/test_check_bench_regression.py`; `BENCH_ENVIRONMENT=<runner-label> python3 scripts/check-bench-regression.py` |
+| Criterion benches for pipeline/filter/cache/stats/metrics | `crates/sito-test/benches/pipeline_bench.rs`, `crates/sito-filter/benches/lookup.rs`, `crates/sito-cache/benches/cache_bench.rs`, `crates/sito-stats/benches/stats_bench.rs`, `crates/sito-stats/benches/metrics_bench.rs` | `BENCH_ENVIRONMENT=<runner-label> cargo bench --workspace --all-features --locked --no-run` |
+| Stored baseline and save command | `benches/baseline.json`, `scripts/save-bench-baseline.sh` | `scripts/save-bench-baseline.sh` |
+| Prometheus exposition parses, HELP/TYPE valid, no duplicate series | `rendered_exposition_parses_with_docs_and_without_duplicate_series` | `cargo test -p sito-stats --test prometheus_exposition` |
+| P3-18 — machete/udeps/coverage | `hygiene` and `coverage` jobs in `ci.yml`; local commands below | `cargo machete`; `cargo +nightly udeps --workspace --all-targets`; `cargo llvm-cov --workspace --all-features --summary-only` |
+| P3-18 — clippy is `--locked`, security runs on every PR | `ci.yml` `clippy` step and `security-check` condition | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` |
+| P3-17 — manual docs dispatch checks the whole tree | `docs.yml` empty-tree range for `workflow_dispatch`/`merge_group` | inspect `.github/workflows/docs.yml`; `actionlint` |
+| P3-19 — no stale advisory suppression | `deny.toml` has no ignored advisories; `cargo deny check` is warning-free | `cargo deny check` |
+| P1-21 — release refuses untested tags (regression) | `scripts/verify-release-gate.sh` requires `ci-gate` and `cargo-deny`; new jobs are inside `ci-gate` | `bash scripts/test-verify-release-gate.sh`; `bash scripts/test-release-workflow.sh` |
+| P2-65/P2-66 — query-log coverage and unsafe-behavior tests | Covered by the WP-0.1/WP-1.8 suites listed above (retention, PII, migration, DNSSEC strictness, DoQ bounds); WP-1.9 adds no new product behavior. | see the P1-19/P1-24/WP-1.8 rows |
+
+The fuzz build (`cargo fuzz build`) is the authoritative compile check; the
+manifest checker is the cheap PR-side guard. The 24-hour clean run and the
+nightly benchmark comparison are release-checklist items, not flaky PR jobs
+(D14/P-7).
+
+## WP-1.10 — docs structure and migration guide
+
+| Acceptance criterion | Named check | Focused command |
+|---|---|---|
+| Config reference validates nested array/map structs, types, defaults and required/optional status | `scripts/check_config_reference.py`; fixtures `test_missing_nested_key_fails`, `test_wrong_nested_default_fails`, `test_wrong_nested_type_fails`, `test_required_nested_field_is_checked` | `python3 scripts/check_config_reference.py --github`; `python3 scripts/test_check_config_reference.py` |
+| Legacy raw `[clients]`/`[rewrites]`/`[ha]`/`[integrations]` allowlists and every kept/deprecated `config-v1-to-v2-map.toml` path stay documented | `test_unknown_kept_map_path_is_not_documented`, `test_deprecated_target_must_be_a_documented_kept_key` | `python3 scripts/test_check_config_reference.py` |
+| The checker fails closed on a missing reference or malformed map and stays concise under `--github` | `test_corrupt_map_fails_closed`, `test_missing_doc_fails_closed`, `test_github_output_is_concise` | `python3 scripts/test_check_config_reference.py` |
+| Every 2.0 breaking-change ID has a migration step and an affected doc/test | `scripts/check_migration_guide.py`; fixtures `test_missing_breaking_id_fails`, `test_empty_migration_step_fails`, `test_duplicate_breaking_id_fails` | `python3 scripts/check_migration_guide.py --github`; `python3 scripts/test_check_migration_guide.py` |
+| Historical audits are labeled as leads, current evidence docs are not | `docs/history/README.md` plus the banner in each historical audit/plan | `python3 scripts/check_markdown_links.py` |
+| Doc links and anchors resolve | `scripts/check_markdown_links.py` | `python3 scripts/check_markdown_links.py --github` |

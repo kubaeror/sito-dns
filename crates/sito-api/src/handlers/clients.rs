@@ -840,6 +840,8 @@ mod tests {
             slave_tracker: None,
             resync_sender: None,
             setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            readiness: Arc::new(crate::readiness::ReadinessState::default()),
+            cert_validity_cache: Arc::new(sito_transport::CertificateValidityCache::new()),
             acme_challenges: None,
             dns_starter: None,
         }
@@ -874,6 +876,7 @@ mod tests {
                 ip: Some(*ip),
                 hostname: Some(format!("host-{ip}")),
                 comment: None,
+                verified: true,
             }]);
             let mut client = sito_core::client::ClientContext::new(*ip);
             let _ = registry.resolve(&mut client, registry.timezone().at_utc(*last_seen));

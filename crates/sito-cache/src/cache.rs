@@ -14,7 +14,7 @@ use sito_proto::{
     DNSClass, Message, MessageType, Name, RData, Record, RecordType, ResponseCode, encode_message,
 };
 
-use crate::entry::{CacheEntry, ValidationStatus};
+use crate::entry::{CacheEntry, PolicyEpoch, ValidationStatus};
 use crate::key::CacheKey;
 
 /// TTL (seconds) clamped onto records served from stale cache per RFC 8767 §5.
@@ -78,39 +78,105 @@ impl DnsCache {
             cache: ArcSwap::from_pointee(cache),
             config: ArcSwap::new(Arc::new(config)),
             // Start at 1 so an entry always carries a meaningful generation.
-            policy_epoch: AtomicU64::new(1),
+            policy_epoch: AtomicU64::new(PolicyEpoch::INITIAL.get()),
             flights: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Current DNSSEC policy generation.
     ///
-    /// Pipeline queries capture this before loading the validator and pass it
-    /// to [`Self::insert_with_status_at_epoch`]; a policy change advances the
-    /// generation, so a query that validated under the old policy cannot
-    /// insert its status after the flush.
+    /// A query must **not** read this live: it captures
+    /// `RuntimeSnapshot::generation` together with the validator, and passes
+    /// that value to [`Self::insert_with_status_at_epoch`]. A config apply
+    /// advances this counter with the validator swap, so the two can never come
+    /// from different generations.
     #[must_use]
-    pub fn policy_epoch(&self) -> u64 {
-        self.policy_epoch.load(Ordering::Acquire)
+    pub fn policy_epoch(&self) -> PolicyEpoch {
+        PolicyEpoch::new(self.policy_epoch.load(Ordering::Acquire))
     }
 
     /// Advances the DNSSEC policy generation and returns the new value.
     ///
-    /// Call this after the new validator is installed (so a query that reads
-    /// the new epoch also observes the new validator) and before/with the
-    /// cache flush. Existing entries are filtered by `get` immediately; the
-    /// flush only reclaims their memory.
-    pub fn advance_policy_epoch(&self) -> u64 {
-        self.policy_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    /// The runtime calls this once per successful config apply, immediately
+    /// before publishing the snapshot that carries the prepared validator. A
+    /// query therefore sees the old validator with the old epoch, or the new
+    /// validator with the new epoch. Existing entries are filtered by `get`
+    /// immediately; the flush only reclaims their memory. Filter-only
+    /// refreshes do not call it.
+    pub fn advance_policy_epoch(&self) -> PolicyEpoch {
+        // Applies are serialized by the runtime write lock; a concurrent
+        // reader still observes either the old or the new generation.
+        PolicyEpoch::new(
+            self.policy_epoch
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1),
+        )
     }
 
     /// Applies hot-reloaded cache settings, rebuilding the cache when
-    /// `size_mb` changes.
+    /// `size_mb` changes and re-clamping every live entry to the new TTL
+    /// policy.
+    ///
+    /// The re-clamp is immediate and does not wait for entries to expire:
+    /// a lowered `max_ttl`/`negative_ttl_max` caps what is served, and a
+    /// raised `min_ttl` raises unvalidated entries to the new floor. Secure
+    /// entries keep the `floor = 0` rule so a reload can never extend an
+    /// authenticated TTL past its signed lifetime. Entries past their old
+    /// lifespan are left to the stale path; a raised `min_ttl` must not
+    /// resurrect them as fresh.
     pub async fn update_config(&self, config: CacheConfig) {
-        if self.config.load().size_mb != config.size_mb {
+        let size_changed = self.config.load().size_mb != config.size_mb;
+        // Publish the policy before the resize so the resize uses the new
+        // stale window, then re-clamp against the same configuration.
+        self.config.store(Arc::new(config.clone()));
+        if size_changed {
             self.resize(config.size_mb as u64).await;
         }
-        self.config.store(Arc::new(config));
+        self.reclamp_entries(&config).await;
+    }
+
+    /// Rewrites every still-fresh entry so its TTLs obey `config`.
+    async fn reclamp_entries(&self, config: &CacheConfig) {
+        let cache = self.cache.load_full();
+        let stale_window_secs = config.serve_stale_hours.saturating_mul(3600);
+        let mut replacements = Vec::new();
+        let mut expired = Vec::new();
+
+        for (key, entry) in cache.iter() {
+            let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
+            let fully_expired =
+                u64::from(entry.max_lifespan_secs).saturating_add(u64::from(stale_window_secs));
+            if u64::from(elapsed_secs) >= fully_expired {
+                expired.push((*key).clone());
+                continue;
+            }
+            // Only entries still fresh under the policy they were stored with
+            // are eligible. Re-clamping a stale entry with a raised min_ttl
+            // would make data whose original lifespan passed fresh again.
+            if elapsed_secs >= entry.max_lifespan_secs {
+                continue;
+            }
+            let reclamped = reclamp_entry(&entry, config);
+            if reclamped.max_lifespan_secs <= elapsed_secs {
+                expired.push((*key).clone());
+            } else {
+                replacements.push(((*key).clone(), Arc::new(reclamped)));
+            }
+        }
+
+        let replaced = replacements.len();
+        for key in expired {
+            cache.invalidate(&key).await;
+        }
+        for (key, entry) in replacements {
+            cache.insert(key, entry).await;
+        }
+        cache.run_pending_tasks().await;
+        debug!(
+            "Re-clamped {replaced} cache entries after a cache policy reload (min_ttl={}s, \
+             max_ttl={}s, negative_ttl_max={}s, serve_stale_hours={})",
+            config.min_ttl, config.max_ttl, config.negative_ttl_max, config.serve_stale_hours
+        );
     }
 
     /// Rebuilds the underlying cache with a new capacity in megabytes,
@@ -163,10 +229,7 @@ impl DnsCache {
     /// after acquiring (the slot holder may already have populated it).
     pub async fn single_flight(&self, key: CacheKey) -> SingleFlightGuard {
         let lock = {
-            let mut flights = self
-                .flights
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut flights = sito_core::sync::lock_or_recover(&self.flights);
             if flights.len() > 1024 {
                 flights.retain(|_, weak| weak.strong_count() > 0);
             }
@@ -185,7 +248,7 @@ impl DnsCache {
 
     /// Acquires the single-flight slot for the query's cache key.
     pub async fn single_flight_for_query(&self, query: &Message) -> Option<SingleFlightGuard> {
-        let key = CacheKey::from_query(query)?;
+        let key = CacheKey::for_query(query)?;
         Some(self.single_flight(key).await)
     }
 
@@ -211,7 +274,7 @@ impl DnsCache {
         &self,
         query: &Message,
     ) -> Option<(Message, ValidationStatus)> {
-        self.get_by_key_with_status(&CacheKey::from_query(query)?)
+        self.get_by_key_with_status(&CacheKey::for_query(query)?)
             .await
             .map(|(message, status, _)| (message, status))
     }
@@ -227,7 +290,7 @@ impl DnsCache {
         &self,
         query: &Message,
     ) -> Option<(Message, ValidationStatus, u64)> {
-        self.get_by_key_with_status(&CacheKey::from_query(query)?)
+        self.get_by_key_with_status(&CacheKey::for_query(query)?)
             .await
     }
 
@@ -251,7 +314,7 @@ impl DnsCache {
 
         // A policy change makes every entry from an older generation
         // unservable immediately, even before the flush reclaims it.
-        if entry.policy_epoch != self.policy_epoch() {
+        if entry.policy_epoch != self.policy_epoch().get() {
             trace!(
                 "Ignoring cache entry for {} from DNSSEC policy epoch {} (current {})",
                 key.qname,
@@ -352,7 +415,7 @@ impl DnsCache {
         &self,
         query: &Message,
     ) -> Option<(Message, ValidationStatus)> {
-        self.get_stale_by_key(&CacheKey::from_query(query)?)
+        self.get_stale_by_key(&CacheKey::for_query(query)?)
             .await
             .map(|(message, status, _)| (message, status))
     }
@@ -366,7 +429,7 @@ impl DnsCache {
         let cache = self.cache.load_full();
         let entry = cache.get(key).await?;
 
-        if entry.policy_epoch != self.policy_epoch() {
+        if entry.policy_epoch != self.policy_epoch().get() {
             trace!(
                 "Ignoring stale cache entry for {} from DNSSEC policy epoch {} (current {})",
                 key.qname,
@@ -419,7 +482,7 @@ impl DnsCache {
 
     /// Prefetch check for `query`, honouring its DO/CD/ECS cache key.
     pub async fn should_prefetch_for_query(&self, query: &Message) -> bool {
-        match CacheKey::from_query(query) {
+        match CacheKey::for_query(query) {
             Some(key) => self.should_prefetch_by_key(&key).await,
             None => false,
         }
@@ -445,6 +508,11 @@ impl DnsCache {
 
     /// Insert a response into the cache, calculating clamped TTLs and entry weight.
     ///
+    /// The entry is always stored as [`ValidationStatus::Unchecked`]: an AD bit
+    /// supplied by an upstream is not proof that this resolver validated the
+    /// data. Callers that did validate must use [`Self::insert_with_status`] or
+    /// [`Self::insert_with_status_at_epoch`].
+    ///
     /// Only well-formed positive or negative answers are cached:
     /// * the response must be a response message whose question section is
     ///   present and matches the query,
@@ -454,12 +522,7 @@ impl DnsCache {
     ///   NODATA and require an SOA in the authority section (RFC 2308);
     ///   negative answers without an SOA are not cached.
     pub async fn insert(&self, query: &Message, response: &Message) {
-        let validation_status = if response.metadata.authentic_data {
-            ValidationStatus::Secure
-        } else {
-            ValidationStatus::Unchecked
-        };
-        self.insert_with_status(query, response, validation_status)
+        self.insert_with_status(query, response, ValidationStatus::Unchecked)
             .await;
     }
 
@@ -481,17 +544,17 @@ impl DnsCache {
     /// Insert a response only when `policy_epoch` is still current.
     ///
     /// Returns `true` when the entry was stored and `false` when a DNSSEC
-    /// policy change made the caller's validation decision stale. The epoch
-    /// must be captured before the validator that produced
-    /// `validation_status` is loaded (see [`DnsCache::policy_epoch`]).
+    /// policy change made the caller's validation decision stale. Pass
+    /// `RuntimeSnapshot::generation` from the same snapshot that supplied the
+    /// validator; never read `policy_epoch()` live in a query.
     pub async fn insert_with_status_at_epoch(
         &self,
         query: &Message,
         response: &Message,
         validation_status: ValidationStatus,
-        policy_epoch: u64,
+        policy_epoch: PolicyEpoch,
     ) -> bool {
-        let Some(key) = CacheKey::from_query(query) else {
+        let Some(key) = CacheKey::for_query(query) else {
             return false;
         };
 
@@ -669,8 +732,8 @@ impl DnsCache {
         if policy_epoch != self.policy_epoch() {
             debug!(
                 qname = %key.qname,
-                policy_epoch,
-                current = self.policy_epoch(),
+                policy_epoch = %policy_epoch,
+                current = %self.policy_epoch(),
                 "Discarding cache insert from an older DNSSEC policy generation"
             );
             return false;
@@ -684,7 +747,7 @@ impl DnsCache {
             authority_ttls,
             additional_ttls,
             validation_status,
-            policy_epoch,
+            policy_epoch: policy_epoch.get(),
             hits: Arc::new(AtomicU32::new(0)),
             estimated_bytes,
         };
@@ -709,8 +772,8 @@ impl DnsCache {
     /// all strict subdomains).
     ///
     /// This is an O(n) scan of the live cache because moka has no secondary
-    /// index; the suffix string is precomputed so the scan performs no
-    /// per-entry formatting.
+    /// index. The predicate uses the shared suffix matcher, so the scan
+    /// performs no per-entry formatting.
     pub fn invalidate_domain(&self, domain: &str) {
         let trimmed = domain.trim();
         // The root name is an ancestor of every cached name, so invalidating
@@ -720,13 +783,15 @@ impl DnsCache {
             self.flush();
             return;
         }
-        let normalized = sito_proto::normalize_domain(trimmed)
+        // The API passes `Name::to_string()` (UTS46-decoded Unicode), while
+        // cache keys are `Name::to_ascii()` punycode. Normalize with IDNA so
+        // `invalidate_domain("münchen.de")` evicts `xn--mnchen-3ya.de`.
+        let normalized = sito_proto::normalize_domain_or_idna(trimmed)
             .unwrap_or_else(|_| trimmed.trim_end_matches('.').to_ascii_lowercase());
-        let subdomain_suffix = format!(".{normalized}");
         let match_name = normalized.clone();
         let cache = self.cache.load();
         if let Err(error) = cache.invalidate_entries_if(move |k, _v| {
-            k.qname == match_name || k.qname.ends_with(&subdomain_suffix)
+            k.qname == match_name || sito_core::matches_domain_suffix(&k.qname, &match_name)
         }) {
             // This should be unreachable because `build_cache` enables
             // invalidation closures. Flush instead of silently claiming the
@@ -744,6 +809,122 @@ impl DnsCache {
     pub fn weighted_size(&self) -> u64 {
         self.cache.load().weighted_size()
     }
+
+    /// Moves an existing entry's `stored_at` into the past (test only).
+    ///
+    /// TTL re-clamp tests need to observe an aged entry without sleeping. The
+    /// production clock is still `Instant::now()`; only `stored_at` is rewound.
+    #[cfg(test)]
+    pub(crate) async fn backdate_entry_for_test(&self, query: &Message, age: std::time::Duration) {
+        let Some(key) = CacheKey::for_query(query) else {
+            return;
+        };
+        let cache = self.cache.load_full();
+        let Some(entry) = cache.get(&key).await else {
+            return;
+        };
+        let Some(stored_at) = Instant::now().checked_sub(age) else {
+            return;
+        };
+        let mut backdated = (*entry).clone();
+        backdated.stored_at = stored_at;
+        cache.insert(key, Arc::new(backdated)).await;
+    }
+}
+
+/// Returns `entry` with its TTL vectors and lifespan re-clamped to `config`.
+///
+/// The cache does not retain the original unclamped TTL, so a re-clamp can
+/// tighten a lowered ceiling (`max_ttl`/`negative_ttl_max`) and raise an
+/// unvalidated entry to a new `min_ttl` floor, but never un-clamp a raised
+/// ceiling. That is intentional: a policy reload must not extend old data as
+/// if it had just been fetched.
+///
+/// Secure entries keep the `floor = 0` rule used by [`DnsCache::insert_with_status`]:
+/// `min_ttl` must not extend an authenticated TTL beyond its signed lifetime.
+fn reclamp_entry(entry: &CacheEntry, config: &CacheConfig) -> CacheEntry {
+    let mut reclamped = entry.clone();
+    let floor = if entry.validation_status.is_secure() {
+        0
+    } else {
+        config.min_ttl
+    };
+    let negative = entry_is_negative(entry);
+    let ceiling = if negative {
+        config.negative_ttl_max.max(config.min_ttl)
+    } else {
+        config.max_ttl.max(config.min_ttl)
+    };
+
+    if negative {
+        // RFC 2308: the negative lifespan is derived from the SOA (and, for
+        // Secure answers, the denial proof or CNAME chain). The entry stores
+        // that post-cap lifespan, not the original SOA TTL, so a reload may
+        // only lower it. Raising it to a new `min_ttl` would outlive the
+        // negative proof. Record TTLs are still raised to the new floor while
+        // the entry is served.
+        let lifespan = entry.max_lifespan_secs.min(ceiling);
+        let record_ceiling = lifespan.max(floor);
+        for (ttls, records) in [
+            (&mut reclamped.answer_ttls, &entry.answer_ttls),
+            (&mut reclamped.authority_ttls, &entry.authority_ttls),
+            (&mut reclamped.additional_ttls, &entry.additional_ttls),
+        ] {
+            *ttls = records
+                .iter()
+                .copied()
+                .map(|ttl| ttl.clamp(floor, record_ceiling))
+                .collect();
+        }
+        reclamped.max_lifespan_secs = lifespan;
+    } else {
+        for (ttls, records) in [
+            (&mut reclamped.answer_ttls, &entry.answer_ttls),
+            (&mut reclamped.authority_ttls, &entry.authority_ttls),
+            (&mut reclamped.additional_ttls, &entry.additional_ttls),
+        ] {
+            *ttls = records
+                .iter()
+                .copied()
+                .map(|ttl| ttl.clamp(floor, ceiling))
+                .collect();
+        }
+        let min_record_ttl = reclamped
+            .answer_ttls
+            .iter()
+            .chain(reclamped.authority_ttls.iter())
+            .chain(reclamped.additional_ttls.iter())
+            .copied()
+            .min()
+            .unwrap_or(config.min_ttl);
+        reclamped.max_lifespan_secs = min_record_ttl;
+    }
+
+    reclamped
+}
+
+/// Whether a cached message represents a negative answer (NXDOMAIN or NODATA).
+///
+/// Mirrors the NODATA detection in [`DnsCache::insert_with_status_at_epoch`],
+/// so a reload classifies an existing entry exactly as the insert did.
+fn entry_is_negative(entry: &CacheEntry) -> bool {
+    let message = &entry.message;
+    if message.metadata.response_code == ResponseCode::NXDomain {
+        return true;
+    }
+    if message.metadata.response_code != ResponseCode::NoError {
+        return false;
+    }
+    let Some(question) = message.queries.first() else {
+        return false;
+    };
+    let query_type = question.query_type();
+    let has_answer_for_query_type = (query_type == RecordType::ANY && !message.answers.is_empty())
+        || message
+            .answers
+            .iter()
+            .any(|record| record.record_type() == query_type);
+    !has_answer_for_query_type
 }
 
 /// Removes DNSSEC records and the AD flag from a response.

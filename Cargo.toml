@@ -11,6 +11,7 @@ members = [
     "crates/sito-dnssec",
     "crates/sito-clients",
     "crates/sito-rewrites",
+    "crates/sito-routeros",
     "crates/sito-api",
     "crates/sito-stats",
     "crates/sito-ha",
@@ -22,7 +23,7 @@ members = [
 exclude = ["vendor/sqlx-sqlite"]
 
 [workspace.package]
-version = "1.9.5"
+version = "2.0.0-alpha.1"
 edition = "2024"
 rust-version = "1.99.1"
 license = "GPL-3.0-only"
@@ -33,7 +34,7 @@ homepage = "https://github.com/kubaeror/sito-dns"
 [workspace.dependencies]
 askama = "0.16"
 clap = { version = "4.6", features = ["derive"] }
-tokio = { version = "1.54", features = ["full"] }
+tokio = { version = "1.54", default-features = false, features = ["rt"] }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 arc-swap = "1.9"
 dashmap = "6.2"
@@ -59,6 +60,7 @@ async-trait = "0.1"
 aho-corasick = "1.1"
 regex-automata = { version = "0.4", features = ["dfa-build", "syntax", "hybrid"] }
 criterion = "0.8"
+proptest = "1.12"
 rustls-pki-types = { version = "1.15", features = ["std"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 base64 = "0.23"
@@ -88,22 +90,23 @@ tar = "0.4"
 utoipa = { version = "6.0", features = ["axum_extras"] }
 
 # Internal workspace dependencies
-sito = { path = "crates/sito", version = "1.9.5" }
-sito-core = { path = "crates/sito-core", version = "1.9.5" }
-sito-proto = { path = "crates/sito-proto", version = "1.9.5" }
-sito-transport = { path = "crates/sito-transport", version = "1.9.5" }
-sito-upstream = { path = "crates/sito-upstream", version = "1.9.5" }
-sito-cache = { path = "crates/sito-cache", version = "1.9.5" }
-sito-filter = { path = "crates/sito-filter", version = "1.9.5" }
-sito-dnssec = { path = "crates/sito-dnssec", version = "1.9.5" }
-sito-clients = { path = "crates/sito-clients", version = "1.9.5" }
-sito-rewrites = { path = "crates/sito-rewrites", version = "1.9.5" }
-sito-api = { path = "crates/sito-api", version = "1.9.5" }
-sito-stats = { path = "crates/sito-stats", version = "1.9.5" }
-sito-runtime = { path = "crates/sito-runtime", version = "1.9.5" }
-sito-ha = { path = "crates/sito-ha", version = "1.9.5" }
-sito-test = { path = "crates/sito-test", version = "1.9.5" }
-sito-test-support = { path = "crates/sito-test-support", version = "1.9.5" }
+sito = { path = "crates/sito", version = "2.0.0-alpha.1" }
+sito-core = { path = "crates/sito-core", version = "2.0.0-alpha.1" }
+sito-proto = { path = "crates/sito-proto", version = "2.0.0-alpha.1" }
+sito-transport = { path = "crates/sito-transport", version = "2.0.0-alpha.1" }
+sito-upstream = { path = "crates/sito-upstream", version = "2.0.0-alpha.1" }
+sito-cache = { path = "crates/sito-cache", version = "2.0.0-alpha.1" }
+sito-filter = { path = "crates/sito-filter", version = "2.0.0-alpha.1" }
+sito-dnssec = { path = "crates/sito-dnssec", version = "2.0.0-alpha.1" }
+sito-clients = { path = "crates/sito-clients", version = "2.0.0-alpha.1" }
+sito-rewrites = { path = "crates/sito-rewrites", version = "2.0.0-alpha.1" }
+sito-routeros = { path = "crates/sito-routeros", version = "2.0.0-alpha.1" }
+sito-api = { path = "crates/sito-api", version = "2.0.0-alpha.1" }
+sito-stats = { path = "crates/sito-stats", version = "2.0.0-alpha.1" }
+sito-runtime = { path = "crates/sito-runtime", version = "2.0.0-alpha.1" }
+sito-ha = { path = "crates/sito-ha", version = "2.0.0-alpha.1" }
+sito-test = { path = "crates/sito-test", version = "2.0.0-alpha.1" }
+sito-test-support = { path = "crates/sito-test-support", version = "2.0.0-alpha.1" }
 
 # sqlx-sqlite 0.9.0 caps libsqlite3-sys at <0.38.0, which bundles SQLite
 # < 3.54.0 (RUSTSEC-2026-0459). The vendored copy only widens that range to

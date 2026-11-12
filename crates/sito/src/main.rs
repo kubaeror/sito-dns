@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use sito::cli::{Cli, Commands, run_backup, run_check_config, run_healthcheck_or_web, run_restore};
-use sito::server::run_server_full;
+use sito::server::run_server_with_lease;
 use sito_core::config::Config;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -118,6 +118,35 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
             },
+            Commands::Config { command } => match command {
+                sito::cli::ConfigCommands::Migrate {
+                    config,
+                    from,
+                    to,
+                    backup,
+                    adopt_safe_defaults,
+                    ignore_unknown_keys,
+                    json,
+                } => {
+                    // Accept both the global `--config` and the subcommand form.
+                    let config_path = config.unwrap_or(default_config_path.clone());
+                    if let Err(e) = sito::cli::run_config_migrate(
+                        &config_path,
+                        &from,
+                        &to,
+                        sito::cli::ConfigMigrateOptions {
+                            backup,
+                            adopt_safe_defaults,
+                            ignore_unknown_keys,
+                            json,
+                        },
+                    ) {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+            },
             Commands::Update {
                 config,
                 check,
@@ -180,7 +209,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Server execution path
     let config_path = default_config_path;
-    let (config, setup_pending) = if config_path.exists() {
+    let config_exists = config_path.exists();
+    // Read/parse the configuration before acquiring the lease: this is a
+    // read-only operation. Every mutation below runs under the lease.
+    let (mut config, setup_pending) = if config_exists {
         let content = std::fs::read_to_string(&config_path).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to open configuration file '{}': {}",
@@ -199,11 +231,35 @@ async fn main() -> anyhow::Result<()> {
         (config, false)
     } else if cli.no_setup {
         // No config file: the built-in defaults would bootstrap
-        // `admin/adminadmin` on 0.0.0.0. Generate a random admin password and
-        // bind the admin UI to loopback instead, printing the password once.
-        let mut config = Config::default();
-        match sito::cli::prepare_no_setup_bootstrap(&config_path, &mut config) {
-            Ok(sito::cli::NoSetupBootstrap::GeneratedPassword(password)) => {
+        // `admin/adminadmin` on 0.0.0.0. `prepare_no_setup_bootstrap` below
+        // generates a random admin password and binds the admin UI to loopback;
+        // it must run only while this process holds the service lease (P2-90).
+        (Config::default(), false)
+    } else {
+        (Config::default(), true)
+    };
+
+    // P2-90: acquire the service lease before any bootstrap mutation. A second
+    // process that cannot acquire it exits here without touching
+    // `users.toml`/`config.toml` or printing a password it could never use.
+    let data_dir = config.server.data_dir.clone();
+    let (bootstrap, service_lease) = match sito::service_lock::with_service_lease(&data_dir, || {
+        if !config_exists && cli.no_setup {
+            sito::cli::prepare_no_setup_bootstrap(&config_path, &mut config)
+        } else {
+            Ok(sito::cli::NoSetupBootstrap::NotNeeded)
+        }
+    }) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    if !config_exists && cli.no_setup {
+        match bootstrap {
+            sito::cli::NoSetupBootstrap::GeneratedPassword(password) => {
                 eprintln!("\n==================================================================");
                 eprintln!(" --no-setup without a configuration file detected.");
                 eprintln!(" Admin UI bound to 127.0.0.1 with a randomly generated password.");
@@ -212,23 +268,16 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!(" Store this password now; it is never shown again.");
                 eprintln!("==================================================================\n");
             }
-            Ok(sito::cli::NoSetupBootstrap::KeptExistingUsers) => {
+            sito::cli::NoSetupBootstrap::KeptExistingUsers => {
                 eprintln!("\n==================================================================");
                 eprintln!(" --no-setup without a configuration file detected.");
                 eprintln!(" Existing credentials were found and kept; the admin UI is bound");
                 eprintln!(" to 127.0.0.1. Use `sito reset-admin` to deliberately rotate them.");
                 eprintln!("==================================================================\n");
             }
-            Ok(sito::cli::NoSetupBootstrap::NotNeeded) => {}
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
+            sito::cli::NoSetupBootstrap::NotNeeded => {}
         }
-        (config, false)
-    } else {
-        (Config::default(), true)
-    };
+    }
 
     // Initialize tracing subscriber per configuration. The filter layer is
     // installable via `sito::logging` so `server.log_level` hot-reloads.
@@ -296,5 +345,5 @@ async fn main() -> anyhow::Result<()> {
         "Starting sito DNS server"
     );
 
-    run_server_full(config, config_path, None, setup_pending).await
+    run_server_with_lease(config, config_path, None, setup_pending, service_lease).await
 }

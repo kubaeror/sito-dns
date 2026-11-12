@@ -252,8 +252,8 @@ docker compose -f docker-compose.ha.yml config
 
 > The `cargo check --manifest-path fuzz/Cargo.toml --locked` step in the
 > original 1.9.2 validation list applied only while the fuzz harness existed
-> through v1.9.3. The harness was removed afterwards; there is no `fuzz/`
-> directory in current trees.
+> through v1.9.3. The harness was removed from the 1.9.x line; the 2.0 branch
+> restored it as a nightly/release mechanism. See `fuzz/README.md`.
 
 For a local release binary:
 

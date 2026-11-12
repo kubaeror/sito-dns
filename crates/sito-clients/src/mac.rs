@@ -211,7 +211,7 @@ impl MacResolver {
         let now = Instant::now();
 
         let cached = {
-            let cache = self.cache.read().unwrap();
+            let cache = sito_core::sync::read_or_recover(&self.cache);
             cache
                 .get(&ip)
                 .filter(|entry| entry.expires_at > now)
@@ -222,7 +222,7 @@ impl MacResolver {
         }
 
         let negatively_cached = {
-            let negative = self.negative.read().unwrap();
+            let negative = sito_core::sync::read_or_recover(&self.negative);
             negative
                 .get(&ip)
                 .is_some_and(|expires_at| *expires_at > now)
@@ -233,12 +233,12 @@ impl MacResolver {
 
         // Snapshot lookup only; the snapshot is maintained off the query path.
         let resolved = {
-            let snapshot = self.snapshot.read().unwrap();
+            let snapshot = sito_core::sync::read_or_recover(&self.snapshot);
             snapshot.get(&ip).cloned()
         };
 
         if let Some(mac) = resolved {
-            self.negative.write().unwrap().remove(&ip);
+            sito_core::sync::write_or_recover(&self.negative).remove(&ip);
             self.store_positive(ip, mac.clone(), now);
             Some(mac)
         } else {
@@ -248,7 +248,7 @@ impl MacResolver {
     }
 
     fn store_positive(&self, ip: IpAddr, mac: String, now: Instant) {
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = sito_core::sync::write_or_recover(&self.cache);
         if cache.len() >= MAX_CACHE_ENTRIES {
             cache.retain(|_, entry| entry.expires_at > now);
             if cache.len() >= MAX_CACHE_ENTRIES
@@ -270,7 +270,7 @@ impl MacResolver {
     }
 
     fn store_negative(&self, ip: IpAddr, now: Instant) {
-        let mut negative = self.negative.write().unwrap();
+        let mut negative = sito_core::sync::write_or_recover(&self.negative);
         if negative.len() >= MAX_CACHE_ENTRIES {
             negative.retain(|_, expires_at| *expires_at > now);
             if negative.len() >= MAX_CACHE_ENTRIES

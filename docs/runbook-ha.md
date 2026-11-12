@@ -56,6 +56,81 @@ exposes only the generic ready flag; read `readiness_reason` on the
 authenticated `/api/v1/ha/status` endpoint (or the logs) for the detailed
 cause.
 
+### Health and status endpoint semantics (WP-1.7)
+
+`/health` is the generic, unauthenticated probe:
+
+| Condition | Response |
+|---|---|
+| Every blocking component is ready | `200 {"status":"ok"}` |
+| Listeners, configured TLS, ACME, HA or the filter engine is not ready | `503 {"status":"unavailable"}` |
+
+It deliberately exposes no component names, reason codes, filesystem paths,
+certificate text or configuration values. The container healthcheck and
+`GET /health` consumers must rely on the status code.
+
+`GET /api/v1/status` (Viewer or higher) is the detailed admin view. It keeps
+`version`, `uptime_seconds`, `role`, `listeners` and `acme`, and adds:
+
+- `ready` — the same aggregate verdict `/health` uses.
+- `reasons[]` — every blocking and advisory reason with `component`, `code`,
+  `message` and (when known) `since_unix_ms`, in component order.
+
+| Component | Blocks `ready`? | Example codes |
+|---|---|---|
+| `listeners` | Yes | `listener_bind_failed`, `listener_rebind_skipped`, `listeners_not_started` |
+| `tls` | Yes when expired; no when expiring | `tls_acceptor_unavailable`, `tls_init_failed`, `tls_cert_expired`, `tls_cert_expiring` |
+| `acme` | Yes for challenge-unavailable/expired/issuance-failed; no for renewal failure/expiring/pending | `acme_challenge_unavailable`, `acme_cert_expired`, `acme_issuance_failed`, `acme_renewal_failed`, `acme_cert_expiring`, `acme_issuance_pending`, `acme_bootstrap_cert` |
+| `ha` | Yes | `ha_not_ready` (including master-loss and publish failure) |
+| `filter` | Yes only when no usable snapshot exists | `filter_unavailable`/`filter_loading` when `unavailable=true`; `filter_degraded` for a retained snapshot, a rejected live apply, or a recorded last error |
+| `stats` | **No** — advisory only | `stats_unavailable` |
+
+A partial filter snapshot (some lists failed, a group lost a rule class, or
+regex patterns were dropped) keeps `ready` true and reports `filter_degraded`:
+the retained snapshot still answers. This also covers `FilterState::Failed`
+with `unavailable == false` (a live apply was rejected while the previous
+snapshot remained active) and `Loading` with a still-usable snapshot. Only
+`unavailable == true` means there is no snapshot and DNS fails closed.
+
+D12 certificate ladder:
+
+- A current valid certificate with a failed renewal keeps serving and reports
+  `acme_renewal_failed` (degraded). A certificate expiring within 30 days reports
+  `acme_cert_expiring`/`tls_cert_expiring` (degraded).
+- An expired or unparseable certificate reports `acme_cert_expired`/
+  `tls_cert_expired` and makes `/health` unavailable.
+- No ACME certificate yet and no error is `acme_issuance_pending` (degraded:
+  DNS listeners still bind); an issuance failure with no certificate is
+  `acme_issuance_failed` (not-ready).
+- A configured static TLS certificate is checked at runtime on every
+  readiness build (cached by file mtime/size) and immediately after a
+  certificate-watcher reload. A process that runs past expiry therefore flips
+  `/health` to not-ready, and replacing the file clears the reason without a
+  rebind or restart. An ACME certificate that currently serves takes precedence
+  over the static pair.
+
+`ReadinessState` starts not-ready (nothing has been published yet). Startup
+publishes listener readiness after the DNS listeners start and TLS readiness
+after the acceptors are initialized. During first-boot setup-pending the DNS
+listeners are intentionally not bound, so `/health` is unavailable until setup
+completes; `sito healthcheck --setup-fallback` accepts that window via the
+setup middleware signal. Once DNS is up, the healthcheck also probes `/health`
+whenever the admin web listener answers (not only on HA nodes); an unreachable
+web listener is ignored on a DNS-only node but is an error when HA is
+configured.
+
+A stats database/writer outage is advisory — resolution does not depend on
+SQLite — so a stats failure never turns into a DNS outage or a `/health` 503.
+`/health` does not run the stats `SELECT 1` probe at all; `/status` does (bounded
+to 750 ms) and reports `stats_unavailable`.
+
+A configured `[dns.tls]`/`[tls]` pair with no usable acceptor is a broken
+listener, not a silently disabled one: `tls` blocks readiness until the
+acceptors are built. An ACME-only deployment that intentionally waits for its
+first real certificate (with `allow_bootstrap_cert = false`) is reported by the
+`acme` component instead.
+
+
 ---
 
 ## 2. Manual Slave -> Master Promotion Procedure
@@ -151,8 +226,8 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
 
    To obtain the master public key for the slave configs:
    ```bash
-   # /api/v1/ha/status requires a Viewer-or-higher token or session.
-   export TOKEN='sito_...'   # Admin API token for resync; Viewer suffices for GETs
+   # All /api/v1/ha/* endpoints require an Admin token or session.
+   export TOKEN='sito_...'   # Admin API token
    curl -s -H "Authorization: Bearer $TOKEN" \
      http://192.168.1.10:8080/api/v1/ha/status | jq -r .master_pubkey
 
@@ -374,9 +449,13 @@ When a slave node fails or must be reprovisioned from bare metal:
    `Degraded`, and keep its previous configuration and file until it is
    restarted with matching values.
 
-   Create `/etc/sito/config.toml`:
+   Create `/etc/sito/config.toml`. This branch uses **config v2**; if the
+   source file is a v1 document, migrate it first with
+   `sito config migrate --from v1 --to v2 --backup` (see the
+   [2.0 migration guide](2.0-migration.md#4-config-v1--v2)). Keep the file
+   `config_version = 2` before starting the node:
    ```toml
-   config_version = 1
+   config_version = 2
 
    [server]
    role = "slave"
@@ -463,7 +542,7 @@ The `/api/v1/*` endpoints used below require authentication. Export an Admin API
 token (or use a session cookie) before running these examples:
 
 ```bash
-export TOKEN='sito_...'   # Admin token: resync requires Admin; GETs accept Viewer+
+export TOKEN='sito_...'   # Admin token: all /api/v1/ha/* endpoints require Admin
 ```
 
 1. **Check HA status on Master**:
@@ -557,3 +636,41 @@ To prevent unauthorized nodes from connecting to the master replication port and
 - Set `slave_token = "<PRE_SHARED_SECRET>"` in the `[ha]` section on both master and slave nodes.
 - The slave transmits this token in the initial `Hello` handshake over the encrypted replication channel.
 - The master validates the token and drops the connection immediately if the token is missing or mismatched.
+
+---
+
+## 7. Planned HA protocol v2 upgrade (Phase 2 — not implemented)
+
+> [!IMPORTANT]
+> This section describes the **planned** Phase 2 HA protocol v2 migration. It
+> is **not implemented** on the current 2.0.0-alpha.1 Phase 1 branch. Phase 1
+> does not change the HA wire protocol, `ha_state.toml` or
+> `ha_watermark.toml`. Do not attempt this procedure until the Phase 2 release
+> notes and a `protocol_version` field are present.
+
+The planned protocol adds `protocol_version = 2` to the handshake and to
+`ha_state.toml`/`ha_watermark.toml`. The upgrade is a coordinated cluster
+change:
+
+1. **Upgrade the master first.** The master starts on protocol v2 and rejects
+   every v1 slave with `protocol_mismatch` plus a readiness reason. Replication
+   is intentionally degraded during the window; DNS keeps answering on each
+   node from its last applied configuration.
+2. **Upgrade slaves one at a time.** A v2 slave also rejects a v1 master with
+   `protocol_mismatch`. Do not point a v2 slave at a v1 master.
+3. **Verify convergence.** Each slave must reach `Synced` with the master's
+   current term/version. `/health` stays generic; read `ready`,
+   `readiness_reason` and `diverged_reason` from `GET /api/v1/ha/status`.
+4. **Shared fields are read-only on slaves.** A local edit to a shared field
+   marks that slave `Degraded` and requires a full resync; node-local fields
+   (`[web]` identity, `[tls]`/`[acme]` paths, `[ha]`, credentials) remain
+   editable. The current Phase 1 bundle sanitizer already preserves those
+   node-local fields, but the read-only enforcement belongs to Phase 2.
+
+**Downgrade is not supported in place.** To return to 1.9.x, stop every node,
+restore the pre-upgrade backups of `config.toml`, `ha_state.toml`,
+`ha_watermark.toml` and the certificate/key material, then start the old
+binary. A v1 node must not read a v2 state/watermark file; the planned v2
+reader refuses `protocol_version = 1` with migration instructions rather than
+guessing. See the
+[2.0 migration guide](2.0-migration.md#8-ha) for the operator summary.

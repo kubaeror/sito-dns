@@ -8,9 +8,9 @@ pub mod pipeline;
 pub mod server;
 pub mod service_lock;
 
-pub use cli::{Cli, Commands, run_check_config, run_healthcheck};
+pub use cli::{Cli, Commands, run_check_config};
 pub use pipeline::DnsPipeline;
-pub use server::{run_server, run_server_full, run_server_with_shutdown};
+pub use server::{run_server_full, run_server_with_shutdown};
 
 #[cfg(test)]
 mod tests {
@@ -43,7 +43,7 @@ mod tests {
         let valid_path = temp_dir.join("valid.toml");
         std::fs::write(
             &valid_path,
-            "config_version = 1\n[server]\nrole = \"master\"\n",
+            "config_version = 2\n[server]\nrole = \"master\"\n",
         )
         .unwrap();
         assert!(run_check_config(&valid_path).is_ok());
@@ -51,7 +51,7 @@ mod tests {
         let invalid_path = temp_dir.join("invalid.toml");
         std::fs::write(
             &invalid_path,
-            "config_version = 1\n[server]\nrole = \"unsupported_role\"\n",
+            "config_version = 2\n[server]\nrole = \"unsupported_role\"\n",
         )
         .unwrap();
         assert!(run_check_config(&invalid_path).is_err());
@@ -351,20 +351,6 @@ mod tests {
             addr
         }
 
-        async fn scoped_manager(
-            base: &Config,
-            bootstrap: &BootstrapResolver,
-            addr: SocketAddr,
-        ) -> Arc<UpstreamManager> {
-            let mut upstream_cfg = base.upstream.clone();
-            upstream_cfg.servers = vec![addr.to_string()];
-            Arc::new(
-                UpstreamManager::from_config(&upstream_cfg, bootstrap)
-                    .await
-                    .unwrap(),
-            )
-        }
-
         async fn resolve_ip(pipeline: &DnsPipeline, name: &str, client_ip: &str) -> Ipv4Addr {
             let mut query = Message::new(7, MessageType::Query, OpCode::Query);
             query
@@ -400,18 +386,6 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let key_a = addr_a.to_string();
-        let key_b = addr_b.to_string();
-        let mut scoped = HashMap::new();
-        scoped.insert(
-            key_a.clone(),
-            scoped_manager(&base, &bootstrap, addr_a).await,
-        );
-        scoped.insert(
-            key_b.clone(),
-            scoped_manager(&base, &bootstrap, addr_b).await,
-        );
-
         let clients_cfg = ClientsConfig {
             entries: vec![
                 ClientEntryConfig {
@@ -421,7 +395,7 @@ mod tests {
                     ignore_query_log: false,
                     ignore_stats: true,
                     use_global_upstreams: false,
-                    upstreams: Some(vec![key_a]),
+                    upstreams: Some(vec![addr_a.to_string()]),
                     trusted: false,
                 },
                 ClientEntryConfig {
@@ -431,12 +405,19 @@ mod tests {
                     ignore_query_log: false,
                     ignore_stats: false,
                     use_global_upstreams: false,
-                    upstreams: Some(vec![key_b]),
+                    upstreams: Some(vec![addr_b.to_string()]),
                     trusted: false,
                 },
             ],
             ..Default::default()
         };
+
+        // Build the map exactly as the server does, instead of hand-keying it:
+        // the production key is an inherited-upstream fingerprint, and a plain
+        // `servers.join(",")` lookup silently falls back to the global manager.
+        let scoped = crate::server::build_scoped_upstreams(&base, &clients_cfg, &HashMap::new())
+            .await
+            .expect("the production scoped-upstream builder must accept valid scopes");
 
         let filter =
             Arc::new(HostsFilterEngine::init(base.filtering.clone(), temp_dir.clone()).await);
@@ -622,14 +603,14 @@ mod tests {
     }
 
     async fn run_graceful_shutdown_once() -> Result<(), ()> {
-        // Find ephemeral free port
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let probe_web = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let web_port = probe_web.local_addr().unwrap().port();
-        drop(probe_web);
+        // Reserve through the shared broker: DNS binds UDP and TCP on the same
+        // number, so a UDP-only probe can collide with a parallel test.
+        let mut dns_lease = sito_test_support::reserve_tcp_udp_port().expect("reserve DNS port");
+        let port = dns_lease.port();
+        let mut web_lease = sito_test_support::reserve_port().expect("reserve web port");
+        let web_port = web_lease.port();
+        dns_lease.release_sockets();
+        web_lease.release_listener();
 
         let temp_dir = std::env::temp_dir().join(format!(
             "sito_srv_test_{}_{}_{}",
@@ -821,17 +802,18 @@ mod tests {
             )
         }
 
-        let reserve_udp_port = || {
-            let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-            port
-        };
-        let first_port = reserve_udp_port();
-        let second_port = reserve_udp_port();
-        let probe_web = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let web_port = probe_web.local_addr().unwrap().port();
-        drop(probe_web);
+        // The DNS listener binds UDP and TCP on the same number.
+        let mut first_lease =
+            sito_test_support::reserve_tcp_udp_port().expect("reserve first rebind port");
+        let first_port = first_lease.port();
+        let mut second_lease =
+            sito_test_support::reserve_tcp_udp_port().expect("reserve second rebind port");
+        let second_port = second_lease.port();
+        let mut web_lease = sito_test_support::reserve_port().expect("reserve web port");
+        let web_port = web_lease.port();
+        first_lease.release_sockets();
+        second_lease.release_sockets();
+        web_lease.release_listener();
 
         let temp_dir = std::env::temp_dir().join(format!(
             "sito_rebind_test_{}_{}",
@@ -900,8 +882,8 @@ mod tests {
 
         // Point the config at an occupied UDP port: the rebind must fail and
         // the previous listeners must be restored.
-        let blocker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let blocked_port = blocker.local_addr().unwrap().port();
+        let blocker = sito_test_support::reserve_udp_port().expect("reserve blocked port");
+        let blocked_port = blocker.port();
         config.dns.port = blocked_port;
         std::fs::write(
             &config_path,
@@ -916,7 +898,10 @@ mod tests {
 
         // A later valid change must still apply: a failed rebind must not
         // permanently orphan the listener manager.
-        let third_port = reserve_udp_port();
+        let mut third_lease =
+            sito_test_support::reserve_tcp_udp_port().expect("reserve third rebind port");
+        let third_port = third_lease.port();
+        third_lease.release_sockets();
         config.dns.port = third_port;
         std::fs::write(
             &config_path,
@@ -1276,6 +1261,18 @@ mod tests {
         let mut blocked = config.filtering.clone();
         blocked.custom_rules = vec!["||adnetwork.com^".to_string()];
         filter.reload_with_config(&blocked).await.unwrap();
+        // The query path reads the filter from the coherent runtime snapshot;
+        // a direct engine reload is only complete once that snapshot is
+        // re-published (the config apply path does both).
+        let generation = pipeline.runtime().generation();
+        pipeline
+            .runtime()
+            .publish_filter(
+                Some(filter.snapshot()),
+                filter.group_snapshots(),
+                generation,
+            )
+            .expect("filter refresh for the current generation");
 
         // Cache hit must still run the CNAME uncloaking check.
         let second = pipeline.handle(make_query(2), client).await.unwrap();

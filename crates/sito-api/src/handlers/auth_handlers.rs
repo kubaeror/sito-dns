@@ -438,9 +438,15 @@ pub async fn enable_totp(
     // ticket is consumed explicitly as well. The session id comes from the
     // validation lookup above: re-reading the cookie here would skip the
     // consume once the session has been purged.
-    let _ = ctx
+    if !ctx
         .auth_mgr
-        .consume_reauth_token(&reauth_token, &username, &session_id);
+        .consume_reauth_token(&reauth_token, &username, &session_id)
+    {
+        tracing::warn!(
+            user = %username,
+            "Re-authentication ticket was already consumed or expired after enabling TOTP"
+        );
+    }
     Ok(Json(GenericMessageResponse {
         message: "TOTP 2FA enabled successfully".to_string(),
     }))
@@ -489,9 +495,15 @@ pub async fn disable_totp(
         })?;
     // Disabling the second factor revokes the authorizing session; consume
     // the ticket with the session id from the single validation lookup above.
-    let _ = ctx
+    if !ctx
         .auth_mgr
-        .consume_reauth_token(&reauth_token, &username, &session_id);
+        .consume_reauth_token(&reauth_token, &username, &session_id)
+    {
+        tracing::warn!(
+            user = %username,
+            "Re-authentication ticket was already consumed or expired after disabling TOTP"
+        );
+    }
     Ok(Json(GenericMessageResponse {
         message: "TOTP 2FA disabled successfully".to_string(),
     }))

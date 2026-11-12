@@ -103,6 +103,8 @@ async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryL
         slave_tracker: None,
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        readiness: Arc::new(sito_api::readiness::ReadinessState::default()),
+        cert_validity_cache: Arc::new(sito_transport::CertificateValidityCache::new()),
         acme_challenges: None,
         dns_starter: None,
     };
@@ -871,6 +873,7 @@ async fn test_acceptance_m5_metrics_auth() {
             port: 8080,
             trusted_proxies: Vec::new(),
             metrics_auth: false,
+            ..Default::default()
         })
         .unwrap(),
     );

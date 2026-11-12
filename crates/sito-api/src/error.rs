@@ -20,6 +20,12 @@ pub struct ProblemDetails {
     /// Optional URI reference identifying the specific occurrence of the problem.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
+    /// Restart-only configuration fields that caused a 409 Conflict (D11).
+    ///
+    /// Present only on configuration writes rejected because they change a
+    /// setting that is read at process start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_required: Option<Box<Vec<String>>>,
 }
 
 impl ProblemDetails {
@@ -30,6 +36,7 @@ impl ProblemDetails {
             status: status.as_u16(),
             detail: detail.into(),
             instance: None,
+            restart_required: None,
         }
     }
 
@@ -51,6 +58,13 @@ impl ProblemDetails {
 
     pub fn conflict(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "Conflict", detail)
+    }
+
+    /// Builds a 409 carrying the restart-only field list (D11).
+    pub fn conflict_with_restart(restart_required: Vec<String>, detail: impl Into<String>) -> Self {
+        let mut problem = Self::conflict(detail);
+        problem.restart_required = Some(Box::new(restart_required));
+        problem
     }
 
     pub fn too_many_requests(detail: impl Into<String>) -> Self {

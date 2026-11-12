@@ -4,14 +4,16 @@
 
 pub mod error;
 pub mod normalize;
+pub mod shaping;
 pub mod wire;
 
 pub use error::ProtoError;
 pub use normalize::{normalize_domain, normalize_domain_or_idna};
+pub use shaping::{DEFAULT_EDNS_PAYLOAD, ResponseShaper, strip_dnssec_records};
 pub use wire::{
     DOT_PADDING_BLOCK_SIZE, apply_dot_padding, client_edns_payload_size, decode_message,
-    encode_message, extract_query_info, set_edns_payload_size, synthesize_blocked_response,
-    synthesize_cname_response, synthesize_records_response, truncate_for_framing,
+    encode_message, set_edns_payload_size, synthesize_blocked_response, synthesize_cname_response,
+    synthesize_records_response, truncate_for_framing,
 };
 
 // Re-export core hickory types so other sito crates don't need direct hickory-proto dependency

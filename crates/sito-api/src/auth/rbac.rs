@@ -79,9 +79,7 @@ fn warn_query_token_deprecation(token: &str) {
     static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let digest = blake3::hash(token.as_bytes()).to_hex().to_string();
     let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut set = warned
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut set = sito_core::sync::lock_or_recover(warned);
     if set.insert(digest) {
         tracing::warn!(
             "Deprecated `?token=` query authentication used on a WebSocket upgrade. \

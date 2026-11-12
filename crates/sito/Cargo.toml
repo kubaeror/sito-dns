@@ -17,7 +17,6 @@ rustls.workspace = true
 hickory-proto.workspace = true
 notify.workspace = true
 rand.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 sito-api.workspace = true
 sito-cache.workspace = true
@@ -29,10 +28,11 @@ sito-filter.workspace = true
 sito-ha.workspace = true
 sito-proto.workspace = true
 sito-rewrites.workspace = true
+sito-routeros = { workspace = true, optional = true }
 sito-stats.workspace = true
 sito-transport.workspace = true
 sito-upstream.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "fs", "net", "io-util", "signal"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -40,6 +40,7 @@ mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait.workspace = true
+sito-test-support.workspace = true
 rcgen.workspace = true
 time.workspace = true
 
@@ -47,6 +48,9 @@ time.workspace = true
 default = []
 embed-ui = ["sito-api/embed-ui"]
 mimalloc = ["dep:mimalloc"]
+# Optional experimental MikroTik RouterOS DHCP lease synchronization. Not part
+# of the default build: `cargo build -p sito --features routeros`.
+routeros = ["dep:sito-routeros", "sito-api/routeros"]
 
 [lints]
 workspace = true

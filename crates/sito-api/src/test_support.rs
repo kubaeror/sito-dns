@@ -41,11 +41,16 @@ pub(crate) async fn mock_context(temp_dir: &Path) -> ServerContext {
     let rewrites = Arc::new(ArcSwap::new(Arc::new(sito_rewrites::RewriteTable::new(
         Default::default(),
     ))));
-    let runtime = Arc::new(sito_runtime::RuntimeState::new(
-        config_arc.clone(),
-        clients.clone(),
-        rewrites.clone(),
-    ));
+    let runtime = Arc::new(
+        sito_runtime::RuntimeState::new(config_arc.clone(), clients.clone(), rewrites.clone())
+            .with_cache(cache.clone()),
+    );
+    runtime.bootstrap_components(
+        Some(filter.snapshot()),
+        filter.group_snapshots(),
+        sito_runtime::DnssecPolicy::from_config(&config_arc.load().dns.dnssec),
+        sito_runtime::TransportPolicy::from(&**config_arc.load()),
+    );
     let runtime_lists = Arc::new(sito_clients::RuntimeLists::from_arcs(
         Arc::new(
             sito_clients::ParentalRegistry::try_bundled()
@@ -53,6 +58,12 @@ pub(crate) async fn mock_context(temp_dir: &Path) -> ServerContext {
         ),
         Arc::new(sito_clients::ServiceRegistry::try_bundled().expect("bundled services must load")),
     ));
+
+    // Handler tests exercise the API, not the DNS startup transaction; publish
+    // the ready state that a successfully started server would publish.
+    let readiness = crate::readiness::ReadinessState::default();
+    readiness.set_listeners_ready();
+    readiness.set_tls_ready();
 
     ServerContext {
         config: config_arc,
@@ -75,6 +86,8 @@ pub(crate) async fn mock_context(temp_dir: &Path) -> ServerContext {
         slave_tracker: None,
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        readiness: Arc::new(readiness),
+        cert_validity_cache: Arc::new(sito_transport::CertificateValidityCache::new()),
         acme_challenges: None,
         dns_starter: None,
     }

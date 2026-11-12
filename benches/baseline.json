@@ -1,0 +1,88 @@
+{
+  "benchmarks": {
+    "cache::hit_lookup": {
+      "median_ns": 611.313
+    },
+    "cache::insert_response": {
+      "median_ns": 2045.19
+    },
+    "cache::miss_lookup": {
+      "median_ns": 480.262
+    },
+    "cache_hit_lookup": {
+      "median_ns": 549.06
+    },
+    "exact_hashset_hit": {
+      "median_ns": 12.187
+    },
+    "exact_hashset_miss": {
+      "median_ns": 10.251
+    },
+    "filter_engine::evaluate_blocked_domain": {
+      "median_ns": 371.076
+    },
+    "filter_engine::evaluate_clean_domain": {
+      "median_ns": 265.444
+    },
+    "metrics::inc_queries": {
+      "median_ns": 82.756
+    },
+    "metrics::observe_query_duration": {
+      "median_ns": 58.431
+    },
+    "metrics::observe_upstream_rtt": {
+      "median_ns": 58.243
+    },
+    "metrics::render_prometheus": {
+      "median_ns": 6933.126
+    },
+    "pipeline_stages::client_sni_extraction": {
+      "median_ns": 21.675
+    },
+    "pipeline_stages::rewrite_wildcard_lookup": {
+      "median_ns": 236.112
+    },
+    "snapshot_evaluate_allowlist_hit": {
+      "median_ns": 310.376
+    },
+    "snapshot_evaluate_exact_hit": {
+      "median_ns": 134.342
+    },
+    "snapshot_evaluate_miss": {
+      "median_ns": 134.576
+    },
+    "snapshot_evaluate_trie_hit": {
+      "median_ns": 274.335
+    },
+    "stats_querylog::insert_batch_100_fresh_db": {
+      "median_ns": 3612918.688
+    },
+    "stats_querylog::page_50_filtered_with_total": {
+      "median_ns": 527401.058
+    },
+    "stats_querylog::page_50_without_total": {
+      "median_ns": 341959.375
+    },
+    "suffix_trie_exact_hit": {
+      "median_ns": 93.357
+    },
+    "suffix_trie_miss": {
+      "median_ns": 49.361
+    },
+    "suffix_trie_subdomain_hit": {
+      "median_ns": 158.927
+    },
+    "wire_proto::decode_message": {
+      "median_ns": 102.764
+    },
+    "wire_proto::encode_message": {
+      "median_ns": 181.454
+    }
+  },
+  "environment": {
+    "description": "local-dev-x86_64-20cpu"
+  },
+  "generated_at": "2026-11-12T15:20:05Z",
+  "schema_version": 1,
+  "tolerance": 0.1
+}

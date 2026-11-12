@@ -949,8 +949,8 @@ Transports {udp, tcp, dot, doh2, doh3, doq} × scenarios {plain query, blocked d
 
 ### 18.3 Fuzzing
 
-- `cargo-fuzz` targets: DNS message decoder (if a custom parser ever appears), rule parser, TOML-config parser, ClientID extraction from URL/SNI
-- CI: scheduled fuzzing was intentionally removed in the CI cost-reduction rework (variant A); no fuzz workflow or harness directory is maintained. Reintroducing coverage-guided fuzzing requires a new plan, a maintainer decision, and a budget review. See `docs/ci.md`.
+- `cargo-fuzz` targets: DNS wire decoder/encoder, ABP rule parser, DNSSEC response validator, HA bundle parser, config TOML parser (`fuzz/`)
+- CI: pull requests build the targets; nightly and the 24-hour release checklist run them with corpus, dictionary and timeouts. See `fuzz/README.md` and `docs/ci.md`.
 
 ### 18.4 Chaos / HA
 

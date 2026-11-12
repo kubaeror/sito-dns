@@ -37,7 +37,7 @@ sito-upstream.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 subtle.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "fs", "net", "io-util", "process"] }
 toml.workspace = true
 totp-rs = { version = "6.0", features = ["gen_secret", "qr", "otpauth"] }
 tracing.workspace = true
@@ -50,6 +50,10 @@ askama = { workspace = true, optional = true }
 [features]
 default = []
 embed-ui = ["dep:rust-embed", "dep:mime_guess", "dep:askama"]
+# Enabled by the optional `sito/routeros` feature. It does not pull the
+# integration crate into sito-api; it only tells configuration validation that
+# this build can honour `[integrations.mikrotik]`.
+routeros = []
 
 [lints]
 workspace = true

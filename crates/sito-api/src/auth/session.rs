@@ -97,6 +97,12 @@ impl Session {
         }
     }
 
+    /// Test-support helper for building a `Cookie` header in integration
+    /// tests. Production handlers use [`Self::to_cookie_header_secure`] or
+    /// [`build_session_cookie`] so the `Secure` attribute follows the request
+    /// scheme. Kept public (but hidden from docs) because `sito-test` is a
+    /// separate crate; listed in `docs/2.0-public-api-diff.md`.
+    #[doc(hidden)]
     pub fn to_cookie_header(&self) -> String {
         self.to_cookie_header_secure(true)
     }

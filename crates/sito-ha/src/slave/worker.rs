@@ -716,6 +716,7 @@ pub(crate) mod test_support {
                         previous.clients.unidentified_store(),
                     )),
                     rewrites: Arc::new(sito_rewrites::RewriteTable::new(rewrites)),
+                    ..(*previous).clone()
                 });
 
                 if let Some(path) = self.config_path.as_deref()
@@ -724,10 +725,16 @@ pub(crate) mod test_support {
                     // Persist failures must leave the live configuration
                     // untouched, exactly like the production applier.
                     self.runtime.replace((*previous).clone());
-                    let _ = self
+                    if let Err(reload_err) = self
                         .filter
                         .reload_with_config(&previous_config.filtering)
-                        .await;
+                        .await
+                    {
+                        tracing::error!(
+                            error = %reload_err,
+                            "Failed to restore the previous filter configuration after a persist failure"
+                        );
+                    }
                     return Err(e.to_string());
                 }
                 Ok(())
@@ -1645,7 +1652,7 @@ mod tests {
         });
 
         let config_toml = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -1733,7 +1740,7 @@ nta = ["internal.example"]
         let push = build_and_sign_push(
             &test_bundle(
                 5,
-                "config_version = 1\n[server]\nrole = \"slave\"\n",
+                "config_version = 2\n[server]\nrole = \"slave\"\n",
                 None,
                 None,
             ),
@@ -1801,7 +1808,7 @@ nta = ["internal.example"]
         let path = dir.join("config.toml");
 
         let local = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -1826,7 +1833,7 @@ password = "routeros-password"
         // Sanitized bundle from the master: no [ha], no instance_name, no
         // client secrets and no RouterOS password.
         let pushed = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -1901,9 +1908,10 @@ url = "https://192.168.1.1"
 
     #[tokio::test]
     async fn test_local_client_id_secrets_read_from_live_config() {
-        let live =
-            Config::from_toml_str("[clients]\nclient_id_secrets = { \"phone\" = \"abc\" }\n")
-                .expect("live config");
+        let live = Config::from_toml_str(
+            "config_version = 2\n[clients]\nclient_id_secrets = { \"phone\" = \"abc\" }\n",
+        )
+        .expect("live config");
         let secrets = local_client_id_secrets(&live);
         assert_eq!(secrets.get("phone").map(String::as_str), Some("abc"));
         assert!(
@@ -1916,7 +1924,7 @@ url = "https://192.168.1.1"
     /// sections survive and only the forced node-local fields are merged.
     #[tokio::test]
     async fn test_persisted_config_without_local_file_keeps_pushed_sections() {
-        let pushed = "config_version = 1\n[server]\nrole = \"slave\"\n";
+        let pushed = "config_version = 2\n[server]\nrole = \"slave\"\n";
         let mut bundle = test_bundle(1, pushed, None, None);
         bundle.custom_rules = vec![];
         let live = Config::default();
@@ -1957,7 +1965,7 @@ url = "https://192.168.1.1"
     #[tokio::test]
     async fn test_persisted_config_preserves_node_local_listener_tls_and_web() {
         let local = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -1987,11 +1995,10 @@ port = 8081
 
 [integrations.mikrotik]
 url = "https://192.168.1.7"
-token = "local-token"
 password = "local-routeros-password"
 "#;
         let pushed = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -2127,7 +2134,7 @@ url = "https://192.168.9.9"
     #[tokio::test]
     async fn test_persisted_config_preserves_node_local_web_identity() {
         let local = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -2145,7 +2152,7 @@ acme_email = "slave@example.com"
 acme_domains = ["slave.example"]
 "#;
         let pushed = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -2223,7 +2230,21 @@ acme_enabled = false
         // fields. `config_apply`'s regression test asserts the same pair does
         // not report `web`.
         let applied = Config::from_toml_str(&merged).expect("merged config");
-        assert_eq!(applied.get_web_config(), live.get_web_config());
+        let applied_web = applied.get_web_config();
+        let live_web = live.get_web_config();
+        // The full WebConfig now also carries deprecated [web] acme_* aliases,
+        // which are cluster-shared and intentionally follow the master. The
+        // node-local listener identity must match exactly.
+        assert_eq!(applied_web.enabled, live_web.enabled);
+        assert_eq!(applied_web.bind, live_web.bind);
+        assert_eq!(applied_web.port, live_web.port);
+        assert_eq!(applied_web.trusted_proxies, live_web.trusted_proxies);
+        assert_eq!(applied_web.metrics_auth, live_web.metrics_auth);
+        assert_eq!(applied_web.public_url, live_web.public_url);
+        assert_eq!(
+            applied_web.tls_terminated_by_proxy,
+            live_web.tls_terminated_by_proxy
+        );
     }
 
     /// A slave without certificate material must not inherit the master's TLS
@@ -2232,7 +2253,7 @@ acme_enabled = false
     #[tokio::test]
     async fn test_pushed_tls_and_acme_are_removed_when_slave_has_none() {
         let pushed = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -2300,7 +2321,7 @@ domains = ["master.example"]
         let mut handles = test_handles(None).await;
         handles.config_path = Some(path.clone());
         let tracker = SlaveStatusTracker::new("slave-corrupt".to_string(), 0, None);
-        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+        let config_toml = "config_version = 2\n[server]\nrole = \"slave\"\n";
         let push =
             build_and_sign_push(&test_bundle(1, config_toml, None, None), &signing_key).unwrap();
 
@@ -2330,7 +2351,7 @@ domains = ["master.example"]
         let path = dir.join("config.toml");
         tokio::fs::write(
             &path,
-            "[server]\nrole = \"slave\"\ninstance_name = \"slave-absent\"\n\n[clients]\nentries = []\n\n[rewrites]\nttl = 60\n",
+            "config_version = 2\n[server]\nrole = \"slave\"\ninstance_name = \"slave-absent\"\n\n[clients]\nentries = []\n\n[rewrites]\nttl = 60\n",
         )
         .await
         .unwrap();
@@ -2340,7 +2361,7 @@ domains = ["master.example"]
         let before = handles.runtime.snapshot();
 
         let config_toml = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "slave"
@@ -2410,7 +2431,7 @@ ttl = 60
         tracker.set_state(SlaveState::Synced);
         let handles = test_handles(Some(path.clone())).await;
 
-        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+        let config_toml = "config_version = 2\n[server]\nrole = \"slave\"\n";
         let bundle = test_bundle(2, config_toml, None, None);
         let push = build_and_sign_push(&bundle, &signing_key).unwrap();
 
@@ -2446,7 +2467,7 @@ ttl = 60
         tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(&path, "config_version = 1\n[server]\nrole = \"slave\"\n")
+        tokio::fs::write(&path, "config_version = 2\n[server]\nrole = \"slave\"\n")
             .await
             .unwrap();
         let applied = apply_config_push(&push, &tracker, &handles, &signing_key.public_key())
@@ -2481,7 +2502,7 @@ ttl = 60
         ));
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let watermark_path = dir.join("ha_watermark.toml");
-        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+        let config_toml = "config_version = 2\n[server]\nrole = \"slave\"\n";
 
         let first = SlaveStatusTracker::new("slave-restart".to_string(), 0, None)
             .with_watermark_path(watermark_path.clone())
@@ -2587,7 +2608,7 @@ ttl = 60
         let push = build_and_sign_push(
             &test_bundle(
                 1,
-                "config_version = 1\n[server]\nrole = \"slave\"\n",
+                "config_version = 2\n[server]\nrole = \"slave\"\n",
                 None,
                 None,
             ),
@@ -2661,7 +2682,7 @@ ttl = 60
             .with_watermark_path(watermark_path.clone())
             .unwrap();
         let handles = test_handles(None).await;
-        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+        let config_toml = "config_version = 2\n[server]\nrole = \"slave\"\n";
 
         // Applied state: term 0, version 50, payload B.
         let applied = ConfigBundle {
@@ -2827,7 +2848,7 @@ ttl = 60
             .with_watermark_path(dir.join("ha_watermark.toml"))
             .unwrap();
         let handles = test_handles(None).await;
-        let config_toml = "config_version = 1\n[server]\nrole = \"slave\"\n";
+        let config_toml = "config_version = 2\n[server]\nrole = \"slave\"\n";
 
         let applied = ConfigBundle {
             term: 0,
@@ -2963,7 +2984,7 @@ ttl = 60
             term: 1,
             ..test_bundle(
                 5,
-                "config_version = 1\n[server]\nrole = \"slave\"\n",
+                "config_version = 2\n[server]\nrole = \"slave\"\n",
                 None,
                 None,
             )
@@ -2982,7 +3003,7 @@ ttl = 60
             term: 0,
             ..test_bundle(
                 6,
-                "config_version = 1\n[server]\nrole = \"slave\"\n",
+                "config_version = 2\n[server]\nrole = \"slave\"\n",
                 None,
                 None,
             )
@@ -3321,7 +3342,7 @@ ttl = 60
         use crate::bundle::sanitize_config_for_bundle;
 
         let master_toml = r#"
-config_version = 1
+config_version = 2
 
 [server]
 role = "master"
@@ -3365,7 +3386,7 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
         // The slave keeps its node-local secret and TLS paths.
         tokio::fs::write(
             &path,
-            "[server]\nrole = \"slave\"\ninstance_name = \"slave-tls\"\n\n[tls]\ncert = \"/etc/sito/slave.crt\"\nkey = \"/etc/sito/slave.key\"\n\n[clients]\nclient_id_secrets = { \"kids-tablet\" = \"client_shared_secret_9876\" }\n",
+            "config_version = 2\n[server]\nrole = \"slave\"\ninstance_name = \"slave-tls\"\n\n[tls]\ncert = \"/etc/sito/slave.crt\"\nkey = \"/etc/sito/slave.key\"\n\n[clients]\nclient_id_secrets = { \"kids-tablet\" = \"client_shared_secret_9876\" }\n",
         )
         .await
         .unwrap();
@@ -3425,7 +3446,7 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
 
         let mut bundle = test_bundle(
             1,
-            "config_version = 1\n[server]\nrole = \"slave\"\n",
+            "config_version = 2\n[server]\nrole = \"slave\"\n",
             None,
             None,
         );

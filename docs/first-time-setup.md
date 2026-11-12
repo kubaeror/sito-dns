@@ -18,7 +18,7 @@ Replace the installer-generated default `config.toml` flow with a web-based firs
 - `crates/sito/src/main.rs:99` — hard error if `config.toml` is missing; server refuses to start.
 - A minimal wizard already exists: `GET /wizard` (`crates/sito-api/src/ui/handlers.rs:1421`), `POST /ui/wizard/complete` (`handlers.rs:1447`), template `crates/sito-api/templates/wizard.html`. Current form only collects: admin user, admin password, one upstream, adblock toggle.
 - `crates/sito-api/src/auth/manager.rs:339` — `AuthManager::is_first_run()` (no users / default `admin/adminadmin` still active). Wizard gating for first-run vs admin session already implemented (returns 403 once initialized) and covered by tests in `crates/sito-test/tests/m6_acceptance.rs` and unit tests in `handlers.rs:1549+`.
-- `crates/sito-api/src/config_writer.rs` — atomic config persistence (`save_config_atomic`) with pre-commit `Config::validate()`, tmp-file + fsync + rename (ADR-0004).
+- `crates/sito-api/src/config_writer.rs` — atomic config persistence (`save_config_document_atomic`) with pre-commit `Config::validate()`, tmp-file + fsync + rename (ADR-0004).
 - `contrib/install.sh` — writes a full default `config.toml` (lines 125–200), prints default credentials `admin/adminadmin` (line 246), and swallows download failures with `|| true` (lines 74–78).
 - Default config conflict: `dot_port = 853` and `doq_port = 853` in the installer heredoc (lines 142, 144) — both protocols on the same port.
 - CI workflows: `.github/workflows/ci.yml` (5 jobs), `.github/workflows/release.yml` (3 jobs). No shellcheck anywhere.
@@ -52,7 +52,7 @@ Single page, grouped sections (steps), all fields pre-filled with current defaul
 
 Handler changes:
 - Extend `WizardCompleteForm` with `Option<String>` fields (all optional) and build a full `Config` from the form; per-section: missing → `Config::default()` values. Reuse/extend the section-mapping helpers already used by `POST /api/v1/config` (`crates/sito-api/src/handlers/config.rs`) where possible to avoid duplicating validation logic.
-- Persist via existing `save_config_atomic` (`config_writer.rs`) — includes `Config::validate()` for free.
+- Persist via the existing atomic config writer (`config_writer.rs`) — includes `Config::validate()` for free.
 - Hot-reload as today: `ctx.config.store(...)`, `ctx.filter.reload_with_config(...)`, `ctx.upstream.reload(...)`, `crate::publish_bundle(&ctx)`.
 - **Start DNS listeners after setup, in-process** (preferred): thread a start handle from the bootstrap-mode path in `run_server_full` (`crates/sito/src/lib.rs`) through `ServerContext` so wizard completion can build and bind the DNS pipeline without a process restart. **Fallback** (if the pipeline structurally requires restart): after saving, show a UI banner + log message instructing `systemctl restart sito`, and flip `setup_pending` to `false` so the next boot starts normally.
 - After successful save: flip `setup_pending` to `false`, then redirect to `/login`.

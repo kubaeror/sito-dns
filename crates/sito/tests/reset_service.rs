@@ -25,7 +25,7 @@ fn fixture(label: &str) -> (PathBuf, PathBuf) {
     std::fs::write(
         &config_path,
         format!(
-            "config_version = 1\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+            "config_version = 2\n[server]\ndata_dir = \"{}\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
             dir.display()
         ),
     )

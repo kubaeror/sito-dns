@@ -15,11 +15,14 @@ use std::time::{Duration, Instant};
 use tar::{Archive, Builder, Header};
 
 use crate::auth::rbac::RequireAdmin;
-use crate::config_apply::{ApplyHooks, FilterApply, apply_and_persist_config, apply_full_config};
+use crate::config_apply::{
+    ApplyHooks, FilterApply, apply_and_persist_config, apply_full_config,
+    restart_required_field_names,
+};
 use crate::error::ProblemDetails;
 use crate::models::{
     BackupMetadata, ConfigResponse, ConfigUpdateResponse, GenericMessageResponse, HaPublishStatus,
-    RestoreConfirmRequest, RestorePreparedResponse, UpdateConfigRequest,
+    RestartRequiredResponse, RestoreConfirmRequest, RestorePreparedResponse, UpdateConfigRequest,
 };
 use crate::state::ServerContext;
 
@@ -199,6 +202,34 @@ pub async fn get_config(
     }))
 }
 
+/// List the settings that only take effect after a process restart (D11).
+#[utoipa::path(
+    get,
+    path = "/api/v1/config/restart-required",
+    responses(
+        (status = 200, description = "Restart-only configuration fields", body = RestartRequiredResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []), ("cookie_auth" = []))
+)]
+pub async fn get_restart_required(
+    _admin: RequireAdmin,
+    State(_ctx): State<ServerContext>,
+) -> Json<RestartRequiredResponse> {
+    Json(RestartRequiredResponse {
+        restart_required_fields: restart_required_field_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        message: "These settings are read at process start. An admin write that changes one of \
+                  them returns 409 Conflict with `restart_required` and is not persisted; edit \
+                  config.toml and restart, or use the installer"
+            .to_string(),
+        apply_endpoint: "/api/v1/config".to_string(),
+    })
+}
+
 /// Update full configuration atomically after pre-commit validation.
 #[utoipa::path(
     put,
@@ -207,6 +238,7 @@ pub async fn get_config(
     responses(
         (status = 200, description = "Configuration updated successfully", body = GenericMessageResponse),
         (status = 400, description = "Invalid configuration", body = ProblemDetails),
+        (status = 409, description = "Configuration changes restart-only fields; nothing was persisted", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
@@ -272,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_restore_archive_rejects_typed_section_errors() {
-        let bad_config = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\nentries = \"not-an-array\"\n";
+        let bad_config = "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\nentries = \"not-an-array\"\n";
         let archive = create_backup_archive(bad_config).expect("archive builds");
         let err = extract_backup_archive(&archive).expect_err("must reject typed errors");
         assert!(err.to_string().contains("[clients]"), "got: {err}");
@@ -415,7 +447,7 @@ token = "ha-token"
         let temp_dir = crate::test_support::temp_dir("sito_cfg_put");
         let ctx = crate::test_support::mock_context(&temp_dir).await;
 
-        let original = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+        let original = "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n";
         tokio::fs::write(&ctx.config_path, original).await.unwrap();
         ctx.set_config(Config::from_toml_str(original).unwrap());
 
@@ -424,7 +456,7 @@ token = "ha-token"
             State(ctx.clone()),
             Extension(ApplyHooks::default()),
             Json(UpdateConfigRequest {
-                config_toml: "config_version = 1\n[upstream]\nservers = [\"oops-typo\"]\n"
+                config_toml: "config_version = 2\n[upstream]\nservers = [\"oops-typo\"]\n"
                     .to_string(),
             }),
         )
@@ -448,7 +480,7 @@ token = "ha-token"
         let temp_dir = crate::test_support::temp_dir("sito_cfg_reload");
         let ctx = crate::test_support::mock_context(&temp_dir).await;
 
-        let seed = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\n[[clients.entries]]\nname = \"phone\"\nids = [\"10.0.0.5\"]\n";
+        let seed = "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\n[[clients.entries]]\nname = \"phone\"\nids = [\"10.0.0.5\"]\n";
         let seed_cfg = Config::from_toml_str(seed).unwrap();
         ctx.set_config(seed_cfg.clone());
         let clients_cfg: sito_clients::ClientsConfig =
@@ -457,7 +489,7 @@ token = "ha-token"
 
         tokio::fs::write(
             &ctx.config_path,
-            "config_version = 1\n[clients]\nentries = \"not-an-array\"\n",
+            "config_version = 2\n[clients]\nentries = \"not-an-array\"\n",
         )
         .await
         .unwrap();
@@ -483,6 +515,123 @@ token = "ha-token"
             ctx.runtime.snapshot().config.upstream.servers,
             vec!["1.1.1.1"],
             "runtime snapshot must be untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// D11: a full-config write that changes a restart-only field returns
+    /// 409 with `restart_required` and leaves both the file and runtime
+    /// untouched.
+    #[tokio::test]
+    async fn test_update_config_restart_only_is_conflict_and_not_persisted() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_put_restart");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let original = "config_version = 2\n[server]\nrole = \"master\"\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+        tokio::fs::write(&ctx.config_path, original).await.unwrap();
+        ctx.set_config(Config::from_toml_str(original).unwrap());
+
+        let err = update_config(
+            admin(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(UpdateConfigRequest {
+                config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n[upstream]\nservers = [\"1.1.1.1\"]\n"
+                    .to_string(),
+            }),
+        )
+        .await
+        .expect_err("a restart-only field must be rejected with 409");
+        assert_eq!(err.status, 409);
+        assert!(
+            err.restart_required
+                .as_deref()
+                .is_some_and(|fields| fields.contains(&"server.role".to_string())),
+            "409 must carry restart_required: {err:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            original,
+            "a restart-only write must not be persisted"
+        );
+        assert_eq!(ctx.config.load().server.role, "master");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// D11: the read-only preview publishes the same matrix the write path
+    /// enforces.
+    #[tokio::test]
+    async fn test_restart_required_preview_lists_the_matrix() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_restart_preview");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let Json(preview) = get_restart_required(admin(), State(ctx.clone())).await;
+        for field in [
+            "server.role",
+            "server.data_dir",
+            "server.instance_name",
+            "web",
+            "tls",
+            "acme",
+        ] {
+            assert!(
+                preview
+                    .restart_required_fields
+                    .iter()
+                    .any(|candidate| candidate == field),
+                "preview is missing '{field}': {:?}",
+                preview.restart_required_fields
+            );
+        }
+        assert_eq!(
+            preview.restart_required_fields.len(),
+            crate::config_apply::restart_required_field_names().len(),
+            "preview and enforcement must use the same matrix"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// D11 parity: restoring a backup that changes a restart-only field
+    /// returns 409 and does not overwrite the live file.
+    #[tokio::test]
+    async fn test_confirm_restore_restart_only_is_conflict_and_not_persisted() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_restore_restart");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let original = "config_version = 2\n[server]\ndata_dir = \"/var/lib/sito\"\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+        tokio::fs::write(&ctx.config_path, original).await.unwrap();
+        ctx.set_config(Config::from_toml_str(original).unwrap());
+
+        let restored = "config_version = 2\n[server]\ndata_dir = \"/srv/restored\"\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+        let token = "restart-test-token".to_string();
+        ctx.restore_tokens.lock().unwrap().insert(
+            token.clone(),
+            (
+                restored.to_string(),
+                Instant::now() + Duration::from_secs(60),
+            ),
+        );
+
+        let err = confirm_restore(
+            admin(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(RestoreConfirmRequest {
+                confirmation_token: token,
+            }),
+        )
+        .await
+        .expect_err("restart-only restore must be rejected");
+        assert_eq!(err.status, 409);
+        assert!(
+            err.restart_required
+                .as_deref()
+                .is_some_and(|fields| fields.contains(&"server.data_dir".to_string()))
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            original,
+            "the restore must not persist a restart-only configuration"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -811,6 +960,7 @@ pub async fn prepare_restore(
     responses(
         (status = 200, description = "Restoration completed successfully", body = GenericMessageResponse),
         (status = 400, description = "Invalid or expired confirmation token", body = ProblemDetails),
+        (status = 409, description = "Restored configuration changes restart-only fields; nothing was persisted", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),

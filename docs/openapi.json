@@ -6,7 +6,7 @@
     "license": {
       "name": "GPL-3.0-only"
     },
-    "version": "1.9.5"
+    "version": "2.0.0-alpha.1"
   },
   "paths": {
     "/api/v1/auth/change-password": {
@@ -1630,6 +1630,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Configuration changes restart-only fields; nothing was persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1711,6 +1721,55 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/config/restart-required": {
+      "get": {
+        "tags": [
+          "crate::handlers::config"
+        ],
+        "summary": "List the settings that only take effect after a process restart (D11).",
+        "operationId": "get_restart_required",
+        "responses": {
+          "200": {
+            "description": "Restart-only configuration fields",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestartRequiredResponse"
                 }
               }
             }
@@ -1866,6 +1925,16 @@
           },
           "403": {
             "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Restored configuration changes restart-only fields; nothing was persisted",
             "content": {
               "application/json": {
                 "schema": {
@@ -4312,6 +4381,16 @@
             ],
             "description": "Optional URI reference identifying the specific occurrence of the problem."
           },
+          "restart_required": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Restart-only configuration fields that caused a 409 Conflict (D11).\n\nPresent only on configuration writes rejected because they change a\nsetting that is read at process start."
+          },
           "status": {
             "type": "integer",
             "format": "int32",
@@ -4523,6 +4602,38 @@
           }
         }
       },
+      "ReadinessReason": {
+        "type": "object",
+        "description": "One reason a component is not fully ready.\n\n`message` is a human-readable summary. It never contains credentials,\nprivate keys or certificate material; detailed diagnostics stay in the\ncomponent-specific authenticated endpoints and the logs.",
+        "required": [
+          "component",
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable reason code."
+          },
+          "component": {
+            "type": "string",
+            "description": "Component identifier (`listeners`, `tls`, `acme`, `ha`, `filter`, `stats`)."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable explanation without secrets."
+          },
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Wall-clock milliseconds when the component became not-ready, when known.",
+            "minimum": 0
+          }
+        }
+      },
       "ReauthRequest": {
         "type": "object",
         "description": "Re-authentication request for a sensitive operation.",
@@ -4558,6 +4669,32 @@
           },
           "reauth_token": {
             "type": "string"
+          }
+        }
+      },
+      "RestartRequiredResponse": {
+        "type": "object",
+        "description": "Restart-only field preview (D11).\n\nRead-only: it lists the settings that only take effect after a process\nrestart. An admin write that changes one of these returns `409 Conflict`\nwith the same field names in `restart_required` and is not persisted.",
+        "required": [
+          "restart_required_fields",
+          "message",
+          "apply_endpoint"
+        ],
+        "properties": {
+          "apply_endpoint": {
+            "type": "string",
+            "description": "Where to send changes that do not require a restart."
+          },
+          "message": {
+            "type": "string",
+            "description": "Operator-facing guidance."
+          },
+          "restart_required_fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Settings that require a process restart, in matrix order."
           }
         }
       },
@@ -4652,7 +4789,9 @@
           "version",
           "uptime_seconds",
           "role",
-          "listeners"
+          "listeners",
+          "ready",
+          "reasons"
         ],
         "properties": {
           "acme": {
@@ -4671,6 +4810,17 @@
             "items": {
               "type": "string"
             }
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "Aggregate readiness verdict shared with `/health`."
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReadinessReason"
+            },
+            "description": "Per-component readiness reasons (blocking and advisory), in component\norder. Empty when every component is ready."
           },
           "role": {
             "type": "string"

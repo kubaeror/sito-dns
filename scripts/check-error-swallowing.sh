@@ -3,10 +3,15 @@
 #
 # This is deliberately narrower than "all `let _ =`/`.ok()` calls": the codebase
 # has hundreds of benign probe/cleanup sites. It flags swallowing around calls
-# that mutate durable state (fsync/rename/permissions/persist/publish/secret
-# writes/reload). Every flagged site must appear in
-# scripts/error-swallowing-allowlist.txt (tab-separated) with the exact source text, and every
-# allowlist entry must have a reason in docs/audit6-best-effort.md.
+# that mutate durable state or report health (fsync/rename/permissions/persist/
+# publish/secret writes/reload/shutdown/lease/bootstrap/readiness/health and
+# lock/unlock). Every flagged production site must appear in
+# scripts/error-swallowing-allowlist.txt (tab-separated) with the exact source
+# text, and every allowlist entry must have a reason in
+# docs/audit6-best-effort.md.
+#
+# The scanner skips inline `#[cfg(test)]` items and `tests/` targets; tests may
+# intentionally exercise failure cleanup without production error policy.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,16 +23,15 @@ if [[ ! -f "${ALLOWLIST}" ]]; then
     exit 2
 fi
 
-# Calls whose error must be handled explicitly or justified as best-effort.
-PATTERN='(let _ = .*(write_secret_file|reload_all|persist|publish_bundle|flush\(|sync_all|set_permissions|rename\(|remove_file|write_pair_metadata|record_bootstrap_cert|\.save|\.store\())|(write_secret_file|reload_all|persist|publish_bundle|sync_all|set_permissions|rename|remove_file|write_pair_metadata|record_bootstrap_cert)\([^)]*\)\.ok\(\)'
-
 matches="$(mktemp)"
 keys="$(mktemp)"
 trap 'rm -f "${matches}" "${keys}"' EXIT
 
-# Scan production sources only; test bodies may intentionally exercise failure
-# cleanup without production error policy.
-grep -rnE "${PATTERN}" crates --include='*.rs' --exclude-dir=tests | grep '/src/' >"${matches}" || true
+# Fixture tests for the statement-aware scanner (multi-line statements,
+# cfg(test) ranges, formatting-macro arguments).
+python3 "${ROOT}/scripts/test-error-swallowing.py"
+
+python3 "${ROOT}/scripts/find-error-swallowing.py" "${ROOT}" >"${matches}"
 
 # Allowlist entries are tab-separated `path<TAB>source text<TAB>reason`. Build `path<TAB>source text`
 # keys, trimming surrounding whitespace on both sides.

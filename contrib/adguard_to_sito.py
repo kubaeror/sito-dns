@@ -192,7 +192,7 @@ def convert_adguard_to_sito(agh_cfg: Dict[str, Any]) -> str:
 
     lines: List[str] = [
         "# Generated automatically from AdGuardHome.yaml by adguard_to_sito.py",
-        "config_version = 1",
+        "config_version = 2",
         "",
         "[server]",
         'role = "master"',

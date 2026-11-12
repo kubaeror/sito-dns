@@ -21,7 +21,7 @@ toml.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 
 [lints]
 workspace = true

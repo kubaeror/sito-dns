@@ -4,11 +4,16 @@
 //! without creating a heavy dependency graph, so the small pieces that tests
 //! need live here instead.
 
+pub mod clock;
+pub mod wait;
+
+pub use clock::{Clock, ManualClock, SystemClock};
+pub use wait::{WAIT_POLL_INTERVAL, WaitTimeout, wait_for, wait_until};
+
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
 /// Ports currently held by tests in this process.
 ///
@@ -65,6 +70,47 @@ fn bind_reserved_udp() -> io::Result<(UdpSocket, u16)> {
         }
     }
     Err(no_unreserved_port("UDP"))
+}
+
+/// Binds an ephemeral loopback TCP+UDP pair on the same number and reserves it.
+///
+/// DNS listens on UDP and TCP with one configured port, so reserving only one
+/// protocol leaves the other open to another test/process choosing the same
+/// number. The pair is reserved atomically or the attempt is retried.
+fn bind_reserved_tcp_udp() -> io::Result<(TcpListener, UdpSocket, u16)> {
+    for _ in 0..20 {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        if !try_reserve_port(port) {
+            continue;
+        }
+        match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
+            Ok(socket) => return Ok((listener, socket, port)),
+            Err(_) => {
+                // Keep the TCP probe until the loop retries; drop the failed
+                // port reservation so another test can use it.
+                release_reserved_ports(&[port]);
+            }
+        }
+    }
+    Err(no_unreserved_port("TCP+UDP"))
+}
+
+/// Claims an already-bound port in the process-wide broker.
+///
+/// Use this for fixtures that must bind the socket themselves (for example a
+/// mock DNS upstream that binds UDP and TCP on the same number). Returns false
+/// when any port is already reserved; the caller must close its sockets and
+/// retry with a different ephemeral port.
+pub fn claim_ports(ports: &[u16]) -> bool {
+    let mut guard = reserved_ports().lock().unwrap();
+    if ports.iter().any(|port| guard.contains(port)) {
+        return false;
+    }
+    for port in ports {
+        guard.insert(*port);
+    }
+    true
 }
 
 /// A loopback TCP port reserved for the lifetime of a test.
@@ -136,6 +182,57 @@ pub fn reserve_port_number() -> io::Result<u16> {
     let (listener, port) = bind_reserved_tcp()?;
     drop(listener);
     Ok(port)
+}
+
+/// A loopback TCP+UDP pair reserved for the lifetime of a test.
+///
+/// DNS listeners bind one configured port for both protocols. Keep this lease
+/// alive for the whole test; call [`ReservedTcpUdpPort::release_sockets`]
+/// immediately before the component under test binds.
+#[derive(Debug)]
+pub struct ReservedTcpUdpPort {
+    port: u16,
+    listener: Option<TcpListener>,
+    socket: Option<UdpSocket>,
+}
+
+impl ReservedTcpUdpPort {
+    /// The reserved port (shared by TCP and UDP).
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The reserved loopback socket address.
+    pub fn addr(&self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port)
+    }
+
+    /// Drops both probe sockets so the code under test can bind the port.
+    ///
+    /// The reservation itself is kept until the lease is dropped.
+    pub fn release_sockets(&mut self) {
+        self.listener = None;
+        self.socket = None;
+    }
+}
+
+impl Drop for ReservedTcpUdpPort {
+    fn drop(&mut self) {
+        drop(self.listener.take());
+        drop(self.socket.take());
+        release_reserved_ports(std::slice::from_ref(&self.port));
+    }
+}
+
+/// Reserves an ephemeral loopback number for both TCP and UDP.
+#[must_use = "the lease must be held for the port to stay reserved"]
+pub fn reserve_tcp_udp_port() -> io::Result<ReservedTcpUdpPort> {
+    let (listener, socket, port) = bind_reserved_tcp_udp()?;
+    Ok(ReservedTcpUdpPort {
+        port,
+        listener: Some(listener),
+        socket: Some(socket),
+    })
 }
 
 /// A loopback UDP port reserved for the lifetime of a test.
@@ -240,6 +337,17 @@ impl PortReservations {
         Ok((socket, port))
     }
 
+    /// Reserves one ephemeral loopback number for both TCP and UDP.
+    ///
+    /// Returns the still-bound probe listener and socket. DNS listeners use one
+    /// configured port for both protocols, so reserving a single protocol is
+    /// not enough to keep another test from claiming the other.
+    pub fn reserve_tcp_udp(&mut self) -> io::Result<(TcpListener, UdpSocket, u16)> {
+        let (listener, socket, port) = bind_reserved_tcp_udp()?;
+        self.ports.push(port);
+        Ok((listener, socket, port))
+    }
+
     /// Transfers ownership of the reserved ports to the caller.
     pub fn commit(mut self) -> Vec<u16> {
         self.armed = false;
@@ -265,27 +373,6 @@ impl Drop for PortReservations {
 /// numbered reservation.
 pub fn release_ports(ports: &[u16]) {
     release_reserved_ports(ports);
-}
-
-/// Polls `condition` every 25 ms until it returns true or `timeout` elapses.
-///
-/// Prefer this over fixed sleeps so tests wait for the actual event (certificate
-/// reload, HA sync, ...) instead of depending on machine speed.
-pub async fn wait_until<F, Fut>(timeout: Duration, mut condition: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if condition().await {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
 }
 
 #[cfg(test)]

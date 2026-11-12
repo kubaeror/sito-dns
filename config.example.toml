@@ -1,4 +1,7 @@
-config_version = 1
+# sito config v2 (frozen at 2.0.0-alpha.1). A v1 document must be migrated:
+#   sito config migrate --from v1 --to v2 --backup
+# Unknown keys are rejected. See docs/config-v2.md.
+config_version = 2
 
 [server]
 role = "master"
@@ -11,9 +14,9 @@ log_format = "json"
 
 [dns]
 # Security: this wildcard default accepts DNS queries from every source that
-# can reach the host, and 1.9.5 has no DNS client allow-list. Restrict the DNS
+# can reach the host, and 2.0 has no DNS client allow-list. Restrict the DNS
 # ports to your LAN with a host firewall, or bind specific LAN addresses.
-# A default-deny DNS ACL is planned for 1.10.0.
+# A default-deny DNS client ACL is not part of the Phase 1 config work package.
 bind = ["0.0.0.0", "::"]
 port = 53
 dot_port = 853
@@ -53,6 +56,21 @@ nta = []
 # Optional explicit trust anchors ("zone:algorithm:base64key"); empty uses
 # the built-in root anchors.
 trust_anchors = []
+
+# Encrypted DNS certificates. [dns.tls] is a deprecated v1 alias; migrate it to
+# [tls] (`sito config migrate --from v1 --to v2 --backup`).
+# [tls]
+# cert = "/etc/sito/cert.pem"
+# key = "/etc/sito/key.pem"
+
+# Automated certificates. The legacy [web] acme_* keys are deprecated aliases
+# for one 2.0 alpha; use this typed section for new deployments.
+# [acme]
+# enabled = false
+# email = "admin@example.com"
+# domains = ["dns.example.com"]
+# staging = false
+# allow_bootstrap_cert = false
 
 [upstream]
 # Upstream schemes supported: tls:// (DoT), https:// (DoH), quic:// (DoQ)
@@ -162,6 +180,9 @@ anonymize_querylog = false
 # url = "https://lists.example.com/services.json"
 
 # RouterOS DHCP lease discovery for client identification.
+# Optional and experimental: not compiled into the default binary. Build with
+# `cargo build -p sito --features routeros`; enabling it in a build without
+# that feature fails startup instead of silently ignoring the setting.
 # [integrations.mikrotik]
 # enabled = false
 # url = "https://192.168.1.1"
@@ -170,13 +191,12 @@ anonymize_querylog = false
 # interval_s = 300
 
 [web]
-# Security: the admin UI is plain HTTP. Keep this on loopback behind an SSH
-# tunnel or a TLS reverse proxy; the DNS [tls] certificate never secures the
-# admin scheme. Binding a wildcard address without declaring a reverse proxy
-# triggers a startup network-exposure warning. The loopback default is planned
-# for 1.10.0; 1.9.5 keeps 0.0.0.0 for compatibility.
+# Security: the admin UI is plain HTTP. Keep the 2.0 loopback default behind an
+# SSH tunnel or a TLS reverse proxy; the DNS [tls] certificate never secures
+# the admin scheme. Binding a wildcard address without declaring a reverse
+# proxy triggers a startup network-exposure warning.
 enabled = true
-bind = "0.0.0.0"
+bind = "127.0.0.1"
 port = 8080
 metrics_auth = true
 # When binding non-loopback over plain HTTP the admin interface is reachable

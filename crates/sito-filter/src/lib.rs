@@ -13,9 +13,12 @@ pub mod subscription;
 
 pub use anti_bypass::AntiBypassRegistry;
 pub use downloader::ListDownloader;
+/// Compiled per-client-group snapshots keyed by group name.
+pub type GroupSnapshots = fnv::FnvHashMap<String, std::sync::Arc<FilterSnapshot>>;
+
 pub use engine::{
     CompileObserver, FilterSnapshot, FilterState, FilterStatus, GroupRuleSet, HostsFilterEngine,
-    apply_rewrite_cancellations,
+    PreparedFilterSnapshot, SnapshotObserver, apply_rewrite_cancellations,
 };
 pub use error::FilterError;
 pub use parser::{

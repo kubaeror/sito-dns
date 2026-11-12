@@ -8,12 +8,9 @@ description = "DNS rewrite rules, wildcard mapping, and auto-PTR generation for 
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
 toml = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 sito-core.workspace = true
-sito-proto.workspace = true
 hickory-proto.workspace = true
 
 [lints]
