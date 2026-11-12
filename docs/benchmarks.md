@@ -11,13 +11,14 @@ Current performance gates:
 
 - Pull requests only compile every Criterion target:
   `cargo bench --workspace --all-features --locked --no-run`.
-- The nightly `bench.yml` workflow runs the Criterion suite and compares it with
-  `benches/baseline.json`; more than 10% slower fails. It refuses to run unless
-  `BENCH_RUNNER_LABEL` names a dedicated/self-hosted runner and
-  `BENCH_ENVIRONMENT` matches the baseline. The committed baseline was generated
-  on the WP-1.9 development host (`local-dev-x86_64-20cpu`), so the nightly gate
-  is **inactive until that runner is provisioned and the baseline regenerated
-  there**. This is an explicit residual, not a hidden threshold. See
+- The nightly `bench.yml` workflow runs the Criterion suite on GitHub-hosted
+  `ubuntu-24.04` and compares it with `benches/baseline.json`; more than 10%
+  slower fails. The baseline must be generated on that same runner class
+  (`update_baseline=true`, download the artifact, commit it); the checker fails
+  closed on an environment mismatch. The current alpha baseline is still the
+  WP-1.9 development-host reference (`local-dev-x86_64-20cpu`), so the nightly
+  gate is **inactive until the one-time GitHub-hosted regeneration**. This is an
+  explicit residual, not a hidden threshold. See
   [docs/ci.md](ci.md#benchmark-baseline).
 - The 24-hour fuzz run and a green benchmark comparison are release-checklist
   items, not PR gates; see

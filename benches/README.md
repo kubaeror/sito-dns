@@ -8,15 +8,13 @@ is more than 10% slower.
 The file is **environment specific**: it records the machine class in
 `environment.description`, and the checker fails closed when the current
 environment (from `--environment`, `BENCH_ENVIRONMENT`, or the automatic host
-description) does not match. Regenerate it on the dedicated benchmark runner:
-
-```bash
-BENCH_ENVIRONMENT=<runner-label> scripts/save-bench-baseline.sh
-```
-
-`bench.yml` refuses to run unless `BENCH_RUNNER_LABEL` names a dedicated runner
-and `BENCH_ENVIRONMENT` is set. For a documented non-gating comparison across
-machines, pass `--reference-only`; never use it in the nightly gate.
+description) does not match. The benchmark gate runs on GitHub-hosted
+`ubuntu-24.04` only. Regenerate the baseline there by dispatching `bench.yml`
+with `update_baseline=true`, downloading the `bench-<run_id>` artifact, and
+committing its `benches/baseline.json` (recorded as
+`environment.description = "github-ubuntu-24.04"`). For a documented
+non-gating comparison across machines, pass `--reference-only`; never use it in
+the nightly gate.
 
 For a short local check without waiting for the full measurement:
 

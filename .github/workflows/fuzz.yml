@@ -3,6 +3,11 @@ name: Fuzz
 # Coverage-guided fuzzing is deliberately NOT a pull-request gate (D14/P-7).
 # Pull requests only build the targets (`ci.yml` → `fuzz-build`). This workflow
 # owns the nightly smoke and the 24-hour release-checklist run.
+#
+# GitHub-hosted jobs are capped at 6 hours. The 24-hour checklist therefore
+# runs as four parallel 6-hour shards per target (24 target-hours aggregate)
+# on `ubuntu-24.04`; no self-hosted runner is required. The shard count is an
+# input so the same workflow can run the short nightly smoke.
 on:
   schedule:
     # Nightly smoke, offset from the weekly quality run.
@@ -10,13 +15,13 @@ on:
   workflow_dispatch:
     inputs:
       fuzz_seconds:
-        description: Seconds per target (86400 for the 24-hour release checklist)
+        description: Seconds per shard (max 21600; use 21600 with shards=4 for ~24h)
         type: string
         default: '600'
-      runner_label:
-        description: Runner label; required for runs longer than 6 hours (self-hosted)
+      shards:
+        description: Parallel shards (1 for the nightly smoke; 4 for the 24h checklist)
         type: string
-        default: ''
+        default: '1'
 
 permissions:
   contents: read
@@ -31,28 +36,56 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  prepare:
+    name: prepare fuzz matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Build the target × shard matrix
+        id: matrix
+        env:
+          INPUT_SHARDS: ${{ github.event_name == 'workflow_dispatch' && inputs.shards || '1' }}
+        run: |
+          set -euo pipefail
+          shards="${INPUT_SHARDS:-1}"
+          case "${shards}" in
+            ''|*[!0-9]*)
+              echo "::error::shards must be a positive integer, got '${shards}'"
+              exit 1
+              ;;
+          esac
+          if [ "${shards}" -lt 1 ] || [ "${shards}" -gt 8 ]; then
+            echo "::error::shards must be between 1 and 8"
+            exit 1
+          fi
+          matrix=$(python3 -c '
+          import json, os
+          shards = int(os.environ["INPUT_SHARDS"])
+          targets = [
+              {"target": "dns_wire", "dictionary": "fuzz/dictionaries/dns_wire.dict"},
+              {"target": "abp_parser", "dictionary": "fuzz/dictionaries/abp_parser.dict"},
+              {"target": "dnssec_response", "dictionary": "fuzz/dictionaries/dns_wire.dict"},
+              {"target": "ha_bundle", "dictionary": "fuzz/dictionaries/ha_bundle.dict"},
+              {"target": "config_toml", "dictionary": "fuzz/dictionaries/config_toml.dict"},
+          ]
+          print(json.dumps([dict(t, shard=i) for t in targets for i in range(shards)]))
+          ')
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+
   fuzz:
-    name: fuzz (${{ matrix.target }})
-    # GitHub-hosted jobs are capped at 6 hours. The 24-hour release run
-    # therefore requires a self-hosted runner label (see the duration step).
-    runs-on: ${{ inputs.runner_label || vars.FUZZ_RUNNER_LABEL || 'ubuntu-24.04' }}
-    # 24 hours plus build/upload overhead. The default nightly run is far
-    # shorter; this is a ceiling, not the configured duration.
-    timeout-minutes: 1560
+    name: fuzz (${{ matrix.target }} shard ${{ matrix.shard }})
+    needs: prepare
+    # GitHub-hosted runner only; the 24h run is split into shards because
+    # GitHub-hosted jobs have a 6-hour ceiling.
+    runs-on: ubuntu-24.04
+    # The fuzz budget is at most 6h; the job ceiling leaves a little room for
+    # checkout/build/upload. A 24h checklist dispatch uses four such shards.
+    timeout-minutes: 360
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: dns_wire
-            dictionary: fuzz/dictionaries/dns_wire.dict
-          - target: abp_parser
-            dictionary: fuzz/dictionaries/abp_parser.dict
-          - target: dnssec_response
-            dictionary: fuzz/dictionaries/dns_wire.dict
-          - target: ha_bundle
-            dictionary: fuzz/dictionaries/ha_bundle.dict
-          - target: config_toml
-            dictionary: fuzz/dictionaries/config_toml.dict
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
@@ -69,8 +102,6 @@ jobs:
         id: duration
         env:
           INPUT_SECONDS: ${{ github.event_name == 'workflow_dispatch' && inputs.fuzz_seconds || '600' }}
-          INPUT_RUNNER_LABEL: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || '' }}
-          RUNNER_VAR: ${{ vars.FUZZ_RUNNER_LABEL || '' }}
         run: |
           set -euo pipefail
           seconds="${INPUT_SECONDS:-600}"
@@ -84,21 +115,15 @@ jobs:
             echo "::error::fuzz_seconds must be at least 30"
             exit 1
           fi
-          # GitHub-hosted jobs have a hard 6-hour execution ceiling. A longer
-          # campaign must run on a self-hosted runner.
           if [ "${seconds}" -gt 21600 ]; then
-            case "${INPUT_RUNNER_LABEL:-${RUNNER_VAR:-}}" in
-              ''|ubuntu-*|windows-*|macos-*)
-                echo "::error::fuzz_seconds=${seconds} exceeds the 6-hour GitHub-hosted limit; pass runner_label=<self-hosted-label> (not a GitHub-hosted label)"
-                exit 1
-                ;;
-            esac
+            echo "::error::fuzz_seconds must be <= 21600 (GitHub-hosted job ceiling); use more shards for a longer aggregate campaign"
+            exit 1
           fi
           echo "seconds=${seconds}" >> "${GITHUB_OUTPUT}"
-          if [ "${seconds}" -ge 86400 ]; then
-            echo "::notice::running the 24-hour release-checklist fuzz for ${{ matrix.target }}"
+          if [ "${seconds}" -ge 19800 ]; then
+            echo "::notice::this shard is part of the 24-hour release-checklist campaign"
           fi
-      - name: Fuzz ${{ matrix.target }}
+      - name: Fuzz ${{ matrix.target }} shard ${{ matrix.shard }}
         env:
           FUZZ_SECONDS: ${{ steps.duration.outputs.seconds }}
           # `cargo fuzz` invokes its own cargo/rustc; without this the repo's
@@ -107,17 +132,18 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly-2026-11-04
         run: |
           set -o pipefail
-          cargo +nightly-2026-11-04 fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} \
+          cargo +nightly-2026-11-04 fuzz run --target x86_64-unknown-linux-gnu "${{ matrix.target }}" \
             -- -dict=${{ matrix.dictionary }} \
+            -seed=${{ matrix.shard }} \
             -max_total_time="${FUZZ_SECONDS}" -timeout=10 -rss_limit_mb=4096 \
-            | tee "fuzz-${{ matrix.target }}.log"
+            | tee "fuzz-${{ matrix.target }}-shard${{ matrix.shard }}.log"
       - name: Upload crash artifacts and corpus
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          name: fuzz-crash-${{ matrix.target }}-shard${{ matrix.shard }}-${{ github.run_id }}
           path: |
             fuzz/artifacts/
             fuzz/corpus/
-            fuzz-${{ matrix.target }}.log
+            fuzz-${{ matrix.target }}-shard${{ matrix.shard }}.log
           if-no-files-found: ignore

@@ -79,27 +79,27 @@ workflows pin both; locally use the installed nightly (for example
 - **Nightly (`.github/workflows/fuzz.yml`, 04:17 UTC):** every target runs for
   the workflow's `fuzz_seconds` (default 600 s) with a per-input timeout of
   10 s and its dictionary. Crashes/timeouts upload the corpus and artifacts.
-- **Release checklist (manual `fuzz.yml` dispatch):** set `fuzz_seconds=86400`
-  and `runner_label=<self-hosted-label>` for a 24-hour clean run per target.
-  GitHub-hosted jobs have a hard 6-hour execution ceiling, so the workflow
-  rejects a longer duration unless the label is a dedicated/self-hosted runner
-  (GitHub-hosted `ubuntu-*`, `windows-*`, `macos-*` labels are rejected). This
-  is the D14/P-7 release gate: it is deliberately not a PR gate because it is
-  long and hardware-timing sensitive.
+- **Release checklist (manual `fuzz.yml` dispatch):** set
+  `fuzz_seconds=21600` and `shards=4` for a ≈24 target-hour clean run per
+  target on GitHub-hosted `ubuntu-24.04`. GitHub-hosted jobs have a hard 6-hour
+  execution ceiling, so the campaign is split into four parallel 6-hour shards
+  rather than one long job; no self-hosted runner is required. This is the
+  D14/P-7 release gate: it is deliberately not a PR gate because it is long and
+  hardware-timing sensitive.
 
 ## 24-hour release checklist
 
 1. Dispatch **Fuzz → Run workflow** on the release candidate commit with
-   `fuzz_seconds=86400` and
-   `runner_label=<self-hosted-linux-fuzz-label>`. Leave the target matrix as
-   all five targets.
-2. Confirm every matrix job completed with no crash, timeout or OOM artifact.
+   `fuzz_seconds=21600` and `shards=4` on GitHub-hosted `ubuntu-24.04`. Leave
+   the target matrix as all five targets.
+2. Confirm every target × shard job completed with no crash, timeout or OOM
+   artifact (four shards per target, ≈24 target-hours aggregate).
 3. Download the `fuzz-crash-<target>-<run_id>` artifacts (if any) and confirm
    the `artifacts/` directory is empty for each target.
 4. Record the run URL, the commit SHA, the five target names,
-   `fuzz_seconds=86400`, the runner label, and the corpus size before/after in
-   the release checklist log (`docs/release-verification.md` → “Fuzz
-   evidence”).
+   `fuzz_seconds=21600` × `shards=4`, the GitHub-hosted runner class, and the
+   corpus size before/after in the release checklist log
+   (`docs/release-verification.md` → “Fuzz evidence”).
 5. A crash is a release blocker. Add the saved input to
    `fuzz/corpus/<target>/seed-*` only after the defect is fixed, so the
    regression is permanent and the seed remains small.

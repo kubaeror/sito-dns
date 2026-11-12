@@ -119,9 +119,10 @@ the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
   absent from the default build. If enabled, only a verified `https://` lease
   grants identity; plaintext or insecure-TLS leases are display-only.
 * Pull requests compile the Criterion benches but do not run a performance
-  threshold. The nightly `bench.yml` comparison is thresholded (>10% fails),
-  but it refuses to run unless `BENCH_RUNNER_LABEL` names a dedicated runner
-  and `BENCH_ENVIRONMENT` matches the committed baseline. The committed
-  baseline is a development-host baseline, so the nightly gate is inactive
-  until that runner is provisioned. This is an explicit residual, not a silent
-  pass.
+  threshold. The nightly `bench.yml` comparison is thresholded (>10% fails) and
+  runs on GitHub-hosted `ubuntu-24.04` only. The committed baseline must be
+  generated on that same runner class (`update_baseline=true`, download the
+  artifact, commit it); the checker fails closed on an environment mismatch.
+  The current alpha baseline is still the development-host reference, so the
+  nightly gate is inactive until that one-time GitHub-hosted regeneration.
+  This is an explicit residual, not a silent pass.
