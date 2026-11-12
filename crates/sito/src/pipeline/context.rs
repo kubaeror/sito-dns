@@ -62,11 +62,12 @@ impl<'a> PipelineContext<'a> {
             None
         } else {
             policy.upstreams.as_ref().and_then(|servers| {
-                pipeline
-                    .scoped_upstreams
-                    .load()
-                    .get(&servers.join(","))
-                    .cloned()
+                // The builder and this lookup must use the same key, including
+                // every inherited `[upstream]` setting the manager was built
+                // with. A plain `servers.join(",")` lookup silently fell back
+                // to the global upstreams in production.
+                let key = sito_runtime::scoped_upstream_key(config, servers);
+                pipeline.scoped_upstreams.load().get(&key).cloned()
             })
         };
         let effective_upstream = scoped_upstream

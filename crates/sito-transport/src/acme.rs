@@ -127,20 +127,21 @@ impl AcmeServiceConfig {
     /// certificates exist, and a CA-issued certificate must never be replaced
     /// by a self-signed placeholder.
     ///
-    /// Missing, unreadable or unparseable material is treated as a bootstrap
-    /// placeholder. Such material cannot be a usable CA-issued certificate,
-    /// and reporting it as "not bootstrap" would let startup select it and
-    /// abort in the TLS builder even when a valid static pair exists.
+    /// Missing or unreadable material is **not** classified as a bootstrap
+    /// placeholder: an unreadable/corrupt certificate must be reported as
+    /// expired (unusable) by readiness, not as an advisory bootstrap state.
+    /// Startup still rejects such a pair through [`Self::stored_cert_is_expired`]
+    /// and [`Self::stored_pair_is_usable`].
     pub fn is_bootstrap_cert(&self) -> bool {
         if bootstrap_marker_path(&self.storage_dir).exists() {
             return true;
         }
         let Ok(cert_bytes) = std::fs::read(self.storage_dir.join("cert.pem")) else {
-            return true;
+            return false;
         };
         // `is_self_signed` returns `None` for unparseable PEM/X.509 input;
-        // treat that as unusable rather than as a CA-issued certificate.
-        is_self_signed(&cert_bytes).unwrap_or(true)
+        // unparseable material is not a bootstrap placeholder either.
+        is_self_signed(&cert_bytes) == Some(true)
     }
 
     /// Whether the certificate currently stored for ACME is already expired
@@ -236,25 +237,131 @@ pub enum CertificateValidity {
     Valid { days_remaining: i64 },
 }
 
-/// Classifies a certificate file for readiness.
+/// Classifies certificate bytes for readiness.
 ///
-/// Missing and unparseable material is not silently treated as valid. A
-/// certificate that cannot be parsed is reported as expired because it cannot
-/// be served.
+/// The warning boundary is evaluated in seconds, not whole days: a certificate
+/// with 0 < remaining < 24 h used to truncate to `0` days and was classified
+/// `Expired`, making `/health` not-ready up to a day before the real expiry.
+fn certificate_validity_from_bytes(cert_pem: &[u8]) -> CertificateValidity {
+    match seconds_until_expiration(cert_pem) {
+        Ok(seconds) if seconds <= 0 => CertificateValidity::Expired,
+        Ok(seconds) => {
+            let days_remaining = seconds / 86400;
+            if seconds <= CERTIFICATE_EXPIRY_WARNING_DAYS * 86400 {
+                CertificateValidity::Expiring { days_remaining }
+            } else {
+                CertificateValidity::Valid { days_remaining }
+            }
+        }
+        Err(_) => CertificateValidity::Expired,
+    }
+}
+
+/// Classifies a static certificate file for readiness.
+///
+/// A missing file is `Missing`; an unreadable file is `Expired` (it cannot be
+/// served), and unparseable bytes are `Expired` too.
 #[must_use]
 pub fn certificate_validity(cert_path: &std::path::Path) -> CertificateValidity {
-    let Ok(bytes) = std::fs::read(cert_path) else {
-        return CertificateValidity::Missing;
-    };
-    match days_until_expiration(&bytes) {
-        Ok(days) if days <= 0 => CertificateValidity::Expired,
-        Ok(days) if days <= CERTIFICATE_EXPIRY_WARNING_DAYS => CertificateValidity::Expiring {
-            days_remaining: days,
-        },
-        Ok(days) => CertificateValidity::Valid {
-            days_remaining: days,
-        },
+    match std::fs::read(cert_path) {
+        Ok(bytes) => certificate_validity_from_bytes(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CertificateValidity::Missing,
         Err(_) => CertificateValidity::Expired,
+    }
+}
+
+/// Classifies ACME certificate bytes, including the bootstrap marker.
+///
+/// Corrupt/expired material is always `Expired`: a bootstrap marker must never
+/// mask an unusable certificate and turn a blocking readiness reason into an
+/// advisory one.
+fn classify_acme_certificate(cert_pem: &[u8], bootstrap_marker: bool) -> CertificateValidity {
+    let validity = certificate_validity_from_bytes(cert_pem);
+    if matches!(validity, CertificateValidity::Expired) {
+        return validity;
+    }
+    if bootstrap_marker || is_self_signed(cert_pem) == Some(true) {
+        CertificateValidity::Bootstrap
+    } else {
+        validity
+    }
+}
+
+/// Cached certificate validity keyed by file modification time and size.
+///
+/// The unauthenticated `/health` probe must not re-read and parse certificate
+/// files on every request. A change in mtime or size invalidates just that
+/// path; a replaced/rotated file is therefore observed on the next probe.
+#[derive(Debug, Default)]
+pub struct CertificateValidityCache {
+    entries: std::sync::Mutex<std::collections::HashMap<PathBuf, CachedCertificate>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedCertificate {
+    modified: Option<SystemTime>,
+    len: u64,
+    validity: CertificateValidity,
+    self_signed: Option<bool>,
+}
+
+impl CertificateValidityCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn cached(&self, path: &std::path::Path) -> Option<CachedCertificate> {
+        let metadata = std::fs::metadata(path).ok()?;
+        let modified = metadata.modified().ok();
+        let len = metadata.len();
+        if let Some(cached) = sito_core::sync::lock_or_recover(&self.entries).get(path)
+            && cached.modified == modified
+            && cached.len == len
+        {
+            return Some(*cached);
+        }
+        let bytes = std::fs::read(path).ok()?;
+        let entry = CachedCertificate {
+            modified,
+            len,
+            validity: certificate_validity_from_bytes(&bytes),
+            self_signed: is_self_signed(&bytes),
+        };
+        sito_core::sync::lock_or_recover(&self.entries).insert(path.to_path_buf(), entry);
+        Some(entry)
+    }
+
+    /// Static-certificate validity with an mtime/size cache.
+    #[must_use]
+    pub fn validity(&self, path: &std::path::Path) -> CertificateValidity {
+        match self.cached(path) {
+            Some(entry) => entry.validity,
+            None if path.exists() => CertificateValidity::Expired,
+            None => CertificateValidity::Missing,
+        }
+    }
+
+    /// ACME-certificate validity with an mtime/size cache.
+    #[must_use]
+    pub fn acme_validity(&self, config: &AcmeServiceConfig) -> CertificateValidity {
+        let cert_path = config.storage_dir.join("cert.pem");
+        let Some(entry) = self.cached(&cert_path) else {
+            return if cert_path.exists() {
+                CertificateValidity::Expired
+            } else {
+                CertificateValidity::Missing
+            };
+        };
+        let marker = bootstrap_marker_path(&config.storage_dir).exists();
+        if matches!(entry.validity, CertificateValidity::Expired) {
+            return CertificateValidity::Expired;
+        }
+        if marker || entry.self_signed == Some(true) {
+            CertificateValidity::Bootstrap
+        } else {
+            entry.validity
+        }
     }
 }
 
@@ -263,13 +370,13 @@ impl AcmeServiceConfig {
     #[must_use]
     pub fn certificate_validity(&self) -> CertificateValidity {
         let cert_path = self.storage_dir.join("cert.pem");
-        if !cert_path.exists() {
-            return CertificateValidity::Missing;
+        match std::fs::read(&cert_path) {
+            Ok(bytes) => {
+                classify_acme_certificate(&bytes, bootstrap_marker_path(&self.storage_dir).exists())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CertificateValidity::Missing,
+            Err(_) => CertificateValidity::Expired,
         }
-        if self.is_bootstrap_cert() {
-            return CertificateValidity::Bootstrap;
-        }
-        certificate_validity(&cert_path)
     }
 }
 
@@ -1319,6 +1426,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Boundary regression: 0 < remaining < 24 h must be `Expiring`, not
+    /// `Expired`. `days_until_expiration` truncates to 0 and made readiness
+    /// fail up to a day early.
+    #[test]
+    fn test_sub_day_remaining_certificate_is_expiring_not_expired() {
+        let now = time::OffsetDateTime::now_utc();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_cert_subday_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("soon.pem");
+        let (pem, _) = generate_ca_signed_cert_with_window(
+            "soon.example",
+            now - time::Duration::days(1),
+            now + time::Duration::hours(1),
+        );
+        std::fs::write(&path, pem).expect("write cert");
+        assert_eq!(
+            certificate_validity(&path),
+            CertificateValidity::Expiring { days_remaining: 0 },
+            "a certificate with one hour left is expiring, not expired"
+        );
+        let seconds = seconds_until_expiration(&std::fs::read(&path).expect("read cert"))
+            .expect("seconds remaining");
+        assert!(seconds > 0 && seconds < 86400, "got {seconds} seconds");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt ACME certificate must be `Expired`, and the cached readiness
+    /// view must observe a replaced file instead of serving stale validity.
+    #[test]
+    fn test_corrupt_acme_certificate_is_expired_and_cache_tracks_replacement() {
+        let now = time::OffsetDateTime::now_utc();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_acme_cache_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let config = AcmeServiceConfig::new(
+            "admin@example.com".into(),
+            vec!["acme.example.com".into()],
+            dir.clone(),
+        );
+        std::fs::write(dir.join("cert.pem"), b"not a certificate\n").expect("write corrupt cert");
+        assert!(!config.is_bootstrap_cert());
+        assert_eq!(config.certificate_validity(), CertificateValidity::Expired);
+
+        let cache = CertificateValidityCache::new();
+        assert_eq!(
+            cache.acme_validity(&config),
+            CertificateValidity::Expired,
+            "an unreadable/corrupt cert is unusable, not advisory bootstrap"
+        );
+
+        // Replace with a valid certificate: the mtime/size cache must not keep
+        // returning the earlier Expired classification.
+        let (pem, _) = generate_ca_signed_cert_with_window(
+            "acme.example.com",
+            now,
+            now + time::Duration::days(90),
+        );
+        std::fs::write(dir.join("cert.pem"), pem).expect("write valid cert");
+        assert!(matches!(
+            cache.acme_validity(&config),
+            CertificateValidity::Valid { .. }
+        ));
+        assert_eq!(
+            cache.acme_validity(&config),
+            config.certificate_validity(),
+            "the cached view must agree with the direct classification"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The default availability (nothing bound yet) must not select
     /// TLS-ALPN-01; a successful 443 bind flips it dynamically.
     #[test]
@@ -1547,8 +1732,13 @@ mod tests {
             dir.clone(),
         );
         assert!(
-            config.is_bootstrap_cert(),
-            "unparseable material must never be treated as a CA-issued certificate"
+            !config.is_bootstrap_cert(),
+            "unreadable/unparseable material is unusable, not an advisory bootstrap placeholder"
+        );
+        assert_eq!(
+            config.certificate_validity(),
+            CertificateValidity::Expired,
+            "a corrupt ACME certificate must report Expired, not Bootstrap"
         );
         assert!(
             config.stored_cert_is_expired(),

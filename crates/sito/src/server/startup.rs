@@ -98,7 +98,7 @@ pub async fn run_server_with_lease(
     // Build per-client upstream managers for entries that opt out of the globals.
     let scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>> =
         Arc::new(ArcSwap::from(Arc::new(
-            build_scoped_upstreams(&config, &clients_config, &HashMap::new()).await,
+            build_scoped_upstreams(&config, &clients_config, &HashMap::new()).await?,
         )));
 
     let client_registry = Arc::new(sito_clients::ClientRegistry::new(clients_config));
@@ -248,6 +248,9 @@ pub async fn run_server_with_lease(
 
     // Server-owned readiness (listeners/TLS) read by `/health` and `/status`.
     let readiness = Arc::new(sito_api::ReadinessState::default());
+    // Mtime/size cache shared by `/health`, startup and watcher reloads so the
+    // unauthenticated probe never re-parses certificate files.
+    let cert_validity_cache = Arc::new(sito_transport::CertificateValidityCache::new());
 
     let apply_hooks = Arc::new(ServerApplyHooks {
         dnssec: dnssec_swap.clone(),
@@ -258,6 +261,7 @@ pub async fn run_server_with_lease(
         listener_acceptors: listener_acceptors.clone(),
         pipeline: pipeline.clone(),
         readiness: readiness.clone(),
+        cert_validity_cache: cert_validity_cache.clone(),
     });
 
     // D12 readiness state shared with the API. Challenge flags are updated by
@@ -287,6 +291,7 @@ pub async fn run_server_with_lease(
         resync_sender,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(setup_pending)),
         readiness: readiness.clone(),
+        cert_validity_cache: cert_validity_cache.clone(),
         acme_challenges: Some(acme_challenges.clone()),
         dns_starter,
     };
@@ -413,11 +418,24 @@ pub async fn run_server_with_lease(
         shutdown_rx: shutdown_rx.clone(),
     }));
 
-    let mut cert_watchers =
-        init_tls_and_acme(&config, &shutdown_rx, &listener_acceptors, &acme_challenges).await?;
+    let mut cert_watchers = init_tls_and_acme(
+        &config,
+        &shutdown_rx,
+        &listener_acceptors,
+        &acme_challenges,
+        &readiness,
+        &cert_validity_cache,
+    )
+    .await?;
     {
         let acceptors = listener_acceptors.lock().await.clone();
-        publish_tls_readiness(&readiness, &config, acceptors.as_ref(), None);
+        publish_tls_readiness(
+            &readiness,
+            &config,
+            acceptors.as_ref(),
+            None,
+            &cert_validity_cache,
+        );
     }
 
     if setup_pending {
@@ -440,6 +458,8 @@ pub async fn run_server_with_lease(
                     &shutdown_rx,
                     &listener_acceptors,
                     &acme_challenges,
+                    &readiness,
+                    &cert_validity_cache,
                 )
                 .await
                 {
@@ -473,6 +493,7 @@ pub async fn run_server_with_lease(
                     &current_cfg,
                     Some(&acceptors),
                     tls_init_error.as_ref(),
+                    &cert_validity_cache,
                 );
                 for warning in
                     exposure_warnings_for_phase(&current_cfg, ExposurePhase::DnsListeners)

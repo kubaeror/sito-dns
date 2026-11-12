@@ -27,6 +27,8 @@ pub(super) struct ServerApplyHooks {
     pub(super) pipeline: Arc<DnsPipeline>,
     /// Server-owned readiness published to `/health` and `/status`.
     pub(super) readiness: Arc<sito_api::ReadinessState>,
+    /// Shared certificate-validity cache used by readiness refreshes.
+    pub(super) cert_validity_cache: Arc<sito_transport::CertificateValidityCache>,
 }
 
 /// Hook-owned components prepared for one staged apply, not yet installed.
@@ -60,7 +62,17 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
             // anything is published.
             let scoped_upstreams = {
                 let existing = self.scoped_upstreams.load_full();
-                build_scoped_upstreams(cfg, clients, &existing).await
+                build_scoped_upstreams(cfg, clients, &existing)
+                    .await
+                    .map_err(|e| {
+                        // A scope that cannot be constructed must fail the staged
+                        // apply before anything is published. Falling back to the
+                        // global upstreams would silently bypass the client's
+                        // `use_global_upstreams = false` policy.
+                        sito_runtime::ApplyError::Internal(format!(
+                            "per-client upstream scope preparation failed: {e}"
+                        ))
+                    })?
             };
 
             Ok(sito_api::config_apply::PreparedHooks {
@@ -140,7 +152,13 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
                             "listener_rebind_skipped",
                             "listener changes could not be applied because TLS acceptors are unavailable",
                         );
-                        publish_tls_readiness(&self.readiness, &listener_config, None, None);
+                        publish_tls_readiness(
+                            &self.readiness,
+                            &listener_config,
+                            None,
+                            None,
+                            &self.cert_validity_cache,
+                        );
                     }
                 }
             }

@@ -196,6 +196,36 @@ fn test_bad_upstream_targets_are_rejected_in_every_scope() {
     }
 }
 
+/// A client that opts out of the global upstreams without a usable scope used
+/// to reach the runtime, be skipped when building the scoped map, and silently
+/// fall back to the global upstreams. It must be rejected before apply.
+#[test]
+fn test_scoped_client_without_upstreams_is_rejected() {
+    for clients in [
+        "[clients]\n[[clients.entries]]\nname = \"phone\"\nuse_global_upstreams = false\n",
+        "[clients]\n[[clients.entries]]\nname = \"phone\"\nuse_global_upstreams = false\nupstreams = []\n",
+    ] {
+        let err = Config::from_toml_str(&format!("{TEST_BASE}{clients}"))
+            .expect_err("a scoped client without upstreams must fail closed");
+        match err {
+            ConfigError::CrossSection { field, message, .. } => {
+                assert_eq!(field, "clients.entries[0].upstreams");
+                assert!(
+                    message.contains("phone") && message.contains("use_global_upstreams = false"),
+                    "the error must name the client and the opt-out: {message}"
+                );
+            }
+            other => panic!("expected CrossSection on the client upstreams, got {other:?}"),
+        }
+    }
+
+    // A scoped client with a usable upstream is still accepted.
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}[clients]\n[[clients.entries]]\nname = \"phone\"\nuse_global_upstreams = false\nupstreams = [\"1.1.1.1\"]\n"
+    ))
+    .expect("a scoped client with an upstream must be accepted");
+}
+
 #[test]
 fn test_invalid_client_cidr_ids_are_rejected() {
     let err = Config::from_toml_str(&format!(

@@ -8,7 +8,7 @@ use sito_core::config::Config;
 use sito_filter::HostsFilterEngine;
 use sito_rewrites::RewriteTable;
 use sito_stats::{MetricsRegistry, QueryLogSender, StatsDb};
-use sito_transport::{AcmeServiceConfig, CertificateValidity};
+use sito_transport::{AcmeServiceConfig, CertificateValidity, CertificateValidityCache};
 use sito_upstream::UpstreamManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -45,6 +45,9 @@ pub struct ServerContext {
     /// Server-owned readiness (listeners/TLS) published by the DNS startup
     /// path and read by `/health` and `/status`.
     pub readiness: Arc<crate::readiness::ReadinessState>,
+    /// Mtime/size cache for certificate validity so the unauthenticated
+    /// `/health` probe does not re-read and parse `cert.pem` on every request.
+    pub cert_validity_cache: Arc<CertificateValidityCache>,
     /// Live ACME challenge-listener state when ACME is enabled; used by
     /// readiness reporting (D12 `acme_challenge_unavailable`).
     pub acme_challenges: Option<sito_transport::AcmeChallengeAvailability>,
@@ -76,6 +79,7 @@ pub struct AcmeReadiness {
 fn acme_readiness_for(
     challenges: Option<&sito_transport::AcmeChallengeAvailability>,
     config: &Config,
+    cert_validity_cache: &CertificateValidityCache,
 ) -> AcmeReadiness {
     let acme_cfg = config.get_acme_config();
     let enabled = acme_cfg.as_ref().is_some_and(|acme| acme.enabled);
@@ -104,7 +108,7 @@ fn acme_readiness_for(
     let validity = acme_cfg
         .as_ref()
         .map_or(CertificateValidity::Missing, |acme| {
-            acme_certificate_validity(config, acme)
+            acme_certificate_validity(config, acme, cert_validity_cache)
         });
     let (ready, reason) = acme_readiness_state(
         challenges.challenge_unavailable(),
@@ -125,6 +129,7 @@ fn acme_readiness_for(
 fn acme_certificate_validity(
     config: &Config,
     acme: &sito_core::config::AcmeConfig,
+    cert_validity_cache: &CertificateValidityCache,
 ) -> CertificateValidity {
     let storage_dir = acme
         .cache_dir
@@ -137,7 +142,105 @@ fn acme_certificate_validity(
         acme.domains.clone(),
         storage_dir,
     );
-    service.certificate_validity()
+    cert_validity_cache.acme_validity(&service)
+}
+
+/// Maps a certificate validity to TLS component readiness (D12).
+///
+/// A valid certificate is ready, one expiring inside the warning window is
+/// degraded (still serving), and an expired/unparseable certificate is
+/// not-ready.
+#[must_use]
+pub fn tls_certificate_readiness(
+    validity: CertificateValidity,
+) -> crate::readiness::ComponentReadiness {
+    match validity {
+        CertificateValidity::Expired => crate::readiness::ComponentReadiness::unavailable(
+            "tls_cert_expired",
+            "configured static TLS certificate is expired; encrypted listeners cannot serve",
+        ),
+        CertificateValidity::Expiring { days_remaining } => {
+            crate::readiness::ComponentReadiness::degraded(
+                "tls_cert_expiring",
+                format!("configured static TLS certificate expires in {days_remaining} day(s)"),
+            )
+        }
+        CertificateValidity::Valid { .. }
+        | CertificateValidity::Missing
+        | CertificateValidity::Bootstrap => crate::readiness::ComponentReadiness::ready(),
+    }
+}
+
+/// Whether an enabled ACME deployment has a usable current certificate that
+/// takes precedence over the static pair (D12 ACME + static matrix).
+fn acme_has_serving_certificate(
+    config: &Config,
+    cert_validity_cache: &CertificateValidityCache,
+) -> bool {
+    config.get_acme_config().is_some_and(|acme| {
+        acme.enabled
+            && matches!(
+                acme_certificate_validity(config, &acme, cert_validity_cache),
+                CertificateValidity::Valid { .. } | CertificateValidity::Expiring { .. }
+            )
+    })
+}
+
+/// Re-evaluates the configured static certificate's validity after startup.
+///
+/// D12 requires an expired static certificate to make `/health` not-ready even
+/// when the process started with a valid one, and a hot-reloaded replacement to
+/// clear the previous `tls_cert_expired`/`tls_cert_expiring` reason. Startup and
+/// the certificate watcher call this directly; readiness aggregation also calls
+/// it so a process that simply runs past expiry is observed on the next probe.
+/// The mtime/size cache keeps the unauthenticated `/health` path cheap.
+pub fn refresh_tls_certificate_readiness(
+    readiness: &crate::readiness::ReadinessState,
+    config: &Config,
+    cert_validity_cache: &CertificateValidityCache,
+) {
+    let Some(tls) = config.get_tls_config() else {
+        return;
+    };
+    let Some(cert) = tls.cert.as_deref() else {
+        return;
+    };
+    if tls.key.is_none() {
+        return;
+    }
+
+    // Never overwrite a startup/acceptor failure with a certificate verdict.
+    // Only a previous certificate reason (or no reason at all) may be revised.
+    if let Some(code) = readiness.tls().code
+        && code != "tls_cert_expired"
+        && code != "tls_cert_expiring"
+    {
+        return;
+    }
+
+    if acme_has_serving_certificate(config, cert_validity_cache) {
+        readiness.set_tls_ready();
+        return;
+    }
+
+    let state = tls_certificate_readiness(cert_validity_cache.validity(cert));
+    if !state.ready {
+        readiness.set_tls_unavailable(
+            state.code.unwrap_or("tls_cert_expired"),
+            state
+                .message
+                .unwrap_or_else(|| "static TLS certificate is expired".to_string()),
+        );
+    } else if state.code.is_some() {
+        readiness.set_tls_degraded(
+            state.code.unwrap_or("tls_cert_expiring"),
+            state
+                .message
+                .unwrap_or_else(|| "static TLS certificate is expiring".to_string()),
+        );
+    } else {
+        readiness.set_tls_ready();
+    }
 }
 
 /// D12 readiness ladder for a challenge path and certificate lifetime.
@@ -243,7 +346,11 @@ impl ServerContext {
     /// reported separately so an existing certificate can still serve traffic.
     #[must_use]
     pub fn acme_readiness(&self, config: &Config) -> AcmeReadiness {
-        acme_readiness_for(self.acme_challenges.as_ref(), config)
+        acme_readiness_for(
+            self.acme_challenges.as_ref(),
+            config,
+            &self.cert_validity_cache,
+        )
     }
 
     /// Blocking-only readiness used by the unauthenticated `/health` probe.
@@ -271,6 +378,11 @@ impl ServerContext {
 
     fn build_readiness_report(&self, stats: Option<&str>) -> crate::readiness::ReadinessReport {
         let config = self.config.load();
+        // A process can outlive its static certificate. Re-evaluate it on every
+        // readiness build (cached by mtime/size) so `/health` flips to not-ready
+        // at expiry and recovers after a watcher reload, without a rebind or
+        // restart. Startup/acceptor failures are preserved by the guard inside.
+        refresh_tls_certificate_readiness(&self.readiness, &config, &self.cert_validity_cache);
         let acme = self.acme_readiness(&config);
         let ha = self.ha_readiness(&config);
         let filter = self.filter.status();
@@ -698,20 +810,22 @@ mod tests {
 
         // No challenge listener at all (fresh defaults are fail-safe false).
         let challenges = sito_transport::AcmeChallengeAvailability::new(false, false);
-        let readiness = acme_readiness_for(Some(&challenges), &config);
+        let readiness =
+            acme_readiness_for(Some(&challenges), &config, &CertificateValidityCache::new());
         assert!(!readiness.ready);
         assert_eq!(readiness.reason, Some("acme_challenge_unavailable"));
 
         // Either bound listener makes ACME issuable.
         let http = sito_transport::AcmeChallengeAvailability::new(false, true);
-        let readiness = acme_readiness_for(Some(&http), &config);
+        let readiness = acme_readiness_for(Some(&http), &config, &CertificateValidityCache::new());
         assert!(
             readiness.ready,
             "HTTP-01 on port 80 is a usable path: {readiness:?}"
         );
 
         let tls_alpn = sito_transport::AcmeChallengeAvailability::new(true, false);
-        let readiness = acme_readiness_for(Some(&tls_alpn), &config);
+        let readiness =
+            acme_readiness_for(Some(&tls_alpn), &config, &CertificateValidityCache::new());
         assert!(
             readiness.ready,
             "TLS-ALPN-01 on 443 is a usable path: {readiness:?}"
@@ -720,14 +834,16 @@ mod tests {
         // A failed issuance is surfaced separately but does not claim the
         // challenge path is missing.
         tls_alpn.record_error("order failed");
-        let readiness = acme_readiness_for(Some(&tls_alpn), &config);
+        let readiness =
+            acme_readiness_for(Some(&tls_alpn), &config, &CertificateValidityCache::new());
         assert!(!readiness.ready);
         assert_eq!(readiness.reason, Some("acme_issuance_failed"));
         assert_eq!(readiness.last_error.as_deref(), Some("order failed"));
 
         // Disabled ACME is always "ready" and produces no warning signal.
         config.acme.as_mut().unwrap().enabled = false;
-        let readiness = acme_readiness_for(Some(&challenges), &config);
+        let readiness =
+            acme_readiness_for(Some(&challenges), &config, &CertificateValidityCache::new());
         assert!(readiness.ready);
         assert!(!readiness.enabled);
         assert_eq!(readiness.reason, None);

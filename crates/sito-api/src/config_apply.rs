@@ -2346,6 +2346,65 @@ acme_enabled = false
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// A refresh can read the current generation *after* a newer apply
+    /// committed while still carrying an older `filtering` value. The
+    /// generation matches, so the filtering comparison is the only guard that
+    /// prevents it from overwriting the newer rules.
+    #[tokio::test]
+    async fn test_filter_refresh_with_matching_generation_but_stale_filtering_is_rejected() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_stale_filtering_only");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut old = (**ctx.config.load()).clone();
+        old.filtering.enabled = true;
+        old.filtering.custom_rules = vec!["||old-filtering.example^".to_string()];
+        apply_and_persist_config(&ctx, &old, FilterApply::Sync, None)
+            .await
+            .expect("old generation");
+        let stale_filtering = old.filtering.clone();
+
+        let mut new = old.clone();
+        new.filtering.custom_rules = vec!["||new-filtering.example^".to_string()];
+        apply_and_persist_config(&ctx, &new, FilterApply::Sync, None)
+            .await
+            .expect("new generation");
+
+        // Deliberately pass the *current* generation with the old filtering
+        // value: only the filtering comparison can reject this refresh.
+        let error = crate::config_apply::apply_filter_refresh(
+            &ctx.filter,
+            &ctx.runtime,
+            &stale_filtering,
+            ctx.runtime.generation(),
+        )
+        .await
+        .expect_err("a refresh with stale filtering but a matching generation must be discarded");
+        assert!(
+            matches!(error, ApplyError::GenerationConflict { .. }),
+            "got {error:?}"
+        );
+
+        let after = ctx.runtime.snapshot();
+        assert_eq!(
+            after.config.filtering.custom_rules,
+            vec!["||new-filtering.example^".to_string()],
+            "the newer filtering configuration must survive"
+        );
+        assert_eq!(
+            after
+                .filter
+                .as_ref()
+                .unwrap()
+                .rules
+                .first()
+                .map(|rule| rule.raw.as_str()),
+            Some("||new-filtering.example^"),
+            "the newer filter must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     /// A failure in the hook commit step (e.g. a listener cannot rebind) must
     /// leave the runtime snapshot, filter engine and upstream manager on the
     /// previous generation.

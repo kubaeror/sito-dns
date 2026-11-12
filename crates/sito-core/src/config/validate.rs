@@ -252,7 +252,11 @@ impl Config {
                     }
                 }
             }
-            if let Some(upstreams) = entry.get("upstreams") {
+            let use_global_upstreams = entry
+                .get("use_global_upstreams")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(true);
+            let upstreams = if let Some(upstreams) = entry.get("upstreams") {
                 let upstreams = upstreams.as_array().ok_or_else(|| {
                     ConfigError::validation(
                         format!("clients.entries[{index}].upstreams"),
@@ -273,6 +277,23 @@ impl Config {
                         )
                     })?;
                 }
+                Some(upstreams)
+            } else {
+                None
+            };
+
+            // Fail closed: a client that opts out of the global upstreams must
+            // carry its own usable scope. Previously a missing or empty list
+            // reached the runtime, was skipped when the scoped map was built,
+            // and silently fell back to the global upstreams (and their shared
+            // cache), bypassing the operator's policy.
+            if !use_global_upstreams && upstreams.is_none_or(Vec::is_empty) {
+                return Err(ConfigError::cross_section(
+                    format!("clients.entries[{index}].upstreams"),
+                    format!(
+                        "client '{name}' sets use_global_upstreams = false but has no per-client upstream targets"
+                    ),
+                ));
             }
         }
         Ok(())

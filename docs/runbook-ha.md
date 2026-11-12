@@ -102,8 +102,12 @@ D12 certificate ladder:
 - No ACME certificate yet and no error is `acme_issuance_pending` (degraded:
   DNS listeners still bind); an issuance failure with no certificate is
   `acme_issuance_failed` (not-ready).
-- A configured static TLS certificate is checked at runtime; an ACME
-  certificate that currently serves takes precedence over the static pair.
+- A configured static TLS certificate is checked at runtime on every
+  readiness build (cached by file mtime/size) and immediately after a
+  certificate-watcher reload. A process that runs past expiry therefore flips
+  `/health` to not-ready, and replacing the file clears the reason without a
+  rebind or restart. An ACME certificate that currently serves takes precedence
+  over the static pair.
 
 `ReadinessState` starts not-ready (nothing has been published yet). Startup
 publishes listener readiness after the DNS listeners start and TLS readiness

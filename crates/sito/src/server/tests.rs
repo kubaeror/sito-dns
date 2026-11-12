@@ -82,13 +82,17 @@ async fn test_scoped_upstream_reload_rebuilds_on_allow_private_targets_change() 
     config.upstream.servers = vec!["1.1.1.1".to_string()];
     let clients = scoped_clients(&["udp://127.0.0.1:53"]);
 
-    let first = build_scoped_upstreams(&config, &clients, &HashMap::new()).await;
+    let first = build_scoped_upstreams(&config, &clients, &HashMap::new())
+        .await
+        .expect("first scope must build");
     assert_eq!(first.len(), 1);
     let first_key = first.keys().next().unwrap().clone();
     let first_manager = first.values().next().unwrap().clone();
 
     config.upstream.allow_private_targets = true;
-    let second = build_scoped_upstreams(&config, &clients, &first).await;
+    let second = build_scoped_upstreams(&config, &clients, &first)
+        .await
+        .expect("reloaded scope must build");
     assert_eq!(second.len(), 1);
     let second_key = second.keys().next().unwrap().clone();
     let second_manager = second.values().next().unwrap().clone();
@@ -107,6 +111,8 @@ async fn test_scoped_upstream_reload_rebuilds_on_allow_private_targets_change() 
 /// not only when the server list changes.
 #[test]
 fn test_scoped_upstream_key_includes_inherited_settings() {
+    use sito_runtime::scoped_upstream_key;
+
     let mut config = Config::default();
     let servers = vec!["tls://dns.example".to_string()];
     let base = scoped_upstream_key(&config, &servers);
@@ -552,7 +558,17 @@ async fn test_invalid_tls_material_is_fatal() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let acceptors = tokio::sync::Mutex::new(None);
     let challenges = AcmeChallengeAvailability::default();
-    let result = init_tls_and_acme(&config, &shutdown_rx, &acceptors, &challenges).await;
+    let readiness = sito_api::ReadinessState::default();
+    let cert_validity_cache = Arc::new(sito_transport::CertificateValidityCache::new());
+    let result = init_tls_and_acme(
+        &config,
+        &shutdown_rx,
+        &acceptors,
+        &challenges,
+        &readiness,
+        &cert_validity_cache,
+    )
+    .await;
     assert!(
         result.is_err(),
         "unreadable certificate material must fail startup, not disable encrypted listeners"
@@ -584,9 +600,18 @@ async fn test_tls_acceptors_rebuilt_from_updated_config() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let acceptors = tokio::sync::Mutex::new(None);
     let challenges = AcmeChallengeAvailability::default();
-    let watchers = init_tls_and_acme(&config, &shutdown_rx, &acceptors, &challenges)
-        .await
-        .expect("TLS initialization");
+    let readiness = sito_api::ReadinessState::default();
+    let cert_validity_cache = Arc::new(sito_transport::CertificateValidityCache::new());
+    let watchers = init_tls_and_acme(
+        &config,
+        &shutdown_rx,
+        &acceptors,
+        &challenges,
+        &readiness,
+        &cert_validity_cache,
+    )
+    .await
+    .expect("TLS initialization");
 
     let snapshot = acceptors
         .lock()
@@ -665,7 +690,13 @@ fn test_publish_tls_readiness_marks_configured_material_without_acceptor_unavail
         key: Some(Path::new("/etc/sito/certs/dns.key").to_path_buf()),
         sni_certs: Vec::new(),
     });
-    publish_tls_readiness(&readiness, &config, Some(&no_acceptors()), None);
+    publish_tls_readiness(
+        &readiness,
+        &config,
+        Some(&no_acceptors()),
+        None,
+        &sito_transport::CertificateValidityCache::new(),
+    );
     let tls = readiness.tls();
     assert!(
         !tls.ready,
@@ -676,7 +707,13 @@ fn test_publish_tls_readiness_marks_configured_material_without_acceptor_unavail
     // No explicit TLS material: the TLS component is not applicable even
     // though the default config lists encrypted listener ports.
     let config = Config::default();
-    publish_tls_readiness(&readiness, &config, Some(&no_acceptors()), None);
+    publish_tls_readiness(
+        &readiness,
+        &config,
+        Some(&no_acceptors()),
+        None,
+        &sito_transport::CertificateValidityCache::new(),
+    );
     assert!(readiness.tls().ready);
 }
 
@@ -693,7 +730,13 @@ fn test_publish_tls_readiness_allows_acme_without_static_material() {
         allow_bootstrap_cert: false,
         ..Default::default()
     });
-    publish_tls_readiness(&readiness, &config, Some(&no_acceptors()), None);
+    publish_tls_readiness(
+        &readiness,
+        &config,
+        Some(&no_acceptors()),
+        None,
+        &sito_transport::CertificateValidityCache::new(),
+    );
     assert!(
         readiness.tls().ready,
         "ACME issuance readiness owns the waiting state"
@@ -702,7 +745,13 @@ fn test_publish_tls_readiness_allows_acme_without_static_material() {
     // A TLS initialization failure always makes the TLS component unavailable,
     // even in an ACME deployment.
     let error = anyhow::anyhow!("certificate parse failure");
-    publish_tls_readiness(&readiness, &config, Some(&no_acceptors()), Some(&error));
+    publish_tls_readiness(
+        &readiness,
+        &config,
+        Some(&no_acceptors()),
+        Some(&error),
+        &sito_transport::CertificateValidityCache::new(),
+    );
     let tls = readiness.tls();
     assert!(!tls.ready);
     assert_eq!(tls.code, Some("tls_init_failed"));
@@ -733,4 +782,167 @@ fn test_static_tls_certificate_readiness_ladder() {
         missing.ready,
         "a live acceptor still serves after the file disappears"
     );
+}
+
+/// A scoped-upstream construction failure must fail the staged apply in
+/// `ConfigApplyHooks::prepare`, before anything is published. It must never
+/// log a warning and let the client fall back to the global upstreams.
+#[tokio::test]
+async fn test_scoped_upstream_construction_failure_aborts_prepare() {
+    use sito_api::config_apply::ConfigApplyHooks;
+    use sito_clients::{ClientRegistry, ParentalRegistry, ServiceRegistry};
+    use sito_filter::HostsFilterEngine;
+    use sito_rewrites::{RewriteTable, RewritesConfig};
+    use std::sync::atomic::AtomicUsize;
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_scoped_prepare_{}_{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut config = Config::default();
+    config.server.data_dir = temp_dir.clone();
+    config.upstream.servers = vec!["1.1.1.1".to_string()];
+    config.filtering.enabled = false;
+    config.dns.dnssec.validate = false;
+
+    let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(100));
+    let upstream = Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+    let filter =
+        Arc::new(HostsFilterEngine::init(config.filtering.clone(), temp_dir.clone()).await);
+    let pipeline = Arc::new(DnsPipeline::new(
+        Arc::new(ArcSwap::new(Arc::new(config.clone()))),
+        filter,
+        Arc::new(DnsCache::new(config.dns.cache.clone())),
+        upstream,
+        Arc::new(DnssecValidator::from_config(&config.dns.dnssec)),
+        Arc::new(ArcSwap::new(Arc::new(ClientRegistry::new(
+            sito_clients::ClientsConfig::default(),
+        )))),
+        Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load")),
+        Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load")),
+        Arc::new(ArcSwap::new(Arc::new(RewriteTable::new(
+            RewritesConfig::default(),
+        )))),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let hooks = ServerApplyHooks {
+        dnssec: Arc::new(ArcSwap::new(Arc::new(DnssecValidator::from_config(
+            &config.dns.dnssec,
+        )))),
+        dnssec_chain_cache: Arc::new(sito_dnssec::ChainCache::new(None)),
+        scoped_upstreams: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+        rate_limiters: Arc::new(Mutex::new(Vec::new())),
+        listener_manager: Arc::new(tokio::sync::Mutex::new(None)),
+        listener_acceptors: Arc::new(tokio::sync::Mutex::new(None)),
+        pipeline,
+        readiness: Arc::new(sito_api::ReadinessState::default()),
+        cert_validity_cache: Arc::new(sito_transport::CertificateValidityCache::new()),
+    };
+
+    for upstreams in [None, Some(vec!["ftp://unsupported.example".to_string()])] {
+        let clients = sito_clients::ClientsConfig {
+            entries: vec![sito_clients::ClientEntryConfig {
+                name: "scoped-client".to_string(),
+                ids: vec!["10.0.0.1".to_string()],
+                group: "default".to_string(),
+                ignore_query_log: false,
+                ignore_stats: false,
+                use_global_upstreams: false,
+                upstreams,
+                trusted: false,
+            }],
+            ..Default::default()
+        };
+        let error = hooks
+            .prepare(&config, &clients)
+            .await
+            .expect_err("an unbuildable scope must abort the staged apply");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("scoped-client"),
+            "the apply error must name the offending client: {rendered}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// D12 runtime ladder: a static certificate that expires while the process is
+/// running must make `/health` not-ready, and a replacement must clear the
+/// reason without a rebind or restart. The health path re-evaluates the file
+/// through the mtime/size cache, so this uses the same helper `/health` calls.
+#[test]
+fn test_static_tls_readiness_follows_runtime_certificate_changes() {
+    fn write_cert(cert_path: &Path, key_path: &Path, not_before_days: i64, not_after_days: i64) {
+        let now = time::OffsetDateTime::now_utc();
+        let key = rcgen::KeyPair::generate().expect("key pair");
+        let mut params = rcgen::CertificateParams::new(vec!["dns.example.com".to_string()])
+            .expect("certificate params");
+        params.not_before = now + time::Duration::days(not_before_days);
+        params.not_after = now + time::Duration::days(not_after_days);
+        let cert = params.self_signed(&key).expect("self-signed cert");
+        std::fs::write(cert_path, cert.pem()).expect("write cert");
+        std::fs::write(key_path, key.serialize_pem()).expect("write key");
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_tls_runtime_{}_{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+
+    let mut config = Config::default();
+    config.dns.tls = Some(sito_core::config::TlsConfig {
+        cert: Some(cert_path.clone()),
+        key: Some(key_path.clone()),
+        sni_certs: Vec::new(),
+    });
+    let readiness = sito_api::ReadinessState::default();
+    readiness.set_tls_ready();
+    let cache = sito_transport::CertificateValidityCache::new();
+
+    write_cert(&cert_path, &key_path, -1, 90);
+    sito_api::refresh_tls_certificate_readiness(&readiness, &config, &cache);
+    assert!(readiness.tls().ready);
+    assert!(readiness.tls().code.is_none());
+
+    write_cert(&cert_path, &key_path, -2, 10);
+    std::thread::sleep(Duration::from_millis(20));
+    sito_api::refresh_tls_certificate_readiness(&readiness, &config, &cache);
+    assert!(
+        readiness.tls().ready,
+        "an expiring certificate still serves"
+    );
+    assert_eq!(readiness.tls().code, Some("tls_cert_expiring"));
+
+    write_cert(&cert_path, &key_path, -2, -1);
+    std::thread::sleep(Duration::from_millis(20));
+    sito_api::refresh_tls_certificate_readiness(&readiness, &config, &cache);
+    assert!(
+        !readiness.tls().ready,
+        "an expired certificate is not ready"
+    );
+    assert_eq!(readiness.tls().code, Some("tls_cert_expired"));
+
+    // A watcher reload replaces the file; readiness must recover immediately.
+    write_cert(&cert_path, &key_path, -1, 90);
+    std::thread::sleep(Duration::from_millis(20));
+    sito_api::refresh_tls_certificate_readiness(&readiness, &config, &cache);
+    assert!(readiness.tls().ready);
+    assert!(
+        readiness.tls().code.is_none(),
+        "a replaced valid certificate must clear the stale reason"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

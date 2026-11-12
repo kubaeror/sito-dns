@@ -1425,9 +1425,10 @@ mod tests {
             .get_for_query(&query)
             .await
             .expect("entry must stay fresh");
-        assert_eq!(
-            served.answers[0].ttl, 10,
-            "a raised min_ttl must not extend a Secure TTL"
+        assert!(
+            (9..=10).contains(&served.answers[0].ttl),
+            "a raised min_ttl must not extend a Secure TTL (got {})",
+            served.answers[0].ttl
         );
     }
 

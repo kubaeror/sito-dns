@@ -126,7 +126,7 @@ fast:
 | File | Cases | Properties |
 |---|---|---|
 | `crates/sito-core/tests/domain_properties.rs` | 96 | normalization idempotence/no panic, lowercase/trailing-dot equivalence, IDN punycode round-trip, wildcard preservation, invalid-char rejection, suffix reflexive/transitive/strict invariants, overlong-label rejection |
-| `crates/sito-filter/tests/parser_properties.rs` | 96 / 64 | arbitrary lines never panic and parse deterministically, canonical form equals `compute_canonical`, modifier order invariance, `$badfilter` recognized and excluded from the canonical form, per-line cap skips hostile lines, byte budget rejects without partial rules |
+| `crates/sito-filter/tests/parser_properties.rs` | 96 / 64 | arbitrary lines never panic and parse deterministically, canonical form matches an independent oracle (not `compute_canonical`), modifier order invariance, `$badfilter` recognized and excluded from the canonical form, per-line cap skips hostile lines, byte budget rejects without partial rules |
 
 Proptest writes `*.proptest-regressions` seeds on failure; commit them when a
 failure represents a real bug so the case is replayed.

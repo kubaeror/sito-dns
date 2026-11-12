@@ -93,6 +93,7 @@ async fn create_test_context(temp_dir: &Path, setup_pending: bool) -> ServerCont
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(setup_pending)),
         readiness: Arc::new(sito_api::readiness::ReadinessState::default()),
+        cert_validity_cache: Arc::new(sito_transport::CertificateValidityCache::new()),
         acme_challenges: None,
         dns_starter: None,
     }

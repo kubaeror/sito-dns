@@ -225,6 +225,7 @@ async fn create_test_context(
         resync_sender: resync_tx,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         readiness: Arc::new(readiness),
+        cert_validity_cache: Arc::new(sito_transport::CertificateValidityCache::new()),
         acme_challenges: None,
         dns_starter: None,
     };

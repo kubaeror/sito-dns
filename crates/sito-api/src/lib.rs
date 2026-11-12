@@ -35,7 +35,9 @@ pub use readiness::{
     ComponentReadiness, ReadinessInputs, ReadinessReason, ReadinessReport, ReadinessState,
 };
 pub use router::{create_router, create_router_with_hooks};
-pub use state::{ServerContext, publish_bundle};
+pub use state::{
+    ServerContext, publish_bundle, refresh_tls_certificate_readiness, tls_certificate_readiness,
+};
 
 #[cfg(test)]
 mod tests {

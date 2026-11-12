@@ -574,6 +574,7 @@ impl CertWatcher {
         sni_certs: &[(String, PathBuf, PathBuf)],
         alpn_protocols: &[Vec<u8>],
         acceptor_mgr: TlsAcceptorManager,
+        on_reload: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Self, TlsError> {
         // Remember the SNI pairs so reloads triggered by other components
         // (e.g. ACME renewal) do not silently drop virtual-host certificates.
@@ -670,6 +671,12 @@ impl CertWatcher {
                 ) {
                     Ok(new_config) => {
                         acceptor_mgr.reload(new_config);
+                        if let Some(on_reload) = &on_reload {
+                            // Republish readiness immediately on reload so a
+                            // replaced certificate clears (or sets) the TLS
+                            // reason without waiting for the next probe.
+                            on_reload();
+                        }
                     }
                     Err(e) => {
                         error!(
@@ -959,10 +966,62 @@ mod tests {
 
         let config = load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()]).unwrap();
         let mgr = TlsAcceptorManager::new(config);
-        let watcher =
-            CertWatcher::start(&cert_file, &key_file, &[], &[b"dot".to_vec()], mgr.clone())
-                .unwrap();
+        let watcher = CertWatcher::start(
+            &cert_file,
+            &key_file,
+            &[],
+            &[b"dot".to_vec()],
+            mgr.clone(),
+            None,
+        )
+        .unwrap();
         (temp_dir, cert_file, key_file, mgr, watcher)
+    }
+
+    /// A successful certificate reload must notify readiness immediately, not
+    /// only on the next health probe. The server passes a callback that
+    /// refreshes the TLS reason after a hot-reloaded replacement.
+    #[tokio::test]
+    async fn test_cert_watcher_invokes_reload_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp_dir = create_test_dir("watch_callback");
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let config = load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()]).unwrap();
+        let mgr = TlsAcceptorManager::new(config);
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&reloads);
+        let _watcher = CertWatcher::start(
+            &cert_file,
+            &key_file,
+            &[],
+            &[b"dot".to_vec()],
+            mgr,
+            Some(Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })),
+        )
+        .unwrap();
+
+        let (replacement_cert, replacement_key) = generate_test_cert(&["replaced.local"]);
+        std::fs::write(&cert_file, replacement_cert).unwrap();
+        std::fs::write(&key_file, replacement_key).unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while reloads.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the watcher did not invoke its reload callback within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// Regression: the watcher must only react to the configured certificate
@@ -1043,6 +1102,7 @@ mod tests {
             &[],
             &[b"dot".to_vec()],
             mgr,
+            None,
         );
         assert!(
             watcher.is_ok(),

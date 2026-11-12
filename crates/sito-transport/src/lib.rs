@@ -23,10 +23,11 @@ pub mod udp;
 
 pub use acme::{
     AcmeChallengeAvailability, AcmeChallengeOptions, AcmeServiceConfig, CertificateValidity,
-    certificate_lifetime_days, certificate_needs_renewal, certificate_validity,
-    days_until_expiration, generate_tls_alpn_01_cert, obtain_or_renew_certificate,
-    obtain_or_renew_certificate_for_transports, record_bootstrap_cert, seconds_until_expiration,
-    start_acme_manager, start_acme_manager_for_transports, write_secret_file,
+    CertificateValidityCache, certificate_lifetime_days, certificate_needs_renewal,
+    certificate_validity, days_until_expiration, generate_tls_alpn_01_cert,
+    obtain_or_renew_certificate, obtain_or_renew_certificate_for_transports, record_bootstrap_cert,
+    seconds_until_expiration, start_acme_manager, start_acme_manager_for_transports,
+    write_secret_file,
 };
 pub use acme_http::start_acme_http01_listener;
 pub use doh::{DohConfig, start_doh_listener};

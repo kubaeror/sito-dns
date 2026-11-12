@@ -351,20 +351,6 @@ mod tests {
             addr
         }
 
-        async fn scoped_manager(
-            base: &Config,
-            bootstrap: &BootstrapResolver,
-            addr: SocketAddr,
-        ) -> Arc<UpstreamManager> {
-            let mut upstream_cfg = base.upstream.clone();
-            upstream_cfg.servers = vec![addr.to_string()];
-            Arc::new(
-                UpstreamManager::from_config(&upstream_cfg, bootstrap)
-                    .await
-                    .unwrap(),
-            )
-        }
-
         async fn resolve_ip(pipeline: &DnsPipeline, name: &str, client_ip: &str) -> Ipv4Addr {
             let mut query = Message::new(7, MessageType::Query, OpCode::Query);
             query
@@ -400,18 +386,6 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let key_a = addr_a.to_string();
-        let key_b = addr_b.to_string();
-        let mut scoped = HashMap::new();
-        scoped.insert(
-            key_a.clone(),
-            scoped_manager(&base, &bootstrap, addr_a).await,
-        );
-        scoped.insert(
-            key_b.clone(),
-            scoped_manager(&base, &bootstrap, addr_b).await,
-        );
-
         let clients_cfg = ClientsConfig {
             entries: vec![
                 ClientEntryConfig {
@@ -421,7 +395,7 @@ mod tests {
                     ignore_query_log: false,
                     ignore_stats: true,
                     use_global_upstreams: false,
-                    upstreams: Some(vec![key_a]),
+                    upstreams: Some(vec![addr_a.to_string()]),
                     trusted: false,
                 },
                 ClientEntryConfig {
@@ -431,12 +405,19 @@ mod tests {
                     ignore_query_log: false,
                     ignore_stats: false,
                     use_global_upstreams: false,
-                    upstreams: Some(vec![key_b]),
+                    upstreams: Some(vec![addr_b.to_string()]),
                     trusted: false,
                 },
             ],
             ..Default::default()
         };
+
+        // Build the map exactly as the server does, instead of hand-keying it:
+        // the production key is an inherited-upstream fingerprint, and a plain
+        // `servers.join(",")` lookup silently falls back to the global manager.
+        let scoped = crate::server::build_scoped_upstreams(&base, &clients_cfg, &HashMap::new())
+            .await
+            .expect("the production scoped-upstream builder must accept valid scopes");
 
         let filter =
             Arc::new(HostsFilterEngine::init(base.filtering.clone(), temp_dir.clone()).await);

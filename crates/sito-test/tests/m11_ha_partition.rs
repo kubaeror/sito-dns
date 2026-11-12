@@ -722,6 +722,7 @@ async fn publish_context(dir: &Path, config_path: &Path) -> ServerContext {
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         readiness: Arc::new(sito_api::readiness::ReadinessState::default()),
+        cert_validity_cache: Arc::new(sito_transport::CertificateValidityCache::new()),
         acme_challenges: None,
         dns_starter: None,
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),

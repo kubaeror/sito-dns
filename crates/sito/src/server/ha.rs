@@ -5,11 +5,11 @@ use super::*;
 
 /// Builds per-client upstream managers, reusing existing managers by key so a
 /// hot reload does not re-resolve unchanged upstream scopes.
-pub(super) async fn build_scoped_upstreams(
+pub(crate) async fn build_scoped_upstreams(
     config: &Config,
     clients: &sito_clients::ClientsConfig,
     existing: &HashMap<String, Arc<UpstreamManager>>,
-) -> HashMap<String, Arc<UpstreamManager>> {
+) -> anyhow::Result<HashMap<String, Arc<UpstreamManager>>> {
     // Build from the current config on every call. Capturing a startup resolver
     // here would leave scoped upstreams on old bootstrap/allow_private_targets
     // settings after a hot reload.
@@ -19,13 +19,22 @@ pub(super) async fn build_scoped_upstreams(
         if entry.use_global_upstreams {
             continue;
         }
+        // Validation rejects this, but never let a hand-built registry or an
+        // older persisted document fall through to the global upstreams: a
+        // scoped client with no scope is a policy bypass.
         let Some(ref servers) = entry.upstreams else {
-            continue;
+            anyhow::bail!(
+                "Client '{}' sets use_global_upstreams = false but has no per-client upstreams",
+                entry.name
+            );
         };
         if servers.is_empty() {
-            continue;
+            anyhow::bail!(
+                "Client '{}' sets use_global_upstreams = false but its upstream list is empty",
+                entry.name
+            );
         }
-        let key = scoped_upstream_key(config, servers);
+        let key = sito_runtime::scoped_upstream_key(config, servers);
         if scoped.contains_key(&key) {
             continue;
         }
@@ -36,42 +45,22 @@ pub(super) async fn build_scoped_upstreams(
         let mut upstream_cfg = config.upstream.clone();
         upstream_cfg.servers.clone_from(servers);
         upstream_cfg.per_domain.clear();
-        match UpstreamManager::from_config(&upstream_cfg, &bootstrap).await {
-            Ok(manager) => {
-                info!(
-                    client = %entry.name,
-                    servers = ?servers,
-                    "Initialized per-client upstream scope"
-                );
-                scoped.insert(key, Arc::new(manager));
-            }
-            Err(e) => warn!(
-                client = %entry.name,
-                error = %e,
-                "Failed to initialize per-client upstreams; this client falls back to global upstreams"
-            ),
-        }
+        let manager = UpstreamManager::from_config(&upstream_cfg, &bootstrap)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to initialize per-client upstreams for client '{}': {e}",
+                    entry.name
+                )
+            })?;
+        info!(
+            client = %entry.name,
+            servers = ?servers,
+            "Initialized per-client upstream scope"
+        );
+        scoped.insert(key, Arc::new(manager));
     }
-    scoped
-}
-
-/// Reuse key for a per-client upstream scope.
-///
-/// Includes every inherited `[upstream]` setting that affects manager
-/// construction, not just the server list. Otherwise a reload that only changes
-/// the bootstrap, timeout, strategy, pool size or `allow_private_targets` would
-/// keep the stale manager (and its old SSRF policy) alive.
-pub(super) fn scoped_upstream_key(config: &Config, servers: &[String]) -> String {
-    let up = &config.upstream;
-    format!(
-        "{}|bootstrap={:?}|timeout_ms={}|strategy={:?}|pool_size={}|allow_private_targets={}",
-        servers.join(","),
-        up.bootstrap,
-        up.timeout_ms,
-        up.strategy,
-        up.pool_size,
-        up.allow_private_targets
-    )
+    Ok(scoped)
 }
 
 /// High-availability role setup produced by [`init_ha`].

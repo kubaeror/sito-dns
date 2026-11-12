@@ -37,6 +37,33 @@ use sito_transport::TlsError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Stable key for a per-client upstream scope.
+///
+/// The server builds its scoped-upstream map with this key and the DNS query
+/// path looks it up with the same function. It includes every inherited
+/// `[upstream]` setting that affects manager construction, not just the server
+/// list: a reload that only changes the bootstrap, timeout, strategy, pool size
+/// or `allow_private_targets` must not keep the stale manager (and its old SSRF
+/// policy) alive.
+///
+/// Keeping this in one place is deliberate. The builder and the query path
+/// previously formatted keys independently, so the production map was keyed by
+/// a fingerprint while lookups used a plain `servers.join(",")`; every scoped
+/// client silently fell back to the global upstreams.
+#[must_use]
+pub fn scoped_upstream_key(config: &Config, servers: &[String]) -> String {
+    let up = &config.upstream;
+    format!(
+        "{}|bootstrap={:?}|timeout_ms={}|strategy={:?}|pool_size={}|allow_private_targets={}",
+        servers.join(","),
+        up.bootstrap,
+        up.timeout_ms,
+        up.strategy,
+        up.pool_size,
+        up.allow_private_targets
+    )
+}
+
 /// Monotonic generation of one runtime configuration.
 ///
 /// This is the cache's [`PolicyEpoch`] under its runtime name: there is one

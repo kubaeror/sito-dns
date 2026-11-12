@@ -18,6 +18,7 @@ pub(super) fn build_tls_acceptor(
     alpn: &[Vec<u8>],
     challenge_keys: Option<Arc<dashmap::DashMap<String, Arc<rustls::sign::CertifiedKey>>>>,
     cert_watchers: &mut Vec<sito_transport::CertWatcher>,
+    on_cert_reload: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> anyhow::Result<TlsAcceptorManager> {
     let config = match challenge_keys.clone() {
         Some(keys) => {
@@ -31,7 +32,7 @@ pub(super) fn build_tls_acceptor(
         Some(keys) => TlsAcceptorManager::with_challenge_keys(config, keys),
         None => TlsAcceptorManager::new(config),
     };
-    match CertWatcher::start(cert, key, sni_tuples, alpn, manager.clone()) {
+    match CertWatcher::start(cert, key, sni_tuples, alpn, manager.clone(), on_cert_reload) {
         Ok(watcher) => cert_watchers.push(watcher),
         Err(e) => warn!(protocol, "Certificate watcher failed to start: {e}"),
     }
@@ -123,24 +124,15 @@ use sito_transport::CertificateValidity;
 pub(super) fn tls_certificate_readiness(
     validity: CertificateValidity,
 ) -> sito_api::ComponentReadiness {
-    match validity {
-        CertificateValidity::Expired => sito_api::ComponentReadiness::unavailable(
-            "tls_cert_expired",
-            "configured static TLS certificate is expired; encrypted listeners cannot serve",
-        ),
-        CertificateValidity::Expiring { days_remaining } => sito_api::ComponentReadiness::degraded(
-            "tls_cert_expiring",
-            format!("configured static TLS certificate expires in {days_remaining} day(s)"),
-        ),
-        CertificateValidity::Valid { .. }
-        | CertificateValidity::Missing
-        | CertificateValidity::Bootstrap => sito_api::ComponentReadiness::ready(),
-    }
+    sito_api::tls_certificate_readiness(validity)
 }
 
 /// Whether an enabled ACME deployment has a usable current certificate that
 /// takes precedence over the static pair (D12 ACME + static matrix).
-fn acme_has_serving_certificate(config: &Config) -> bool {
+fn acme_has_serving_certificate(
+    config: &Config,
+    cert_validity_cache: &sito_transport::CertificateValidityCache,
+) -> bool {
     let Some(acme) = config.get_acme_config().filter(|acme| acme.enabled) else {
         return false;
     };
@@ -156,7 +148,7 @@ fn acme_has_serving_certificate(config: &Config) -> bool {
         storage_dir,
     );
     matches!(
-        service.certificate_validity(),
+        cert_validity_cache.acme_validity(&service),
         CertificateValidity::Valid { .. } | CertificateValidity::Expiring { .. }
     )
 }
@@ -172,6 +164,7 @@ pub(super) fn publish_tls_readiness(
     config: &Config,
     acceptors: Option<&ListenerAcceptors>,
     init_error: Option<&anyhow::Error>,
+    cert_validity_cache: &sito_transport::CertificateValidityCache,
 ) {
     if let Some(error) = init_error {
         warn!(error = %error, "TLS initialization failed; encrypted listeners are not serving");
@@ -201,7 +194,7 @@ pub(super) fn publish_tls_readiness(
             "tls_acceptor_unavailable",
             "configured TLS material has no usable acceptor; encrypted listeners are not serving",
         );
-    } else if static_tls_configured && !acme_has_serving_certificate(config) {
+    } else if static_tls_configured && !acme_has_serving_certificate(config, cert_validity_cache) {
         // D12 static-certificate ladder: expiry at runtime is a readiness
         // signal, not just an acceptor-presence check. An ACME certificate
         // that is currently valid takes precedence over the static pair.
@@ -209,7 +202,7 @@ pub(super) fn publish_tls_readiness(
             .get_tls_config()
             .and_then(|tls| tls.cert.as_deref())
             .map_or(CertificateValidity::Missing, |path| {
-                sito_transport::certificate_validity(path)
+                cert_validity_cache.validity(path)
             });
         match tls_certificate_readiness(validity) {
             readiness_state if !readiness_state.ready => {
@@ -243,6 +236,8 @@ pub(super) async fn init_tls_and_acme(
     shutdown_rx: &watch::Receiver<bool>,
     listener_acceptors: &tokio::sync::Mutex<Option<ListenerAcceptors>>,
     acme_challenges: &sito_transport::AcmeChallengeAvailability,
+    readiness: &sito_api::ReadinessState,
+    cert_validity_cache: &Arc<sito_transport::CertificateValidityCache>,
 ) -> anyhow::Result<Vec<sito_transport::CertWatcher>> {
     // ACME and TLS setup
     let acme_cfg = config.get_acme_config();
@@ -377,6 +372,19 @@ pub(super) async fn init_tls_and_acme(
     // Kept alive for the lifetime of the server so certificate hot-reload works.
     let mut cert_watchers: Vec<sito_transport::CertWatcher> = Vec::new();
 
+    // A watcher reload changes the material serving on every encrypted
+    // transport. Republish the static-certificate readiness immediately so a
+    // replaced file clears `tls_cert_expired`/`tls_cert_expiring` without a
+    // rebind or restart.
+    let on_cert_reload: Option<Arc<dyn Fn() + Send + Sync>> = {
+        let readiness = readiness.clone();
+        let config = config.clone();
+        let cert_validity_cache = Arc::clone(cert_validity_cache);
+        Some(Arc::new(move || {
+            sito_api::refresh_tls_certificate_readiness(&readiness, &config, &cert_validity_cache);
+        }))
+    };
+
     let (dot_acceptor_mgr, doh_acceptor_mgr, doq_acceptor_mgr, doh3_acceptor_mgr) =
         if let Some((cert, key)) = &material {
             let doh_mgr = build_tls_acceptor(
@@ -387,6 +395,7 @@ pub(super) async fn init_tls_and_acme(
                 &[b"h2".to_vec(), b"http/1.1".to_vec(), b"acme-tls/1".to_vec()],
                 Some(challenge_keys.clone()),
                 &mut cert_watchers,
+                on_cert_reload.clone(),
             )?;
             let dot_mgr = build_tls_acceptor(
                 "dot",
@@ -396,6 +405,7 @@ pub(super) async fn init_tls_and_acme(
                 &[b"dot".to_vec()],
                 None,
                 &mut cert_watchers,
+                on_cert_reload.clone(),
             )?;
             let doq_mgr = build_tls_acceptor(
                 "doq",
@@ -405,6 +415,7 @@ pub(super) async fn init_tls_and_acme(
                 &[b"doq".to_vec()],
                 None,
                 &mut cert_watchers,
+                on_cert_reload.clone(),
             )?;
             let doh3_mgr = build_tls_acceptor(
                 "doh3",
@@ -414,6 +425,7 @@ pub(super) async fn init_tls_and_acme(
                 &[b"h3".to_vec()],
                 None,
                 &mut cert_watchers,
+                on_cert_reload.clone(),
             )?;
             (Some(dot_mgr), Some(doh_mgr), Some(doq_mgr), Some(doh3_mgr))
         } else {
