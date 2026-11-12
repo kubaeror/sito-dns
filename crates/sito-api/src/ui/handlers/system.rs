@@ -13,7 +13,7 @@ pub async fn system_page(State(ctx): State<ServerContext>, headers: HeaderMap) -
     };
     let csrf = get_csrf_token(&ctx, &headers);
 
-    let status = get_status_response(&ctx);
+    let status = get_status_response(&ctx).await;
     let uptime_str = format_duration(status.uptime_seconds);
 
     HtmlTemplate(SystemTemplate {

@@ -130,11 +130,7 @@ impl HostsFilterEngine {
                 // a clients/groups save must enforce the new group rules now,
                 // not at the next scheduled refresh.
                 let staged = self.staging_engine(Some(groups));
-                let list_rules = staged
-                    .list_rules
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
+                let list_rules = sito_core::sync::lock_or_recover(&staged.list_rules).clone();
                 if let Some(degraded) = staged.rebuild_group_snapshots(&list_rules) {
                     status.degraded_groups = degraded;
                 }
@@ -199,20 +195,14 @@ impl HostsFilterEngine {
             config: ArcSwap::new(self.config.load_full()),
             data_dir: self.data_dir.clone(),
             list_rules: std::sync::Mutex::new(
-                self.list_rules
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
+                sito_core::sync::lock_or_recover(&self.list_rules).clone(),
             ),
             reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             status: ArcSwap::new(Arc::new(self.status())),
             group_defs: ArcSwap::new(Arc::new(group_defs)),
             group_snapshots: ArcSwap::new(self.group_snapshots()),
             compile_observer: std::sync::RwLock::new(
-                self.compile_observer
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
+                sito_core::sync::read_or_recover(&self.compile_observer).clone(),
             ),
             // Staging must not publish metrics/status before the snapshot is
             // committed; the live engine's observer fires in `publish_prepared`.

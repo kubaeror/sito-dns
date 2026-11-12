@@ -127,9 +127,7 @@ fn take_warning_slot(source: &str) -> Option<bool> {
     static LIMITS: OnceLock<Mutex<HashMap<String, (Instant, usize)>>> = OnceLock::new();
     let limits = LIMITS.get_or_init(|| Mutex::new(HashMap::new()));
     let now = Instant::now();
-    let mut guard = limits
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = sito_core::sync::lock_or_recover(limits);
     let entry = guard
         .entry(source.to_string())
         .or_insert_with(|| (now, 0usize));

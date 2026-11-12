@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
@@ -317,7 +317,7 @@ struct TokensFile {
 /// Locks a mutex, recovering the guard when the lock was poisoned by a panic
 /// in another task instead of propagating the panic.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    sito_core::sync::lock_or_recover(mutex)
 }
 
 /// A fixed Argon2 hash used to keep the unknown-username login path as
@@ -380,9 +380,7 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
         // start of a write that is then rejected (and interleave another
         // mutation while it is still in flight).
         let signal = {
-            let mut signals = SECRET_WRITE_START_SIGNALS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut signals = sito_core::sync::lock_or_recover(&SECRET_WRITE_START_SIGNALS);
             signals
                 .iter()
                 .position(|(signal_path, _)| signal_path == path)
@@ -392,9 +390,7 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
             let _ = sender.send(());
         }
         let delay = {
-            let mut delays = SECRET_WRITE_DELAYS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut delays = sito_core::sync::lock_or_recover(&SECRET_WRITE_DELAYS);
             delays
                 .iter()
                 .position(|(delayed_path, _)| delayed_path == path)
@@ -404,9 +400,7 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
             std::thread::sleep(delay);
         }
         let should_fail = {
-            let mut rules = SECRET_WRITE_FAIL_AFTER
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut rules = sito_core::sync::lock_or_recover(&SECRET_WRITE_FAIL_AFTER);
             if let Some(index) = rules.iter().position(|(rule_path, _)| rule_path == path) {
                 if rules[index].1 == 0 {
                     rules.remove(index);
@@ -425,9 +419,7 @@ fn write_secret_file(path: &Path, content: &str) -> std::io::Result<()> {
                 "injected users-file write failure",
             ));
         }
-        SECRET_WRITE_THREADS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        sito_core::sync::lock_or_recover(&SECRET_WRITE_THREADS)
             .push((path.to_path_buf(), std::thread::current().id()));
     }
     if let Some(parent) = path.parent() {

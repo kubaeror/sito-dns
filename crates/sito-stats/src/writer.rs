@@ -139,6 +139,12 @@ pub struct QueryLogSender {
 }
 
 impl QueryLogSender {
+    /// Whether the writer task has exited (the channel is closed).
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// Attempts to enqueue a query log entry.
     ///
     /// If anonymization is enabled, masks the client IP address.

@@ -13,7 +13,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio_rustls::TlsAcceptor;
@@ -657,7 +657,7 @@ impl CertWatcher {
                 // Linux; re-register it so later in-place changes are still
                 // noticed.
                 if let Some(watcher) = task_watcher.upgrade() {
-                    let mut watcher = watcher.lock().unwrap_or_else(PoisonError::into_inner);
+                    let mut watcher = sito_core::sync::lock_or_recover(&watcher);
                     register_watches(&mut watcher, &task_files);
                 }
 

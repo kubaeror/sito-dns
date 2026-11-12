@@ -232,45 +232,23 @@ pub async fn setup_pending_middleware(
     (StatusCode::FOUND, [(axum::http::header::LOCATION, target)]).into_response()
 }
 
-/// Unauthenticated liveness probe that also reports whether the first-run
-/// setup wizard is still pending (used by the container healthcheck).
-async fn health_handler(State(ctx): State<ServerContext>) -> impl IntoResponse {
-    let cfg = ctx.config.load();
-    let ha_required = crate::state::ha_readiness_required(&cfg);
-    let ha = ctx.ha_readiness(&cfg);
-    // This endpoint is unauthenticated and reachable wherever the web listener
-    // is bound. Expose only a generic reason; the detailed cause (certificate
-    // path, OS error, master URL, validation text) stays in the authenticated
-    // `/api/v1/ha/status` response and the server logs.
-    let ha_reason = if ha.ready {
-        None
+/// Generic readiness probe.
+///
+/// Unauthenticated and intentionally opaque: it reports only `ok` or
+/// `unavailable`. Component details, reason codes, error text and configuration
+/// values stay on the authenticated `/status` endpoint and in the logs
+/// (P2-89/P2-87).
+pub(crate) async fn health_handler(State(ctx): State<ServerContext>) -> impl IntoResponse {
+    // Blocking-only report: no stats DB probe on the unauthenticated probe.
+    let report = ctx.health_report();
+    if report.ready {
+        (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
     } else {
-        Some("HA replication is not ready")
-    };
-    // D12: expose a stable challenge/issuance reason code without leaking any
-    // filesystem path, ACME account detail or certificate error text. This
-    // endpoint is unauthenticated, so `last_error` stays on `/api/v1/status`.
-    let acme = ctx.acme_readiness(&cfg);
-    let acme_reason = acme.reason;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "setup_pending": ctx.is_setup_pending(),
-            // The container healthcheck (and any external probe) must be able
-            // to distinguish a healthy DNS listener from a broken HA role.
-            "ha": {
-                "required": ha_required,
-                "ready": ha.ready,
-                "reason": ha_reason,
-            },
-            "acme": {
-                "enabled": acme.enabled,
-                "ready": acme.ready,
-                "reason": acme_reason,
-            },
-        })),
-    )
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "unavailable" })),
+        )
+    }
 }
 
 async fn not_found_handler() -> impl IntoResponse {
@@ -477,4 +455,78 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
             ctx,
             crate::security::security_headers_middleware,
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use std::sync::Arc;
+
+    async fn health_body(ctx: ServerContext) -> (StatusCode, serde_json::Value) {
+        let response = health_handler(State(ctx)).await.into_response();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read health body");
+        let body = serde_json::from_slice(&bytes).expect("health body must be JSON");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn test_health_is_generic_and_opaque_when_ready() {
+        let temp_dir = crate::test_support::temp_dir("sito_health_ready");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let (status, body) = health_body(ctx).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({ "status": "ok" }));
+        assert!(
+            body.get("ha").is_none() && body.get("acme").is_none(),
+            "/health must not expose component details: {body}"
+        );
+        assert!(
+            body.get("setup_pending").is_none(),
+            "/health must stay the generic liveness/readiness probe: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_health_unavailable_when_listeners_are_broken() {
+        let temp_dir = crate::test_support::temp_dir("sito_health_listeners");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.readiness
+            .set_listeners_unavailable("listener_bind_failed", "no DNS listener is bound");
+
+        let (status, body) = health_body(ctx).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, serde_json::json!({ "status": "unavailable" }));
+        assert!(
+            !body.to_string().contains("listener_bind_failed"),
+            "the public probe must not leak readiness reasons: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_health_unavailable_when_ha_is_broken() {
+        let temp_dir = crate::test_support::temp_dir("sito_health_ha");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let mut config = (*ctx.config.load_full()).clone();
+        config.ha = Some(toml::from_str("replication_port = 8953").expect("valid ha table"));
+        ctx.config.store(Arc::new(config));
+
+        let (status, body) = health_body(ctx).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a master with a configured replication listener but no coordinator is not ready"
+        );
+        assert_eq!(body, serde_json::json!({ "status": "unavailable" }));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

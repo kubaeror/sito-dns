@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use std::sync::PoisonError;
 
 fn auth_temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("sito_auth_{label}_{}", rand::random::<u64>()));

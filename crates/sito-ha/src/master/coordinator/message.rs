@@ -74,7 +74,7 @@ impl MasterCoordinator {
         // Ignore acknowledgements from a superseded connection: the
         // entry now belongs to a newer session.
         let owned = {
-            let slaves = self.slaves.lock().unwrap();
+            let slaves = sito_core::sync::lock_or_recover(&self.slaves);
             slaves
                 .get(slave_instance)
                 .is_some_and(|s| s.connection_id == connection_id)
@@ -156,7 +156,8 @@ impl MasterCoordinator {
                     "{reason}"
                 );
                 self.mark_diverged(DivergenceKind::Fork, slave_instance, version, term, reason);
-                if let Some(slave) = self.slaves.lock().unwrap().get_mut(slave_instance)
+                if let Some(slave) =
+                    sito_core::sync::lock_or_recover(&self.slaves).get_mut(slave_instance)
                     && slave.connection_id == connection_id
                 {
                     slave.synced_version = 0;
@@ -192,7 +193,7 @@ impl MasterCoordinator {
                 term,
                 "Slave successfully applied configuration bundle"
             );
-            let mut slaves = self.slaves.lock().unwrap();
+            let mut slaves = sito_core::sync::lock_or_recover(&self.slaves);
             if let Some(s) = slaves.get_mut(slave_instance)
                 && s.connection_id == connection_id
             {
@@ -206,7 +207,7 @@ impl MasterCoordinator {
             #[allow(clippy::cast_precision_loss)]
             self.metrics
                 .set_ha_config_version(slave_instance, version as f64);
-            self.stale_repushes.lock().unwrap().remove(slave_instance);
+            sito_core::sync::lock_or_recover(&self.stale_repushes).remove(slave_instance);
             // This slave has accepted the current term/version, so any
             // divergence record for it (fork, ahead, newer-term) is now
             // resolved. Other slaves' records are untouched: H-10
@@ -256,7 +257,7 @@ impl MasterCoordinator {
         upstreams: &HashMap<String, crate::protocol::UpstreamReport>,
     ) -> bool {
         let upstreams_count = upstreams.len();
-        let mut slaves = self.slaves.lock().unwrap();
+        let mut slaves = sito_core::sync::lock_or_recover(&self.slaves);
         let Some(s) = slaves.get_mut(slave_instance) else {
             return true;
         };
@@ -279,7 +280,7 @@ impl MasterCoordinator {
         true
     }
     fn process_pong(&self, slave_instance: &str, connection_id: u64) {
-        let mut slaves = self.slaves.lock().unwrap();
+        let mut slaves = sito_core::sync::lock_or_recover(&self.slaves);
         if let Some(s) = slaves.get_mut(slave_instance)
             && s.connection_id == connection_id
         {
@@ -287,9 +288,9 @@ impl MasterCoordinator {
         }
     }
     fn process_hello(&self, slave_instance: &str, connection_id: u64) {
-        if let Some(ref push) = *self.active_push.lock().unwrap() {
+        if let Some(ref push) = *sito_core::sync::lock_or_recover(&self.active_push) {
             let sender = {
-                let slaves = self.slaves.lock().unwrap();
+                let slaves = sito_core::sync::lock_or_recover(&self.slaves);
                 slaves
                     .get(slave_instance)
                     .filter(|s| s.connection_id == connection_id)

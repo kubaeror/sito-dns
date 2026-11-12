@@ -250,10 +250,7 @@ impl RuntimeLists {
         // Serialize the clone-modify-store sequence: concurrent refreshes of
         // different categories would otherwise publish registries missing each
         // other's update (lost update).
-        let _apply_guard = self
-            .apply_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _apply_guard = sito_core::sync::lock_or_recover(&self.apply_lock);
 
         let (entries, new_parental, new_services) = if category.eq_ignore_ascii_case("services") {
             let registry = ServiceRegistry::from_json(content).map_err(|e| e.to_string())?;
@@ -272,12 +269,13 @@ impl RuntimeLists {
         // An empty response is always rejected while any content is active so
         // a broken first fetch cannot silently disable protection.
         let category_key = category.to_ascii_lowercase();
-        let previous_status = self.statuses.read().ok().and_then(|statuses| {
+        let previous_status = {
+            let statuses = sito_core::sync::read_or_recover(&self.statuses);
             statuses
                 .get(category)
                 .or_else(|| statuses.get(&category_key))
                 .cloned()
-        });
+        };
         let previous = previous_status.as_ref().map_or(0, |status| status.entries);
         let was_bundled = previous_status.as_ref().is_none_or(|status| status.bundled);
         let truncating = entries == 0 || entries.saturating_mul(2) < previous;

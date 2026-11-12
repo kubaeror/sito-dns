@@ -725,10 +725,16 @@ pub(crate) mod test_support {
                     // Persist failures must leave the live configuration
                     // untouched, exactly like the production applier.
                     self.runtime.replace((*previous).clone());
-                    let _ = self
+                    if let Err(reload_err) = self
                         .filter
                         .reload_with_config(&previous_config.filtering)
-                        .await;
+                        .await
+                    {
+                        tracing::error!(
+                            error = %reload_err,
+                            "Failed to restore the previous filter configuration after a persist failure"
+                        );
+                    }
                     return Err(e.to_string());
                 }
                 Ok(())

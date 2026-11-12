@@ -80,7 +80,8 @@ impl DnsListenerManager {
         )
         .await?;
 
-        if let Ok(mut registry) = rate_limiters.lock() {
+        {
+            let mut registry = sito_core::sync::lock_or_recover(&rate_limiters);
             registry.clear();
             registry.extend(limiters);
         }
@@ -98,11 +99,18 @@ impl DnsListenerManager {
         self.plan != ListenerPlan::from_config(config)
     }
 
+    /// Whether this manager owns at least one running listener task.
+    ///
+    /// A failed rebind that restored the previous generation keeps this true;
+    /// a rebind whose revert also failed leaves it false, and readiness must
+    /// report the DNS listener as unavailable.
+    pub(super) fn is_running(&self) -> bool {
+        !self.handles.is_empty()
+    }
+
     pub(super) async fn stop(&mut self) {
         let _ = self.shutdown_tx.send(true);
-        if let Ok(mut registry) = self.rate_limiters.lock() {
-            registry.clear();
-        }
+        sito_core::sync::lock_or_recover(&self.rate_limiters).clear();
         for handle in self.handles.drain(..) {
             let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         }

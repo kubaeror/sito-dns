@@ -139,6 +139,23 @@ function over 200 lines without a matching `(file, function)` row fails CI.
 Changes to either script, the helper, or the exception list are classified as
 code changes so the test lane re-runs them.
 
+## Error-swallowing allowlist
+
+`bash scripts/check-error-swallowing.sh` enforces the D14 reviewed allowlist.
+`scripts/find-error-swallowing.py` scans production Rust sources (inline
+`#[cfg(test)]` items and `tests/` targets are skipped) for `let _ =`/`.ok()`
+around security/config-apply/persistence/readiness calls: secret writes,
+`persist`/`publish`/`save`/`store`, `reload`/`flush`/`shutdown`, `lease`/
+`bootstrap`, `readiness`/`health`, `lock`/`unlock`, `read`/`load`, and the
+existing fsync/rename/remove-file patterns. The scanner joins a statement until
+its parentheses/brackets balance and the terminating `;` is reached, so
+multi-line swallows are detected; formatting macros are excluded so their
+arguments are not mistaken for the swallowed operation.
+`scripts/test-error-swallowing.py` pins those fixtures and runs from the
+checker. Every flagged site must be handled with a typed error or listed in
+`scripts/error-swallowing-allowlist.txt` with a reason in
+`docs/audit6-best-effort.md`.
+
 ## Required check and branch protection
 
 `ci-gate` is the single check that should be required for `main`. It depends on

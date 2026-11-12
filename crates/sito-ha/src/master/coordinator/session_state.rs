@@ -222,11 +222,11 @@ impl<'a> SessionMachine<'a> {
         // previous entry; `connection_id` lets the superseded session detect
         // that it no longer owns the entry.
         {
-            let mut slaves = self.coordinator.slaves.lock().unwrap();
+            let mut slaves = sito_core::sync::lock_or_recover(&self.coordinator.slaves);
             // A reconnecting instance starts with an empty queue; accounting
             // from every superseded session must not leak into the new one.
             {
-                let mut queued = self.coordinator.queued_bytes.lock().unwrap();
+                let mut queued = sito_core::sync::lock_or_recover(&self.coordinator.queued_bytes);
                 queued.retain(|(instance, _), _| instance != slave_instance);
                 queued.insert((slave_instance.clone(), connection_id), 0);
             }
@@ -257,7 +257,7 @@ impl<'a> SessionMachine<'a> {
 
         // Always enqueue the current push on connect; a slave that is already
         // up to date acknowledges without re-applying.
-        if let Some(ref push) = *self.coordinator.active_push.lock().unwrap() {
+        if let Some(ref push) = *sito_core::sync::lock_or_recover(&self.coordinator.active_push) {
             let cur_v = self.coordinator.get_current_version();
             info!(
                 instance = %slave_instance,
@@ -292,7 +292,7 @@ impl<'a> SessionMachine<'a> {
     pub(super) fn heartbeat(&self) -> HeartbeatAction {
         let volume = Duration::from_secs(self.ping_secs.saturating_mul(3));
         let (superseded, stale) = {
-            let slaves = self.coordinator.slaves.lock().unwrap();
+            let slaves = sito_core::sync::lock_or_recover(&self.coordinator.slaves);
             match slaves.get(&self.state.slave_instance) {
                 Some(s) if s.connection_id == self.state.connection_id => {
                     (false, s.last_ping.elapsed() > volume)
@@ -314,7 +314,7 @@ impl<'a> SessionMachine<'a> {
     }
 
     pub(super) fn record_pong(&self) {
-        let mut slaves = self.coordinator.slaves.lock().unwrap();
+        let mut slaves = sito_core::sync::lock_or_recover(&self.coordinator.slaves);
         if let Some(s) = slaves.get_mut(&self.state.slave_instance)
             && s.connection_id == self.state.connection_id
         {

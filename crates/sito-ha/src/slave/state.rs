@@ -108,8 +108,8 @@ impl SlaveStatusTracker {
                 .store(watermark.version, Ordering::SeqCst);
             self.current_term.store(watermark.term, Ordering::SeqCst);
         }
-        *self.watermark.lock().unwrap() = watermark;
-        *self.watermark_path.lock().unwrap() = Some(path);
+        *sito_core::sync::lock_or_recover(&self.watermark) = watermark;
+        *sito_core::sync::lock_or_recover(&self.watermark_path) = Some(path);
         Ok(self)
     }
 
@@ -135,14 +135,12 @@ impl SlaveStatusTracker {
 
     /// Returns the last durably applied bundle watermark, if any.
     pub fn get_watermark(&self) -> Option<AppliedWatermark> {
-        self.watermark.lock().unwrap().clone()
+        sito_core::sync::lock_or_recover(&self.watermark).clone()
     }
 
     /// Returns true when a same-version payload fork has been latched.
     pub fn is_forked(&self) -> bool {
-        self.watermark
-            .lock()
-            .unwrap()
+        sito_core::sync::lock_or_recover(&self.watermark)
             .as_ref()
             .is_some_and(|watermark| watermark.forked)
     }
@@ -171,9 +169,9 @@ impl SlaveStatusTracker {
         // Fail closed: latch in memory before the durable write so a failed
         // write cannot let the next same-term push through. The caller still
         // receives the error and must not treat replication as recovered.
-        *self.watermark.lock().unwrap() = Some(watermark.clone());
+        *sito_core::sync::lock_or_recover(&self.watermark) = Some(watermark.clone());
 
-        if let Some(path) = self.watermark_path.lock().unwrap().clone() {
+        if let Some(path) = sito_core::sync::lock_or_recover(&self.watermark_path).clone() {
             let payload = serde_json::to_vec_pretty(&watermark).map_err(|e| {
                 HaError::Serialization(format!("Failed to serialize HA watermark: {e}"))
             })?;
@@ -242,7 +240,7 @@ impl SlaveStatusTracker {
             applied_config_digest: config_digest.map(str::to_string),
         };
 
-        if let Some(path) = self.watermark_path.lock().unwrap().clone() {
+        if let Some(path) = sito_core::sync::lock_or_recover(&self.watermark_path).clone() {
             let payload = serde_json::to_vec_pretty(&watermark).map_err(|e| {
                 HaError::Serialization(format!("Failed to serialize HA watermark: {e}"))
             })?;
@@ -255,7 +253,7 @@ impl SlaveStatusTracker {
             })?;
         }
 
-        *self.watermark.lock().unwrap() = Some(watermark);
+        *sito_core::sync::lock_or_recover(&self.watermark) = Some(watermark);
         if config_digest.is_some() {
             self.local_config_drift
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -350,11 +348,11 @@ impl SlaveStatusTracker {
     }
 
     pub fn get_state(&self) -> SlaveState {
-        *self.state.lock().unwrap()
+        *sito_core::sync::lock_or_recover(&self.state)
     }
 
     pub fn set_state(&self, new_state: SlaveState) {
-        *self.state.lock().unwrap() = new_state;
+        *sito_core::sync::lock_or_recover(&self.state) = new_state;
     }
 
     pub fn get_version(&self) -> u64 {
@@ -363,7 +361,7 @@ impl SlaveStatusTracker {
 
     /// Records or clears the last connection/handshake failure.
     pub fn set_connection_error(&self, reason: Option<String>) {
-        *self.connection_error.lock().unwrap() = reason;
+        *sito_core::sync::lock_or_recover(&self.connection_error) = reason;
     }
 
     /// Readiness of the slave's replication path.
@@ -374,17 +372,14 @@ impl SlaveStatusTracker {
     /// dead replication link.
     #[must_use]
     pub fn readiness(&self) -> crate::readiness::HaReadiness {
-        if let Some(error) = self.connection_error.lock().unwrap().clone() {
+        if let Some(error) = sito_core::sync::lock_or_recover(&self.connection_error).clone() {
             return crate::readiness::HaReadiness::not_ready(error);
         }
         let state = self.get_state();
         if state == SlaveState::Synced {
             return crate::readiness::HaReadiness::ready();
         }
-        let reason = self
-            .degraded_reason
-            .lock()
-            .unwrap()
+        let reason = sito_core::sync::lock_or_recover(&self.degraded_reason)
             .clone()
             .unwrap_or_else(|| match state {
                 SlaveState::Degraded => "slave is degraded".to_string(),
@@ -413,18 +408,18 @@ impl SlaveStatusTracker {
     pub fn mark_synced_with_term(&self, version: u64, term: u64) {
         self.current_version.store(version, Ordering::SeqCst);
         self.current_term.store(term, Ordering::SeqCst);
-        *self.state.lock().unwrap() = SlaveState::Synced;
-        *self.degraded_reason.lock().unwrap() = None;
-        *self.connection_error.lock().unwrap() = None;
-        *self.last_synced_at.lock().unwrap() = Some(Utc::now());
+        *sito_core::sync::lock_or_recover(&self.state) = SlaveState::Synced;
+        *sito_core::sync::lock_or_recover(&self.degraded_reason) = None;
+        *sito_core::sync::lock_or_recover(&self.connection_error) = None;
+        *sito_core::sync::lock_or_recover(&self.last_synced_at) = Some(Utc::now());
     }
 
     pub fn mark_degraded(&self, reason: String) {
-        *self.state.lock().unwrap() = SlaveState::Degraded;
-        *self.degraded_reason.lock().unwrap() = Some(reason);
+        *sito_core::sync::lock_or_recover(&self.state) = SlaveState::Degraded;
+        *sito_core::sync::lock_or_recover(&self.degraded_reason) = Some(reason);
         // A degraded node is connected (the failure is in the apply path), so
         // do not let an earlier transport error mask the actual reason.
-        *self.connection_error.lock().unwrap() = None;
+        *sito_core::sync::lock_or_recover(&self.connection_error) = None;
     }
 }
 

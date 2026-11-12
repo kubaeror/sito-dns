@@ -10,6 +10,11 @@ pub struct StatusResponse {
     pub uptime_seconds: u64,
     pub role: String,
     pub listeners: Vec<String>,
+    /// Aggregate readiness verdict shared with `/health`.
+    pub ready: bool,
+    /// Per-component readiness reasons (blocking and advisory), in component
+    /// order. Empty when every component is ready.
+    pub reasons: Vec<crate::readiness::ReadinessReason>,
     /// ACME challenge/issuance readiness (D12). Omitted when ACME is disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acme: Option<AcmeStatus>,

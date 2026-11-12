@@ -56,7 +56,7 @@ impl MasterCoordinator {
         if !listener.ready {
             return listener;
         }
-        if let Some(error) = self.last_publish_error.lock().unwrap().clone() {
+        if let Some(error) = sito_core::sync::lock_or_recover(&self.last_publish_error).clone() {
             return HaReadiness::not_ready(format!(
                 "last HA configuration publish failed: {error}"
             ));
@@ -65,7 +65,7 @@ impl MasterCoordinator {
     }
 
     pub(super) fn set_publish_error(&self, error: Option<String>) {
-        *self.last_publish_error.lock().unwrap() = error;
+        *sito_core::sync::lock_or_recover(&self.last_publish_error) = error;
     }
 
     /// Records a publish failure detected before the bundle reaches the
@@ -174,7 +174,7 @@ impl MasterCoordinator {
         &self,
         bundle: &ConfigBundle,
     ) -> std::io::Result<Option<(PathBuf, Vec<u8>)>> {
-        let path = self.state_path.lock().unwrap().clone();
+        let path = sito_core::sync::lock_or_recover(&self.state_path).clone();
         let Some(path) = path else {
             return Ok(None);
         };
@@ -208,7 +208,7 @@ impl MasterCoordinator {
         #[cfg(test)]
         let version = bundle.version;
         #[cfg(test)]
-        let hook = self.state_write_hook.lock().unwrap().clone();
+        let hook = sito_core::sync::lock_or_recover(&self.state_write_hook).clone();
         tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             if let Some(hook) = hook.as_ref() {
@@ -226,7 +226,7 @@ impl MasterCoordinator {
     /// never silently publishes a rollback; the sequence then restarts from a
     /// fresh v1 only when no state can be recovered.
     pub fn restore_state(&self) -> Result<Option<u64>, HaError> {
-        let path = self.state_path.lock().unwrap().clone();
+        let path = sito_core::sync::lock_or_recover(&self.state_path).clone();
         let Some(path) = path else {
             return Ok(None);
         };
@@ -300,8 +300,8 @@ impl MasterCoordinator {
         Self::ensure_push_fits(&push)?;
         self.current_version.store(bundle.version, Ordering::SeqCst);
         self.current_term.store(bundle.term, Ordering::SeqCst);
-        *self.active_bundle.lock().unwrap() = Some(bundle.clone());
-        *self.active_push.lock().unwrap() = Some(push.clone());
+        *sito_core::sync::lock_or_recover(&self.active_bundle) = Some(bundle.clone());
+        *sito_core::sync::lock_or_recover(&self.active_push) = Some(push.clone());
         self.record_published_envelope(&push);
         // Upgrade a legacy state file with the signing-key identity so a
         // future key loss is detectable. A write failure here is actionable:
@@ -348,14 +348,12 @@ impl MasterCoordinator {
     /// Returns true when any divergence (version gap, stale term, or fork) is
     /// currently latched.
     pub fn is_diverged(&self) -> bool {
-        !self.diverged.lock().unwrap().is_empty()
+        !sito_core::sync::lock_or_recover(&self.diverged).is_empty()
     }
 
     /// Returns the most severe recorded divergence reason, if any.
     pub fn diverged_reason(&self) -> Option<String> {
-        self.diverged
-            .lock()
-            .unwrap()
+        sito_core::sync::lock_or_recover(&self.diverged)
             .values()
             .max_by_key(|d| (d.kind, d.acked_version, d.acked_term))
             .map(|d| d.reason.clone())

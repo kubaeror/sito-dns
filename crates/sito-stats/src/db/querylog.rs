@@ -302,36 +302,20 @@ impl StatsDb {
     /// Invalidates all cached dashboard aggregates. Called after clear and
     /// retention so the next dashboard poll reflects the deleted history.
     pub fn invalidate_stats_cache(&self) {
-        let mut global = self
-            .cache
-            .global
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut global = sito_core::sync::lock_or_recover(&self.cache.global);
         *global = None;
         drop(global);
-        let mut hourly = self
-            .cache
-            .hourly
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut hourly = sito_core::sync::lock_or_recover(&self.cache.hourly);
         *hourly = None;
         drop(hourly);
-        let mut upstream = self
-            .cache
-            .upstream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut upstream = sito_core::sync::lock_or_recover(&self.cache.upstream);
         *upstream = None;
     }
 
     /// Dashboard global statistics served from a short-lived cache.
     pub async fn get_global_stats_cached(&self, window_ms: i64) -> Result<GlobalStats, StatsError> {
         {
-            let guard = self
-                .cache
-                .global
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = sito_core::sync::lock_or_recover(&self.cache.global);
             if let Some(cached) = guard.as_ref()
                 && cached.window_ms == window_ms
                 && cached.at.elapsed() < DASHBOARD_CACHE_TTL
@@ -341,11 +325,7 @@ impl StatsDb {
         }
 
         let value = self.get_global_stats(window_ms).await?;
-        let mut guard = self
-            .cache
-            .global
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = sito_core::sync::lock_or_recover(&self.cache.global);
         *guard = Some(CachedGlobal {
             window_ms,
             at: Instant::now(),
@@ -360,11 +340,7 @@ impl StatsDb {
         window_ms: i64,
     ) -> Result<Vec<UpstreamStats>, StatsError> {
         {
-            let guard = self
-                .cache
-                .upstream
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = sito_core::sync::lock_or_recover(&self.cache.upstream);
             if let Some(cached) = guard.as_ref()
                 && cached.window_ms == window_ms
                 && cached.at.elapsed() < DASHBOARD_CACHE_TTL
@@ -374,11 +350,7 @@ impl StatsDb {
         }
 
         let value = self.get_upstream_stats(window_ms).await?;
-        let mut guard = self
-            .cache
-            .upstream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = sito_core::sync::lock_or_recover(&self.cache.upstream);
         *guard = Some(CachedUpstream {
             window_ms,
             at: Instant::now(),
@@ -393,11 +365,7 @@ impl StatsDb {
         hours: u32,
     ) -> Result<Vec<HourlyActivity>, StatsError> {
         {
-            let guard = self
-                .cache
-                .hourly
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = sito_core::sync::lock_or_recover(&self.cache.hourly);
             if let Some(cached) = guard.as_ref()
                 && cached.hours == hours
                 && cached.at.elapsed() < DASHBOARD_CACHE_TTL
@@ -407,11 +375,7 @@ impl StatsDb {
         }
 
         let value = self.get_hourly_activity(hours).await?;
-        let mut guard = self
-            .cache
-            .hourly
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = sito_core::sync::lock_or_recover(&self.cache.hourly);
         *guard = Some(CachedHourly {
             hours,
             at: Instant::now(),

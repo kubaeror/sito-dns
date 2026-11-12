@@ -81,6 +81,43 @@ impl Drop for ServiceLease {
     }
 }
 
+/// Acquires the service lease with the operator-facing error message used by
+/// the server startup path.
+pub fn acquire_service_lease(data_dir: &Path) -> anyhow::Result<ServiceLease> {
+    ServiceLease::acquire(data_dir).map_err(|e| {
+        if e.kind() == io::ErrorKind::WouldBlock {
+            anyhow::anyhow!(
+                "Another sito server is already running for data directory '{}'. Stop it before starting a second instance. ({e})",
+                data_dir.display()
+            )
+        } else {
+            anyhow::anyhow!(
+                "Failed to acquire the service lease in '{}': {e}",
+                data_dir.display()
+            )
+        }
+    })
+}
+
+/// Acquires the service lease and then runs a bootstrap mutation while holding
+/// it.
+///
+/// P2-90: `--no-setup` used to write `users.toml` (and print a random admin
+/// password) before `run_server_full` acquired the lease. A concurrent start
+/// could therefore rotate credentials that the winner would never use. This
+/// helper is the only supported way to run a bootstrap mutation: the closure
+/// does not run unless this process owns the lease, and the returned lease must
+/// be passed into [`crate::server::run_server_with_lease`] so it is held for
+/// the whole server lifetime and the whole bootstrap operation.
+pub fn with_service_lease<T>(
+    data_dir: &Path,
+    bootstrap: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<(T, ServiceLease)> {
+    let lease = acquire_service_lease(data_dir)?;
+    let value = bootstrap()?;
+    Ok((value, lease))
+}
+
 /// Reports whether a server is running for `data_dir` without disturbing it.
 ///
 /// IO errors other than a missing lease file are propagated so callers can
@@ -159,6 +196,42 @@ mod tests {
         let _lease = ServiceLease::acquire(&dir).unwrap();
         let err = ServiceLease::acquire(&dir).expect_err("second lease must fail");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-90: a held lease must prevent a second process from running any
+    /// bootstrap mutation. No timing is involved: the contender is refused
+    /// before the closure is invoked, so `users.toml`/`config.toml` cannot be
+    /// rotated or printed by the losing process.
+    #[test]
+    fn test_held_lease_prevents_bootstrap_mutation() {
+        let dir = temp_dir("bootstrap_guard");
+        let held = ServiceLease::acquire(&dir).unwrap();
+        let ran = std::sync::atomic::AtomicBool::new(false);
+
+        let result = with_service_lease(&dir, || {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::fs::write(dir.join("users.toml"), "admin:rotated")?;
+            Ok::<_, anyhow::Error>(())
+        });
+        assert!(result.is_err(), "a held lease must refuse the bootstrap");
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the bootstrap closure must not run while another process owns the lease"
+        );
+        assert!(
+            !dir.join("users.toml").exists(),
+            "the contender must not write bootstrap credentials"
+        );
+
+        drop(held);
+        let ((), lease) = with_service_lease(&dir, || {
+            std::fs::write(dir.join("users.toml"), "admin:bootstrapped")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .expect("the bootstrap must run once the lease is released");
+        assert!(dir.join("users.toml").exists());
+        drop(lease);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

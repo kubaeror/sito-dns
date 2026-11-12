@@ -14,6 +14,7 @@ pub mod engine;
 pub mod error;
 pub mod net;
 pub mod ssrf;
+pub mod sync;
 pub mod verdict;
 
 pub use client::{ClientContext, ClientId, ClientIdentity, ClientIdentityRef, IdentitySource};

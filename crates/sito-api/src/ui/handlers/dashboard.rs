@@ -60,7 +60,7 @@ pub async fn dashboard_page(State(ctx): State<ServerContext>, headers: HeaderMap
         .get_global_stats_cached(86_400_000)
         .await
         .unwrap_or_default();
-    let status = get_status_response(&ctx);
+    let status = get_status_response(&ctx).await;
     let uptime_str = format_duration(status.uptime_seconds);
     let blocked_pct_str = format!("{:.1}", stats.blocked_percentage);
     let upstreams = get_upstreams_list(&ctx).await;
@@ -110,7 +110,7 @@ pub async fn dashboard_stats_partial(
         .get_global_stats_cached(86_400_000)
         .await
         .unwrap_or_default();
-    let status = get_status_response(&ctx);
+    let status = get_status_response(&ctx).await;
     let uptime_str = format_duration(status.uptime_seconds);
     let blocked_pct_str = format!("{:.1}", stats.blocked_percentage);
 

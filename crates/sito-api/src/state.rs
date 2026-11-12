@@ -8,6 +8,7 @@ use sito_core::config::Config;
 use sito_filter::HostsFilterEngine;
 use sito_rewrites::RewriteTable;
 use sito_stats::{MetricsRegistry, QueryLogSender, StatsDb};
+use sito_transport::{AcmeServiceConfig, CertificateValidity};
 use sito_upstream::UpstreamManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,6 +42,9 @@ pub struct ServerContext {
     pub slave_tracker: Option<sito_ha::SlaveStatusTracker>,
     pub resync_sender: Option<tokio::sync::mpsc::Sender<()>>,
     pub setup_pending: Arc<AtomicBool>,
+    /// Server-owned readiness (listeners/TLS) published by the DNS startup
+    /// path and read by `/health` and `/status`.
+    pub readiness: Arc<crate::readiness::ReadinessState>,
     /// Live ACME challenge-listener state when ACME is enabled; used by
     /// readiness reporting (D12 `acme_challenge_unavailable`).
     pub acme_challenges: Option<sito_transport::AcmeChallengeAvailability>,
@@ -73,7 +77,8 @@ fn acme_readiness_for(
     challenges: Option<&sito_transport::AcmeChallengeAvailability>,
     config: &Config,
 ) -> AcmeReadiness {
-    let enabled = config.get_acme_config().is_some_and(|acme| acme.enabled);
+    let acme_cfg = config.get_acme_config();
+    let enabled = acme_cfg.as_ref().is_some_and(|acme| acme.enabled);
     if !enabled {
         return AcmeReadiness {
             enabled: false,
@@ -96,13 +101,16 @@ fn acme_readiness_for(
     };
     let options = challenges.options();
     let last_error = challenges.last_error();
-    let (ready, reason) = if challenges.challenge_unavailable() {
-        (false, Some("acme_challenge_unavailable"))
-    } else if last_error.is_some() {
-        (false, Some("acme_issuance_failed"))
-    } else {
-        (true, None)
-    };
+    let validity = acme_cfg
+        .as_ref()
+        .map_or(CertificateValidity::Missing, |acme| {
+            acme_certificate_validity(config, acme)
+        });
+    let (ready, reason) = acme_readiness_state(
+        challenges.challenge_unavailable(),
+        validity,
+        last_error.is_some(),
+    );
     AcmeReadiness {
         enabled,
         ready,
@@ -110,6 +118,67 @@ fn acme_readiness_for(
         tls_alpn_available: options.tls_alpn_available,
         reason,
         last_error,
+    }
+}
+
+/// Returns the effective ACME certificate validity for readiness.
+fn acme_certificate_validity(
+    config: &Config,
+    acme: &sito_core::config::AcmeConfig,
+) -> CertificateValidity {
+    let storage_dir = acme
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| config.server.data_dir.join("acme"));
+    let service = AcmeServiceConfig::new(
+        acme.email
+            .clone()
+            .unwrap_or_else(|| "admin@example.com".to_string()),
+        acme.domains.clone(),
+        storage_dir,
+    );
+    service.certificate_validity()
+}
+
+/// D12 readiness ladder for a challenge path and certificate lifetime.
+///
+/// A valid certificate keeps serving while renewal retries (degraded, not
+/// blocking); an expiring certificate is also degraded; an expired certificate
+/// or a missing challenge path is not-ready. A first boot with no certificate
+/// yet and no error is issuance-pending (advisory): DNS listeners still bind.
+fn acme_readiness_state(
+    challenge_unavailable: bool,
+    validity: CertificateValidity,
+    renewal_error: bool,
+) -> (bool, Option<&'static str>) {
+    if challenge_unavailable {
+        return (false, Some("acme_challenge_unavailable"));
+    }
+    match validity {
+        CertificateValidity::Missing => {
+            if renewal_error {
+                (false, Some("acme_issuance_failed"))
+            } else {
+                (true, Some("acme_issuance_pending"))
+            }
+        }
+        CertificateValidity::Bootstrap => (true, Some("acme_bootstrap_cert")),
+        CertificateValidity::Expired => (false, Some("acme_cert_expired")),
+        CertificateValidity::Expiring { .. } => (
+            true,
+            Some(if renewal_error {
+                "acme_renewal_failed"
+            } else {
+                "acme_cert_expiring"
+            }),
+        ),
+        CertificateValidity::Valid { .. } => {
+            if renewal_error {
+                (true, Some("acme_renewal_failed"))
+            } else {
+                (true, None)
+            }
+        }
     }
 }
 
@@ -175,6 +244,73 @@ impl ServerContext {
     #[must_use]
     pub fn acme_readiness(&self, config: &Config) -> AcmeReadiness {
         acme_readiness_for(self.acme_challenges.as_ref(), config)
+    }
+
+    /// Blocking-only readiness used by the unauthenticated `/health` probe.
+    ///
+    /// The advisory stats database probe is deliberately excluded: `/health`
+    /// only renders the status word, so running a `SELECT 1` there would add
+    /// unauthenticated storage I/O without changing the response. `/status` and
+    /// the UI use [`Self::readiness_report`], which includes the probe.
+    #[must_use]
+    pub fn health_report(&self) -> crate::readiness::ReadinessReport {
+        self.build_readiness_report(None)
+    }
+
+    /// Aggregated readiness used by `/status` and the UI.
+    ///
+    /// Blocking components are listeners, TLS, ACME, HA and a filter engine
+    /// with no usable snapshot. A retained/partial filter snapshot, an expiring
+    /// certificate and a stats database/writer outage are advisory reasons
+    /// only: resolution still works, so they are surfaced in `/status` without
+    /// failing `/health` (P2-89/D8/D12 policy).
+    pub async fn readiness_report(&self) -> crate::readiness::ReadinessReport {
+        let stats = self.stats_readiness_message().await;
+        self.build_readiness_report(stats.as_deref())
+    }
+
+    fn build_readiness_report(&self, stats: Option<&str>) -> crate::readiness::ReadinessReport {
+        let config = self.config.load();
+        let acme = self.acme_readiness(&config);
+        let ha = self.ha_readiness(&config);
+        let filter = self.filter.status();
+
+        crate::readiness::ReadinessReport::from_parts(crate::readiness::ReadinessInputs {
+            listeners: self.readiness.listeners(),
+            tls: self.readiness.tls(),
+            acme: &acme,
+            ha: &ha,
+            filter: &filter,
+            stats,
+        })
+    }
+
+    /// Probes the stats database/writer for `/status`.
+    ///
+    /// The probe is bounded so a locked SQLite pool cannot stall an admin
+    /// request or the container healthcheck. A failure is advisory: it is
+    /// reported as a readiness reason but does not make the DNS service
+    /// not-ready.
+    async fn stats_readiness_message(&self) -> Option<String> {
+        if self.stats_db.is_closed() || self.querylog_sender.is_closed() {
+            return Some("stats database or query-log writer is closed".to_string());
+        }
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            self.stats_db.health_check(),
+        )
+        .await;
+        match probe {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "Stats readiness probe failed");
+                Some("stats database probe failed".to_string())
+            }
+            Err(_) => {
+                tracing::warn!("Stats readiness probe timed out");
+                Some("stats database probe timed out".to_string())
+            }
+        }
     }
 
     /// Acquires the configuration apply/persist lock.
@@ -595,5 +731,130 @@ mod tests {
         assert!(readiness.ready);
         assert!(!readiness.enabled);
         assert_eq!(readiness.reason, None);
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    /// `/health` must not run the advisory stats `SELECT 1`; the authenticated
+    /// `/status` report keeps it.
+    #[tokio::test]
+    async fn test_health_report_skips_the_stats_probe() {
+        let dir = crate::test_support::temp_dir("sito_health_stats_split");
+        let ctx = crate::test_support::mock_context(&dir).await;
+        ctx.stats_db.pool().close().await;
+
+        let health = ctx.health_report();
+        assert!(health.ready);
+        assert!(
+            health
+                .reasons
+                .iter()
+                .all(|reason| reason.component != "stats"),
+            "/health must not spend an advisory stats probe: {:?}",
+            health.reasons
+        );
+
+        let status = ctx.readiness_report().await;
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|reason| reason.component == "stats" && reason.code == "stats_unavailable"),
+            "/status must still report the stats outage: {:?}",
+            status.reasons
+        );
+        assert!(status.ready, "a stats outage stays advisory");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod acme_readiness_ladder_tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_certificate_is_ready() {
+        assert_eq!(
+            acme_readiness_state(
+                false,
+                CertificateValidity::Valid { days_remaining: 90 },
+                false
+            ),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn test_valid_certificate_with_renewal_error_is_degraded() {
+        assert_eq!(
+            acme_readiness_state(
+                false,
+                CertificateValidity::Valid { days_remaining: 90 },
+                true
+            ),
+            (true, Some("acme_renewal_failed"))
+        );
+    }
+
+    #[test]
+    fn test_expiring_certificate_is_degraded() {
+        assert_eq!(
+            acme_readiness_state(
+                false,
+                CertificateValidity::Expiring { days_remaining: 10 },
+                false
+            ),
+            (true, Some("acme_cert_expiring"))
+        );
+        assert_eq!(
+            acme_readiness_state(
+                false,
+                CertificateValidity::Expiring { days_remaining: 10 },
+                true
+            ),
+            (true, Some("acme_renewal_failed"))
+        );
+    }
+
+    #[test]
+    fn test_expired_certificate_is_not_ready() {
+        assert_eq!(
+            acme_readiness_state(false, CertificateValidity::Expired, true),
+            (false, Some("acme_cert_expired"))
+        );
+    }
+
+    #[test]
+    fn test_missing_certificate_is_pending_or_failed() {
+        assert_eq!(
+            acme_readiness_state(false, CertificateValidity::Missing, false),
+            (true, Some("acme_issuance_pending"))
+        );
+        assert_eq!(
+            acme_readiness_state(false, CertificateValidity::Missing, true),
+            (false, Some("acme_issuance_failed"))
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_certificate_is_advisory() {
+        assert_eq!(
+            acme_readiness_state(false, CertificateValidity::Bootstrap, false),
+            (true, Some("acme_bootstrap_cert"))
+        );
+    }
+
+    #[test]
+    fn test_challenge_unavailable_is_not_ready_regardless_of_certificate() {
+        assert_eq!(
+            acme_readiness_state(
+                true,
+                CertificateValidity::Valid { days_remaining: 90 },
+                false
+            ),
+            (false, Some("acme_challenge_unavailable"))
+        );
     }
 }

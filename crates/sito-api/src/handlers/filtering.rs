@@ -289,7 +289,11 @@ pub async fn refresh_filtering(
     let prepared = ctx.filter.prepare(&cfg.filtering).await;
     if let Some(error) = prepared.error.as_ref() {
         let error = error.to_string();
-        let _ = ctx.filter.publish_prepared(prepared);
+        if ctx.filter.publish_prepared(prepared).is_ok() {
+            tracing::error!(
+                "Filter refresh publish unexpectedly succeeded after a staged load failure"
+            );
+        }
         return Err(ProblemDetails::internal_error(format!(
             "Refresh failed: {error}"
         )));

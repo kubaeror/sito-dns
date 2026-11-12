@@ -13,11 +13,37 @@ pub async fn run_server_with_shutdown(
 }
 
 /// Runs the DNS server with custom config path, shutdown receiver, and setup-pending mode.
+///
+/// Acquires the service lease for `config.server.data_dir` for the whole server
+/// lifetime. Callers that already acquired it before a bootstrap mutation must
+/// use [`run_server_with_lease`] so the same lease is held continuously.
 pub async fn run_server_full(
     config: Config,
     config_path: impl AsRef<Path>,
     custom_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
     setup_pending: bool,
+) -> anyhow::Result<()> {
+    let service_lease = crate::service_lock::acquire_service_lease(&config.server.data_dir)?;
+    run_server_with_lease(
+        config,
+        config_path,
+        custom_shutdown,
+        setup_pending,
+        service_lease,
+    )
+    .await
+}
+
+/// Runs the DNS server with a caller-held service lease.
+///
+/// The lease must have been acquired before any bootstrap mutation (P2-90) and
+/// is held until this function returns, covering the whole server lifetime.
+pub async fn run_server_with_lease(
+    config: Config,
+    config_path: impl AsRef<Path>,
+    custom_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+    setup_pending: bool,
+    service_lease: crate::service_lock::ServiceLease,
 ) -> anyhow::Result<()> {
     validate_typed_sections(&config)?;
 
@@ -28,23 +54,10 @@ pub async fn run_server_full(
         warn!("NETWORK EXPOSURE: {warning}");
     }
 
-    // Hold a single-instance lease for the whole server lifetime. The reset
+    // Hold the single-instance lease for the whole server lifetime. The reset
     // commands use the same lease to distinguish "stopped" from "running" and
     // refuse to pretend that credentials/sessions were revoked live.
-    let _service_lease =
-        crate::service_lock::ServiceLease::acquire(&config.server.data_dir).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                anyhow::anyhow!(
-                    "Another sito server is already running for data directory '{}'. Stop it before starting a second instance. ({e})",
-                    config.server.data_dir.display()
-                )
-            } else {
-                anyhow::anyhow!(
-                    "Failed to acquire the service lease in '{}': {e}",
-                    config.server.data_dir.display()
-                )
-            }
-        })?;
+    let _service_lease = service_lease;
 
     // Canonicalize so the file watcher compares absolute event paths, and so
     // the default relative `config.toml` still yields a watchable directory.
@@ -233,6 +246,9 @@ pub async fn run_server_full(
     let listener_acceptors: Arc<tokio::sync::Mutex<Option<ListenerAcceptors>>> =
         Arc::new(tokio::sync::Mutex::new(None));
 
+    // Server-owned readiness (listeners/TLS) read by `/health` and `/status`.
+    let readiness = Arc::new(sito_api::ReadinessState::default());
+
     let apply_hooks = Arc::new(ServerApplyHooks {
         dnssec: dnssec_swap.clone(),
         dnssec_chain_cache: dnssec_chain_cache.clone(),
@@ -241,6 +257,7 @@ pub async fn run_server_full(
         listener_manager: listener_manager.clone(),
         listener_acceptors: listener_acceptors.clone(),
         pipeline: pipeline.clone(),
+        readiness: readiness.clone(),
     });
 
     // D12 readiness state shared with the API. Challenge flags are updated by
@@ -269,6 +286,7 @@ pub async fn run_server_full(
         slave_tracker: slave_tracker.clone(),
         resync_sender,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(setup_pending)),
+        readiness: readiness.clone(),
         acme_challenges: Some(acme_challenges.clone()),
         dns_starter,
     };
@@ -397,6 +415,10 @@ pub async fn run_server_full(
 
     let mut cert_watchers =
         init_tls_and_acme(&config, &shutdown_rx, &listener_acceptors, &acme_challenges).await?;
+    {
+        let acceptors = listener_acceptors.lock().await.clone();
+        publish_tls_readiness(&readiness, &config, acceptors.as_ref(), None);
+    }
 
     if setup_pending {
         info!(
@@ -413,7 +435,7 @@ pub async fn run_server_full(
                 // the initial acceptors were built from the empty config.
                 // Re-initialize so DoT/DoH/DoQ listen immediately instead of
                 // requiring a restart.
-                match init_tls_and_acme(
+                let tls_init_error = match init_tls_and_acme(
                     &current_cfg,
                     &shutdown_rx,
                     &listener_acceptors,
@@ -421,12 +443,18 @@ pub async fn run_server_full(
                 )
                 .await
                 {
-                    Ok(watchers) => cert_watchers.extend(watchers),
-                    Err(e) => warn!(
-                        error = %e,
-                        "Failed to initialize TLS after setup; encrypted listeners may be unavailable"
-                    ),
-                }
+                    Ok(watchers) => {
+                        cert_watchers.extend(watchers);
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Failed to initialize TLS after setup; encrypted listeners may be unavailable"
+                        );
+                        Some(e)
+                    }
+                };
                 let acceptors = listener_acceptors
                     .lock()
                     .await
@@ -438,6 +466,14 @@ pub async fn run_server_full(
                         doh3: None,
                         acme_challenges: AcmeChallengeAvailability::default(),
                     });
+                // A failure here used to be a warning only; readiness now
+                // reflects that a configured encrypted listener is not serving.
+                publish_tls_readiness(
+                    &readiness,
+                    &current_cfg,
+                    Some(&acceptors),
+                    tls_init_error.as_ref(),
+                );
                 for warning in
                     exposure_warnings_for_phase(&current_cfg, ExposurePhase::DnsListeners)
                 {
@@ -451,6 +487,7 @@ pub async fn run_server_full(
                 )
                 .await?;
                 *listener_manager.lock().await = Some(manager);
+                readiness.set_listeners_ready();
                 spawn_slave_worker_after_listeners(
                     &mut ha_runtime,
                     &server_ctx,
@@ -497,6 +534,7 @@ pub async fn run_server_full(
         )
         .await?;
         *listener_manager.lock().await = Some(manager);
+        readiness.set_listeners_ready();
         spawn_slave_worker_after_listeners(
             &mut ha_runtime,
             &server_ctx,

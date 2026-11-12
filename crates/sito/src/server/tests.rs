@@ -642,3 +642,95 @@ fn test_exposure_warning_phases_suppress_dns_while_setup_pending() {
         "a loopback DNS bind must not warn after setup completes"
     );
 }
+
+fn no_acceptors() -> ListenerAcceptors {
+    ListenerAcceptors {
+        dot: None,
+        doh: None,
+        doq: None,
+        doh3: None,
+        acme_challenges: AcmeChallengeAvailability::default(),
+    }
+}
+
+/// P2-87: configured TLS material without an acceptor must make TLS readiness
+/// false instead of silently serving plain DNS only.
+#[test]
+fn test_publish_tls_readiness_marks_configured_material_without_acceptor_unavailable() {
+    let readiness = sito_api::ReadinessState::default();
+
+    let mut config = Config::default();
+    config.dns.tls = Some(sito_core::config::TlsConfig {
+        cert: Some(Path::new("/etc/sito/certs/dns.crt").to_path_buf()),
+        key: Some(Path::new("/etc/sito/certs/dns.key").to_path_buf()),
+        sni_certs: Vec::new(),
+    });
+    publish_tls_readiness(&readiness, &config, Some(&no_acceptors()), None);
+    let tls = readiness.tls();
+    assert!(
+        !tls.ready,
+        "configured TLS material without an acceptor is not ready"
+    );
+    assert_eq!(tls.code, Some("tls_acceptor_unavailable"));
+
+    // No explicit TLS material: the TLS component is not applicable even
+    // though the default config lists encrypted listener ports.
+    let config = Config::default();
+    publish_tls_readiness(&readiness, &config, Some(&no_acceptors()), None);
+    assert!(readiness.tls().ready);
+}
+
+/// An ACME-only deployment that intentionally waits for its first real
+/// certificate is covered by ACME readiness, not by a broken-TLS reason.
+#[test]
+fn test_publish_tls_readiness_allows_acme_without_static_material() {
+    let readiness = sito_api::ReadinessState::default();
+    let mut config = Config::default();
+    config.acme = Some(sito_core::config::AcmeConfig {
+        enabled: true,
+        email: Some("admin@example.com".to_string()),
+        domains: vec!["dns.example.com".to_string()],
+        allow_bootstrap_cert: false,
+        ..Default::default()
+    });
+    publish_tls_readiness(&readiness, &config, Some(&no_acceptors()), None);
+    assert!(
+        readiness.tls().ready,
+        "ACME issuance readiness owns the waiting state"
+    );
+
+    // A TLS initialization failure always makes the TLS component unavailable,
+    // even in an ACME deployment.
+    let error = anyhow::anyhow!("certificate parse failure");
+    publish_tls_readiness(&readiness, &config, Some(&no_acceptors()), Some(&error));
+    let tls = readiness.tls();
+    assert!(!tls.ready);
+    assert_eq!(tls.code, Some("tls_init_failed"));
+}
+
+/// D12 static TLS ladder: valid serves, expiring is degraded, expired is
+/// not-ready.
+#[test]
+fn test_static_tls_certificate_readiness_ladder() {
+    let ready = tls_certificate_readiness(sito_transport::CertificateValidity::Valid {
+        days_remaining: 90,
+    });
+    assert!(ready.ready);
+    assert!(ready.code.is_none());
+
+    let expiring = tls_certificate_readiness(sito_transport::CertificateValidity::Expiring {
+        days_remaining: 10,
+    });
+    assert!(expiring.ready, "an expiring certificate still serves");
+    assert_eq!(expiring.code, Some("tls_cert_expiring"));
+
+    let expired = tls_certificate_readiness(sito_transport::CertificateValidity::Expired);
+    assert!(!expired.ready);
+    assert_eq!(expired.code, Some("tls_cert_expired"));
+
+    let missing = tls_certificate_readiness(sito_transport::CertificateValidity::Missing);
+    assert!(
+        missing.ready,
+        "a live acceptor still serves after the file disappears"
+    );
+}

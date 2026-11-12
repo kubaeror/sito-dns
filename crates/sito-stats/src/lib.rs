@@ -2371,3 +2371,26 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    /// WP-1.7: the readiness probe must distinguish an open pool from a closed
+    /// one so `/status` can report `stats_unavailable`.
+    #[tokio::test]
+    async fn test_health_check_detects_a_closed_pool() {
+        let db = StatsDb::in_memory().await.expect("in-memory stats db");
+        assert!(!db.is_closed());
+        db.health_check()
+            .await
+            .expect("an open pool answers SELECT 1");
+
+        db.pool().close().await;
+        assert!(db.is_closed());
+        assert!(
+            db.health_check().await.is_err(),
+            "a closed pool must fail the readiness probe"
+        );
+    }
+}

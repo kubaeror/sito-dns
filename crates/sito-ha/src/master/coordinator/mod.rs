@@ -160,7 +160,7 @@ struct HandshakeBudget {
 
 impl HandshakeBudget {
     fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<HandshakePermit> {
-        let mut active = self.active.lock().unwrap();
+        let mut active = sito_core::sync::lock_or_recover(&self.active);
         let count = active.entry(ip).or_insert(0);
         if *count >= MAX_HANDSHAKES_PER_IP {
             return None;
@@ -180,7 +180,7 @@ struct HandshakePermit {
 
 impl Drop for HandshakePermit {
     fn drop(&mut self) {
-        let mut active = self.budget.active.lock().unwrap();
+        let mut active = sito_core::sync::lock_or_recover(&self.budget.active);
         if let Some(count) = active.get_mut(&self.ip) {
             *count = count.saturating_sub(1);
             if *count == 0 {

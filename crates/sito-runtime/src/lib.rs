@@ -486,12 +486,7 @@ impl RuntimeState {
             transport_policy: plan.transport_policy,
         };
         #[cfg(test)]
-        if let Some(hook) = self
-            .before_publish
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
+        if let Some(hook) = sito_core::sync::lock_or_recover(&self.before_publish).clone() {
             hook();
         }
         self.snapshot.store(Arc::new(next.clone()));
@@ -614,16 +609,11 @@ impl RuntimeState {
 
     #[cfg(test)]
     fn set_before_publish_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
-        *self
-            .before_publish
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+        *sito_core::sync::lock_or_recover(&self.before_publish) = hook;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.write_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        sito_core::sync::lock_or_recover(&self.write_lock)
     }
 }
 

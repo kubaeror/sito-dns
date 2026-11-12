@@ -113,6 +113,128 @@ pub(super) fn record_doh_listener_binding(
         .set_tls_alpn_available(doh_bound && config.dns.doh_port == 443 && advertises_acme_alpn);
 }
 
+use sito_transport::CertificateValidity;
+
+/// Maps a static certificate's validity to the TLS component readiness.
+///
+/// D12: a valid certificate is ready, one expiring inside the warning window is
+/// degraded (still serving), and an expired/unparseable certificate is
+/// not-ready.
+pub(super) fn tls_certificate_readiness(
+    validity: CertificateValidity,
+) -> sito_api::ComponentReadiness {
+    match validity {
+        CertificateValidity::Expired => sito_api::ComponentReadiness::unavailable(
+            "tls_cert_expired",
+            "configured static TLS certificate is expired; encrypted listeners cannot serve",
+        ),
+        CertificateValidity::Expiring { days_remaining } => sito_api::ComponentReadiness::degraded(
+            "tls_cert_expiring",
+            format!("configured static TLS certificate expires in {days_remaining} day(s)"),
+        ),
+        CertificateValidity::Valid { .. }
+        | CertificateValidity::Missing
+        | CertificateValidity::Bootstrap => sito_api::ComponentReadiness::ready(),
+    }
+}
+
+/// Whether an enabled ACME deployment has a usable current certificate that
+/// takes precedence over the static pair (D12 ACME + static matrix).
+fn acme_has_serving_certificate(config: &Config) -> bool {
+    let Some(acme) = config.get_acme_config().filter(|acme| acme.enabled) else {
+        return false;
+    };
+    let storage_dir = acme
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| config.server.data_dir.join("acme"));
+    let service = sito_transport::AcmeServiceConfig::new(
+        acme.email
+            .clone()
+            .unwrap_or_else(|| "admin@example.com".to_string()),
+        acme.domains.clone(),
+        storage_dir,
+    );
+    matches!(
+        service.certificate_validity(),
+        CertificateValidity::Valid { .. } | CertificateValidity::Expiring { .. }
+    )
+}
+
+/// Publishes TLS readiness for the acceptors installed by [`init_tls_and_acme`].
+///
+/// A configured static `[dns.tls]`/`[tls]` pair with no acceptor is a broken
+/// configured listener (P2-87), not a silently disabled one: readiness must be
+/// false. ACME-only deployments that intentionally wait for a real certificate
+/// (`acme.allow_bootstrap_cert = false`) are covered by ACME readiness instead.
+pub(super) fn publish_tls_readiness(
+    readiness: &sito_api::ReadinessState,
+    config: &Config,
+    acceptors: Option<&ListenerAcceptors>,
+    init_error: Option<&anyhow::Error>,
+) {
+    if let Some(error) = init_error {
+        warn!(error = %error, "TLS initialization failed; encrypted listeners are not serving");
+        readiness.set_tls_unavailable(
+            "tls_init_failed",
+            "TLS initialization failed; configured encrypted listeners are not serving",
+        );
+        return;
+    }
+
+    let static_tls_configured = config
+        .get_tls_config()
+        .is_some_and(|tls| tls.cert.is_some() && tls.key.is_some());
+    let has_acceptor = acceptors.is_some_and(|acceptors| {
+        acceptors.dot.is_some()
+            || acceptors.doh.is_some()
+            || acceptors.doq.is_some()
+            || acceptors.doh3.is_some()
+    });
+
+    // P2-87: configured TLS material that produced no acceptor used to
+    // disappear silently. Ports alone are not a TLS configuration: the default
+    // DoT/DoH ports exist in every config, so only explicit `[dns.tls]`/`[tls]`
+    // material (or an initialization error) marks the TLS component broken.
+    if static_tls_configured && !has_acceptor {
+        readiness.set_tls_unavailable(
+            "tls_acceptor_unavailable",
+            "configured TLS material has no usable acceptor; encrypted listeners are not serving",
+        );
+    } else if static_tls_configured && !acme_has_serving_certificate(config) {
+        // D12 static-certificate ladder: expiry at runtime is a readiness
+        // signal, not just an acceptor-presence check. An ACME certificate
+        // that is currently valid takes precedence over the static pair.
+        let validity = config
+            .get_tls_config()
+            .and_then(|tls| tls.cert.as_deref())
+            .map_or(CertificateValidity::Missing, |path| {
+                sito_transport::certificate_validity(path)
+            });
+        match tls_certificate_readiness(validity) {
+            readiness_state if !readiness_state.ready => {
+                readiness.set_tls_unavailable(
+                    readiness_state.code.unwrap_or("tls_cert_expired"),
+                    readiness_state
+                        .message
+                        .unwrap_or_else(|| "static TLS certificate is expired".to_string()),
+                );
+            }
+            readiness_state if readiness_state.code.is_some() => {
+                readiness.set_tls_degraded(
+                    readiness_state.code.unwrap_or("tls_cert_expiring"),
+                    readiness_state
+                        .message
+                        .unwrap_or_else(|| "static TLS certificate is expiring".to_string()),
+                );
+            }
+            _ => readiness.set_tls_ready(),
+        }
+    } else {
+        readiness.set_tls_ready();
+    }
+}
+
 /// Loads certificates and ACME configuration, builds the per-protocol TLS
 /// acceptors, publishes them for in-process listener rebinds, starts the ACME
 /// renewal manager and returns the certificate watchers that must stay alive.

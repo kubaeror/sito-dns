@@ -19,7 +19,7 @@ impl MasterCoordinator {
         acked_term: u64,
         reason: String,
     ) {
-        let mut diverged = self.diverged.lock().unwrap();
+        let mut diverged = sito_core::sync::lock_or_recover(&self.diverged);
         if diverged
             .get(instance)
             .is_none_or(|d| (kind, acked_version) >= (d.kind, d.acked_version))
@@ -45,8 +45,8 @@ impl MasterCoordinator {
     /// advisory record before that slave proves recovery by ACKing the current
     /// term/version.
     pub(super) fn clear_divergence_for(&self, instance: &str) {
-        let slaves = self.slaves.lock().unwrap();
-        let mut diverged = self.diverged.lock().unwrap();
+        let slaves = sito_core::sync::lock_or_recover(&self.slaves);
+        let mut diverged = sito_core::sync::lock_or_recover(&self.diverged);
         if diverged.remove(instance).is_some() && slaves.contains_key(instance) {
             self.metrics.set_ha_diverged(instance, false);
         }
@@ -130,7 +130,7 @@ impl MasterCoordinator {
         else {
             return;
         };
-        let mut history = self.active_push_history.lock().unwrap();
+        let mut history = sito_core::sync::lock_or_recover(&self.active_push_history);
         history.push_back(PublishedEnvelope {
             term: *term,
             version: *version,
@@ -152,8 +152,8 @@ impl MasterCoordinator {
         push_msg: &HaMessage,
     ) {
         self.current_version.store(version, Ordering::SeqCst);
-        *self.active_bundle.lock().unwrap() = Some(bundle);
-        *self.active_push.lock().unwrap() = Some(push_msg.clone());
+        *sito_core::sync::lock_or_recover(&self.active_bundle) = Some(bundle);
+        *sito_core::sync::lock_or_recover(&self.active_push) = Some(push_msg.clone());
         self.record_published_envelope(push_msg);
     }
 
@@ -184,10 +184,7 @@ impl MasterCoordinator {
         // Serialize the check-then-store: two concurrent publishers could
         // otherwise both pass the monotonicity check and store out of order,
         // regressing the active version and broadcasting a stale bundle.
-        let _publish_guard = self
-            .publish_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _publish_guard = sito_core::sync::lock_or_recover(&self.publish_lock);
 
         let (bundle, version, push_msg, _previous) = self.prepare_bundle(bundle)?;
         // Persist before publishing: a failed write must leave both the
@@ -272,10 +269,7 @@ impl MasterCoordinator {
         let _persist_guard = self.persist_lock.lock().await;
 
         let (bundle, version, push_msg, previous_version) = {
-            let _publish_guard = self
-                .publish_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _publish_guard = sito_core::sync::lock_or_recover(&self.publish_lock);
             self.prepare_bundle(bundle)?
         };
 
@@ -289,10 +283,7 @@ impl MasterCoordinator {
         }
 
         let conflict = {
-            let _publish_guard = self
-                .publish_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _publish_guard = sito_core::sync::lock_or_recover(&self.publish_lock);
             // A synchronous publisher may have advanced the sequence while the
             // write was in flight. Publishing our older prepared version would
             // regress the cluster, so report the conflict and restore the
@@ -302,7 +293,7 @@ impl MasterCoordinator {
                 self.publish_prepared(bundle, version, &push_msg);
                 None
             } else {
-                Some(self.active_bundle.lock().unwrap().clone())
+                Some(sito_core::sync::lock_or_recover(&self.active_bundle).clone())
             }
         };
 
@@ -343,8 +334,8 @@ impl MasterCoordinator {
     pub fn broadcast(&self, msg: &HaMessage) -> usize {
         let wire_size = msg.to_json().map_or(0, |json| json.len());
         let mut notified = 0;
-        let slaves = self.slaves.lock().unwrap();
-        let mut queued = self.queued_bytes.lock().unwrap();
+        let slaves = sito_core::sync::lock_or_recover(&self.slaves);
+        let mut queued = sito_core::sync::lock_or_recover(&self.queued_bytes);
         for slave in slaves.values() {
             let instance = &slave.instance;
             let session = (instance.clone(), slave.connection_id);
@@ -418,7 +409,7 @@ impl MasterCoordinator {
         // increment: the session loop subtracts under the same lock, and
         // releasing it in between would let the subtract observe the old value
         // and turn the later increment into phantom bytes.
-        let mut queued = self.queued_bytes.lock().unwrap();
+        let mut queued = sito_core::sync::lock_or_recover(&self.queued_bytes);
         // Registration installs the session key and reconnect removes every
         // old key for the instance. A missing key therefore means this sender
         // belongs to a superseded session: refuse instead of recreating
@@ -447,7 +438,7 @@ impl MasterCoordinator {
         if wire_size == 0 {
             return;
         }
-        let mut queued = self.queued_bytes.lock().unwrap();
+        let mut queued = sito_core::sync::lock_or_recover(&self.queued_bytes);
         if let Some(current) = queued.get_mut(&(instance.to_string(), connection_id)) {
             *current = current.saturating_sub(wire_size);
         }
@@ -468,11 +459,8 @@ impl MasterCoordinator {
     ) {
         let instance = instance.to_string();
         let session = (instance.clone(), connection_id);
-        let first_schedule = self
-            .pending_fallbacks
-            .lock()
-            .unwrap()
-            .insert(session.clone());
+        let first_schedule =
+            sito_core::sync::lock_or_recover(&self.pending_fallbacks).insert(session.clone());
         if !first_schedule {
             debug!(
                 instance = %instance,
@@ -487,10 +475,7 @@ impl MasterCoordinator {
         tokio::spawn(async move {
             // Prefer the latest active bundle; fall back to the message that
             // could not be enqueued.
-            let latest = coordinator
-                .active_push
-                .lock()
-                .unwrap()
+            let latest = sito_core::sync::lock_or_recover(&coordinator.active_push)
                 .clone()
                 .or(Some(fallback));
             if let Some(latest) = latest {
@@ -506,12 +491,13 @@ impl MasterCoordinator {
                 let mut reserved = false;
                 loop {
                     let (owns, has_room) = {
-                        let slaves = coordinator.slaves.lock().unwrap();
+                        let slaves = sito_core::sync::lock_or_recover(&coordinator.slaves);
                         let owns = slaves
                             .get(&instance)
                             .is_some_and(|s| s.connection_id == connection_id);
                         if owns {
-                            let mut queued = coordinator.queued_bytes.lock().unwrap();
+                            let mut queued =
+                                sito_core::sync::lock_or_recover(&coordinator.queued_bytes);
                             let current = queued.get(&session).copied().unwrap_or(0);
                             if size == 0 || current.saturating_add(size) <= MAX_SLAVE_QUEUE_BYTES {
                                 if size > 0 {
@@ -538,7 +524,8 @@ impl MasterCoordinator {
                     // The send failed, so release the reservation. The key may
                     // already be gone if a reconnect superseded this session.
                     if size > 0 {
-                        let mut queued = coordinator.queued_bytes.lock().unwrap();
+                        let mut queued =
+                            sito_core::sync::lock_or_recover(&coordinator.queued_bytes);
                         if let Some(current) = queued.get_mut(&session) {
                             *current = current.saturating_sub(size);
                         }
@@ -546,27 +533,23 @@ impl MasterCoordinator {
                     warn!(instance = %instance, "Failed to deliver queued HA push: {e}");
                 }
             }
-            coordinator
-                .pending_fallbacks
-                .lock()
-                .unwrap()
-                .remove(&session);
+            sito_core::sync::lock_or_recover(&coordinator.pending_fallbacks).remove(&session);
         });
     }
 
     /// Re-pushes the active bundle to one slave that acknowledged a stale
     /// version, at most once per acknowledged version to avoid retry loops.
     pub(super) fn maybe_repush(&self, instance: &str, stale_version: u64) {
-        let mut repushed = self.stale_repushes.lock().unwrap();
+        let mut repushed = sito_core::sync::lock_or_recover(&self.stale_repushes);
         if repushed.get(instance) == Some(&stale_version) {
             return;
         }
         repushed.insert(instance.to_string(), stale_version);
         drop(repushed);
 
-        if let Some(push) = self.active_push.lock().unwrap().clone() {
+        if let Some(push) = sito_core::sync::lock_or_recover(&self.active_push).clone() {
             let target = {
-                let slaves = self.slaves.lock().unwrap();
+                let slaves = sito_core::sync::lock_or_recover(&self.slaves);
                 slaves
                     .get(instance)
                     .map(|slave| (slave.sender.clone(), slave.connection_id))
@@ -598,7 +581,7 @@ impl MasterCoordinator {
     /// specific slave ACKs the current term/version, because a queued re-push
     /// is not proof that the slave recovered.
     pub fn trigger_resync(&self) -> ResyncOutcome {
-        let push_opt = self.active_push.lock().unwrap().clone();
+        let push_opt = sito_core::sync::lock_or_recover(&self.active_push).clone();
         let slaves_notified = match push_opt {
             Some(ref push) => self.broadcast(push),
             None => 0,
@@ -613,8 +596,8 @@ impl MasterCoordinator {
     /// Returns a list of summaries for all currently connected replica slaves.
     pub fn list_slaves(&self) -> Vec<SlaveSummary> {
         let cur_v = self.get_current_version();
-        let slaves = self.slaves.lock().unwrap();
-        let diverged = self.diverged.lock().unwrap();
+        let slaves = sito_core::sync::lock_or_recover(&self.slaves);
+        let diverged = sito_core::sync::lock_or_recover(&self.diverged);
         slaves
             .values()
             .map(|s| s.to_summary(cur_v, diverged.contains_key(&s.instance)))
@@ -623,6 +606,6 @@ impl MasterCoordinator {
 
     /// Returns the count of currently connected slaves.
     pub fn connected_slave_count(&self) -> usize {
-        self.slaves.lock().unwrap().len()
+        sito_core::sync::lock_or_recover(&self.slaves).len()
     }
 }

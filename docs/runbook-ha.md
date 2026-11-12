@@ -56,6 +56,77 @@ exposes only the generic ready flag; read `readiness_reason` on the
 authenticated `/api/v1/ha/status` endpoint (or the logs) for the detailed
 cause.
 
+### Health and status endpoint semantics (WP-1.7)
+
+`/health` is the generic, unauthenticated probe:
+
+| Condition | Response |
+|---|---|
+| Every blocking component is ready | `200 {"status":"ok"}` |
+| Listeners, configured TLS, ACME, HA or the filter engine is not ready | `503 {"status":"unavailable"}` |
+
+It deliberately exposes no component names, reason codes, filesystem paths,
+certificate text or configuration values. The container healthcheck and
+`GET /health` consumers must rely on the status code.
+
+`GET /api/v1/status` (Viewer or higher) is the detailed admin view. It keeps
+`version`, `uptime_seconds`, `role`, `listeners` and `acme`, and adds:
+
+- `ready` — the same aggregate verdict `/health` uses.
+- `reasons[]` — every blocking and advisory reason with `component`, `code`,
+  `message` and (when known) `since_unix_ms`, in component order.
+
+| Component | Blocks `ready`? | Example codes |
+|---|---|---|
+| `listeners` | Yes | `listener_bind_failed`, `listener_rebind_skipped`, `listeners_not_started` |
+| `tls` | Yes when expired; no when expiring | `tls_acceptor_unavailable`, `tls_init_failed`, `tls_cert_expired`, `tls_cert_expiring` |
+| `acme` | Yes for challenge-unavailable/expired/issuance-failed; no for renewal failure/expiring/pending | `acme_challenge_unavailable`, `acme_cert_expired`, `acme_issuance_failed`, `acme_renewal_failed`, `acme_cert_expiring`, `acme_issuance_pending`, `acme_bootstrap_cert` |
+| `ha` | Yes | `ha_not_ready` (including master-loss and publish failure) |
+| `filter` | Yes only when no usable snapshot exists | `filter_unavailable`/`filter_loading` when `unavailable=true`; `filter_degraded` for a retained snapshot, a rejected live apply, or a recorded last error |
+| `stats` | **No** — advisory only | `stats_unavailable` |
+
+A partial filter snapshot (some lists failed, a group lost a rule class, or
+regex patterns were dropped) keeps `ready` true and reports `filter_degraded`:
+the retained snapshot still answers. This also covers `FilterState::Failed`
+with `unavailable == false` (a live apply was rejected while the previous
+snapshot remained active) and `Loading` with a still-usable snapshot. Only
+`unavailable == true` means there is no snapshot and DNS fails closed.
+
+D12 certificate ladder:
+
+- A current valid certificate with a failed renewal keeps serving and reports
+  `acme_renewal_failed` (degraded). A certificate expiring within 30 days reports
+  `acme_cert_expiring`/`tls_cert_expiring` (degraded).
+- An expired or unparseable certificate reports `acme_cert_expired`/
+  `tls_cert_expired` and makes `/health` unavailable.
+- No ACME certificate yet and no error is `acme_issuance_pending` (degraded:
+  DNS listeners still bind); an issuance failure with no certificate is
+  `acme_issuance_failed` (not-ready).
+- A configured static TLS certificate is checked at runtime; an ACME
+  certificate that currently serves takes precedence over the static pair.
+
+`ReadinessState` starts not-ready (nothing has been published yet). Startup
+publishes listener readiness after the DNS listeners start and TLS readiness
+after the acceptors are initialized. During first-boot setup-pending the DNS
+listeners are intentionally not bound, so `/health` is unavailable until setup
+completes; `sito healthcheck --setup-fallback` accepts that window via the
+setup middleware signal. Once DNS is up, the healthcheck also probes `/health`
+whenever the admin web listener answers (not only on HA nodes); an unreachable
+web listener is ignored on a DNS-only node but is an error when HA is
+configured.
+
+A stats database/writer outage is advisory — resolution does not depend on
+SQLite — so a stats failure never turns into a DNS outage or a `/health` 503.
+`/health` does not run the stats `SELECT 1` probe at all; `/status` does (bounded
+to 750 ms) and reports `stats_unavailable`.
+
+A configured `[dns.tls]`/`[tls]` pair with no usable acceptor is a broken
+listener, not a silently disabled one: `tls` blocks readiness until the
+acceptors are built. An ACME-only deployment that intentionally waits for its
+first real certificate (with `allow_bootstrap_cert = false`) is reported by the
+`acme` component instead.
+
+
 ---
 
 ## 2. Manual Slave -> Master Promotion Procedure

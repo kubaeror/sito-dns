@@ -428,9 +428,15 @@ pub async fn account_totp_enable_handler(
         };
         return account_problem_page(&ctx, &user, &csrf, problem);
     }
-    let _ = ctx
+    if !ctx
         .auth_mgr
-        .consume_reauth_token(&form.reauth_token, &user.username, &session_id);
+        .consume_reauth_token(&form.reauth_token, &user.username, &session_id)
+    {
+        tracing::warn!(
+            user = %user.username,
+            "Re-authentication ticket was already consumed or expired after enabling TOTP from the web UI"
+        );
+    }
     tracing::info!(user = %user.username, "User enabled TOTP 2FA from the web UI");
     // Enabling TOTP revokes every session for the account by design.
     Redirect::to("/login").into_response()
@@ -481,9 +487,15 @@ pub async fn account_totp_disable_handler(
         .await
     {
         Ok(ticket) => {
-            let _ = ctx
+            if !ctx
                 .auth_mgr
-                .consume_reauth_token(&ticket.token, &user.username, &session_id);
+                .consume_reauth_token(&ticket.token, &user.username, &session_id)
+            {
+                tracing::warn!(
+                    user = %user.username,
+                    "Re-authentication ticket was already consumed or expired after disabling TOTP from the web UI"
+                );
+            }
         }
         Err(ReauthError::InvalidCredentials) => {
             return account_problem_page(

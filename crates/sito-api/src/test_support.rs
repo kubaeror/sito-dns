@@ -59,6 +59,12 @@ pub(crate) async fn mock_context(temp_dir: &Path) -> ServerContext {
         Arc::new(sito_clients::ServiceRegistry::try_bundled().expect("bundled services must load")),
     ));
 
+    // Handler tests exercise the API, not the DNS startup transaction; publish
+    // the ready state that a successfully started server would publish.
+    let readiness = crate::readiness::ReadinessState::default();
+    readiness.set_listeners_ready();
+    readiness.set_tls_ready();
+
     ServerContext {
         config: config_arc,
         runtime,
@@ -80,6 +86,7 @@ pub(crate) async fn mock_context(temp_dir: &Path) -> ServerContext {
         slave_tracker: None,
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        readiness: Arc::new(readiness),
         acme_challenges: None,
         dns_starter: None,
     }

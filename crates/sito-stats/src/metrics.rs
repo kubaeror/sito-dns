@@ -13,8 +13,10 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt::Write;
+#[cfg(test)]
+use std::sync::PoisonError;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Standard latency buckets for DNS query duration and upstream RTT (in seconds).
 const LATENCY_BUCKETS: &[f64] = &[
@@ -203,7 +205,7 @@ impl LabelInterner {
             return id;
         }
 
-        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        let mut state = sito_core::sync::write_or_recover(&self.state);
         if let Some(&id) = state.ids.get(value) {
             return id;
         }
@@ -225,9 +227,7 @@ impl LabelInterner {
     }
 
     fn label(&self, id: u32) -> Arc<str> {
-        self.state
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+        sito_core::sync::read_or_recover(&self.state)
             .labels
             .get(id as usize)
             .cloned()
@@ -250,7 +250,7 @@ where
         return;
     }
 
-    let mut guard = map.write().unwrap_or_else(PoisonError::into_inner);
+    let mut guard = sito_core::sync::write_or_recover(map);
     guard
         .entry(key)
         .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -265,7 +265,7 @@ fn observe_histogram(map: &HistogramMap, id: u32, value: f64) {
         {
             Arc::clone(histogram)
         } else {
-            let mut guard = map.write().unwrap_or_else(PoisonError::into_inner);
+            let mut guard = sito_core::sync::write_or_recover(map);
             Arc::clone(
                 guard
                     .entry(id)
@@ -273,10 +273,7 @@ fn observe_histogram(map: &HistogramMap, id: u32, value: f64) {
             )
         }
     };
-    histogram
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .observe(value);
+    sito_core::sync::lock_or_recover(&histogram).observe(value);
 }
 
 /// Thread-safe registry maintaining all Prometheus metrics specified in Table 14.2.
@@ -433,10 +430,7 @@ impl MetricsRegistry {
             return;
         }
 
-        let mut guard = self
-            .upstream_health
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut guard = sito_core::sync::write_or_recover(&self.upstream_health);
         match guard.get(&upstream_id) {
             Some(slot) => slot.store(bits, Ordering::Relaxed),
             None => {
@@ -469,10 +463,7 @@ impl MetricsRegistry {
     }
 
     pub fn inc_dnssec_bogus(&self, upstream: &str) {
-        let mut map = self
-            .dnssec_bogus
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut map = sito_core::sync::lock_or_recover(&self.dnssec_bogus);
         *map.entry(upstream.to_string()).or_insert(0) += 1;
     }
 
@@ -490,40 +481,28 @@ impl MetricsRegistry {
     }
 
     pub fn set_ha_config_version(&self, instance: &str, version: f64) {
-        let mut map = self
-            .ha_config_version
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_config_version);
         map.insert(instance.to_string(), version);
     }
 
     /// Removes the per-instance HA config version label (e.g. on disconnect) to
     /// prevent unbounded metric cardinality growth.
     pub fn remove_ha_config_version(&self, instance: &str) {
-        let mut map = self
-            .ha_config_version
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_config_version);
         map.remove(instance);
     }
 
     /// Publishes whether the master observed a version-continuity divergence
     /// with a slave instance (`1` = diverged, `0` = continuity restored).
     pub fn set_ha_diverged(&self, instance: &str, diverged: bool) {
-        let mut map = self
-            .ha_diverged
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_diverged);
         map.insert(instance.to_string(), diverged);
     }
 
     /// Removes the per-instance HA divergence series (e.g. on disconnect) so
     /// metric cardinality cannot grow with churn.
     pub fn remove_ha_diverged(&self, instance: &str) {
-        let mut map = self
-            .ha_diverged
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_diverged);
         map.remove(instance);
     }
 
@@ -533,10 +512,7 @@ impl MetricsRegistry {
     /// identifier (`replication_disabled`, `missing_master_url`,
     /// `tls_init_failed`, `bind_failed`).
     pub fn inc_ha_startup_noop(&self, role: &str, reason: &str) {
-        let mut map = self
-            .ha_startup_noop
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_startup_noop);
         *map.entry((role.to_string(), reason.to_string()))
             .or_insert(0) += 1;
     }
@@ -623,10 +599,7 @@ impl MetricsRegistry {
 
     /// Records how long the last filter snapshot compilation took.
     pub fn observe_filter_compile(&self, seconds: f64) {
-        let mut hist = self
-            .filter_compile_seconds
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut hist = sito_core::sync::lock_or_recover(&self.filter_compile_seconds);
         hist.observe(seconds);
     }
 
@@ -643,10 +616,7 @@ impl MetricsRegistry {
 
     /// Returns total query count and blocked query count processed by this registry.
     pub fn get_queries_and_blocked(&self) -> (u64, u64) {
-        let map = self
-            .queries_total
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
+        let map = sito_core::sync::read_or_recover(&self.queries_total);
         let mut total = 0u64;
         let mut blocked = 0u64;
         for (&(_proto, _qtype, verdict), count) in map.iter() {
@@ -668,12 +638,9 @@ impl MetricsRegistry {
     pub fn get_upstream_reports(&self) -> std::collections::HashMap<String, (f64, u64)> {
         let mut res = std::collections::HashMap::new();
         {
-            let map = self
-                .upstream_rtt
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.upstream_rtt);
             for (&upstream, hist) in map.iter() {
-                let hist = hist.lock().unwrap_or_else(PoisonError::into_inner);
+                let hist = sito_core::sync::lock_or_recover(hist);
                 let rtt_ms = if hist.count > 0 {
                     (hist.sum / hist.count as f64) * 1000.0
                 } else {
@@ -684,10 +651,7 @@ impl MetricsRegistry {
             }
         }
         {
-            let map = self
-                .upstream_errors
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.upstream_errors);
             for (&(upstream, _kind), count) in map.iter() {
                 let entry = res
                     .entry(self.labels.label(upstream).to_string())
@@ -710,10 +674,7 @@ impl MetricsRegistry {
         let mut queries_total = 0u64;
         let mut blocked_total = 0u64;
         {
-            let map = self
-                .queries_total
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.queries_total);
             for (&(_proto, _qtype, verdict), count) in map.iter() {
                 let count = count.load(Ordering::Relaxed);
                 queries_total += count;
@@ -725,12 +686,9 @@ impl MetricsRegistry {
 
         let mut upstreams: HashMap<String, UpstreamSnapshot> = HashMap::new();
         {
-            let map = self
-                .upstream_rtt
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.upstream_rtt);
             for (&upstream, hist) in map.iter() {
-                let hist = hist.lock().unwrap_or_else(PoisonError::into_inner);
+                let hist = sito_core::sync::lock_or_recover(hist);
                 upstreams.insert(
                     self.labels.label(upstream).to_string(),
                     UpstreamSnapshot {
@@ -743,10 +701,7 @@ impl MetricsRegistry {
             }
         }
         {
-            let map = self
-                .upstream_errors
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.upstream_errors);
             for (&(upstream, _kind), count) in map.iter() {
                 upstreams
                     .entry(self.labels.label(upstream).to_string())
@@ -781,10 +736,7 @@ impl MetricsRegistry {
         out.push_str("# HELP sito_queries_total Total DNS queries processed\n");
         out.push_str("# TYPE sito_queries_total counter\n");
         {
-            let map = self
-                .queries_total
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.queries_total);
             if map.is_empty() {
                 out.push_str(
                     "sito_queries_total{proto=\"udp\",qtype=\"1\",verdict=\"allowed\"} 0\n",
@@ -829,10 +781,7 @@ impl MetricsRegistry {
         out.push_str("# HELP sito_transport_queries_total Total DNS queries by transport\n");
         out.push_str("# TYPE sito_transport_queries_total counter\n");
         {
-            let map = self
-                .transport_queries_total
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.transport_queries_total);
             if map.is_empty() {
                 out.push_str("sito_transport_queries_total{proto=\"udp\"} 0\n");
             } else {
@@ -857,10 +806,7 @@ impl MetricsRegistry {
         out.push_str("# HELP sito_query_duration_seconds Histogram of query duration in seconds\n");
         out.push_str("# TYPE sito_query_duration_seconds histogram\n");
         {
-            let map = self
-                .query_duration
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.query_duration);
             if map.is_empty() {
                 for &b in LATENCY_BUCKETS {
                     let _ = writeln!(
@@ -880,7 +826,7 @@ impl MetricsRegistry {
                     .collect();
                 entries.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
                 for (verdict, hist) in entries {
-                    let hist = hist.lock().unwrap_or_else(PoisonError::into_inner);
+                    let hist = sito_core::sync::lock_or_recover(&hist);
                     for (i, &b) in LATENCY_BUCKETS.iter().enumerate() {
                         let c = hist.counts[i];
                         let _ = writeln!(
@@ -918,10 +864,7 @@ impl MetricsRegistry {
         out.push_str("# HELP sito_upstream_rtt_seconds Upstream round-trip time in seconds\n");
         out.push_str("# TYPE sito_upstream_rtt_seconds histogram\n");
         {
-            let map = self
-                .upstream_rtt
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.upstream_rtt);
             if map.is_empty() {
                 for &b in LATENCY_BUCKETS {
                     let _ = writeln!(
@@ -941,7 +884,7 @@ impl MetricsRegistry {
                     .collect();
                 entries.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
                 for (upstream, hist) in entries {
-                    let hist = hist.lock().unwrap_or_else(PoisonError::into_inner);
+                    let hist = sito_core::sync::lock_or_recover(&hist);
                     for (i, &b) in LATENCY_BUCKETS.iter().enumerate() {
                         let c = hist.counts[i];
                         let _ = writeln!(
@@ -976,10 +919,7 @@ impl MetricsRegistry {
         out.push_str("# HELP sito_upstream_errors_total Total errors encountered per upstream\n");
         out.push_str("# TYPE sito_upstream_errors_total counter\n");
         {
-            let map = self
-                .upstream_errors
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.upstream_errors);
             if map.is_empty() {
                 out.push_str(
                     "sito_upstream_errors_total{upstream=\"default\",kind=\"timeout\"} 0\n",
@@ -1015,10 +955,7 @@ impl MetricsRegistry {
         out.push_str("# HELP sito_upstream_health Upstream resolver health status (1 = healthy, 0 = degraded/down)\n");
         out.push_str("# TYPE sito_upstream_health gauge\n");
         {
-            let map = self
-                .upstream_health
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.upstream_health);
             if map.is_empty() {
                 out.push_str("sito_upstream_health{upstream=\"default\"} 1\n");
             } else {
@@ -1167,10 +1104,7 @@ impl MetricsRegistry {
         );
         out.push_str("# TYPE sito_filter_compile_seconds histogram\n");
         {
-            let hist = self
-                .filter_compile_seconds
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let hist = sito_core::sync::lock_or_recover(&self.filter_compile_seconds);
             for (i, &b) in LATENCY_BUCKETS.iter().enumerate() {
                 let c = hist.counts[i];
                 let _ = writeln!(out, "sito_filter_compile_seconds_bucket{{le=\"{b}\"}} {c}");
@@ -1191,10 +1125,7 @@ impl MetricsRegistry {
         out.push_str("# HELP sito_dnssec_bogus_total Total DNSSEC bogus responses detected\n");
         out.push_str("# TYPE sito_dnssec_bogus_total counter\n");
         {
-            let map = self
-                .dnssec_bogus
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::lock_or_recover(&self.dnssec_bogus);
             if map.is_empty() {
                 out.push_str("sito_dnssec_bogus_total{upstream=\"default\"} 0\n");
             } else {
@@ -1212,10 +1143,7 @@ impl MetricsRegistry {
         out.push_str("# HELP sito_clients_identified_total Total clients successfully identified by method\n");
         out.push_str("# TYPE sito_clients_identified_total counter\n");
         {
-            let map = self
-                .clients_identified
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::read_or_recover(&self.clients_identified);
             if map.is_empty() {
                 out.push_str("sito_clients_identified_total{method=\"ip\"} 0\n");
             } else {
@@ -1265,10 +1193,7 @@ impl MetricsRegistry {
         out.push_str("# HELP sito_ha_config_version Configuration version of HA node instances\n");
         out.push_str("# TYPE sito_ha_config_version gauge\n");
         {
-            let map = self
-                .ha_config_version
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::lock_or_recover(&self.ha_config_version);
             if map.is_empty() {
                 out.push_str("sito_ha_config_version{instance=\"local\"} 1\n");
             } else {
@@ -1288,10 +1213,7 @@ impl MetricsRegistry {
         );
         out.push_str("# TYPE sito_ha_diverged gauge\n");
         {
-            let map = self
-                .ha_diverged
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::lock_or_recover(&self.ha_diverged);
             for (instance, diverged) in map.iter() {
                 let _ = writeln!(
                     out,
@@ -1308,10 +1230,7 @@ impl MetricsRegistry {
         );
         out.push_str("# TYPE sito_ha_startup_noop_total counter\n");
         {
-            let map = self
-                .ha_startup_noop
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let map = sito_core::sync::lock_or_recover(&self.ha_startup_noop);
             for ((role, reason), count) in map.iter() {
                 let _ = writeln!(
                     out,

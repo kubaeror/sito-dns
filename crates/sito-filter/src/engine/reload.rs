@@ -321,7 +321,7 @@ impl HostsFilterEngine {
             );
         }
         self.snapshot.store(Arc::new(new_snapshot));
-        *self.list_rules.lock().unwrap() = new_list_rules;
+        *sito_core::sync::lock_or_recover(&self.list_rules) = new_list_rules;
         // Bump the generation before rebuilding groups. A concurrent
         // `set_group_rules` that started from the old list map will detect the
         // change and discard its stale compilation instead of overwriting the
@@ -330,11 +330,7 @@ impl HostsFilterEngine {
         // Group rule sets are selected from the list rules, so they must track
         // the freshly loaded snapshot.
         let degraded_groups = {
-            let list_rules = self
-                .list_rules
-                .lock()
-                .map(|g| g.clone())
-                .unwrap_or_default();
+            let list_rules = sito_core::sync::lock_or_recover(&self.list_rules).clone();
             self.rebuild_group_snapshots(&list_rules)
                 .unwrap_or_default()
         };
@@ -374,7 +370,7 @@ impl HostsFilterEngine {
             // `unavailable_for_fail_closed` false while disabled and forces a
             // fresh successful load before fail-closed can be relied on again.
             self.snapshot.store(Arc::new(FilterSnapshot::default()));
-            self.list_rules.lock().unwrap().clear();
+            sito_core::sync::lock_or_recover(&self.list_rules).clear();
             self.set_status(FilterStatus {
                 state: FilterState::Disabled,
                 ..FilterStatus::default()
@@ -417,7 +413,7 @@ impl HostsFilterEngine {
                 return Err(FilterError::NoSourcesConfigured);
             }
             self.snapshot.store(Arc::new(FilterSnapshot::unavailable()));
-            self.list_rules.lock().unwrap().clear();
+            sito_core::sync::lock_or_recover(&self.list_rules).clear();
             self.set_status(FilterStatus {
                 state: FilterState::Failed,
                 rule_count: 0,
@@ -500,7 +496,7 @@ impl HostsFilterEngine {
         let max_rules = config.max_rules;
         let max_list_bytes = config.max_list_bytes;
         let allow_empty = config.allow_empty_list;
-        let base_rules = self.list_rules.lock().unwrap().clone();
+        let base_rules = sito_core::sync::lock_or_recover(&self.list_rules).clone();
         let enabled_names: FnvHashSet<String> = config
             .lists
             .iter()

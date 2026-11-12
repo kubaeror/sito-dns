@@ -562,10 +562,13 @@ pub fn ha_readiness_required(config: &Config) -> bool {
 /// completed (or when the API cannot confirm setup-pending), a failing DNS
 /// probe stays a healthcheck failure so a broken DNS listener is never masked.
 ///
-/// When `ha_required` is set, a successful DNS probe is not sufficient: the
-/// `/health` endpoint must also report the HA role as ready. This keeps a
-/// failed mTLS listener or a slave that never completed its handshake from
-/// looking healthy just because DNS still answers.
+/// When the admin web listener is available, a successful DNS probe is not
+/// sufficient: the generic `/health` endpoint must also return `200
+/// {"status":"ok"}`. This keeps a failed mTLS listener, an unready TLS/ACME
+/// listener, a broken filter engine or a slave that never completed its
+/// handshake from looking healthy just because DNS still answers. When HA is
+/// configured (`ha_required`), an unreachable web listener is itself a failure;
+/// on a DNS-only node an unreachable admin listener is ignored.
 pub async fn run_healthcheck_or_web(
     dns_addr: Option<SocketAddr>,
     web_addr: SocketAddr,
@@ -602,83 +605,65 @@ pub async fn run_healthcheck_or_web(
         }
     }
 
-    if ha_required {
-        probe_ha_readiness(web_addr, timeout_ms).await?;
-    }
     if let Some(note) = setup_pending_note {
+        // During setup-pending the DNS listeners are intentionally not bound
+        // and `/health` is expected to be unavailable; the setup fallback is
+        // the operator's explicit opt-in for that window.
         println!("{note}");
-    }
-    Ok(())
-}
-
-/// Verifies the HA readiness reported by the public `/health` endpoint.
-///
-/// Any inability to obtain a definitive answer fails closed: an unreachable
-/// web API or a payload without the `ha` object is an error, not a pass.
-async fn probe_ha_readiness(web_addr: SocketAddr, timeout_ms: u64) -> Result<(), anyhow::Error> {
-    let (status, body) = http_get(web_addr, "/health", timeout_ms)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot verify HA readiness from {web_addr}/health: {e}"))?;
-    if status != 200 {
-        return Err(anyhow::anyhow!(
-            "cannot verify HA readiness: {web_addr}/health returned HTTP {status}"
-        ));
-    }
-    let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-        anyhow::anyhow!("invalid HA readiness response from {web_addr}/health: {e}")
-    })?;
-    let ha = value.get("ha").ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot verify HA readiness: {web_addr}/health does not expose the HA readiness signal"
-        )
-    })?;
-    if !ha
-        .get("required")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(anyhow::anyhow!(
-            "cannot verify HA readiness: {web_addr}/health does not report the configured HA role as required"
-        ));
-    }
-    let ready = ha
-        .get("ready")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "cannot verify HA readiness: {web_addr}/health has no boolean `ha.ready` field"
-            )
-        })?;
-    if ready {
         return Ok(());
     }
-    // Deliberately ignore any server-provided detail: this message is printed
-    // into container logs from a public probe. Operators get the detailed
-    // cause from the authenticated `/api/v1/ha/status` endpoint or the logs.
-    Err(anyhow::anyhow!(
-        "Healthcheck failed: HA replication is not ready (see /api/v1/ha/status or the server logs for the reason)"
-    ))
+
+    // Probe `/health` whenever the admin listener answers. On a DNS-only node
+    // an unreachable web listener is not a failure; with HA configured it is.
+    probe_readiness(web_addr, timeout_ms, ha_required).await
+}
+
+/// Verifies the readiness reported by the public `/health` endpoint.
+///
+/// `/health` is intentionally generic (P2-89): it returns `200 {"status":"ok"}`
+/// only when every blocking component is ready, and `503
+/// {"status":"unavailable"}` otherwise. A reachable endpoint that returns
+/// anything else, or a 200 body without `status: ok`, fails closed. When
+/// `required` is false (a DNS-only node) an unreachable admin listener is
+/// ignored; when HA is configured it is an error.
+async fn probe_readiness(
+    web_addr: SocketAddr,
+    timeout_ms: u64,
+    required: bool,
+) -> Result<(), anyhow::Error> {
+    match http_get(web_addr, "/health", timeout_ms).await {
+        Ok((200, body)) => {
+            let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+                anyhow::anyhow!("invalid readiness response from {web_addr}/health: {e}")
+            })?;
+            if value.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "cannot verify readiness: {web_addr}/health did not report `status: ok`"
+                ))
+            }
+        }
+        Ok((503, _)) => Err(anyhow::anyhow!(
+            "Healthcheck failed: the server reports it is not ready (see /api/v1/status or the server logs for the reason)"
+        )),
+        Ok((other, _)) => Err(anyhow::anyhow!(
+            "cannot verify readiness: {web_addr}/health returned HTTP {other}"
+        )),
+        Err(e) if required => Err(anyhow::anyhow!(
+            "cannot verify readiness from {web_addr}/health: {e}"
+        )),
+        Err(_) => Ok(()),
+    }
 }
 
 /// Reports whether the admin API is in first-boot setup-pending mode.
 ///
-/// `/health` and `/status` are preferred when they expose a JSON
-/// `setup_pending` boolean. Otherwise the setup-gating middleware signal is
-/// used: while setup is pending, `/api/v1/*` is short-circuited with
-/// `503 Setup not completed`; once an admin account exists the normal auth
+/// `/health` is generic and no longer carries a `setup_pending` field. While
+/// setup is pending, the setup-gating middleware short-circuits `/api/v1/*`
+/// with `503 Setup not completed`; once an admin account exists the normal auth
 /// layer answers instead (typically `401`).
 async fn probe_setup_pending(web_addr: SocketAddr, timeout_ms: u64) -> Result<bool, anyhow::Error> {
-    for path in ["/health", "/status"] {
-        if let Ok((200, body)) = http_get(web_addr, path, timeout_ms).await
-            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
-            && let Some(pending) = value
-                .get("setup_pending")
-                .and_then(serde_json::Value::as_bool)
-        {
-            return Ok(pending);
-        }
-    }
-
     match http_get(web_addr, "/api/v1/status", timeout_ms).await {
         Ok((503, body)) if body.contains("Setup not completed") => Ok(true),
         Ok(_) => Ok(false),
@@ -939,8 +924,13 @@ pub fn run_restore(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ =
-            std::fs::set_permissions(target_config_path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(target_config_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Restored '{}' but failed to set mode 0600: {e}. Fix the permissions before starting the server.",
+                    target_config_path.display()
+                )
+            })?;
     }
     fsync_parent_dir(target_config_path);
 
@@ -1053,7 +1043,8 @@ pub fn prepare_no_setup_bootstrap(
     rand::rng().fill(&mut bytes);
     let mut password = String::with_capacity(48);
     for byte in &bytes {
-        let _ = std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"));
+        std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"))
+            .expect("writing a hex digit into a String cannot fail");
     }
     sito_api::AuthManager::reset_admin_credentials(&config.server.data_dir, &password).map_err(
         |e| {
@@ -1308,7 +1299,8 @@ fn generate_reset_admin_password() -> String {
     rand::rng().fill(&mut bytes);
     let mut password = String::with_capacity(48);
     for byte in &bytes {
-        let _ = std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"));
+        std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"))
+            .expect("writing a hex digit into a String cannot fail");
     }
     password
 }
@@ -2159,20 +2151,16 @@ mod tests {
     #[tokio::test]
     async fn test_healthcheck_fails_when_ha_is_not_ready() {
         let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
-        let web_addr = spawn_http_router(vec![(
-            "/health",
-            200,
-            r#"{"status":"ok","setup_pending":false,"ha":{"required":true,"ready":false,"reason":"master mTLS initialization failed: Permission denied"}}"#,
-        )])
-        .await;
+        let web_addr =
+            spawn_http_router(vec![("/health", 503, r#"{"status":"unavailable"}"#)]).await;
 
         let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
             .await
-            .expect_err("a healthy DNS probe must not mask an unready HA node");
+            .expect_err("a healthy DNS probe must not mask an unready node");
         let message = err.to_string();
         assert!(
-            message.contains("HA replication is not ready"),
-            "the healthcheck must report the unready HA role: {message}"
+            message.contains("not ready"),
+            "the healthcheck must report the unready node: {message}"
         );
         // `/health` is public; the healthcheck must not echo internal paths or
         // OS errors from the server's detailed readiness reason into logs.
@@ -2185,33 +2173,41 @@ mod tests {
     #[tokio::test]
     async fn test_healthcheck_passes_when_ha_is_ready() {
         let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
-        let web_addr = spawn_http_router(vec![(
-            "/health",
-            200,
-            r#"{"status":"ok","setup_pending":false,"ha":{"required":true,"ready":true,"reason":null}}"#,
-        )])
-        .await;
+        let web_addr = spawn_http_router(vec![("/health", 200, r#"{"status":"ok"}"#)]).await;
 
         run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
             .await
-            .expect("a ready HA node must satisfy the healthcheck");
+            .expect("a ready node must satisfy the healthcheck");
+    }
+
+    /// A DNS-only deployment must not ignore a reachable `/health` that says
+    /// the node is not ready (for example a broken filter or TLS listener).
+    #[tokio::test]
+    async fn test_healthcheck_fails_when_reachable_health_is_not_ready_without_ha() {
+        let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
+        let web_addr =
+            spawn_http_router(vec![("/health", 503, r#"{"status":"unavailable"}"#)]).await;
+
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, false)
+            .await
+            .expect_err("a reachable not-ready node must fail the healthcheck");
+        assert!(
+            err.to_string().contains("not ready"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
     async fn test_healthcheck_ha_required_without_signal_fails_closed() {
         let dns_addr = spawn_udp_responder(dns_response(0x4242, ResponseCode::NoError)).await;
-        let web_addr = spawn_http_router(vec![(
-            "/health",
-            200,
-            r#"{"status":"ok","setup_pending":false}"#,
-        )])
-        .await;
+        let web_addr =
+            spawn_http_router(vec![("/health", 200, r#"{"setup_pending":false}"#)]).await;
 
         let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 2_000, false, true)
             .await
-            .expect_err("a missing HA readiness signal must fail closed");
+            .expect_err("a missing generic status field must fail closed");
         assert!(
-            err.to_string().contains("HA readiness"),
+            err.to_string().contains("readiness") || err.to_string().contains("status: ok"),
             "unexpected error: {err}"
         );
     }
@@ -2253,12 +2249,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_healthcheck_setup_fallback_accepts_pending_health_json() {
+    async fn test_healthcheck_setup_fallback_requires_the_middleware_signal() {
         let (dns_addr, _silent) = spawn_silent_udp().await;
-        let web_addr = spawn_http_router(vec![("/health", 200, "{\"setup_pending\": true}")]).await;
-        run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
+        // `/health` is generic and no longer carries `setup_pending`; a generic
+        // 200 must not be mistaken for a pending wizard.
+        let web_addr = spawn_http_router(vec![
+            ("/health", 200, r#"{"status":"ok"}"#),
+            ("/api/v1/status", 401, "Unauthorized"),
+        ])
+        .await;
+        let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
             .await
-            .expect("setup-pending web interface must satisfy the setup fallback");
+            .expect_err("a generic health response must not satisfy the setup fallback");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -2539,6 +2545,57 @@ mod tests {
         let generation = std::fs::read_to_string(dir.join("auth_generation")).unwrap();
         assert_eq!(generation.trim(), "2");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_lease_tests {
+    use super::prepare_no_setup_bootstrap;
+    use crate::service_lock::{ServiceLease, with_service_lease};
+    use sito_core::config::Config;
+
+    /// P2-90: the real `--no-setup` bootstrap must refuse to write
+    /// `users.toml` while another process owns the service lease. This is a
+    /// deterministic regression: the contender is rejected before the
+    /// bootstrap closure runs, so no timing window exists.
+    #[test]
+    fn test_no_setup_bootstrap_requires_the_service_lease() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_bootstrap_lease_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let mut config = Config::default();
+        config.server.data_dir = dir.clone();
+
+        let held = ServiceLease::acquire(&dir).expect("first lease");
+        let err = with_service_lease(&dir, || {
+            prepare_no_setup_bootstrap(&config_path, &mut config)
+        })
+        .expect_err("a held lease must refuse the bootstrap");
+        assert!(
+            err.to_string().contains("already running"),
+            "unexpected lease error: {err}"
+        );
+        assert!(
+            !config_path.exists() && !dir.join("users.toml").exists(),
+            "a losing process must not write bootstrap state"
+        );
+
+        drop(held);
+        let (outcome, lease) = with_service_lease(&dir, || {
+            prepare_no_setup_bootstrap(&config_path, &mut config)
+        })
+        .expect("the bootstrap must run after the lease is released");
+        assert!(matches!(
+            outcome,
+            super::NoSetupBootstrap::GeneratedPassword(_)
+        ));
+        assert!(dir.join("users.toml").exists());
+        drop(lease);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

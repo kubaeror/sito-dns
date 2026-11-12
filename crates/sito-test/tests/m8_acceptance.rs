@@ -143,10 +143,20 @@ async fn create_test_context(
     config.server.role = role.to_string();
     config.server.instance_name = format!("{role}-test");
     config.server.data_dir = temp_dir.clone();
+    // These acceptance tests exercise HA, not filtering. The built-in defaults
+    // have filtering enabled with zero sources, which is fail-closed and would
+    // (correctly) make readiness false; disable it so the HA signal is what the
+    // assertions measure.
+    config.filtering.enabled = false;
     let config_toml = toml::to_string_pretty(&config).unwrap();
     tokio::fs::write(&config_path, &config_toml).await.unwrap();
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config.clone())));
+    // These acceptance tests exercise HA, not the DNS startup transaction.
+    // Publish the ready state a successfully started server would publish.
+    let readiness = sito_api::ReadinessState::default();
+    readiness.set_listeners_ready();
+    readiness.set_tls_ready();
     let cache = Arc::new(DnsCache::new(config.dns.cache.clone()));
     let filter = Arc::new(
         HostsFilterEngine::init_with_observer(
@@ -214,6 +224,7 @@ async fn create_test_context(
         slave_tracker: slave_track,
         resync_sender: resync_tx,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        readiness: Arc::new(readiness),
         acme_challenges: None,
         dns_starter: None,
     };
@@ -764,8 +775,7 @@ async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
     let master_app = create_router(master_ctx);
 
     let health = get_json(&master_app, "/health", None).await;
-    assert_eq!(health["ha"]["required"], true);
-    assert_eq!(health["ha"]["ready"], true);
+    assert_eq!(health, serde_json::json!({ "status": "ok" }));
 
     coordinator.mark_replication_failed("master mTLS initialization failed: Permission denied");
     let status = get_json(&master_app, "/api/v1/ha/status", Some(&master_token)).await;
@@ -780,24 +790,24 @@ async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
             .contains("Permission denied"),
         "readiness reason must survive to /ha/status: {status}"
     );
-    let health = get_json(&master_app, "/health", None).await;
-    assert_eq!(health["ha"]["required"], true);
-    assert_eq!(health["ha"]["ready"], false);
-    // `/health` is unauthenticated: it must not leak the detailed reason
-    // (certificate path, OS error, internal master URL, TOML/validation text)
-    // that remains available on the authenticated `/api/v1/ha/status`.
-    let public_reason = health["ha"]["reason"].as_str().unwrap_or_default();
-    assert_eq!(
-        public_reason, "HA replication is not ready",
-        "public health must use a generic HA reason: {health}"
+    let (health_status, health) = get_json_status(&master_app, "/health", None).await;
+    assert_eq!(health_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(health, serde_json::json!({ "status": "unavailable" }));
+    // `/health` is unauthenticated and generic: it must not leak the detailed
+    // reason (certificate path, OS error, internal master URL, TOML/validation
+    // text) that remains available on the authenticated `/api/v1/ha/status`.
+    let public_body = health.to_string();
+    assert!(
+        !public_body.contains('/'),
+        "no filesystem paths in /health: {health}"
     );
     assert!(
-        !public_reason.contains('/'),
-        "no filesystem paths in /health"
+        !public_body.contains("Permission denied"),
+        "no OS error detail in /health: {health}"
     );
     assert!(
-        !public_reason.contains("Permission denied"),
-        "no OS error detail in /health"
+        !public_body.contains("HA replication"),
+        "/health must not expose a component reason: {health}"
     );
 
     // Slave: readiness requires an actual sync, not just a configured URL.
@@ -823,10 +833,17 @@ async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
             .contains("mTLS handshake failed"),
         "handshake failure must reach /ha/status: {status}"
     );
-    let slave_health = get_json(&slave_app, "/health", None).await;
-    assert_eq!(slave_health["ha"]["ready"], false);
+    let (health_status, slave_health) = get_json_status(&slave_app, "/health", None).await;
+    assert_eq!(health_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        slave_health["ha"]["reason"], "HA replication is not ready",
+        slave_health,
+        serde_json::json!({ "status": "unavailable" }),
+        "slave /health must stay generic"
+    );
+    assert!(
+        !slave_health
+            .to_string()
+            .contains("mTLS handshake failed with master"),
         "slave /health must not expose the handshake/master URL detail"
     );
 
@@ -834,6 +851,12 @@ async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
     let status = get_json(&slave_app, "/api/v1/ha/status", Some(&slave_token)).await;
     assert_eq!(status["ready"], true);
     assert!(status["readiness_reason"].is_null());
+    let health = get_json(&slave_app, "/health", None).await;
+    assert_eq!(
+        health,
+        serde_json::json!({ "status": "ok" }),
+        "a synced slave must be ready again"
+    );
 
     let _ = std::fs::remove_dir_all(&master_dir);
     let _ = std::fs::remove_dir_all(&slave_dir);
@@ -869,10 +892,13 @@ async fn test_m8_ha_disabled_reason_is_exposed_in_status() {
     );
 
     let health = get_json(&master_app, "/health", None).await;
-    assert_eq!(health["ha"]["required"], false);
-    assert_eq!(health["ha"]["ready"], true);
+    assert_eq!(
+        health,
+        serde_json::json!({ "status": "ok" }),
+        "deliberately disabled replication is ready and generic"
+    );
     assert!(
-        health["ha"]["reason"].is_null(),
+        !health.to_string().contains("replication_port"),
         "public /health must not expose the disabled explanation: {health}"
     );
 
@@ -1115,9 +1141,9 @@ async fn test_m8_ha_runtime_child_probe() {
             let app = create_router(ctx);
 
             let health = get_json(&app, "/health", None).await;
-            assert_eq!(health["ha"]["required"], true);
             assert_eq!(
-                health["ha"]["ready"], true,
+                health,
+                serde_json::json!({ "status": "ok" }),
                 "public /health must flip to ready after chown: {health}"
             );
             let status = get_json(&app, "/api/v1/ha/status", Some(&token)).await;
@@ -1131,8 +1157,12 @@ async fn test_m8_ha_runtime_child_probe() {
     }
 }
 
-/// GETs `path` from the router and decodes a JSON body.
-async fn get_json(app: &axum::Router, path: &str, token: Option<&str>) -> serde_json::Value {
+/// GETs `path` from the router and decodes a JSON body with its status.
+async fn get_json_status(
+    app: &axum::Router,
+    path: &str,
+    token: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let mut request = Request::builder().uri(path);
     if let Some(token) = token {
         request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
@@ -1142,11 +1172,18 @@ async fn get_json(app: &axum::Router, path: &str, token: Option<&str>) -> serde_
         .oneshot(request.body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    serde_json::from_slice(&bytes).unwrap()
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// GETs `path` from the router and decodes a `200 OK` JSON body.
+async fn get_json(app: &axum::Router, path: &str, token: Option<&str>) -> serde_json::Value {
+    let (status, body) = get_json_status(app, path, token).await;
+    assert_eq!(status, StatusCode::OK, "{path}");
+    body
 }
 
 // ----------------------------------------------------------------------------

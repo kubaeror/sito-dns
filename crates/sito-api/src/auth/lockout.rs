@@ -4,13 +4,13 @@
 //! Per-IP rate limiting for login endpoints.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Locks a mutex, recovering from poisoning instead of panicking (a panic
 /// would abort the resolver build because release uses `panic = "abort"`).
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    sito_core::sync::lock_or_recover(mutex)
 }
 
 pub const MAX_FAILED_ATTEMPTS: u32 = 5;

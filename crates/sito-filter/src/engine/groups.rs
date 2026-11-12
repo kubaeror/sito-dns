@@ -75,11 +75,7 @@ impl HostsFilterEngine {
         self.group_sources_configured
             .store(has_group_sources, Ordering::Release);
         self.group_defs.store(Arc::new(groups));
-        let list_rules = self
-            .list_rules
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let list_rules = sito_core::sync::lock_or_recover(&self.list_rules).clone();
         if let Some(degraded) = self.rebuild_group_snapshots(&list_rules) {
             self.update_group_status(degraded);
         }

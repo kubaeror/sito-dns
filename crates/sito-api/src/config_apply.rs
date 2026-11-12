@@ -431,6 +431,64 @@ pub async fn apply_and_persist_document_rejecting_restart(
     apply_and_persist_document_locked(ctx, candidate, document, filter_apply, hooks).await
 }
 
+/// How the previous `config.toml` was read before an apply, for rollback.
+#[derive(Debug)]
+enum PreviousDocumentRead {
+    Present(String),
+    Missing,
+    /// The file existed but could not be read. A rollback must not treat this
+    /// like `Missing`: deleting the newly written document could destroy the
+    /// only copy of a configuration that was previously present.
+    Unreadable(std::io::Error),
+}
+
+async fn read_previous_document(path: &std::path::Path) -> PreviousDocumentRead {
+    match tokio::fs::read_to_string(path).await {
+        Ok(document) => PreviousDocumentRead::Present(document),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PreviousDocumentRead::Missing,
+        Err(e) => PreviousDocumentRead::Unreadable(e),
+    }
+}
+
+/// Restores (or removes) the on-disk document after an oversized HA bundle.
+///
+/// `Missing` is the only case where removing the new document is safe. An
+/// unreadable previous document is preserved and logged: the apply already
+/// failed, and deleting the file would make the operator's previous
+/// configuration unrecoverable.
+async fn rollback_document_after_oversized_bundle(
+    config_path: &std::path::Path,
+    previous: &Config,
+    previous_document: &PreviousDocumentRead,
+) {
+    match previous_document {
+        PreviousDocumentRead::Present(document) => {
+            if let Err(e) = save_config_document_atomic(config_path, document, previous).await {
+                tracing::error!(
+                    error = %e.detail,
+                    "Failed to restore the previous configuration document after an oversized HA bundle"
+                );
+            }
+        }
+        PreviousDocumentRead::Missing => {
+            if let Err(e) = tokio::fs::remove_file(config_path).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::error!(
+                    error = %e,
+                    "Failed to remove the rejected configuration document after an oversized HA bundle"
+                );
+            }
+        }
+        PreviousDocumentRead::Unreadable(error) => {
+            tracing::error!(
+                error = %error,
+                "Could not read the previous configuration document during an oversized-HA-bundle rollback; preserving the newly written document instead of deleting it. Fix or restore config.toml before restarting."
+            );
+        }
+    }
+}
+
 /// Persist variant that must be called with [`ServerContext::apply_lock`] held.
 async fn apply_and_persist_document_locked(
     ctx: &ServerContext,
@@ -440,7 +498,7 @@ async fn apply_and_persist_document_locked(
     hooks: Option<&dyn ConfigApplyHooks>,
 ) -> Result<AppliedReport, ProblemDetails> {
     let previous = (**ctx.config.load()).clone();
-    let previous_document = tokio::fs::read_to_string(&ctx.config_path).await.ok();
+    let previous_document = read_previous_document(&ctx.config_path).await;
     let mut report = apply_full_config_locked(ctx, candidate, filter_apply, hooks).await?;
 
     if let Err(e) = save_config_document_atomic(&ctx.config_path, document, candidate).await {
@@ -471,27 +529,12 @@ async fn apply_and_persist_document_locked(
                 limit,
                 "HA bundle exceeds the replication limit; rolling back the local apply"
             );
-            if let Some(previous_document) = previous_document.as_deref()
-                && let Err(e) =
-                    save_config_document_atomic(&ctx.config_path, previous_document, &previous)
-                        .await
-            {
-                tracing::error!(
-                    error = %e.detail,
-                    "Failed to restore the previous configuration document after an oversized HA bundle"
-                );
-            } else if previous_document.is_none() {
-                // There was no previous document: remove the newly written one
-                // so a restart cannot load the rejected configuration.
-                if let Err(e) = tokio::fs::remove_file(&ctx.config_path).await
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::error!(
-                        error = %e,
-                        "Failed to remove the rejected configuration document after an oversized HA bundle"
-                    );
-                }
-            }
+            rollback_document_after_oversized_bundle(
+                &ctx.config_path,
+                &previous,
+                &previous_document,
+            )
+            .await;
             if let Err(e) = apply_full_config_locked(ctx, &previous, filter_apply, hooks).await {
                 tracing::error!(
                     error = %e.detail,
@@ -820,7 +863,7 @@ pub(crate) async fn apply_filter_refresh(
     filtering: &sito_core::config::FilteringConfig,
     expected: RuntimeGeneration,
 ) -> Result<usize, ApplyError> {
-    let mut prepared = engine.prepare(filtering).await;
+    let prepared = engine.prepare(filtering).await;
 
     // The prepared value holds the engine reload guard. While it is held no
     // config apply can stage/publish a new filter, so this check is stable.
@@ -834,10 +877,20 @@ pub(crate) async fn apply_filter_refresh(
         });
     }
 
-    if let Some(error) = prepared.error.take() {
-        // Keep the previous rules; publish the failure status only.
-        let _ = engine.publish_prepared(prepared);
-        return Err(ApplyError::Filter(error));
+    if prepared.error.is_some() {
+        // Keep the previous rules; publish the failure status only. With the
+        // staged error still present, `publish_prepared` returns it after
+        // installing the status, so that error is the one we report. An `Ok`
+        // here would mean the staged error vanished; surface that as an
+        // internal error instead of logging a false success/failure.
+        let publish = engine.publish_prepared(prepared);
+        if let Err(error) = publish {
+            return Err(ApplyError::Filter(error));
+        }
+        tracing::error!("Filter publish unexpectedly succeeded after a staged load failure");
+        return Err(ApplyError::Internal(
+            "filter apply failed but the staged error was not reported".to_string(),
+        ));
     }
 
     let snapshot = prepared.snapshot.clone();
@@ -2477,5 +2530,84 @@ acme_enabled = false
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}
+
+#[cfg(test)]
+mod rollback_document_tests {
+    use super::*;
+
+    fn temp_config_path(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = crate::test_support::temp_dir(label);
+        let path = dir.join("config.toml");
+        (dir, path)
+    }
+
+    /// A read error is not "no previous document": the rollback must preserve
+    /// the newly written file instead of deleting the only copy.
+    #[tokio::test]
+    async fn test_unreadable_previous_document_preserves_the_new_file() {
+        let (dir, path) = temp_config_path("sito_rollback_unreadable");
+        tokio::fs::write(&path, "new-document")
+            .await
+            .expect("write new document");
+        let unreadable = PreviousDocumentRead::Unreadable(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+
+        rollback_document_after_oversized_bundle(&path, &Config::default(), &unreadable).await;
+
+        assert_eq!(
+            tokio::fs::read_to_string(&path)
+                .await
+                .expect("new document must survive"),
+            "new-document"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_missing_previous_document_removes_the_new_file() {
+        let (dir, path) = temp_config_path("sito_rollback_missing");
+        tokio::fs::write(&path, "new-document")
+            .await
+            .expect("write new document");
+
+        rollback_document_after_oversized_bundle(
+            &path,
+            &Config::default(),
+            &PreviousDocumentRead::Missing,
+        )
+        .await;
+
+        assert!(
+            !path.exists(),
+            "a genuinely absent previous document is removed so restart cannot load the rejected config"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_present_previous_document_is_restored() {
+        let (dir, path) = temp_config_path("sito_rollback_present");
+        tokio::fs::write(&path, "new-document")
+            .await
+            .expect("write new document");
+
+        rollback_document_after_oversized_bundle(
+            &path,
+            &Config::default(),
+            &PreviousDocumentRead::Present("config_version = 2\n".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            tokio::fs::read_to_string(&path)
+                .await
+                .expect("restored document"),
+            "config_version = 2\n"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

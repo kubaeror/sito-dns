@@ -9,6 +9,22 @@ impl StatsDb {
         &self.pool
     }
 
+    /// Whether the pool has been closed (shutdown or unrecoverable failure).
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.pool.is_closed()
+    }
+
+    /// Cheap readiness probe for the stats database.
+    ///
+    /// A single `SELECT 1` detects a locked/corrupt/unavailable database
+    /// without touching query-log data. Callers bound the probe with a timeout
+    /// so a wedged disk cannot stall a health endpoint.
+    pub async fn health_check(&self) -> Result<(), StatsError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// Whether `value` is a stored keyed digest (current or legacy prefix).
     ///
     /// Requiring exactly 64 hex characters avoids treating a real IPv6 address

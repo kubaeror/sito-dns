@@ -840,6 +840,7 @@ mod tests {
             slave_tracker: None,
             resync_sender: None,
             setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            readiness: Arc::new(crate::readiness::ReadinessState::default()),
             acme_challenges: None,
             dns_starter: None,
         }

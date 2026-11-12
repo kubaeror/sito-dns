@@ -218,6 +218,61 @@ impl AcmeServiceConfig {
     }
 }
 
+/// Warning window for an expiring certificate (D12).
+pub const CERTIFICATE_EXPIRY_WARNING_DAYS: i64 = 30;
+
+/// Validity of a certificate file for readiness decisions (D12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateValidity {
+    /// No certificate file exists (first boot or ACME issuance pending).
+    Missing,
+    /// The self-signed bootstrap placeholder is the only material available.
+    Bootstrap,
+    /// The certificate is expired or cannot be parsed.
+    Expired,
+    /// The certificate is valid but expires within the warning window.
+    Expiring { days_remaining: i64 },
+    /// The certificate is valid beyond the warning window.
+    Valid { days_remaining: i64 },
+}
+
+/// Classifies a certificate file for readiness.
+///
+/// Missing and unparseable material is not silently treated as valid. A
+/// certificate that cannot be parsed is reported as expired because it cannot
+/// be served.
+#[must_use]
+pub fn certificate_validity(cert_path: &std::path::Path) -> CertificateValidity {
+    let Ok(bytes) = std::fs::read(cert_path) else {
+        return CertificateValidity::Missing;
+    };
+    match days_until_expiration(&bytes) {
+        Ok(days) if days <= 0 => CertificateValidity::Expired,
+        Ok(days) if days <= CERTIFICATE_EXPIRY_WARNING_DAYS => CertificateValidity::Expiring {
+            days_remaining: days,
+        },
+        Ok(days) => CertificateValidity::Valid {
+            days_remaining: days,
+        },
+        Err(_) => CertificateValidity::Expired,
+    }
+}
+
+impl AcmeServiceConfig {
+    /// Classifies the stored ACME certificate for readiness.
+    #[must_use]
+    pub fn certificate_validity(&self) -> CertificateValidity {
+        let cert_path = self.storage_dir.join("cert.pem");
+        if !cert_path.exists() {
+            return CertificateValidity::Missing;
+        }
+        if self.is_bootstrap_cert() {
+            return CertificateValidity::Bootstrap;
+        }
+        certificate_validity(&cert_path)
+    }
+}
+
 /// Seconds remaining until the first certificate in `cert_pem` expires.
 ///
 /// Negative values mean the certificate is already expired. This is the
@@ -760,20 +815,16 @@ impl AcmeChallengeAvailability {
 
     /// Record a failed issuance/renewal attempt for readiness reporting.
     pub fn record_error(&self, error: impl Into<String>) {
-        if let Ok(mut slot) = self.last_error.lock() {
-            *slot = Some(error.into());
-        }
+        *sito_core::sync::lock_or_recover(&self.last_error) = Some(error.into());
     }
 
     /// Clear the last error after a successful issuance check.
     pub fn record_success(&self) {
-        if let Ok(mut slot) = self.last_error.lock() {
-            *slot = None;
-        }
+        *sito_core::sync::lock_or_recover(&self.last_error) = None;
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.last_error.lock().ok().and_then(|slot| slot.clone())
+        sito_core::sync::lock_or_recover(&self.last_error).clone()
     }
 }
 
@@ -1212,6 +1263,60 @@ mod tests {
             days >= 0,
             "Test cert should be valid for non-negative days: {days}"
         );
+    }
+
+    /// D12 ladder: a certificate's remaining lifetime determines whether
+    /// readiness should be valid, degraded, or not-ready.
+    #[test]
+    fn test_certificate_validity_ladder() {
+        let now = time::OffsetDateTime::now_utc();
+        let dir = std::env::temp_dir().join(format!(
+            "sito_cert_validity_{}_{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let missing = certificate_validity(&dir.join("missing.pem"));
+        assert_eq!(missing, CertificateValidity::Missing);
+
+        let valid_path = dir.join("valid.pem");
+        let (valid_pem, _) = generate_ca_signed_cert_with_window(
+            "valid.example",
+            now,
+            now + time::Duration::days(90),
+        );
+        std::fs::write(&valid_path, valid_pem).expect("write valid cert");
+        assert!(matches!(
+            certificate_validity(&valid_path),
+            CertificateValidity::Valid { .. }
+        ));
+
+        let expiring_path = dir.join("expiring.pem");
+        let (expiring_pem, _) = generate_ca_signed_cert_with_window(
+            "expiring.example",
+            now - time::Duration::days(60),
+            now + time::Duration::days(10),
+        );
+        std::fs::write(&expiring_path, expiring_pem).expect("write expiring cert");
+        assert!(matches!(
+            certificate_validity(&expiring_path),
+            CertificateValidity::Expiring { .. }
+        ));
+
+        let expired_path = dir.join("expired.pem");
+        let (expired_pem, _) = generate_ca_signed_cert_with_window(
+            "expired.example",
+            now - time::Duration::days(90),
+            now - time::Duration::hours(1),
+        );
+        std::fs::write(&expired_path, expired_pem).expect("write expired cert");
+        assert_eq!(
+            certificate_validity(&expired_path),
+            CertificateValidity::Expired
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The default availability (nothing bound yet) must not select

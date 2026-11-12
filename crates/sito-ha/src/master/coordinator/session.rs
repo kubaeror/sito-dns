@@ -172,7 +172,7 @@ impl MasterCoordinator {
     /// when a newer connection has replaced it, in which case the live entry is
     /// left untouched.
     pub(super) fn unregister_session(&self, instance: &str, connection_id: u64) -> bool {
-        let mut slaves = self.slaves.lock().unwrap();
+        let mut slaves = sito_core::sync::lock_or_recover(&self.slaves);
         let owned = slaves
             .get(instance)
             .is_some_and(|s| s.connection_id == connection_id);
@@ -181,11 +181,9 @@ impl MasterCoordinator {
             // Drop the per-slave catch-up and divergence bookkeeping with the
             // session so neither map nor its metric label can grow across
             // reconnects.
-            self.stale_repushes.lock().unwrap().remove(instance);
-            self.diverged.lock().unwrap().remove(instance);
-            self.queued_bytes
-                .lock()
-                .unwrap()
+            sito_core::sync::lock_or_recover(&self.stale_repushes).remove(instance);
+            sito_core::sync::lock_or_recover(&self.diverged).remove(instance);
+            sito_core::sync::lock_or_recover(&self.queued_bytes)
                 .remove(&(instance.to_string(), connection_id));
             self.metrics.remove_ha_diverged(instance);
         }
@@ -196,9 +194,7 @@ impl MasterCoordinator {
 
     /// Returns the payload hash of a still-retained published envelope.
     pub(super) fn published_envelope_hash(&self, term: u64, version: u64) -> Option<String> {
-        self.active_push_history
-            .lock()
-            .unwrap()
+        sito_core::sync::lock_or_recover(&self.active_push_history)
             .iter()
             .find(|envelope| envelope.term == term && envelope.version == version)
             .map(|envelope| envelope.payload_hash.clone())

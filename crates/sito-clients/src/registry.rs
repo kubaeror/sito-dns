@@ -181,7 +181,7 @@ impl ClientRegistry {
 
     /// Update the RouterOS lease table.
     pub fn update_routeros_leases(&self, leases: Vec<RouterOsLease>) {
-        *self.routeros_leases.write().unwrap() = leases;
+        *sito_core::sync::write_or_recover(&self.routeros_leases) = leases;
     }
 
     /// Snapshot of discovered-but-unconfigured clients, newest first.
@@ -201,10 +201,7 @@ impl ClientRegistry {
     /// [`ClientRegistry::unidentified_clients`].
     #[must_use]
     pub fn unidentified_clients_at(&self, now: DateTime<Utc>) -> Vec<UnidentifiedClient> {
-        let mut guard = self
-            .unidentified_clients
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = sito_core::sync::write_or_recover(&self.unidentified_clients);
         // Prune on read as well as on insert: a client that stops querying must
         // not remain visible indefinitely just because no new lease arrived.
         guard.retain(|_, client| now - client.last_seen < UNIDENTIFIED_CLIENT_TTL);
@@ -411,7 +408,7 @@ impl ClientRegistry {
         // in identification when the operator explicitly opts in; MAC/IP lease
         // matching stays active either way.
         let trust_names = self.config.trust_routeros_lease_names;
-        let leases = self.routeros_leases.read().unwrap();
+        let leases = sito_core::sync::read_or_recover(&self.routeros_leases);
 
         for lease in leases.iter() {
             if !lease.verified {
@@ -480,7 +477,7 @@ impl ClientRegistry {
     /// Records a discovered client, bounding the map by age and size.
     fn record_unidentified(&self, ip: IpAddr, lease: &RouterOsLease, now: DateTime<FixedOffset>) {
         let now_utc = now.with_timezone(&Utc);
-        let mut unidentified = self.unidentified_clients.write().unwrap();
+        let mut unidentified = sito_core::sync::write_or_recover(&self.unidentified_clients);
 
         // Drop stale entries first; a long-idle client must not pin memory.
         unidentified.retain(|_, client| now_utc - client.last_seen < UNIDENTIFIED_CLIENT_TTL);

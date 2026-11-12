@@ -81,7 +81,7 @@ pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
 
 // ---------------------------------------------------------------------------
 
-pub(crate) fn get_status_response(ctx: &ServerContext) -> StatusResponse {
+pub(crate) async fn get_status_response(ctx: &ServerContext) -> StatusResponse {
     let cfg = ctx.config.load();
     let uptime = ctx.start_time.elapsed().as_secs();
     let mut listeners = Vec::new();
@@ -103,11 +103,14 @@ pub(crate) fn get_status_response(ctx: &ServerContext) -> StatusResponse {
         reason: acme_readiness.reason.map(str::to_string),
         last_error: acme_readiness.last_error,
     });
+    let readiness = ctx.readiness_report().await;
     StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: uptime,
         role: cfg.server.role.clone(),
         listeners,
+        ready: readiness.ready,
+        reasons: readiness.reasons,
         acme,
     }
 }

@@ -36,11 +36,7 @@ impl HostsFilterEngine {
     }
 
     pub(super) fn set_status(&self, status: FilterStatus) {
-        let observer = self
-            .status_observer
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let observer = sito_core::sync::read_or_recover(&self.status_observer).clone();
         if let Some(observer) = observer {
             observer(&status);
         }

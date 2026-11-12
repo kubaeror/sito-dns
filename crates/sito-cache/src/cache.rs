@@ -229,10 +229,7 @@ impl DnsCache {
     /// after acquiring (the slot holder may already have populated it).
     pub async fn single_flight(&self, key: CacheKey) -> SingleFlightGuard {
         let lock = {
-            let mut flights = self
-                .flights
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut flights = sito_core::sync::lock_or_recover(&self.flights);
             if flights.len() > 1024 {
                 flights.retain(|_, weak| weak.strong_count() > 0);
             }

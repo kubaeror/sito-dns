@@ -36,28 +36,18 @@ impl HostsFilterEngine {
     /// Every parse+compile attempt performed by this engine reports its
     /// wall-clock duration, including the initial load and scheduled refreshes.
     pub fn set_compile_observer(&self, observer: CompileObserver) {
-        *self
-            .compile_observer
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+        *sito_core::sync::write_or_recover(&self.compile_observer) = Some(observer);
     }
 
     /// Installs the observer that receives rules published by a scheduled or
     /// partial list refresh. Config applies publish through the runtime plan
     /// and do not call it.
     pub fn set_snapshot_observer(&self, observer: SnapshotObserver) {
-        *self
-            .snapshot_observer
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+        *sito_core::sync::write_or_recover(&self.snapshot_observer) = Some(observer);
     }
 
     pub(super) fn observe_snapshot(&self) {
-        let observer = self
-            .snapshot_observer
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let observer = sito_core::sync::read_or_recover(&self.snapshot_observer).clone();
         if let Some(observer) = observer {
             observer(self.snapshot(), self.group_snapshots());
         }
@@ -68,18 +58,11 @@ impl HostsFilterEngine {
     /// The observer runs synchronously whenever a new [`FilterStatus`] is
     /// published, so API- and scheduler-driven reloads both update metrics.
     pub fn set_status_observer(&self, observer: StatusObserver) {
-        *self
-            .status_observer
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+        *sito_core::sync::write_or_recover(&self.status_observer) = Some(observer);
     }
 
     pub(super) fn observe_compile(&self, elapsed: Duration) {
-        let observer = self
-            .compile_observer
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let observer = sito_core::sync::read_or_recover(&self.compile_observer).clone();
         if let Some(observer) = observer {
             observer(elapsed.as_secs_f64());
         }

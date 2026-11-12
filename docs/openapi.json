@@ -4602,6 +4602,38 @@
           }
         }
       },
+      "ReadinessReason": {
+        "type": "object",
+        "description": "One reason a component is not fully ready.\n\n`message` is a human-readable summary. It never contains credentials,\nprivate keys or certificate material; detailed diagnostics stay in the\ncomponent-specific authenticated endpoints and the logs.",
+        "required": [
+          "component",
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable reason code."
+          },
+          "component": {
+            "type": "string",
+            "description": "Component identifier (`listeners`, `tls`, `acme`, `ha`, `filter`, `stats`)."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable explanation without secrets."
+          },
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Wall-clock milliseconds when the component became not-ready, when known.",
+            "minimum": 0
+          }
+        }
+      },
       "ReauthRequest": {
         "type": "object",
         "description": "Re-authentication request for a sensitive operation.",
@@ -4757,7 +4789,9 @@
           "version",
           "uptime_seconds",
           "role",
-          "listeners"
+          "listeners",
+          "ready",
+          "reasons"
         ],
         "properties": {
           "acme": {
@@ -4776,6 +4810,17 @@
             "items": {
               "type": "string"
             }
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "Aggregate readiness verdict shared with `/health`."
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReadinessReason"
+            },
+            "description": "Per-component readiness reasons (blocking and advisory), in component\norder. Empty when every component is ready."
           },
           "role": {
             "type": "string"

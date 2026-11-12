@@ -25,6 +25,8 @@ pub(super) struct ServerApplyHooks {
     pub(super) listener_manager: Arc<tokio::sync::Mutex<Option<DnsListenerManager>>>,
     pub(super) listener_acceptors: Arc<tokio::sync::Mutex<Option<ListenerAcceptors>>>,
     pub(super) pipeline: Arc<DnsPipeline>,
+    /// Server-owned readiness published to `/health` and `/status`.
+    pub(super) readiness: Arc<sito_api::ReadinessState>,
 }
 
 /// Hook-owned components prepared for one staged apply, not yet installed.
@@ -104,7 +106,7 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
                     let acceptors = self.listener_acceptors.lock().await.clone();
                     if let Some(acceptors) = acceptors {
                         info!("DNS listener bindings changed; rebinding in-process");
-                        manager
+                        if let Err(error) = manager
                             .restart(
                                 &listener_config,
                                 self.pipeline.clone(),
@@ -112,13 +114,33 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
                                 self.rate_limiters.clone(),
                             )
                             .await
-                            .map_err(|e| {
-                                sito_runtime::ApplyError::Tls(sito_transport::TlsError::Config(
-                                    format!("Failed to rebind DNS listeners: {e}"),
-                                ))
-                            })?;
+                        {
+                            // A failed rebind that restored the previous
+                            // generation still serves DNS; a failed revert
+                            // leaves the listener slot empty and must make
+                            // `/health` unavailable.
+                            if manager.is_running() {
+                                self.readiness.set_listeners_ready();
+                            } else {
+                                self.readiness.set_listeners_unavailable(
+                                    "listener_bind_failed",
+                                    "DNS listeners could not be rebound and no previous generation is running",
+                                );
+                            }
+                            return Err(sito_runtime::ApplyError::Tls(
+                                sito_transport::TlsError::Config(format!(
+                                    "Failed to rebind DNS listeners: {error}"
+                                )),
+                            ));
+                        }
+                        self.readiness.set_listeners_ready();
                     } else {
                         warn!("Listener TLS acceptors unavailable; keeping current listeners");
+                        self.readiness.set_listeners_unavailable(
+                            "listener_rebind_skipped",
+                            "listener changes could not be applied because TLS acceptors are unavailable",
+                        );
+                        publish_tls_readiness(&self.readiness, &listener_config, None, None);
                     }
                 }
             }
@@ -127,7 +149,8 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
             self.dnssec.store(prepared.dnssec_validator);
             self.scoped_upstreams
                 .store(Arc::new(prepared.scoped_upstreams));
-            if let Ok(limiters) = self.rate_limiters.lock() {
+            {
+                let limiters = sito_core::sync::lock_or_recover(&self.rate_limiters);
                 for limiter in limiters.iter() {
                     limiter.set_rate(listener_config.dns.rate_limit_per_ip);
                 }

@@ -140,6 +140,8 @@ mod tests {
             uptime_seconds: 3661,
             role: "master".to_string(),
             listeners: vec!["0.0.0.0:53 (UDP/TCP)".to_string()],
+            ready: true,
+            reasons: Vec::new(),
             acme: None,
         };
 
@@ -333,6 +335,8 @@ mod tests {
             uptime_seconds: 120,
             role: "master".to_string(),
             listeners: vec![],
+            ready: true,
+            reasons: Vec::new(),
             acme: None,
         };
         let sys_tmpl = SystemTemplate {
