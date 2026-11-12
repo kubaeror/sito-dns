@@ -12,10 +12,12 @@ feature-depth = 1
 
 [advisories]
 version = 2
-# No ignored advisories. The previous RUSTSEC-2026-0374 suppression became
-# stale (`advisory-not-detected`) and was removed in WP-1.9/P3-19. Add a new
-# entry only with a reviewed reason and the advisory actually matching a crate.
-ignore = []
+# RUSTSEC-2026-0374: `basic-toml` 0.1.10 is unmaintained. It is a build-time
+# dependency of `askama_derive` 0.16 (pulled in by `askama`); it is not linked
+# into the shipped binary and has no safe upgrade. `cargo-deny`'s advisory DB
+# detects it in CI even though a stale local DB may not. Remove this entry once
+# askama moves off basic-toml.
+ignore = ["RUSTSEC-2026-0374"]
 
 [licenses]
 allow = [

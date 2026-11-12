@@ -40,6 +40,9 @@ Optional dictionaries are in `dictionaries/`:
 ```bash
 # Build every target (what the PR `fuzz-build` job runs)
 cargo fuzz build
+# CI pins the gnu target and the toolchain so ASan does not select a musl host:
+# RUSTUP_TOOLCHAIN=nightly-2026-11-04 cargo +nightly-2026-11-04 fuzz build \
+#   --target x86_64-unknown-linux-gnu
 
 # Build one target
 cargo fuzz build dns_wire

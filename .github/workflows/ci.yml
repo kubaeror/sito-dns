@@ -258,8 +258,15 @@ jobs:
         with:
           tool: cargo-fuzz@0.13.2
       - name: Build every fuzz target
-        run: cargo +nightly-2026-11-04 fuzz build
+        env:
+          # `cargo fuzz` invokes its own cargo/rustc; without this the repo's
+          # rust-toolchain.toml can select the runner's musl-host 1.99.1 and
+          # ASan then fails on a statically linked libc.
+          RUSTUP_TOOLCHAIN: nightly-2026-11-04
+        run: cargo +nightly-2026-11-04 fuzz build --target x86_64-unknown-linux-gnu
       - name: Check fuzz target formatting
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2026-11-04
         run: cargo +nightly-2026-11-04 fmt --manifest-path fuzz/Cargo.toml --check
 
   hygiene:

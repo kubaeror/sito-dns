@@ -212,7 +212,7 @@ the mechanism compiles and the cheap checks pass.
 | Lane | Trigger | Command | Why it is safe for PRs |
 |---|---|---|---|
 | `bench-build` | Code change | `cargo bench --workspace --all-features --locked --no-run` | Compiles every Criterion target; does not measure. |
-| `fuzz-build` | Code or `fuzz/**` change | `cargo +nightly-2026-11-04 fuzz build` and `cargo +nightly-2026-11-04 fmt --manifest-path fuzz/Cargo.toml --check` | Builds the five targets with a pinned nightly and checks their formatting; does not fuzz. |
+| `fuzz-build` | Code or `fuzz/**` change | `RUSTUP_TOOLCHAIN=nightly-2026-11-04 cargo +nightly-2026-11-04 fuzz build --target x86_64-unknown-linux-gnu` and the pinned `cargo fmt` check | Builds the five targets with a pinned nightly and the gnu target (ASan is incompatible with a musl-host toolchain) and checks their formatting; does not fuzz. |
 | `hygiene` | Code or dependency change | `cargo machete`; `cargo +nightly-2026-11-04 udeps --workspace --all-targets` | Deterministic dependency-graph checks. |
 | `coverage` | Code change | `cargo llvm-cov --workspace --all-features --locked --summary-only --fail-under-lines "$MIN_LINE_COVERAGE"` then `cargo llvm-cov report --lcov --output-path target/lcov.info` | Runs the test suite with instrumentation, enforces a configurable line floor, and uploads the LCOV report. |
 
