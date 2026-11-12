@@ -15,7 +15,7 @@ benchmarks, the action pin policy, and the monthly runner-minute budget.
 | **Container** | `container.yml` | `workflow_call` from CI and Weekly, `push` to `main` on container paths, `workflow_dispatch` | Validates both Compose files, builds/smoke-tests the development `Dockerfile`, and builds `Dockerfile.release` with stub binaries. |
 | **Security** | `security.yml` | `workflow_call` from CI and Weekly, `push` to `main`, `workflow_dispatch` | Runs `cargo-deny check`. |
 | **Weekly Quality** | `weekly.yml` | Sunday at 03:00 UTC (`schedule`), `workflow_dispatch` | Release-mode tests plus the reusable Container and Security workflows. Benchmarks moved to `bench.yml`. |
-| **Fuzz** | `fuzz.yml` | Nightly at 04:17 UTC (`schedule`), `workflow_dispatch` (`fuzz_seconds`) | Builds and runs the five cargo-fuzz targets with their checked-in corpus and dictionary. Default smoke is 600 s per target; a manual `fuzz_seconds=86400` run is the 24-hour release-checklist gate. Uploads corpus/artifacts on failure. |
+| **Fuzz** | `fuzz.yml` | Nightly at 04:17 UTC (`schedule`), `workflow_dispatch` (`fuzz_seconds`, `shards`) | Builds and runs the five cargo-fuzz targets with their checked-in corpus and dictionary on GitHub-hosted `ubuntu-24.04`. Default smoke is 600 s per target; the 24-hour release checklist is `fuzz_seconds=21600` with `shards=4` (four 6-hour shards per target, ≈24 target-hours aggregate). Uploads corpus/artifacts on failure. |
 | **Bench** | `bench.yml` | Nightly at 05:42 UTC (`schedule`), `workflow_dispatch` (`update_baseline`) | Runs the workspace Criterion suite and fails when a benchmark is more than 10% slower than `benches/baseline.json`. `update_baseline=true` writes and uploads a replacement baseline. |
 | **Release** | `release.yml` | Push of a `v*` tag only | Verifies the tag, builds and signs the three release archives, stages a draft GitHub release, verifies the artifacts, publishes the multi-arch container image, and finally publishes the release. |
 | **Artifact E2E** | `artifact-e2e.yml` | `workflow_call` from Release, `workflow_dispatch` with a tag | Re-downloads a staged draft or published release and verifies checksums, signatures, and execution of every architecture in the release runtime image. |
@@ -238,7 +238,7 @@ on every code change. See `crates/sito-stats/tests/prometheus_exposition.rs`.
 | Evidence | PR | Nightly | Release checklist |
 |---|---|---|---|
 | Fuzz targets compile | `fuzz-build` | Builds again before running | Required |
-| Fuzz execution | Not run | 600 s per target (`fuzz.yml`, 04:17 UTC) | 86,400 s per target (`fuzz_seconds=86400`) |
+| Fuzz execution | Not run | 600 s per target, 1 shard (`fuzz.yml`, 04:17 UTC) | 4 shards × 21,600 s per target (≈24 target-hours) on GitHub-hosted runners |
 | Benchmark compile | `bench-build` | Runs the full suite | Required |
 | Benchmark threshold | Not run | `bench.yml` compares to `benches/baseline.json`; >10% fails | Required |
 | Coverage | `coverage`, 85% line floor | Same lane on code changes | Required through green `ci-gate` ancestry |
@@ -267,20 +267,21 @@ an environment mismatch: the baseline's `environment.description` must equal
 only escape hatch is the explicit, documented `--reference-only` flag, which
 prints a warning and must never be used by the nightly gate.
 
-`bench.yml` refuses to run at all unless the `BENCH_RUNNER_LABEL` repository
-variable names a dedicated/self-hosted runner (GitHub-hosted `ubuntu-*`,
-`windows-*`, `macos-*` labels are rejected) and `BENCH_ENVIRONMENT` is set. It
-then passes `--environment "$BENCH_ENVIRONMENT"`, so a stale baseline fails
-immediately with an instruction to regenerate rather than producing a
-false-green or false-red comparison. Run
-`scripts/save-bench-baseline.sh` on that runner and commit the resulting file;
-`update_baseline=true` on a manual dispatch uploads a replacement for review.
+`bench.yml` runs on GitHub-hosted `ubuntu-24.04` only — no self-hosted runner
+label is required. It passes `--environment "github-ubuntu-24.04"`, so a
+baseline from a different host fails immediately with an instruction to
+regenerate rather than producing a false-green or false-red comparison. To
+generate a GitHub-hosted baseline, dispatch `bench.yml` with
+`update_baseline=true`, download the `bench-<run_id>` artifact, and commit its
+`benches/baseline.json`. The committed alpha baseline is still the WP-1.9
+development-host reference until that one-time dispatch is done.
 
-The committed baseline in this branch was generated on the WP-1.9 development
-host and records `environment.description = "local-dev-x86_64-20cpu"`. The
-nightly gate therefore remains **inactive until the dedicated runner is
-provisioned and the baseline regenerated there**; this is an explicit residual,
-not a silent threshold. Do not mix a laptop baseline with CI, and do not
+The committed alpha baseline records
+`environment.description = "local-dev-x86_64-20cpu"`. Run the one-time
+`update_baseline=true` dispatch on GitHub-hosted `ubuntu-24.04`, download the
+artifact, and commit the resulting `benches/baseline.json` to activate the
+nightly gate. Until that is done the comparison fails closed with an explicit
+environment-mismatch error — a visible residual, never a false green. Do not
 regenerate the baseline to make a real regression pass.
 
 ## Required check and branch protection
@@ -425,11 +426,11 @@ a deliberate split:
   checked-in corpus and dictionary, a 10 s per-input timeout, and a 26-hour job
   ceiling. A crash/timeout fails the workflow and uploads `fuzz/artifacts/` and
   the corpus.
-- **Release checklist:** dispatch `fuzz.yml` with `fuzz_seconds=86400` and a
-  self-hosted `runner_label` (GitHub-hosted jobs are capped at 6 hours), then
-  record the run URL, commit, target list and corpus size in
-  `docs/release-verification.md`. The 24-hour clean run is a D14 release gate,
-  not a flaky PR job.
+- **Release checklist:** dispatch `fuzz.yml` with `fuzz_seconds=21600` and
+  `shards=4` on GitHub-hosted runners (four 6-hour shards per target, ≈24
+  target-hours aggregate), then record the run URL, commit, target list,
+  shard count and corpus size in `docs/release-verification.md`. The 24-hour
+  clean run is a D14 release gate, not a flaky PR job.
 
 `fuzz/README.md` documents the targets, input bounds, corpus seeds,
 dictionaries, exact commands and the 24-hour checklist. Do not reintroduce a
@@ -490,8 +491,8 @@ Operating levers if the budget must stay lower:
 
 - Reduce the nightly `fuzz_seconds` (the 24-hour release run remains manual).
 - Run `fuzz.yml` weekly instead of nightly; keep the PR `fuzz-build`.
-- Set `BENCH_RUNNER_LABEL` to a self-hosted benchmark host and remove the
-  nightly bench from the GitHub-hosted budget.
+- Reduce the nightly bench frequency (the gate runs on GitHub-hosted
+  `ubuntu-24.04`; it cannot be moved to a self-hosted host by design).
 - Use `ci:full` only when needed; it is an exception path.
 
 Approximate runner-minutes per run (sum of billed jobs; parallel jobs count separately; warm caches; cold caches are higher):

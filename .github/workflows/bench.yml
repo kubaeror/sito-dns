@@ -5,11 +5,11 @@ name: Bench
 # only meaningful on the runner class that produced it. Pull requests just
 # compile the benches (`ci.yml` → `bench-build`).
 #
-# The committed baseline was generated on the WP-1.9 development host. The
-# workflow refuses to run unless BENCH_RUNNER_LABEL names a dedicated runner
-# and BENCH_ENVIRONMENT is set; the checker then fails on an environment
-# mismatch. Provision the runner, regenerate the baseline there with
-# `update_baseline=true`, and commit the artifact.
+# The runner class is GitHub-hosted `ubuntu-24.04` only. The committed
+# baseline must be generated on that same runner: dispatch this workflow with
+# `update_baseline=true`, download the `bench-<run_id>` artifact, and commit
+# `benches/baseline.json`. The comparison fails closed on an environment
+# mismatch, so a dev-host baseline cannot silently pass on GitHub.
 on:
   schedule:
     # Nightly, after the fuzz smoke starts.
@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       update_baseline:
-        description: Write a new benches/baseline.json from this run (uploaded as an artifact)
+        description: Write a new benches/baseline.json from this GitHub-hosted run (uploaded as an artifact)
         type: boolean
         default: false
 
@@ -31,41 +31,19 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Repository variable so operators can point the gate at a dedicated
-  # self-hosted benchmark runner without editing this file. The baseline must
-  # be generated on the same runner class.
-  BENCH_ENVIRONMENT: ${{ vars.BENCH_ENVIRONMENT }}
+  # GitHub-hosted runner class recorded in benches/baseline.json. The workflow
+  # is deliberately limited to GitHub-hosted runners; no self-hosted label is
+  # read or required.
+  BENCH_ENVIRONMENT: ${{ vars.BENCH_ENVIRONMENT || 'github-ubuntu-24.04' }}
   BENCH_TOLERANCE: ${{ vars.BENCH_TOLERANCE }}
 
 jobs:
   bench:
-    name: bench
-    runs-on: ${{ vars.BENCH_RUNNER_LABEL || 'ubuntu-24.04' }}
+    name: bench (GitHub-hosted ubuntu-24.04)
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The committed baseline is absolute and environment specific. Refuse to
-      # present the comparison as meaningful on an unconfigured/default runner.
-      - name: Require the dedicated benchmark runner
-        env:
-          RUNNER_LABEL: ${{ vars.BENCH_RUNNER_LABEL }}
-          ENVIRONMENT: ${{ vars.BENCH_ENVIRONMENT }}
-        run: |
-          set -euo pipefail
-          if [ -z "${RUNNER_LABEL}" ]; then
-            echo "::error::BENCH_RUNNER_LABEL is not set; benchmark comparisons are only valid on the dedicated runner. Set the repository variable, or use workflow_dispatch input update_baseline after provisioning."
-            exit 1
-          fi
-          case "${RUNNER_LABEL}" in
-            ubuntu-*|windows-*|macos-*)
-              echo "::error::BENCH_RUNNER_LABEL='${RUNNER_LABEL}' is a GitHub-hosted label; use a dedicated/self-hosted benchmark runner"
-              exit 1
-              ;;
-          esac
-          if [ -z "${ENVIRONMENT}" ]; then
-            echo "::error::BENCH_ENVIRONMENT is not set; it must name the runner class recorded in benches/baseline.json"
-            exit 1
-          fi
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
         with:
           toolchain: 1.99.1
@@ -77,7 +55,7 @@ jobs:
       - name: Compare against the committed baseline (fails above the tolerance)
         if: ${{ !inputs.update_baseline }}
         env:
-          CURRENT_ENVIRONMENT: ${{ vars.BENCH_ENVIRONMENT }}
+          CURRENT_ENVIRONMENT: ${{ env.BENCH_ENVIRONMENT }}
         run: |
           set -o pipefail
           tolerance_args=()
@@ -92,7 +70,7 @@ jobs:
       - name: Save a new baseline
         if: ${{ inputs.update_baseline }}
         env:
-          CURRENT_ENVIRONMENT: ${{ vars.BENCH_ENVIRONMENT }}
+          CURRENT_ENVIRONMENT: ${{ env.BENCH_ENVIRONMENT }}
         run: |
           set -o pipefail
           python3 scripts/check-bench-regression.py \

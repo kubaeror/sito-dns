@@ -233,23 +233,23 @@ release, run the 24-hour checklist on the release candidate commit:
 ```bash
 gh workflow run fuzz.yml \
   --ref <release-commit-or-branch> \
-  -f fuzz_seconds=86400 \
-  -f runner_label=<self-hosted-linux-fuzz-label>
+  -f fuzz_seconds=21600 \
+  -f shards=4
 gh run list --workflow fuzz.yml --limit 1
 gh run watch <run-id> --exit-status
 ```
 
-GitHub-hosted jobs stop after 6 hours. The workflow therefore refuses
-`fuzz_seconds > 21600` unless `runner_label` names a self-hosted runner (or the
-`FUZZ_RUNNER_LABEL` repository variable is set); use a self-hosted runner for
-the 24-hour run.
+The workflow runs on GitHub-hosted `ubuntu-24.04` only. GitHub-hosted jobs stop
+after 6 hours, so the 24-hour checklist is four parallel 6-hour shards per
+target (≈24 target-hours aggregate); no self-hosted runner is required.
 
 Record in the release checklist:
 
 - run URL and commit SHA;
 - all five matrix targets (`dns_wire`, `abp_parser`, `dnssec_response`,
   `ha_bundle`, `config_toml`) completed with no crash, timeout or OOM;
-- `fuzz_seconds=86400` and the per-input timeout of 10 s;
+- `fuzz_seconds=21600` × `shards=4` (≈24 target-hours aggregate) and the
+  per-input timeout of 10 s;
 - the checked-in seed-corpus size before the run and the corpus size reported
   by the job after the run (a growing corpus is expected; a crash is not);
 - confirmation that `fuzz/artifacts/` is empty for every target.
@@ -270,15 +270,15 @@ gh run list --workflow bench.yml --limit 1
 gh run watch <run-id> --exit-status
 ```
 
-Record the run URL, the `BENCH_ENVIRONMENT` description, the tolerance
-(`BENCH_TOLERANCE` or the baseline's stored value, default `0.10`), and any
-`improved`/`new` lines. `bench.yml` refuses to start unless
-`BENCH_RUNNER_LABEL` names a dedicated/self-hosted runner and
-`BENCH_ENVIRONMENT` is set, and the checker fails closed on an environment
-mismatch. A `REGRESSION` line above the tolerance fails the job and blocks the
-release until it is fixed or explicitly re-baselined on the dedicated runner
-with a reviewed reason. The committed `benches/baseline.json` is environment
-specific; the checklist records which runner produced it.
+Record the run URL, the `BENCH_ENVIRONMENT` description
+(`github-ubuntu-24.04`), the tolerance (`BENCH_TOLERANCE` or the baseline's
+stored value, default `0.10`), and any `improved`/`new` lines. `bench.yml` runs
+on GitHub-hosted `ubuntu-24.04` only; the committed baseline must be generated
+on that same runner class (`update_baseline=true`, download the artifact, commit
+it). The checker fails closed on an environment mismatch. A `REGRESSION` line
+above the tolerance fails the job and blocks the release until it is fixed or
+explicitly re-baselined on GitHub-hosted `ubuntu-24.04` with a reviewed reason.
+The checklist records the baseline environment.
 
 ## Docs and migration evidence
 
