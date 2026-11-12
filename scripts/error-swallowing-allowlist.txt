@@ -5,12 +5,12 @@
 # docs/audit6-best-effort.md for the rationale behind each category.
 crates/sito/src/cli.rs	let _ = dir.sync_all();	Parent-directory fsync after a successful rename: best effort, the rename already happened.
 crates/sito/src/service_lock.rs	let _ = std::fs::remove_file(&self.path);	Drop-time lock cleanup; a leftover lock is reported by the next startup, not actionable here.
-crates/sito/src/server.rs	let _ = tokio::task::spawn_blocking(move || cache.flush()).await;	Periodic DNSSEC chain-cache flush is best effort; the cache stays in memory and is retried next interval.
+crates/sito/src/server/startup.rs	let _ = tokio::task::spawn_blocking(move || cache.flush()).await;	Periodic DNSSEC chain-cache flush is best effort; the cache stays in memory and is retried next interval.
 crates/sito-dnssec/src/chain_cache.rs	let _ = std::fs::remove_file(&tmp);	Cleanup of a partially written temporary cache file after a failed atomic write.
 crates/sito-api/src/config_writer.rs	let _ = tokio::fs::remove_file(&tmp_path).await;	Cleanup of the temporary file after a failed atomic config write; the original file is untouched.
 crates/sito-api/src/config_writer.rs	let _ = dir.sync_all().await;	Post-rename directory fsync is best effort; data was already written and renamed.
-crates/sito-api/src/auth/manager.rs	let _ = std::fs::remove_file(&tmp_path);	Cleanup of a temporary users-file write after a failed atomic replace.
-crates/sito-api/src/auth/manager.rs	let _ = std::fs::remove_file(backup_path);	Cleanup of a rollback copy after the restore already succeeded.
+crates/sito-api/src/auth/manager/mod.rs	let _ = std::fs::remove_file(&tmp_path);	Cleanup of a temporary users-file write after a failed atomic replace.
+crates/sito-api/src/auth/manager/mod.rs	let _ = std::fs::remove_file(backup_path);	Cleanup of a rollback copy after the restore already succeeded.
 crates/sito-api/src/updater.rs	let _ = std::fs::remove_file(&self.path);	Best-effort removal of the temporary updater artifact; no state depends on it.
 crates/sito-api/src/updater.rs	let _ = tokio::fs::remove_file(dest).await;	Best-effort removal of an installation staging path before a retry.
 crates/sito-filter/src/subscription.rs	let _ = tokio::fs::remove_file(&escape).await;	Removes a traversal-test fixture outside the data dir; failure only leaves a temp file.

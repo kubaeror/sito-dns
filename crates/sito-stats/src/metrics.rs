@@ -765,7 +765,18 @@ impl MetricsRegistry {
     /// Generates the Prometheus text exposition representation conforming to Table 14.2.
     pub fn render_prometheus(&self) -> String {
         let mut out = String::new();
+        self.render_query_family(&mut out);
+        self.render_upstream_family(&mut out);
+        self.render_cache_family(&mut out);
+        self.render_filter_family(&mut out);
+        self.render_dnssec_client_family(&mut out);
+        self.render_ha_retention_family(&mut out);
+        self.render_build_info(&mut out);
+        out
+    }
 
+    /// Query counters and latency histogram.
+    fn render_query_family(&self, out: &mut String) {
         // 1. sito_queries_total
         out.push_str("# HELP sito_queries_total Total DNS queries processed\n");
         out.push_str("# TYPE sito_queries_total counter\n");
@@ -899,7 +910,10 @@ impl MetricsRegistry {
                 }
             }
         }
+    }
 
+    /// Upstream latency, error, and health families.
+    fn render_upstream_family(&self, out: &mut String) {
         // 3. sito_upstream_rtt_seconds
         out.push_str("# HELP sito_upstream_rtt_seconds Upstream round-trip time in seconds\n");
         out.push_str("# TYPE sito_upstream_rtt_seconds histogram\n");
@@ -1027,7 +1041,10 @@ impl MetricsRegistry {
                 }
             }
         }
+    }
 
+    /// Cache hit/miss, DNSSEC key-cache, and stale-serve families.
+    fn render_cache_family(&self, out: &mut String) {
         // 6. sito_cache_hits_total & misses
         out.push_str("# HELP sito_cache_hits_total Total DNS cache hits\n");
         out.push_str("# TYPE sito_cache_hits_total counter\n");
@@ -1078,7 +1095,10 @@ impl MetricsRegistry {
             "sito_cache_stale_served_total {}",
             self.cache_stale_served.load(Ordering::Relaxed)
         );
+    }
 
+    /// Filter rule and compile-duration families.
+    fn render_filter_family(&self, out: &mut String) {
         // 9. sito_filter_rules
         out.push_str("# HELP sito_filter_rules Number of active filter rules per list\n");
         out.push_str("# TYPE sito_filter_rules gauge\n");
@@ -1163,7 +1183,10 @@ impl MetricsRegistry {
             let _ = writeln!(out, "sito_filter_compile_seconds_sum {}", hist.sum);
             let _ = writeln!(out, "sito_filter_compile_seconds_count {}", hist.count);
         }
+    }
 
+    /// DNSSEC, client, and DoH bypass families.
+    fn render_dnssec_client_family(&self, out: &mut String) {
         // 11. sito_dnssec_bogus_total
         out.push_str("# HELP sito_dnssec_bogus_total Total DNSSEC bogus responses detected\n");
         out.push_str("# TYPE sito_dnssec_bogus_total counter\n");
@@ -1223,7 +1246,10 @@ impl MetricsRegistry {
             "sito_doh_bypass_blocked_total {}",
             self.doh_bypass_blocked.load(Ordering::Relaxed)
         );
+    }
 
+    /// HA, querylog, and stats-retention families.
+    fn render_ha_retention_family(&self, out: &mut String) {
         // 14. sito_ha_slaves_connected
         out.push_str(
             "# HELP sito_ha_slaves_connected Number of HA replica slaves currently connected\n",
@@ -1362,7 +1388,10 @@ impl MetricsRegistry {
             "sito_stats_rollup_retention_days {}",
             self.stats_rollup_retention_days.load(Ordering::Relaxed)
         );
+    }
 
+    /// Build metadata.
+    fn render_build_info(&self, out: &mut String) {
         // 20. sito_build_info
         out.push_str("# HELP sito_build_info Build and version metadata\n");
         out.push_str("# TYPE sito_build_info gauge\n");
@@ -1372,8 +1401,6 @@ impl MetricsRegistry {
             escape_label_value(&self.build_version),
             escape_label_value(&self.build_commit)
         );
-
-        out
     }
 }
 

@@ -13,6 +13,9 @@ cargo deny check
 python3 scripts/check_config_reference.py --github
 python3 scripts/check_markdown_links.py
 bash scripts/check-error-swallowing.sh
+bash scripts/check-file-size.sh
+bash scripts/check-function-size.sh
+python3 scripts/test_rust_size.py
 ```
 
 Blank/deferred rows are explained in `docs/release-notes-1.9.4.md` and
@@ -50,6 +53,23 @@ named by the command.
 | P1-25 | `test_health_probe_sets_recursion_desired`, `test_forced_refresh_picks_up_rotated_address`, `test_formerr_triggers_one_no_edns_retry` | `cargo test -p sito-upstream test_health_probe_sets_recursion_desired` |
 | P1-26 | `test_apply_publishes_config_and_filter_together_after_staging`, `test_failed_hook_leaves_old_config_and_filter`, `test_query_during_apply_sees_old_or_new_never_torn` | `cargo test -p sito-api test_apply_publishes_config_and_filter_together_after_staging`; `cargo test -p sito-runtime test_query_during_apply` |
 | P1-27 | `test_dnssec_policy_change_flushes_response_cache`, `test_dnssec_policy_change_rejects_in_flight_old_epoch_insert`, `test_pipeline_uses_snapshot_generation_for_dnssec_cache_insert`, `test_policy_epoch_rejects_in_flight_insert_and_hides_old_entries`, `test_m11_policy_change_rejects_in_flight_cache_insert` | `cargo test -p sito-api test_dnssec_policy_change_flushes_response_cache`; `cargo test -p sito-runtime test_dnssec_policy_change_rejects_in_flight_old_epoch_insert`; `cargo test -p sito --lib test_pipeline_uses_snapshot_generation_for_dnssec_cache_insert`; `cargo test -p sito-cache test_policy_epoch_rejects_in_flight_insert_and_hides_old_entries`; `cargo test -p sito-test --test m11_dnssec_security test_m11_policy_change_rejects_in_flight_cache_insert` |
+
+## Structural budget checks (WP-1.5)
+
+The monolith split is enforced by two checked scripts and their regression
+lane. They count production lines/functions only: `#[cfg(test)]` items and the
+test-only crates (`sito-test`, `sito-test-support`) are excluded, as are Cargo
+`tests/`/`benches/`/`examples/` targets and parent-gated `src/tests/` modules.
+
+| Finding | Named check | Focused command |
+|---|---|---|
+| P3-1 | No production Rust file exceeds 2,000 lines | `bash scripts/check-file-size.sh` |
+| P3-2 | No production function exceeds 200 lines without a documented exception | `bash scripts/check-function-size.sh` |
+| P3-6 | Size budgets run in the CI `test` lane and the baseline command list | `docs/ci.md`, `.github/workflows/ci.yml` |
+| P3-6 | Checker regression fixtures cover cfg(test) lookalikes, real test modules, `src/tests` gating, and both thresholds | `python3 scripts/test_rust_size.py` |
+
+`docs/large-functions.md` is the reviewed exception list. An undocumented
+function over 200 lines fails the checker.
 
 ## 1.9.4 final-review additions
 

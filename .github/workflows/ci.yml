@@ -65,6 +65,14 @@ jobs:
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
               - 'rustfmt.toml'
+              # Structural budgets are code checks even though the scripts and
+              # exception list are not Rust sources.
+              - 'scripts/check-file-size.sh'
+              - 'scripts/check-function-size.sh'
+              - 'scripts/rust_size.py'
+              - 'scripts/test_rust_size.py'
+              - 'scripts/fixtures/rust-size/**'
+              - 'docs/large-functions.md'
             docs:
               - 'docs/**'
               - '**/*.md'
@@ -167,6 +175,12 @@ jobs:
         run: python3 scripts/check_config_reference.py --github
       - name: Verify best-effort error swallowing is reviewed
         run: bash scripts/check-error-swallowing.sh
+      - name: Verify production module and function size budgets
+        run: |
+          bash scripts/check-file-size.sh
+          bash scripts/check-function-size.sh
+      - name: Test the structural size checker
+        run: python3 scripts/test_rust_size.py
 
   openapi:
     name: openapi

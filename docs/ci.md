@@ -36,7 +36,7 @@ part of the required `ci-gate` check, not separate advisory workflows.
 | Change | Lanes that run |
 |---|---|
 | Docs only (`docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates) | `ci.yml`: `changes`, `docs-check`, `ci-gate`. `docs-check` calls `docs.yml`, which runs `meta` (config-reference defaults/types/link checks; the configuration check only needs the config-reference diff, while link checking covers the repository's tracked Markdown). No Rust, Docker, or `cargo-deny`. The `docs/openapi.json` exception below runs `openapi`. |
-| Code (`crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`) | `ci.yml`: `changes`, `fmt`, `clippy`, `test`, `build` (x86_64, aarch64, armv7), `ci-gate`. Dependency changes also run `security-check`. |
+| Code (`crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`, structural-size scripts and `docs/large-functions.md`) | `ci.yml`: `changes`, `fmt`, `clippy`, `test`, `build` (x86_64, aarch64, armv7), `ci-gate`. Dependency changes also run `security-check`. |
 | OpenAPI spec only (`docs/openapi.json` without crate changes) | `ci.yml`: `changes`, `openapi`, `ci-gate`; `docs-check` also runs because the path is under `docs/`. |
 | API crate (`crates/sito-api/**`) | Full code lane. `openapi` is skipped because `test` already regenerates and diffs the spec. |
 | Contrib/scripts (`contrib/**`, `scripts/**`) | `ci.yml`: `changes`, `contrib`, `ci-gate`. `contrib` runs `shellcheck` on the installer, the AdGuard converter fixture test, and the release-helper tests. |
@@ -114,6 +114,30 @@ The override is implemented through `ci.yml`; it does not change the standalone
 label, dispatch `docs.yml`, `container.yml`, or `security.yml` directly from the
 Actions tab; all three accept `workflow_dispatch`. The weekly run exercises the
 container and security lanes together.
+
+## Structural size budgets
+
+The `test` job enforces the WP-1.5 module boundaries in addition to the unit
+tests:
+
+```bash
+bash scripts/check-file-size.sh      # no production Rust file > 2,000 lines
+bash scripts/check-function-size.sh  # no production fn > 200 lines unless documented
+```
+
+Both scripts share `scripts/rust_size.py`. "Production" excludes
+`#[cfg(test)]` items (including sibling `tests.rs` files marked with a genuine
+leading `#![cfg(test)]` attribute) and the test-only crates `sito-test` and
+`sito-test-support`. Cargo `tests/`, `benches/`, and `examples/` targets and
+parent-gated `src/tests/` modules are also test code, not production.
+
+Attribute detection runs on masked source, so `#[cfg(test)]` or
+`#![cfg(test)]` mentioned in a comment or string cannot hide production code.
+`python3 scripts/test_rust_size.py` pins those forms with checked-in fixtures
+and threshold cases. The function check reads `docs/large-functions.md`; a
+function over 200 lines without a matching `(file, function)` row fails CI.
+Changes to either script, the helper, or the exception list are classified as
+code changes so the test lane re-runs them.
 
 ## Required check and branch protection
 

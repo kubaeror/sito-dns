@@ -32,24 +32,24 @@ DOC = ROOT / "docs" / "configuration-reference.md"
 
 # section number -> (title fragment, [(source file, struct name), ...])
 SECTIONS: dict[int, tuple[str, list[tuple[str, str]]]] = {
-    1: ("Top-Level Options", [("crates/sito-core/src/config.rs", "Config")]),
-    2: ("`[server]`", [("crates/sito-core/src/config.rs", "ServerConfig")]),
-    3: ("`[dns]`", [("crates/sito-core/src/config.rs", "DnsConfig")]),
-    4: ("`[dns.cache]`", [("crates/sito-core/src/config.rs", "CacheConfig")]),
-    5: ("`[dns.dnssec]`", [("crates/sito-core/src/config.rs", "DnssecConfig")]),
+    1: ("Top-Level Options", [("crates/sito-core/src/config/schema.rs", "Config")]),
+    2: ("`[server]`", [("crates/sito-core/src/config/schema.rs", "ServerConfig")]),
+    3: ("`[dns]`", [("crates/sito-core/src/config/schema.rs", "DnsConfig")]),
+    4: ("`[dns.cache]`", [("crates/sito-core/src/config/schema.rs", "CacheConfig")]),
+    5: ("`[dns.dnssec]`", [("crates/sito-core/src/config/schema.rs", "DnssecConfig")]),
     6: (
         "`[tls]` and `[acme]`",
         [
-            ("crates/sito-core/src/config.rs", "TlsConfig"),
-            ("crates/sito-core/src/config.rs", "AcmeConfig"),
+            ("crates/sito-core/src/config/schema.rs", "TlsConfig"),
+            ("crates/sito-core/src/config/schema.rs", "AcmeConfig"),
         ],
     ),
-    7: ("`[upstream]`", [("crates/sito-core/src/config.rs", "UpstreamConfig")]),
+    7: ("`[upstream]`", [("crates/sito-core/src/config/schema.rs", "UpstreamConfig")]),
     8: (
         "`[filtering]`",
         [
-            ("crates/sito-core/src/config.rs", "FilteringConfig"),
-            ("crates/sito-core/src/config.rs", "FilterListConfig"),
+            ("crates/sito-core/src/config/schema.rs", "FilteringConfig"),
+            ("crates/sito-core/src/config/schema.rs", "FilterListConfig"),
         ],
     ),
     9: ("`[clients]`", [("crates/sito-clients/src/config.rs", "ClientsConfig")]),
@@ -57,15 +57,15 @@ SECTIONS: dict[int, tuple[str, list[tuple[str, str]]]] = {
     11: (
         "`[web]` & `[auth]`",
         [
-            ("crates/sito-core/src/config.rs", "WebConfig"),
-            ("crates/sito-core/src/config.rs", "AuthConfig"),
+            ("crates/sito-core/src/config/schema.rs", "WebConfig"),
+            ("crates/sito-core/src/config/schema.rs", "AuthConfig"),
         ],
     ),
     12: (
         "`[stats]`",
         [
-            ("crates/sito-core/src/config.rs", "StatsConfig"),
-            ("crates/sito-core/src/config.rs", "PrivacyConfig"),
+            ("crates/sito-core/src/config/schema.rs", "StatsConfig"),
+            ("crates/sito-core/src/config/schema.rs", "PrivacyConfig"),
         ],
     ),
     13: ("`[ha]`", [("crates/sito-ha/src/config.rs", "HaConfig")]),
