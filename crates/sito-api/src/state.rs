@@ -199,16 +199,6 @@ pub fn refresh_tls_certificate_readiness(
     config: &Config,
     cert_validity_cache: &CertificateValidityCache,
 ) {
-    let Some(tls) = config.get_tls_config() else {
-        return;
-    };
-    let Some(cert) = tls.cert.as_deref() else {
-        return;
-    };
-    if tls.key.is_none() {
-        return;
-    }
-
     // Never overwrite a startup/acceptor failure with a certificate verdict.
     // Only a previous certificate reason (or no reason at all) may be revised.
     if let Some(code) = readiness.tls().code
@@ -217,6 +207,22 @@ pub fn refresh_tls_certificate_readiness(
     {
         return;
     }
+
+    // A removed or incomplete static pair cannot carry a certificate reason.
+    // Clear a stale `tls_cert_expired`/`tls_cert_expiring` left by an earlier
+    // configuration; otherwise `/health` would stay not-ready forever after
+    // the operator removes `[tls]` material.
+    let Some(cert) =
+        config
+            .get_tls_config()
+            .and_then(|tls| match (tls.cert.as_deref(), tls.key.as_deref()) {
+                (Some(cert), Some(_key)) => Some(cert),
+                _ => None,
+            })
+    else {
+        readiness.set_tls_ready();
+        return;
+    };
 
     if acme_has_serving_certificate(config, cert_validity_cache) {
         readiness.set_tls_ready();

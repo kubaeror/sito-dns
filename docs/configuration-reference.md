@@ -337,7 +337,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `entries.ignore_query_log` | boolean | `false` | Exclude this client's queries from the detailed query log. |
 | `entries.ignore_stats` | boolean | `false` | Exclude this client from Prometheus counters. |
 | `entries.use_global_upstreams` | boolean | `true` | Resolve through `upstream.servers`. Set to `false` to use the per-client `upstreams` list only. |
-| `entries.upstreams` | array of strings | `None` | Per-client upstream targets used when `use_global_upstreams = false`. Answers bypass the shared cache. |
+| `entries.upstreams` | array of strings | `None` | Per-client upstream targets. Mandatory and non-empty when `use_global_upstreams = false`; config validation rejects a missing/empty list instead of falling back to the global upstreams. Answers bypass the shared cache. |
 | `entries.trusted` | boolean | `false` | Mark the client as trusted for policy decisions that distinguish trusted clients. |
 
 ### `[clients.groups.<name>]`

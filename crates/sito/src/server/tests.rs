@@ -946,3 +946,32 @@ fn test_static_tls_readiness_follows_runtime_certificate_changes() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Removing `[tls]` material (or leaving only half of the pair) must clear a
+/// stale certificate reason from the previous configuration. Returning early
+/// used to leave `/health` not-ready forever after the operator removed TLS.
+#[test]
+fn test_refresh_tls_readiness_clears_stale_cert_reason_when_material_removed() {
+    let readiness = sito_api::ReadinessState::default();
+    let cache = sito_transport::CertificateValidityCache::new();
+
+    readiness.set_tls_unavailable("tls_cert_expired", "previously expired");
+    let config = Config::default();
+    sito_api::refresh_tls_certificate_readiness(&readiness, &config, &cache);
+    assert!(readiness.tls().ready);
+    assert!(readiness.tls().code.is_none());
+
+    readiness.set_tls_degraded("tls_cert_expiring", "previously expiring");
+    let mut incomplete = Config::default();
+    incomplete.dns.tls = Some(sito_core::config::TlsConfig {
+        cert: Some(Path::new("/etc/sito/certs/dns.crt").to_path_buf()),
+        key: None,
+        sni_certs: Vec::new(),
+    });
+    sito_api::refresh_tls_certificate_readiness(&readiness, &incomplete, &cache);
+    assert!(readiness.tls().ready);
+    assert!(
+        readiness.tls().code.is_none(),
+        "an incomplete pair must not retain a certificate reason"
+    );
+}
