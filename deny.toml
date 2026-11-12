@@ -12,11 +12,10 @@ feature-depth = 1
 
 [advisories]
 version = 2
-ignore = [
-    # Build-time-only via askama_macros (template config parsing); not linked
-    # into the runtime binary. Askama has not dropped basic-toml yet.
-    "RUSTSEC-2026-0374",
-]
+# No ignored advisories. The previous RUSTSEC-2026-0374 suppression became
+# stale (`advisory-not-detected`) and was removed in WP-1.9/P3-19. Add a new
+# entry only with a reviewed reason and the advisory actually matching a crate.
+ignore = []
 
 [licenses]
 allow = [

@@ -69,9 +69,10 @@ python3 scripts/check_config_reference.py
 python3 scripts/check_markdown_links.py
 ```
 
-Scheduled fuzzing was intentionally removed and is not part of CI; there is no
-`fuzz/` harness in this repository. See
-[docs/ci.md](ci.md#scheduled-fuzzing-was-intentionally-removed).
+Scheduled fuzzing was removed from the 1.9.x CI line; the 2.0 branch restored
+the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
+[docs/ci.md](ci.md#fuzzing-is-nightlyrelease-not-a-pr-gate) and
+[fuzz/README.md](../fuzz/README.md).
 
 ---
 

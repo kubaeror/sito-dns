@@ -49,16 +49,11 @@ jobs:
           elif [ -n "${BEFORE_SHA}" ] && [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]; then
             range="${BEFORE_SHA}..HEAD"
           else
-            # workflow_dispatch (or a push with an all-zero before SHA): compare
-            # against the previous commit so the meta checks still see a change
-            # set instead of silently skipping.
-            if git rev-parse --verify -q 'HEAD^' >/dev/null; then
-              range="HEAD^..HEAD"
-            else
-              # Single-commit branch: diff the empty tree against HEAD so every
-              # tracked file is treated as changed instead of failing here.
-              range="$(git hash-object -t tree /dev/null)..HEAD"
-            fi
+            # workflow_dispatch and any event without a usable `before` SHA
+            # (including merge_group) check the whole tree. Diffing only
+            # HEAD^..HEAD let a manual dispatch on a multi-commit branch skip
+            # the configuration-reference and actionlint checks (P3-17).
+            range="$(git hash-object -t tree /dev/null)..HEAD"
           fi
           git diff --name-only "${range}" > changed-files.txt
           cat changed-files.txt

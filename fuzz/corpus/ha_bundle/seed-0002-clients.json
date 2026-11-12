@@ -1,0 +1,1 @@
+{"version":7,"term":2,"timestamp":1700000000,"config_toml":"config_version = 2\n[server]\nrole = \"slave\"\ndata_dir = \"/var/lib/sito\"\n","custom_rules":["||ads.example.com^"],"clients":{"entries":[{"ip":"192.168.1.10","name":"laptop"}],"client_id_secrets":{"laptop":"secret"}},"lists":[]}

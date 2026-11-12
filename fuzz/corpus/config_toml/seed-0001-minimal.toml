@@ -1,0 +1,4 @@
+config_version = 2
+
+[server]
+data_dir = "/var/lib/sito"

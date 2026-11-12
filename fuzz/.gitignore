@@ -1,0 +1,12 @@
+# Fuzz build output and crash artifacts. Seed corpus files stay tracked; see
+# the negations below. cargo-fuzz writes new corpus entries under hashed file
+# names, and crash/timeout inputs under artifacts/.
+target/
+artifacts/
+coverage/
+
+# Cargo-fuzz's generated per-input corpus entries are ephemeral. Un-ignore the
+# directories and the checked-in seed-* files so the seeds remain in git.
+corpus/**/*
+!corpus/**/
+!corpus/**/seed-*

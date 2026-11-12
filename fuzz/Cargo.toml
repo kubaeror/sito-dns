@@ -1,0 +1,53 @@
+[package]
+name = "sito-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sito-core = { path = "../crates/sito-core" }
+sito-proto = { path = "../crates/sito-proto" }
+sito-filter = { path = "../crates/sito-filter" }
+sito-dnssec = { path = "../crates/sito-dnssec" }
+sito-ha = { path = "../crates/sito-ha" }
+
+[[bin]]
+name = "dns_wire"
+path = "fuzz_targets/dns_wire.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "abp_parser"
+path = "fuzz_targets/abp_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "dnssec_response"
+path = "fuzz_targets/dnssec_response.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ha_bundle"
+path = "fuzz_targets/ha_bundle.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+
+# Keep debug info so a crash report is actionable. The fuzz workspace is
+# independent of the root workspace and never enters a release build.
+[profile.release]
+debug = 1
+
+[workspace]

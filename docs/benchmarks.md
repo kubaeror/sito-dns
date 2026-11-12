@@ -4,10 +4,11 @@ This document records the benchmarking results, throughput analysis, and
 resource consumption profile from the original reference-hardware run against
 the performance contracts in **ADR-0008 (Performance Budget)**. The absolute
 numbers below were captured on that hardware at **v1.0.0** and are **not**
-re-measured for every 1.9.x release. The weekly `cargo bench` job uploads
-estimates and the weekly release-mode tests run the opt-in `SITO_BENCH_TESTS`
-perf test, but **there is no threshold or regression check**: a slower result
-does not fail CI. Re-run
+re-measured for every 1.9.x release. The nightly `bench.yml` workflow runs the
+Criterion workspace suite and compares it with `benches/baseline.json`; a
+benchmark more than 10% slower than the baseline fails the job. Pull requests
+only compile the benches (`cargo bench --no-run`). The weekly release-mode tests
+still run the opt-in `SITO_BENCH_TESTS` perf test. Re-run
 `cargo bench -p sito-test --bench pipeline_bench` on your own hardware before
 comparing.
 

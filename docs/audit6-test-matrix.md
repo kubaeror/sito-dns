@@ -239,3 +239,31 @@ evidence and the exact commands are recorded in
 | Domain normalization property tests | `normalization_is_idempotent_and_never_panics`, `lowercase_and_one_trailing_dot_are_equivalent`, `idn_labels_round_trip_through_punycode`, `wildcard_labels_are_preserved_exactly`, `suffix_matching_is_reflexive_transitive_and_strict_only_for_children` | `cargo test -p sito-core --test domain_properties` |
 | ABP parser property tests | `arbitrary_lines_never_panic`, `parsed_canonical_matches_recomputed_canonical`, `modifier_order_does_not_change_the_canonical_form`, `badfilter_suffix_is_recognised_and_excluded_from_the_canonical_form`, `long_lines_are_skipped_without_materialising_a_rule`, `byte_budget_rejects_without_returning_partial_rules` | `cargo test -p sito-filter --test parser_properties` |
 | 20-run parallel stability | harness/m11/HA/cache plus the changed `sito --lib` and `sito-transport` suites, 20 consecutive runs, no port collisions or timing flakes | see `docs/test-harness.md#stability-evidence` |
+
+## WP-1.9 — fuzz, benchmarks and CI gates
+
+WP-1.9 restores the fuzz harness (P2-64) and adds the structural PR gates,
+coverage, dependency hygiene, Prometheus exposition parsing and the thresholded
+benchmark gate. The long runs are intentionally nightly/release evidence (D14);
+the named checks below prove the mechanism and the fast gates.
+
+| Finding / acceptance | Named test / check | Focused command |
+|---|---|---|
+| P2-64 — fuzz harness exists with five targets | `scripts/check-fuzz-targets.py` (manifest, target sources, seed corpus, gitignore); `cargo fuzz build` in the `fuzz-build` job | `python3 scripts/check-fuzz-targets.py`; `python3 scripts/test_check_fuzz_targets.py`; `cargo fuzz build` |
+| P2-64 — nightly fuzz with corpus and timeout | `.github/workflows/fuzz.yml` (nightly 600 s/target, `-timeout=10`, dictionary, crash artifacts); 24 h manual `fuzz_seconds=86400` documented in `docs/release-verification.md` | dispatch `fuzz.yml`; see `fuzz/README.md` |
+| P2-64 — target behavior is covered locally | `dns_wire`, `abp_parser`, `dnssec_response`, `ha_bundle`, `config_toml` targets and `fuzz/corpus/*/seed-*` | `cargo fuzz run <target> -- -max_total_time=60` |
+| Benchmark gate fails on >10% regression | `scripts/test_check_bench_regression.py` (within/exact/above tolerance, missing, save/round-trip, CLI exit codes); `scripts/check-bench-regression.py`; `bench.yml` | `python3 scripts/test_check_bench_regression.py`; `python3 scripts/check-bench-regression.py` |
+| Criterion benches for pipeline/filter/cache/stats/metrics | `crates/sito-test/benches/pipeline_bench.rs`, `crates/sito-filter/benches/lookup.rs`, `crates/sito-cache/benches/cache_bench.rs`, `crates/sito-stats/benches/stats_bench.rs`, `crates/sito-stats/benches/metrics_bench.rs` | `cargo bench --workspace --all-features --locked --no-run` |
+| Stored baseline and save command | `benches/baseline.json`, `scripts/save-bench-baseline.sh` | `scripts/save-bench-baseline.sh` |
+| Prometheus exposition parses, HELP/TYPE valid, no duplicate series | `rendered_exposition_parses_with_docs_and_without_duplicate_series` | `cargo test -p sito-stats --test prometheus_exposition` |
+| P3-18 — machete/udeps/coverage | `hygiene` and `coverage` jobs in `ci.yml`; local commands below | `cargo machete`; `cargo +nightly udeps --workspace --all-targets`; `cargo llvm-cov --workspace --all-features --summary-only` |
+| P3-18 — clippy is `--locked`, security runs on every PR | `ci.yml` `clippy` step and `security-check` condition | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` |
+| P3-17 — manual docs dispatch checks the whole tree | `docs.yml` empty-tree range for `workflow_dispatch`/`merge_group` | inspect `.github/workflows/docs.yml`; `actionlint` |
+| P3-19 — no stale advisory suppression | `deny.toml` has no ignored advisories; `cargo deny check` is warning-free | `cargo deny check` |
+| P1-21 — release refuses untested tags (regression) | `scripts/verify-release-gate.sh` requires `ci-gate` and `cargo-deny`; new jobs are inside `ci-gate` | `bash scripts/test-verify-release-gate.sh`; `bash scripts/test-release-workflow.sh` |
+| P2-65/P2-66 — query-log coverage and unsafe-behavior tests | Covered by the WP-0.1/WP-1.8 suites listed above (retention, PII, migration, DNSSEC strictness, DoQ bounds); WP-1.9 adds no new product behavior. | see the P1-19/P1-24/WP-1.8 rows |
+
+The fuzz build (`cargo fuzz build`) is the authoritative compile check; the
+manifest checker is the cheap PR-side guard. The 24-hour clean run and the
+nightly benchmark comparison are release-checklist items, not flaky PR jobs
+(D14/P-7).

@@ -14,5 +14,14 @@ moka.workspace = true
 tokio = { workspace = true, features = ["macros", "time", "sync"] }
 tracing.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+hickory-proto.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[[bench]]
+name = "cache_bench"
+harness = false
+
 [lints]
 workspace = true

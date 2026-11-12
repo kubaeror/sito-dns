@@ -1,0 +1,119 @@
+name: Fuzz
+
+# Coverage-guided fuzzing is deliberately NOT a pull-request gate (D14/P-7).
+# Pull requests only build the targets (`ci.yml` → `fuzz-build`). This workflow
+# owns the nightly smoke and the 24-hour release-checklist run.
+on:
+  schedule:
+    # Nightly smoke, offset from the weekly quality run.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds per target (86400 for the 24-hour release checklist)
+        type: string
+        default: '600'
+      runner_label:
+        description: Runner label; required for runs longer than 6 hours (self-hosted)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  # A scheduled smoke must not cancel a manual 24-hour release run.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    # GitHub-hosted jobs are capped at 6 hours. The 24-hour release run
+    # therefore requires a self-hosted runner label (see the duration step).
+    runs-on: ${{ inputs.runner_label || vars.FUZZ_RUNNER_LABEL || 'ubuntu-24.04' }}
+    # 24 hours plus build/upload overhead. The default nightly run is far
+    # shorter; this is a ceiling, not the configured duration.
+    timeout-minutes: 1560
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: dns_wire
+            dictionary: fuzz/dictionaries/dns_wire.dict
+          - target: abp_parser
+            dictionary: fuzz/dictionaries/abp_parser.dict
+          - target: dnssec_response
+            dictionary: fuzz/dictionaries/dns_wire.dict
+          - target: ha_bundle
+            dictionary: fuzz/dictionaries/ha_bundle.dict
+          - target: config_toml
+            dictionary: fuzz/dictionaries/config_toml.dict
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: nightly-2026-11-04
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: fuzz-${{ matrix.target }}
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Resolve the fuzz duration
+        id: duration
+        env:
+          INPUT_SECONDS: ${{ github.event_name == 'workflow_dispatch' && inputs.fuzz_seconds || '600' }}
+          INPUT_RUNNER_LABEL: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || '' }}
+          RUNNER_VAR: ${{ vars.FUZZ_RUNNER_LABEL || '' }}
+        run: |
+          set -euo pipefail
+          seconds="${INPUT_SECONDS:-600}"
+          case "${seconds}" in
+            ''|*[!0-9]*)
+              echo "::error::fuzz_seconds must be a positive integer, got '${seconds}'"
+              exit 1
+              ;;
+          esac
+          if [ "${seconds}" -lt 30 ]; then
+            echo "::error::fuzz_seconds must be at least 30"
+            exit 1
+          fi
+          # GitHub-hosted jobs have a hard 6-hour execution ceiling. A longer
+          # campaign must run on a self-hosted runner.
+          if [ "${seconds}" -gt 21600 ]; then
+            case "${INPUT_RUNNER_LABEL:-${RUNNER_VAR:-}}" in
+              ''|ubuntu-*|windows-*|macos-*)
+                echo "::error::fuzz_seconds=${seconds} exceeds the 6-hour GitHub-hosted limit; pass runner_label=<self-hosted-label> (not a GitHub-hosted label)"
+                exit 1
+                ;;
+            esac
+          fi
+          echo "seconds=${seconds}" >> "${GITHUB_OUTPUT}"
+          if [ "${seconds}" -ge 86400 ]; then
+            echo "::notice::running the 24-hour release-checklist fuzz for ${{ matrix.target }}"
+          fi
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          FUZZ_SECONDS: ${{ steps.duration.outputs.seconds }}
+        run: |
+          set -o pipefail
+          cargo +nightly-2026-11-04 fuzz run ${{ matrix.target }} \
+            -- -dict=${{ matrix.dictionary }} \
+            -max_total_time="${FUZZ_SECONDS}" -timeout=10 -rss_limit_mb=4096 \
+            | tee "fuzz-${{ matrix.target }}.log"
+      - name: Upload crash artifacts and corpus
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/
+            fuzz/corpus/
+            fuzz-${{ matrix.target }}.log
+          if-no-files-found: ignore

@@ -1,0 +1,35 @@
+config_version = 2
+
+[server]
+role = "master"
+data_dir = "/var/lib/sito"
+
+[dns]
+port = 53
+bind = ["127.0.0.1"]
+
+[dns.cache]
+enabled = true
+size_mb = 64
+
+[dns.dnssec]
+validate = true
+mode = "validate"
+
+[upstream]
+servers = ["tls://dns.example"]
+
+[filtering]
+enabled = true
+lists = []
+custom_rules = []
+
+[clients]
+entries = []
+
+[rewrites]
+entries = []
+
+[web]
+port = 8080
+bind = "127.0.0.1"

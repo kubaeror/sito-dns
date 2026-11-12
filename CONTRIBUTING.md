@@ -91,13 +91,13 @@ Run the hook setup script to configure pre-commit and commit message validation:
 Before submitting a pull request, run the test and lint verification:
 ```bash
 # Code formatting check
-cargo fmt --check
+cargo fmt --all --check
 
 # Strict clippy lints
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 
 # Unit and integration tests
-cargo test --workspace
+cargo test --workspace --all-features --locked
 
 # HA certificate ownership (root-gated; skipped in unprivileged runs)
 # Generates root-owned keys, proves uid 65532 cannot read them, chowns, then
@@ -148,8 +148,8 @@ manually when a change is likely to affect the from-source image build.
 Local parity before pushing:
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all --check
+cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 cargo test --workspace --all-features --locked
 python3 scripts/check_config_reference.py
 python3 -m py_compile scripts/ci_usage.py
@@ -159,9 +159,12 @@ docker compose -f docker-compose.ha.yml config >/dev/null
 cargo deny check
 ```
 
-Scheduled fuzzing is no longer part of CI, and there is no fuzz workflow or
-harness directory. See [docs/ci.md](docs/ci.md#scheduled-fuzzing-was-intentionally-removed)
-for the accepted risk and the change-control rule.
+Scheduled fuzzing is not part of pull-request CI. The 2.0 branch has a
+`fuzz/` cargo-fuzz workspace; pull requests build the five targets and the
+nightly/release workflows run them. See
+[fuzz/README.md](fuzz/README.md) and
+[docs/ci.md](docs/ci.md#fuzzing-is-nightlyrelease-not-a-pr-gate) for the split
+and change-control rule.
 
 ---
 

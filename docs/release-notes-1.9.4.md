@@ -328,10 +328,14 @@ Additional deferred/unchanged items:
   behavior; moving it behind an optional feature is a 2.0 item.
 - **Fuzzing** is not part of the 1.9.4 build or CI. The old `fuzz/Cargo.toml`
   commands in the 1.9.2/1.9.3 release notes are marked historical; the harness
-  existed through the v1.9.3 tag and was removed by the post-tag CI rework. See
-  [docs/ci.md](ci.md#scheduled-fuzzing-was-intentionally-removed).
-- **Benchmarks** remain a v1.0.0 reference-hardware record. The weekly job runs
-  `cargo bench` and uploads estimates but has no threshold or regression gate.
+  existed through the v1.9.3 tag and was removed by the post-tag CI rework. The
+  2.0 branch restored it as a nightly/release mechanism. See
+  [docs/ci.md](ci.md#fuzzing-is-nightlyrelease-not-a-pr-gate).
+- **Benchmarks** remain a v1.0.0 reference-hardware record. The 2.0 branch adds
+  a nightly `bench.yml` comparison against a committed Criterion baseline with
+  a 10% regression gate; the old weekly upload job is gone. The baseline is
+  environment specific and the gate is inactive until the dedicated runner
+  provisions it.
 - **Structural 2.0 work** (one validator, one runtime generation, one DNSSEC
   chain/denial walker, one HA session model, one filter status model) is not in
   this patch.
