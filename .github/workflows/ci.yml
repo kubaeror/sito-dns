@@ -99,6 +99,9 @@ jobs:
             config_docs:
               - 'docs/configuration-reference.md'
               - 'scripts/check_config_reference.py'
+              - 'scripts/test_check_config_reference.py'
+              - 'scripts/check_migration_guide.py'
+              - 'scripts/test_check_migration_guide.py'
               - 'scripts/check_markdown_links.py'
             api:
               - 'docs/openapi.json'
@@ -193,6 +196,11 @@ jobs:
         run: git diff --exit-code docs/openapi.json
       - name: Verify configuration reference matches the config structs
         run: python3 scripts/check_config_reference.py --github
+      - name: Test the documentation checkers
+        run: |
+          python3 scripts/test_check_config_reference.py
+          python3 scripts/check_migration_guide.py --github
+          python3 scripts/test_check_migration_guide.py
       - name: Verify best-effort error swallowing is reviewed
         run: bash scripts/check-error-swallowing.sh
       - name: Verify production module and function size budgets

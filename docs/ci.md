@@ -11,7 +11,7 @@ benchmarks, the action pin policy, and the monthly runner-minute budget.
 | Workflow | File | Triggers | Purpose |
 |---|---|---|---|
 | **CI** | `ci.yml` | `pull_request` to `main`, `push` to `main`, `merge_group`, `workflow_dispatch` (`full`) | Classifies the change set and runs `fmt`, `clippy`, `test`, the three-target `build` matrix, `openapi`, `contrib`, `bench-build`, `fuzz-build`, `hygiene` (machete/udeps), `coverage`, and the reusable `docs-check`, `container-check`, `security-check` lanes. Publishes the single required check `ci-gate`. |
-| **Docs** | `docs.yml` | `workflow_call` from CI, `push` to `main` on docs/workflow paths, `workflow_dispatch` | Runs the configuration-reference drift/default/type check, the internal Markdown link checker, and the pinned `actionlint` container for `.github/workflows/**`. |
+| **Docs** | `docs.yml` | `workflow_call` from CI, `push` to `main` on docs/workflow paths, `workflow_dispatch` | Runs the configuration-reference nested/default/type/map check, the migration-guide breaking-change check, the internal Markdown link checker, and the pinned `actionlint` container for `.github/workflows/**`. |
 | **Container** | `container.yml` | `workflow_call` from CI and Weekly, `push` to `main` on container paths, `workflow_dispatch` | Validates both Compose files, builds/smoke-tests the development `Dockerfile`, and builds `Dockerfile.release` with stub binaries. |
 | **Security** | `security.yml` | `workflow_call` from CI and Weekly, `push` to `main`, `workflow_dispatch` | Runs `cargo-deny check`. |
 | **Weekly Quality** | `weekly.yml` | Sunday at 03:00 UTC (`schedule`), `workflow_dispatch` | Release-mode tests plus the reusable Container and Security workflows. Benchmarks moved to `bench.yml`. |
@@ -37,7 +37,7 @@ part of the required `ci-gate` check, not separate advisory workflows.
 
 | Change | Lanes that run |
 |---|---|
-| Docs only (`docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates) | `ci.yml`: `changes`, `docs-check`, `security-check`, `ci-gate`. `docs-check` calls `docs.yml`, which runs `meta` (config-reference defaults/types/link checks; the configuration check only needs the config-reference diff, while link checking covers the repository's tracked Markdown). `security-check` calls `security.yml` (`cargo-deny`) on every PR/merge group, including docs-only changes. No Rust or Docker lanes. The `docs/openapi.json` exception below runs `openapi`. |
+| Docs only (`docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates) | `ci.yml`: `changes`, `docs-check`, `security-check`, `ci-gate`. `docs-check` calls `docs.yml`, which runs `meta` (config-reference nested/default/type/map checks when the reference or checker changes; the migration-guide breaking-change check; and the internal link check over the repository's tracked Markdown). `security-check` calls `security.yml` (`cargo-deny`) on every PR/merge group, including docs-only changes. No Rust or Docker lanes. The `docs/openapi.json` exception below runs `openapi`. |
 | Code (`crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`, structural-size scripts, `benches/**`, `fuzz/Cargo.toml`, `fuzz/fuzz_targets/**`, `fuzz/corpus/**`, `fuzz/dictionaries/**`, `fuzz/.gitignore`, and `docs/large-functions.md`) | `ci.yml`: `changes`, `fmt`, `clippy`, `test`, `build` (x86_64, aarch64, armv7), `bench-build`, `fuzz-build`, `hygiene`, `coverage`, `security-check`, `ci-gate`. |
 | OpenAPI spec only (`docs/openapi.json` without crate changes) | `ci.yml`: `changes`, `openapi`, `ci-gate`; `docs-check` also runs because the path is under `docs/`. |
 | API crate (`crates/sito-api/**`) | Full code lane. `openapi` is skipped because `test` already regenerates and diffs the spec. |
@@ -76,6 +76,27 @@ request pays the small `changes` + `ci-gate` overhead (roughly 1–2 minutes).
 composite actions in `.github/actions/**` (there is no such directory today).
 If composite actions are added later, add a dedicated validator for them rather
 than relying on `actionlint`.
+
+### Documentation checkers
+
+Three dependency-free Python checks protect the docs contract:
+
+| Checker | What it proves | Fast regression fixtures |
+|---|---|---|
+| `scripts/check_config_reference.py --github` | Every top-level and nested (`[[tls.sni_certs]]`, `[[upstream.per_domain]]`, `[[filtering.lists]]`, `[[clients.entries]]`, `[clients.groups.<name>]`, `[[clients.groups.<name>.blocked_services]]`, `[[rewrites.entries]]`, `[integrations.lists.categories.<name>]`) config field is documented with the right type, default and required/optional status. It also checks the legacy raw-section key allowlists (`[clients]`, `[rewrites]`, `[ha]`, `[integrations]`) against `crates/sito-core/config-v1-to-v2-map.toml` and verifies every kept map path / deprecated alias target is documented. A missing doc file or malformed map **fails closed** with exit 1. `--github` prints one `::error::` line per failure. | `python3 scripts/test_check_config_reference.py` (nested key/default/type/required drift, unknown map path, alias target, corrupt map, missing doc, concise annotations). |
+| `scripts/check_migration_guide.py --github` | Every stable `BC-<n>` breaking-change ID declared in `docs/2.0-public-api-diff.md` has one row in the `docs/2.0-migration.md` breaking-change index with a concrete migration step and an affected doc/test. Duplicate IDs, placeholder steps and a missing index fail closed. | `python3 scripts/test_check_migration_guide.py` (missing ID, empty step, duplicate, missing table/diff, concise annotations). |
+| `scripts/check_markdown_links.py --github` | Every repository-local Markdown link and heading anchor resolves. External URLs are never fetched, so the check is deterministic. | — |
+
+The `test` lane runs the configuration-reference checker and its fixtures on
+code changes; the `docs` lane runs it when the reference or checker changes and
+runs the migration and link checks on every docs change. All three are cheap
+enough to also run locally before pushing.
+
+The migration checker only validates IDs that already exist in the public API
+diff. It cannot infer that a new change is breaking: when adding one, assign a
+new `BC-<n>` in `docs/2.0-public-api-diff.md` first, then add the migration row.
+A breaking change without an ID is a review responsibility, not a checker
+failure.
 
 A docs-only pull request therefore costs roughly the two small `ci.yml` jobs
 (`changes`, `ci-gate`), the `docs-check` job, and the `cargo-deny`

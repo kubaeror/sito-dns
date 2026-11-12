@@ -1,3 +1,11 @@
+> **Historical document — not evidence.** This document records the state at
+> its original commit and is kept for context only. Historical audits and plans
+> are leads; verify every claim against the current code and tests. Current
+> references: [2.0 migration guide](2.0-migration.md),
+> [config v2](config-v2.md), [2.0 public API diff](2.0-public-api-diff.md),
+> [P0/P1 test evidence](audit6-test-matrix.md) and the
+> [historical/current documentation index](history/README.md).
+
 # sito-dns v1.4.0 — Full Audit #3 (post first-time-setup-wizard)
 
 > **Superseded in part by Audit 4 (`docs/audit4-followup-plan.md`, v1.6.0).**

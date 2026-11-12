@@ -1,13 +1,23 @@
 # Security Review and Threat Model (current)
 
 This document summarizes the **implemented** security controls and known
-limitations of the current tree (1.9.x). It replaces an earlier v1.0.0/v1.2.1
-audit record whose claims had drifted from the code. Point-in-time audits with
-file/line evidence and remediation status live in:
+limitations of the current development tree (**2.0.0-alpha.1**, Phase 1
+foundations) and calls out where the published stable **1.9.5** line differs.
+It replaces an earlier v1.0.0/v1.2.1 audit record whose claims had drifted from
+the code. Point-in-time audits with file/line evidence and remediation status
+live in the [historical documentation index](history/README.md); they are
+leads, not current evidence.
 
-* [`docs/audit6.md`](audit6.md) — current readiness audit and Phase 0 status.
-* [`docs/audit5.md`](audit5.md) — independent audit of v1.6.0 (historical).
-* [`docs/audit4-followup-plan.md`](audit4-followup-plan.md) — previous batch (historical).
+Current contracts:
+
+* [`docs/2.0-migration.md`](2.0-migration.md) — breaking changes and the Phase
+  1/Phase 2 boundary.
+* [`docs/config-v2.md`](config-v2.md) — config v2 validation, unknown-key policy
+  and restart-only matrix.
+* [`docs/runbook-ha.md`](runbook-ha.md#health-and-status-endpoint-semantics-wp-17)
+  — `/health` vs `/api/v1/status` and the D12 certificate readiness ladder.
+* [`docs/audit6-test-matrix.md`](audit6-test-matrix.md) — named regression tests
+  for the P0/P1 safety findings.
 
 Everything below is verifiable in the source; the referenced modules are the
 implementation of record.
@@ -27,10 +37,11 @@ implementation of record.
 | **DoS / flooding** | One shared token bucket across UDP/TCP/DoT/DoH/DoQ/DoH3, keyed by IPv4 `/24` and IPv6 `/64` and checked before reading request bodies on DoH/DoQ; per-source connection caps, handshake/request deadlines, maximum connection lifetimes, bounded QUIC windows/streams, and approximate-LRU rate-limit eviction. | `sito-transport`, `crates/sito/src/server.rs` |
 | **HA security** | mTLS with BLAKE3 certificate pinning (optional explicit insecure WS for isolated networks), constant-time shared-token check, Ed25519-signed bundles with monotonic versions, master-loss heartbeat deadline (`3 × ping_interval_secs`), applied-config digest drift detection, per-slave publish outcomes that make `/health` false on failure, 64-global/8-per-IP session admission, and a bounded signing-key identity check on state restore. | `sito-ha` |
 | **Secrets** | HA bundles strip TLS/web keys, auth hashes/tokens, RouterOS credentials and per-client shared secrets (`${SECRET:*}` placeholders where applicable; node-local values are restored on the slave). Config/users/tokens/sessions and ACME keys are written 0600 atomically. Headers and cookies are never logged. | `sito-ha::bundle`, `sito-api::config_writer`, `sito-transport::acme` |
-| **TLS** | rustls-only, TLS 1.2/1.3, AEAD cipher suites, RPK/SNI certificate support, atomic certificate reload, native ACME (TLS-ALPN-01 with a bound TCP 443 listener, otherwise HTTP-01). Bootstrap certificates are 7-day self-signed placeholders and are not served unless `acme.allow_bootstrap_cert = true`; invalid, expired, or mismatched configured TLS material is a startup error. A successful issuance reloads DoT, DoH, DoQ, and DoH3. | `sito-transport::tls`, `::acme` |
+| **TLS/ACME readiness** | rustls-only, TLS 1.2/1.3, AEAD cipher suites, RPK/SNI certificate support, atomic certificate reload, native ACME (TLS-ALPN-01 with a bound TCP 443 listener, otherwise HTTP-01). Bootstrap certificates are 7-day self-signed placeholders and are not served unless `acme.allow_bootstrap_cert = true`; invalid, expired, or mismatched configured TLS material is a startup error. A successful issuance reloads DoT, DoH, DoQ, and DoH3. Readiness distinguishes current-with-renewal-failure (`acme_renewal_failed`, degraded), expiring within 30 days (`acme_cert_expiring`/`tls_cert_expiring`, degraded), and expired/unparseable (`acme_cert_expired`/`tls_cert_expired`, not ready); there is no self-signed fallback for an expired ACME certificate. | `sito-transport::tls`, `::acme`, `sito-api::readiness` |
 | **DNSSEC** | Fail-closed validation with trust-anchor chains, DS/DNSKEY walking, NSEC/NSEC3 denial proofs (including wildcard denial and delegation-boundary checks), algorithm/digest policy, key-cache bounds, a 5-second per-query validation deadline, CD/DO semantics and AD only for validated answers. | `sito-dnssec` |
 | **Supply chain** | `cargo deny` (advisories/bans/licenses/sources) in CI, SHA-pinned GitHub Actions, digest-pinned container bases, signed (cosign) release archives. The **installer** requires signatures by default (`SITO_REQUIRE_SIGNATURE=1`, explicit `=0` opt-out); the **self-updater** uses `server.update_require_signature = true` by default (explicit `false` opt-out). When verification runs, a signature that is present is always checked. With `required = false` and no verifier configured, the updater logs a warning and proceeds without verification; this is an explicit operator opt-out, not a silent downgrade. Release tags are gated on the required branch plus green CI/security checks, and container images are scanned and cosign-signed. | `deny.toml`, `.github/workflows`, `contrib/install.sh`, `sito-api::updater` |
-| **API integrity** | Config writes run the same deep typed-section validation as startup, invalid configs are rejected before persisting, restore archives are decompression-capped, tokens expire by default (90 days), deleting a user revokes sessions. | `sito-api::config_validation`, `handlers::config`, `auth::manager` |
+| **API integrity** | Config writes run the same deep typed-section validation as startup, invalid configs are rejected before persisting, restart-only writes return 409 and persist nothing, restore archives are decompression-capped, unknown keys are rejected everywhere except the explicit migration flag, tokens expire by default (90 days), deleting a user revokes sessions. `/metrics` requires a Viewer-or-higher token or session by default (`web.metrics_auth = true`). | `sito-api::config_validation`, `config_apply`, `handlers::config`, `auth::manager`, `handlers::metrics` |
+| **Health/status split** | `/health` is generic (`200`/`503` only) and leaks no setup state, component names, reasons, paths or configuration values. Authenticated `GET /api/v1/status` carries `ready`/`reasons[]`; `GET /api/v1/ha/status` carries the detailed HA reason. A stats outage is advisory and never makes DNS unhealthy. | `sito-api::readiness`, `handlers::status`, `handlers::ha` |
 
 ---
 
@@ -65,7 +76,10 @@ implementation of record.
 cargo test --workspace --all-features
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo deny check
-python3 scripts/check_config_reference.py
+python3 scripts/check_config_reference.py --github
+python3 scripts/test_check_config_reference.py
+python3 scripts/check_migration_guide.py --github
+python3 scripts/test_check_migration_guide.py
 python3 scripts/check_markdown_links.py
 ```
 
@@ -100,7 +114,14 @@ the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
   rollup hashes, rollup retention, clear/vacuum, optional query-log totals,
   cached dashboard aggregates, and bounded retention chunks. See the
   [1.9.4 release notes](release-notes-1.9.4.md#stats-privacy-retention-and-polling).
-* RouterOS integration remains experimental/niche and is not part of the core
-  security posture; it is planned to move behind an optional feature in 2.0.
-* The weekly benchmark workflow records estimates but does not enforce a
-  performance threshold or fail on regression.
+* RouterOS integration is experimental/niche and is not part of the core
+  security posture. It now lives in the optional `sito-routeros` crate and is
+  absent from the default build. If enabled, only a verified `https://` lease
+  grants identity; plaintext or insecure-TLS leases are display-only.
+* Pull requests compile the Criterion benches but do not run a performance
+  threshold. The nightly `bench.yml` comparison is thresholded (>10% fails),
+  but it refuses to run unless `BENCH_RUNNER_LABEL` names a dedicated runner
+  and `BENCH_ENVIRONMENT` matches the committed baseline. The committed
+  baseline is a development-host baseline, so the nightly gate is inactive
+  until that runner is provisioned. This is an explicit residual, not a silent
+  pass.

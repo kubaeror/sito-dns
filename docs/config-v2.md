@@ -5,8 +5,9 @@ WP-1.3**: later work may add optional fields with defaults (or a v2.1
 migration), but must not change the meaning of an existing key or its default
 without a migration.
 
-`docs/2.0-migration.md` (WP-1.10) will link here for the full 2.0 upgrade
-guide. This page is the schema, validation, migration and restart reference.
+[`docs/2.0-migration.md`](2.0-migration.md) links here from the full 2.0
+upgrade guide. This page is the schema, validation, migration and restart
+reference.
 
 ## 1. Version and schema freeze
 
@@ -174,7 +175,7 @@ not supported in place.
 Automated migration by the installer/Docker entrypoint (only when
 `config_version = 1`) and `--no-migrate` belong to WP-2.13; the CLI above is
 the supported manual path in Phase 1. The full narrative migration guide is
-WP-1.10.
+[`docs/2.0-migration.md`](2.0-migration.md).
 
 ## 6. Deprecated aliases (one 2.0 alpha)
 
@@ -270,4 +271,5 @@ schema also fails the fixture test.
 - `/api/v2` and the API v1 compatibility facade are Phase 2 work (WP-2.11);
   the Phase 1 preview deliberately uses `/api/v1/config/restart-required`.
 - Installer/Docker auto-migration is WP-2.13. The full narrative migration
-  guide is WP-1.10. This document does not change their contracts.
+  guide is [`docs/2.0-migration.md`](2.0-migration.md). This document does not
+  change their contracts.

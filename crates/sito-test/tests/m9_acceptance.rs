@@ -614,7 +614,7 @@ fn test_m9_network_exposure_guidance_is_lan_only() {
         "sudo ufw allow OpenSSH",
         "do not open 8080",
         "ssh -L 8080:127.0.0.1:8080",
-        "1.10.0",
+        "loopback admin default is already in the **2.0**",
         "web.bind",
         "dns.bind",
     ] {

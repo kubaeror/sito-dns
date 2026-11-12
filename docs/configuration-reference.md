@@ -12,9 +12,9 @@ This document is the exhaustive configuration reference for **sito v2.0.0-alpha.
 `sito` is configured using a single TOML file (default path: `/etc/sito/config.toml` or specified via `--config <path>`). Environment-variable configuration overrides are **not supported**; all settings come from the TOML file. HA secret placeholders (`${SECRET:name}`) resolve from the `DNSD_SECRET_<name>` environment variable, then a bare `<name>` environment variable; there is no on-disk local secret store, and a placeholder that cannot be resolved rejects the whole pushed configuration.
 
 > [!NOTE]
-> The tables below are validated against the Rust config structs in CI (`scripts/check_config_reference.py`); adding a setting without documenting it fails the build.
+> The tables below are validated against the Rust config structs in CI (`scripts/check_config_reference.py`): top-level and nested array/map structs, types, defaults, required fields, the legacy raw-section key allowlists and the checked-in v1→v2 map. Adding a setting without documenting it, or documenting a default/type that drifts from the struct, fails the build. Regression fixtures for the checker live in `scripts/test_check_config_reference.py`.
 >
-> Configuration persistence round-trips modeled fields via the `Config` schema. Unknown keys are rejected at load time (startup, `check-config`, API writes, restore and HA apply); comments are not preserved when the web console or API saves the file.
+> Configuration persistence round-trips modeled fields via the `Config` schema. Unknown keys are rejected at load time (startup, `check-config`, API writes, restore and HA apply); comments are not preserved when the web console or API saves the file. The upgrade path and unknown-key migration flag are in [`docs/2.0-migration.md`](2.0-migration.md) and [`docs/config-v2.md`](config-v2.md).
 
 ---
 
@@ -175,6 +175,14 @@ allow_bootstrap_cert = false
 | `acme.http_port` | integer | `80` | Port for the dedicated ACME HTTP-01 challenge listener. |
 | `acme.allow_bootstrap_cert` | boolean | `false` | Serve a short-lived self-signed certificate on encrypted listeners while the first ACME certificate is being issued. When `false` (default), DoT/DoH/DoQ/DoH3 stay disabled until a trusted certificate exists. |
 
+### `[[tls.sni_certs]]` entries
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `sni_certs.domain` | string | required | SNI hostname this certificate pair serves. Normalized and required to be unique across the array. |
+| `sni_certs.cert` | string | required | Path to the PEM certificate chain for this SNI hostname. |
+| `sni_certs.key` | string | required | Path to the PEM private key for this SNI hostname. |
+
 > [!NOTE]
 > `[dns.tls]` (cert/key/sni_certs) and the legacy `[web] acme_enabled`,
 > `acme_email`, `acme_domains`, `acme_staging`, `acme_cache_dir` keys are
@@ -219,6 +227,13 @@ servers = ["udp://192.168.1.1:53"]
 | `pool_size` | integer | `4` | Number of persistent TCP/TLS connections maintained per upstream endpoint. |
 | `allow_private_targets` | boolean | `false` | Allow hostname-configured upstreams to resolve to private/loopback/link-local/reserved addresses. Disabled by default so a compromised or spoofed bootstrap cannot redirect an upstream into the local network or cloud metadata. IP literals in `servers` are always accepted as an explicit operator choice. This is a config-file-only key: the REST/UI upstream update preserves the current value rather than accepting it in the DTO. |
 | `per_domain` | array of tables | `[]` | Domain-specific upstream forwarder rules (e.g., routing LAN domains to internal router). |
+
+### `[[upstream.per_domain]]` entries
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `per_domain.domains` | array of strings | required | Domain suffixes served by this rule. Values are normalized as domains. |
+| `per_domain.servers` | array of strings | required | Upstream targets for the matching domains. Same syntax and SSRF rules as `upstream.servers`. |
 
 ---
 
@@ -312,6 +327,42 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `trust_routeros_lease_names` | boolean | `false` | Trust RouterOS DHCP lease host names/comments for client identification. Off by default because lease data is client-controlled. |
 | `timezone` | string | `"local"` | Timezone used to evaluate client schedules and time-of-day rules. `"local"`/`"system"` uses the host zone (DST-aware); `"UTC"` and fixed offsets (`"+02:00"`, `"-05:30"`, `"+0530"`, `"UTC+2"`) are also accepted. IANA names are not supported (no tzdb dependency); schedules in UTC-only deployments should set this explicitly. |
 
+### `[[clients.entries]]` entries
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `entries.name` | string | required | Unique display name for the client; also the key used by `client_id_secrets`. |
+| `entries.ids` | array of strings | `[]` | IP addresses, CIDRs, MAC addresses and shared-secret DoH path/DoT SNI labels that identify this client. A display name never authenticates a client. |
+| `entries.group` | string | `"default"` | Policy group name the client belongs to. |
+| `entries.ignore_query_log` | boolean | `false` | Exclude this client's queries from the detailed query log. |
+| `entries.ignore_stats` | boolean | `false` | Exclude this client from Prometheus counters. |
+| `entries.use_global_upstreams` | boolean | `true` | Resolve through `upstream.servers`. Set to `false` to use the per-client `upstreams` list only. |
+| `entries.upstreams` | array of strings | `None` | Per-client upstream targets used when `use_global_upstreams = false`. Answers bypass the shared cache. |
+| `entries.trusted` | boolean | `false` | Mark the client as trusted for policy decisions that distinguish trusted clients. |
+
+### `[clients.groups.<name>]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `groups.description` | string | `None` | Optional operator note for the group. |
+| `groups.filtering` | boolean | `true` | Apply filtering rules to members of this group. |
+| `groups.lists` | array of strings | `[]` | Filter list names applied to this group in addition to global lists. |
+| `groups.custom_rules` | array of strings | `[]` | Inline ABP/AdGuard rules applied only to this group. |
+| `groups.safe_search` | boolean | `false` | Force safe-search resolution for group members. |
+| `groups.safe_search_youtube` | string | `None` | YouTube safe-search mode when `safe_search` is enabled (`"off"`, `"moderate"` or `"strict"`). |
+| `groups.parental` | boolean | `false` | Enable parental-category blocking for group members. |
+| `groups.parental_categories` | array of strings | `[]` | Parental categories to block (for example `"adult"`, `"gambling"`). |
+| `groups.schedule_enabled` | boolean | `false` | Enable the group's time-of-day schedule. |
+| `groups.schedule` | string | `None` | Cron-style schedule used when `schedule_enabled = true`, evaluated in `clients.timezone`. |
+| `groups.blocked_services` | array of tables | `[]` | Service-specific block rules for members of this group. |
+
+### `[[clients.groups.<name>.blocked_services]]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `groups.blocked_services.service` | string | required | Service identifier (`tiktok`, `youtube`, …) to block. |
+| `groups.blocked_services.schedule` | string | `None` | Optional cron-style schedule that limits when the service is blocked. |
+
 ---
 
 ## 10. `[rewrites]` — Local DNS Records & Overrides
@@ -333,6 +384,16 @@ exception_clients = ["admin-laptop"]
 | `auto_ptr` | boolean | `false` | Automatically synthesize reverse PTR records (`in-addr.arpa` / `ip6.arpa`) for local A/AAAA rewrites in RFC 1918 / ULA ranges. Opt-in. |
 | `ttl` | integer | `60` | TTL for synthesized rewrite records. |
 | `entries` | array of tables | `[]` | Local record rewrites (`domain`, `type` (`A`/`AAAA`/`CNAME`/`PTR`/`TXT`), `answer`, and optional `exception_clients`). |
+
+### `[[rewrites.entries]]` entries
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `entries.domain` | string | required | Domain or wildcard pattern to answer locally (`*.home.arpa`). Normalized as a domain. |
+| `entries.type` | string | required | Record type: `"A"`, `"AAAA"`, `"CNAME"`, `"PTR"` or `"TXT"`. |
+| `entries.answer` | string | required | Answer value for the record. |
+| `entries.exception_clients` | array of strings | `[]` | Client names/groups/MACs that bypass the rewrite. Matching requires an authenticated identity; IP/CIDR matching still uses the query source. |
+| `entries.id` | string | `None` | Stable rewrite identifier preserved by the admin rewrite API and returned by `/api/v1/rewrites`. The DNS rewrite loader does not use it. If it is absent, the API synthesizes `legacy-<index>`; removing an existing id changes the identifier clients see. |
 
 ---
 
@@ -371,6 +432,11 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL, but are revalidated against `users.toml` on load and on every request (account exists, role and credential epoch match); entries written before credential epochs existed are rejected once, so users re-login and API tokens are re-issued after upgrading. Corrupt stores are backed up and start empty. Stop the service before `sito reset-sessions`; the reset refuses to run against a live server unless `--force` is given. |
 | `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+
+`[web]` and `[auth]` are parsed into typed structs (`WebConfig`, `AuthConfig`)
+with `deny_unknown_fields`; the single validator (`Config::validate_full()`)
+checks port, URL scheme, ACME alias consistency and auth TTL/lockout bounds at
+startup, `check-config`, API writes, restore and HA apply.
 
 > [!WARNING]
 > `web.bind` defaults to `127.0.0.1` in config v2 and the admin UI is served
@@ -446,6 +512,12 @@ anonymize_querylog = false
 | `stats.rollup_retention_days` | integer | `365` | Days to keep hourly rollups (aggregate totals, top domains and keyed-hash client identifiers) before deleting them (must be ≥ 1). |
 | `stats.rollup_client_names` | boolean | `false` | Include client display names in hourly rollups. Off by default; raw client IPs are never stored in rollups (keyed BLAKE3 hashes are used). |
 | `privacy.anonymize_querylog` | boolean | `false` | Mask client IPs (/24 for IPv4, /56 for IPv6) before persisting to database and before live-tail broadcast. |
+
+`[stats]` and `[privacy]` are typed sections parsed with `deny_unknown_fields`;
+`retention_days` and `rollup_retention_days` must be at least 1, so a zero
+cannot silently delete every row while query logging is advertised as enabled.
+The one-validator pipeline rejects an unknown or removed `[stats]`/`[privacy]`
+key before any retention task starts.
 
 > Clearing the query log (`DELETE /api/v1/querylog`, `sito clear-query-log`, or
 > the UI “Clear Logs” button) deletes both `query_log` and `stats_hourly` by
@@ -648,6 +720,14 @@ url = "https://lists.example.com/services.json"
 | `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be ≥ 1). |
 | `categories` | table (map of category → source) | `{}` | Sources keyed by category id (`adult`, `gambling`, `services`, or any custom parental category). Each entry has a required `url` (`https://`, `http://` or `file://`), an optional `refresh_hours` override and an optional `license` string for operator reference. Refreshed domain lists replace the bundled content of that category; `services` expects service JSON. |
 
+### `[integrations.lists.categories.<name>]` entries
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `categories.url` | string | required | Source URL for the category (`https://`, `http://` or `file://`). |
+| `categories.refresh_hours` | integer | `None` | Per-category refresh interval in hours. When unset, `integrations.lists.refresh_hours` is used; must be greater than 0 when set. |
+| `categories.license` | string | `None` | SPDX license identifier of the upstream data, for operator reference. |
+
 ---
 
 ## 16. Hot Reload Matrix
@@ -728,3 +808,24 @@ applies the hot settings and reports the restart-only fields that remain.
 > `config_version` is evaluated whenever the file is loaded; only version `2`
 > is accepted, and unknown keys/tables are rejected before any component is
 > touched. See [`docs/config-v2.md`](config-v2.md).
+
+---
+
+## 17. Health and status endpoints
+
+The config-to-runtime contract includes two readiness endpoints. They are not
+configuration keys, but the hot-reload and restart rules above determine what
+they report after a change.
+
+| Endpoint | Auth | Contract |
+|---|---|---|
+| `GET /health` | None | `200 {"status":"ok"}` when every blocking component is ready; `503 {"status":"unavailable"}` otherwise. It exposes no component names, reason codes, setup state, paths or configuration values. During first-boot setup-pending it is unavailable until setup completes; `sito healthcheck --setup-fallback` accepts that window. |
+| `GET /api/v1/status` | Viewer or higher | Keeps `version`, `uptime_seconds`, `role`, `listeners`, `acme`; adds `ready` and `reasons[]` (`component`, stable `code`, `message`, optional `since_unix_ms`). The stats probe is bounded to 750 ms and is advisory. |
+| `GET /api/v1/ha/status` | Admin | Detailed HA `ready`, `readiness_reason`, `diverged`/`diverged_reason`, role/version and master public key. |
+| `GET /api/v1/config/restart-required` | Admin | Read-only preview of the restart-only field matrix used by the 409 response. |
+
+A restart-only change returns **409 Conflict** with `restart_required` and is
+not persisted; hot fields report their new state after the next config apply.
+The full component readiness matrix, D12 certificate ladder and HA publish
+semantics are in [`docs/runbook-ha.md`](runbook-ha.md#health-and-status-endpoint-semantics-wp-17).
+The operator upgrade path is in [`docs/2.0-migration.md`](2.0-migration.md).

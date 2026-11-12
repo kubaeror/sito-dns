@@ -11,6 +11,9 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --workspace --all-features --locked
 cargo deny check
 python3 scripts/check_config_reference.py --github
+python3 scripts/test_check_config_reference.py
+python3 scripts/check_migration_guide.py --github
+python3 scripts/test_check_migration_guide.py
 python3 scripts/check_markdown_links.py
 bash scripts/check-error-swallowing.sh
 bash scripts/check-file-size.sh
@@ -267,3 +270,14 @@ The fuzz build (`cargo fuzz build`) is the authoritative compile check; the
 manifest checker is the cheap PR-side guard. The 24-hour clean run and the
 nightly benchmark comparison are release-checklist items, not flaky PR jobs
 (D14/P-7).
+
+## WP-1.10 — docs structure and migration guide
+
+| Acceptance criterion | Named check | Focused command |
+|---|---|---|
+| Config reference validates nested array/map structs, types, defaults and required/optional status | `scripts/check_config_reference.py`; fixtures `test_missing_nested_key_fails`, `test_wrong_nested_default_fails`, `test_wrong_nested_type_fails`, `test_required_nested_field_is_checked` | `python3 scripts/check_config_reference.py --github`; `python3 scripts/test_check_config_reference.py` |
+| Legacy raw `[clients]`/`[rewrites]`/`[ha]`/`[integrations]` allowlists and every kept/deprecated `config-v1-to-v2-map.toml` path stay documented | `test_unknown_kept_map_path_is_not_documented`, `test_deprecated_target_must_be_a_documented_kept_key` | `python3 scripts/test_check_config_reference.py` |
+| The checker fails closed on a missing reference or malformed map and stays concise under `--github` | `test_corrupt_map_fails_closed`, `test_missing_doc_fails_closed`, `test_github_output_is_concise` | `python3 scripts/test_check_config_reference.py` |
+| Every 2.0 breaking-change ID has a migration step and an affected doc/test | `scripts/check_migration_guide.py`; fixtures `test_missing_breaking_id_fails`, `test_empty_migration_step_fails`, `test_duplicate_breaking_id_fails` | `python3 scripts/check_migration_guide.py --github`; `python3 scripts/test_check_migration_guide.py` |
+| Historical audits are labeled as leads, current evidence docs are not | `docs/history/README.md` plus the banner in each historical audit/plan | `python3 scripts/check_markdown_links.py` |
+| Doc links and anchors resolve | `scripts/check_markdown_links.py` | `python3 scripts/check_markdown_links.py --github` |

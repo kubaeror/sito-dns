@@ -11,12 +11,21 @@ structs in every crate and verifies:
 * documented *types* match the Rust field type where the mapping is
   unambiguous;
 * documented *defaults* match the serde/default value where it can be extracted
-  safely (explicit literal default functions and simple zero/`None` values).
+  safely (explicit literal default functions and simple zero/`None` values);
+* documented *required* fields have no serde default;
+* nested array-of-table and map-value structs (SNI certificates, per-domain
+  upstreams, client entries/groups/blocked services, rewrite entries and
+  curated-list categories) are documented and type/default checked;
+* every v2-accepted path in ``config-v1-to-v2-map.toml`` is documented, and
+  every deprecated alias points at a documented kept key (the legacy raw
+  ``[clients]``/``[rewrites]``/``[ha]``/``[integrations]`` allowlists).
 
 Defaults that use custom enum/struct constructors are skipped rather than
-guessed. Run with ``--github`` for a compact CI-friendly failure summary. Run
-with ``--write`` to append placeholder rows for newly added struct fields
-(existing prose is preserved and the author fills in the description afterwards).
+guessed. The checker fails closed (exit 1) on a missing document, a malformed
+map or any unresolved key. Run with ``--github`` for a compact CI-friendly
+failure summary. Run with ``--write`` to append placeholder rows for newly
+added top-level struct fields (existing prose is preserved and the author fills
+in the description afterwards).
 """
 
 from __future__ import annotations
@@ -25,10 +34,12 @@ import argparse
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "configuration-reference.md"
+MAP_PATH = ROOT / "crates" / "sito-core" / "config-v1-to-v2-map.toml"
 
 # section number -> (title fragment, [(source file, struct name), ...])
 SECTIONS: dict[int, tuple[str, list[tuple[str, str]]]] = {
@@ -90,6 +101,33 @@ PREFIX_BY_STRUCT: dict[tuple[int, str], str] = {
     (12, "PrivacyConfig"): "privacy.",
 }
 
+# Nested structs documented in their own sub-tables. The prefix is the
+# documented key prefix (for example `entries.` under `[clients]`); `[]` and
+# `*` in the v1->v2 map are normalized to the same dotted form.
+NESTED_BY_SECTION: dict[int, list[tuple[str, str, str]]] = {
+    6: [("sni_certs.", "SniCertConfig", "crates/sito-core/src/config/schema.rs")],
+    7: [("per_domain.", "PerDomainUpstream", "crates/sito-core/src/config/schema.rs")],
+    8: [("lists.", "FilterListConfig", "crates/sito-core/src/config/schema.rs")],
+    9: [
+        ("entries.", "ClientEntryConfig", "crates/sito-clients/src/config.rs"),
+        ("groups.", "ClientGroupConfig", "crates/sito-clients/src/config.rs"),
+        (
+            "groups.blocked_services.",
+            "BlockedServiceConfig",
+            "crates/sito-clients/src/config.rs",
+        ),
+    ],
+    10: [("entries.", "RewriteEntryConfig", "crates/sito-rewrites/src/config.rs")],
+    15: [("categories.", "ListSourceConfig", "crates/sito-clients/src/runtime_lists.rs")],
+}
+
+# Fields that are containers for a nested sub-table, so they have no row of
+# their own in that sub-table.
+NESTED_SKIP = {
+    (9, "ClientGroupConfig"): {"blocked_services"},
+    (15, "ListCategoriesConfig"): {"categories"},
+}
+
 # Fields that are containers for other documented sections or documented
 # inline inside array-of-table rows, so they have no table row of their own.
 SKIP_REVERSE_BY_SECTION = {
@@ -106,9 +144,58 @@ SKIP_REVERSE_BY_SECTION = {
     15: {"categories"},
 }
 
+# Section roots used to cross-check the v1->v2 map. A section can own more than
+# one root (`[tls]` + `[acme]`, `[web]` + `[auth]`, `[stats]` + `[privacy]`).
+SECTION_ROOTS: dict[int, tuple[str, ...]] = {
+    1: ("",),
+    2: ("server",),
+    3: ("dns",),
+    4: ("dns.cache",),
+    5: ("dns.dnssec",),
+    6: ("tls", "acme"),
+    7: ("upstream",),
+    8: ("filtering",),
+    9: ("clients",),
+    10: ("rewrites",),
+    11: ("web", "auth"),
+    12: ("stats", "privacy"),
+    13: ("ha",),
+    14: ("integrations.mikrotik",),
+    15: ("integrations.lists",),
+}
+
+# Sections whose v2 key set is enforced by a raw-key walk over the checked-in
+# map rather than by a single typed `#[serde(deny_unknown_fields)]` struct.
+LEGACY_RAW_ROOTS = ("clients", "rewrites", "ha", "integrations")
+
+# Documented raw-section keys that are intentionally not fields of the typed
+# struct but must still be accepted by the v1->v2 map. Each entry states why the
+# key is preserved. This is an explicit, reviewed allowlist: any other
+# documented key that is absent from both the struct and the map fails.
+MAP_ONLY_DOC_KEYS: dict[int, dict[str, str]] = {
+    10: {
+        "entries.id": (
+            "Stable rewrite identifier: the admin rewrite API preserves it and "
+            "returns it from /api/v1/rewrites; the DNS rewrite loader ignores it."
+        ),
+    },
+}
+
+# Serde enums that serialize as strings; the reference documents them as
+# `string (...)` so the type column is checked instead of skipped.
+STRING_ENUMS = {
+    "UpstreamStrategy",
+    "UpstreamEcs",
+    "BlockingMode",
+    "DnssecMode",
+    "YouTubeSafeSearchMode",
+    "Schedule",
+    "ClientTimeZone",
+}
+
 SECTION_RE = re.compile(r"^##\s+(\d+)\.\s")
 STRUCT_RE = re.compile(r"^\s*pub struct\s+(\w+)")
-FIELD_RE = re.compile(r"^\s*pub\s+([a-z_][a-z0-9_]*)\s*:\s*(.+?),?\s*$")
+FIELD_RE = re.compile(r"^\s*pub\s+(?:r#)?([a-z_][a-z0-9_]*)\s*:\s*(.+?),?\s*$")
 RENAME_RE = re.compile(r'#\[serde\([^]]*rename\s*=\s*"([^"]+)"')
 DEFAULT_FN_RE = re.compile(r'#\[serde\([^]]*default\s*=\s*"([^"]+)"')
 NUMERIC_TYPES = {
@@ -152,6 +239,9 @@ def rust_type_to_doc(rust_type: str) -> str:
         return "table"
     if compact.startswith("toml::") or compact == "toml::Value":
         return "table"
+    leaf = compact.rsplit("::", 1)[-1]
+    if leaf in STRING_ENUMS:
+        return "string"
     if compact.endswith("Config") or compact.endswith("Upstream"):
         return "table"
     return "value"
@@ -360,11 +450,15 @@ def parse_struct_fields(path: Path) -> dict[str, dict[str, dict[str, object]]]:
                 default_value = None
             else:
                 default_value = UNKNOWN
+            has_default = pending_has_default or pending_default_fn is not None
             structs[current][key] = {
                 "type": field_type,
                 "doc": " ".join(pending_doc),
                 "default": default_value,
-                "has_default": pending_has_default or pending_default_fn is not None,
+                "has_default": has_default,
+                # A non-Option field without `#[serde(default...)]` is required.
+                "required": not has_default
+                and not field_type.replace(" ", "").startswith("Option<"),
             }
             pending_rename = None
             pending_default_fn = None
@@ -422,45 +516,160 @@ def parse_documented_keys() -> dict[int, list[str]]:
     return keys
 
 
-def struct_for_key(key: str, structs: dict[str, dict[str, dict[str, object]]]) -> set[str]:
-    """Find the struct(s) owning a documented key (dotted prefix aware)."""
-    if "." not in key:
-        return {name for name, fields in structs.items() if key in fields}
-    prefix, _, leaf = key.rpartition(".")
-    candidates = {
-        name
-        for name, fields in structs.items()
-        if leaf in fields
-        and name.lower().replace("config", "") in prefix.lower().replace(".", "")
-    }
-    return candidates or {
-        name for name, fields in structs.items() if leaf in fields
-    }
+def fields_by_doc_key(
+    section: int, field_cache: dict[Path, dict[str, dict[str, dict[str, object]]]]
+) -> dict[str, dict[str, object]]:
+    """Return every documented key -> field metadata for one section.
+
+    Includes top-level structs, array-of-table element structs, nested map
+    value structs and nested container fields.
+    """
+    sources = SECTIONS[section][1]
+    structs: dict[str, dict[str, dict[str, object]]] = {}
+    for rel, struct_name in sources:
+        path = ROOT / rel
+        if path not in field_cache:
+            field_cache[path] = parse_struct_fields(path)
+        structs[struct_name] = field_cache[path].get(struct_name, {})
+
+    expected: dict[str, dict[str, object]] = {}
+    for struct_name, fields in structs.items():
+        prefix = prefix_for(section, struct_name, len(structs))
+        for field, meta in fields.items():
+            expected[prefix + field] = meta
+
+    for prefix, struct_name, rel in NESTED_BY_SECTION.get(section, []):
+        path = ROOT / rel
+        if path not in field_cache:
+            field_cache[path] = parse_struct_fields(path)
+        for field, meta in field_cache[path].get(struct_name, {}).items():
+            expected[prefix + field] = meta
+    return expected
 
 
-def owner_for_key(
-    section: int, key: str, structs: dict[str, dict[str, dict[str, object]]]
-) -> str | None:
-    """Pick the struct that owns a documented key using explicit table prefixes."""
-    best: tuple[int, str] | None = None
-    leaf = key.rpartition(".")[2] if "." in key else key
-    for name, fields in structs.items():
-        if leaf not in fields:
+def required_doc_keys(
+    section: int, field_cache: dict[Path, dict[str, dict[str, dict[str, object]]]]
+) -> set[str]:
+    """Keys that must have a documentation row (containers excluded)."""
+    sources = SECTIONS[section][1]
+    structs: dict[str, dict[str, dict[str, object]]] = {}
+    for rel, struct_name in sources:
+        path = ROOT / rel
+        if path not in field_cache:
+            field_cache[path] = parse_struct_fields(path)
+        structs[struct_name] = field_cache[path].get(struct_name, {})
+
+    required: set[str] = set()
+    for struct_name, fields in structs.items():
+        prefix = prefix_for(section, struct_name, len(structs))
+        required |= {prefix + field for field in fields}
+    required -= SKIP_REVERSE_BY_SECTION.get(section, set())
+
+    for prefix, struct_name, rel in NESTED_BY_SECTION.get(section, []):
+        path = ROOT / rel
+        if path not in field_cache:
+            field_cache[path] = parse_struct_fields(path)
+        skip = NESTED_SKIP.get((section, struct_name), set())
+        required |= {
+            prefix + field
+            for field in field_cache[path].get(struct_name, {})
+            if field not in skip
+        }
+    return required
+
+
+def normalize_map_path(path: str) -> str:
+    """Map `a[].b.*.c` to the reference's `a.b.c` key form."""
+    normalized = path.replace("[]", "")
+    normalized = re.sub(r"\.\*\.", ".", normalized)
+    normalized = re.sub(r"\.\*$", "", normalized)
+    return normalized.strip(".")
+
+
+def full_doc_keys(section: int, key: str) -> set[str]:
+    """Expand a table key to the absolute TOML path(s) it documents."""
+    roots = SECTION_ROOTS.get(section, ("",))
+    if any(root and (key == root or key.startswith(root + ".")) for root in roots):
+        return {key}
+    return {f"{root}.{key}" if root else key for root in roots}
+
+
+def load_map_fields() -> list[dict[str, object]]:
+    """Parse the checked-in v1->v2 map; malformed input raises ValueError."""
+    try:
+        data = tomllib.loads(MAP_PATH.read_text())
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"{MAP_PATH.relative_to(ROOT)} is not valid TOML: {exc}") from exc
+    if data.get("schema_version") != 2:
+        raise ValueError("config-v1-to-v2-map.toml schema_version must be 2")
+    fields = data.get("field", [])
+    if not isinstance(fields, list):
+        raise ValueError("config-v1-to-v2-map.toml [[field]] entries must be an array")
+    return fields
+
+
+def check_map(documented_full: set[str]) -> list[str]:
+    """Every v2-accepted map path must be documented; aliases point at a kept key."""
+    errors: list[str] = []
+    try:
+        fields = load_map_fields()
+    except (OSError, ValueError) as exc:
+        return [str(exc)]
+
+    by_path: dict[str, dict[str, object]] = {}
+    for entry in fields:
+        path = entry.get("path")
+        status = entry.get("status")
+        if not isinstance(path, str) or not path:
+            errors.append("config-v1-to-v2-map.toml: [[field]] entry without a path")
             continue
-        prefix = prefix_for(section, name, len(structs))
-        if prefix:
-            if key.startswith(prefix):
-                candidate = (len(prefix), name)
-                if best is None or candidate > best:
-                    best = candidate
-        elif "." not in key:
-            candidate = (0, name)
-            if best is None or candidate > best:
-                best = candidate
-    if best is not None:
-        return best[1]
-    matches = struct_for_key(key, structs)
-    return sorted(matches)[0] if matches else None
+        if status not in {"kept", "deprecated", "removed", "dead"}:
+            errors.append(
+                f"config-v1-to-v2-map.toml: `{path}` has unknown status `{status}`"
+            )
+        by_path[path] = entry
+
+    for root in LEGACY_RAW_ROOTS:
+        if not any(
+            str(entry.get("path", "")).startswith(root + ".")
+            for entry in fields
+        ):
+            errors.append(
+                f"config-v1-to-v2-map.toml: legacy raw section `[{root}]` has no allowlist entries"
+            )
+
+    for path, entry in by_path.items():
+        status = entry.get("status")
+        if status == "kept":
+            if normalize_map_path(path) not in documented_full:
+                errors.append(
+                    f"config-v1-to-v2-map.toml: kept path `{path}` is not documented "
+                    "in docs/configuration-reference.md"
+                )
+        elif status == "deprecated":
+            target = entry.get("to")
+            if not isinstance(target, str) or not target:
+                errors.append(
+                    f"config-v1-to-v2-map.toml: deprecated path `{path}` has no `to` target"
+                )
+                continue
+            target_entry = by_path.get(target)
+            if target_entry is None:
+                errors.append(
+                    f"config-v1-to-v2-map.toml: deprecated path `{path}` points at "
+                    f"unknown target `{target}`"
+                )
+            elif target_entry.get("status") != "kept":
+                errors.append(
+                    f"config-v1-to-v2-map.toml: deprecated path `{path}` target "
+                    f"`{target}` is not a kept key"
+                )
+            if normalize_map_path(target) not in documented_full:
+                errors.append(
+                    f"config-v1-to-v2-map.toml: deprecated path `{path}` target "
+                    f"`{target}` is not documented in docs/configuration-reference.md"
+                )
+    return errors
 
 
 def parse_doc_default(raw: str):
@@ -627,47 +836,47 @@ def write_missing_rows() -> list[str]:
     return added
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--github", action="store_true", help="annotate failures for GitHub Actions")
-    parser.add_argument(
-        "--write",
-        action="store_true",
-        help="append placeholder rows for undocumented fields before checking",
-    )
-    args = parser.parse_args()
-
-    if args.write:
-        added = write_missing_rows()
-        for row in added:
-            print(f"added placeholder row: {row}")
-
+def check_document(rows: list[dict[str, object]]) -> tuple[list[str], int]:
     field_cache: dict[Path, dict[str, dict[str, dict[str, object]]]] = {}
     errors: list[str] = []
-    rows = parse_doc_table()
     documented_by_section: dict[int, list[str]] = {}
+    documented_full: set[str] = set()
     for row in rows:
-        documented_by_section.setdefault(int(row["section"]), []).append(str(row["key"]))
+        section = int(row["section"])
+        key = str(row["key"])
+        documented_by_section.setdefault(section, []).append(key)
+        documented_full |= full_doc_keys(section, key)
 
-    for number, (title, sources) in SECTIONS.items():
-        structs: dict[str, dict[str, dict[str, object]]] = {}
-        for rel, struct_name in sources:
-            path = ROOT / rel
-            if path not in field_cache:
-                field_cache[path] = parse_struct_fields(path)
-            structs[struct_name] = field_cache[path].get(struct_name, {})
+    map_kept: set[str] = set()
+    try:
+        for entry in load_map_fields():
+            if entry.get("status") == "kept" and isinstance(entry.get("path"), str):
+                map_kept.add(normalize_map_path(str(entry["path"])))
+    except (OSError, ValueError):
+        # check_map reports the actionable failure below.
+        pass
 
+    for number, (title, _sources) in SECTIONS.items():
+        expected = fields_by_doc_key(number, field_cache)
         documented = set(documented_by_section.get(number, []))
 
         for row in [r for r in rows if int(r["section"]) == number]:
             key = str(row["key"])
-            owner = owner_for_key(number, key, structs)
-            if owner is None:
+            meta = expected.get(key)
+            if meta is None:
+                # A raw key accepted by the map but not modelled by a typed
+                # struct is allowed only when both the explicit reviewed list
+                # and the checked-in kept map agree.
+                if key in MAP_ONLY_DOC_KEYS.get(number, {}) and any(
+                    candidate in map_kept for candidate in full_doc_keys(number, key)
+                ):
+                    continue
                 errors.append(
-                    f"section {number} ({title}) line {row['line']}: documented key `{key}` not found in structs"
+                    f"section {number} ({title}) line {row['line']}: documented key "
+                    f"`{key}` is neither a struct field nor an explicitly allowed "
+                    "kept map path"
                 )
                 continue
-            meta = structs[owner][key.rpartition(".")[2] if "." in key else key]
 
             expected_type = rust_type_to_doc(str(meta["type"]))
             documented_type = normalize_doc_type(str(row["type"]))
@@ -677,16 +886,30 @@ def main() -> int:
                     f"`{row['type']}` in docs but `{expected_type}` in Rust ({meta['type']})"
                 )
 
-            expected_default = meta["default"]
             documented_default = parse_doc_default(str(row["default_raw"]))
             is_todo_placeholder = str(row.get("description", "")).strip().startswith("TODO:")
             placeholder_default = str(row["default_raw"]).strip().strip("`").strip() == "—"
             if is_todo_placeholder and placeholder_default:
                 # `--write` emits `—` only when the Rust default is not safely
                 # extractable. The author must replace it when filling the row.
-                match = None
-            else:
-                match = defaults_equal(expected_default, documented_default)
+                continue
+
+            if meta.get("required"):
+                if documented_default is not REQUIRED:
+                    errors.append(
+                        f"section {number} ({title}) line {row['line']}: `{key}` is "
+                        "required in Rust but the docs give a default"
+                    )
+                continue
+            if documented_default is REQUIRED:
+                errors.append(
+                    f"section {number} ({title}) line {row['line']}: `{key}` has a "
+                    "Rust default but is documented as required"
+                )
+                continue
+
+            expected_default = meta["default"]
+            match = defaults_equal(expected_default, documented_default)
             if match is False:
                 if expected_default is UNKNOWN:
                     expected_display = "required/not extractable"
@@ -697,18 +920,38 @@ def main() -> int:
                     f"`{row['default_raw']}` in docs but {expected_display} in Rust"
                 )
 
-        # Reverse direction: every pub field of the section structs must appear.
-        expected_keys: set[str] = set()
-        for struct_name in structs:
-            prefix = prefix_for(number, struct_name, len(structs))
-            expected_keys |= {prefix + field for field in structs[struct_name]}
-        skip_reverse = SKIP_REVERSE_BY_SECTION.get(number, set())
-
-        for key in sorted(expected_keys - documented - skip_reverse):
+        # Reverse direction: every pub field of the section structs, including
+        # nested array/map element structs, must appear.
+        for key in sorted(required_doc_keys(number, field_cache) - documented):
             errors.append(f"section {number} ({title}): struct field `{key}` is not documented")
 
+    errors.extend(check_map(documented_full))
+    return errors, sum(len(v) for v in documented_by_section.values())
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--github", action="store_true", help="annotate failures for GitHub Actions")
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="append placeholder rows for undocumented fields before checking",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        if args.write:
+            added = write_missing_rows()
+            for row in added:
+                print(f"added placeholder row: {row}")
+        rows = parse_doc_table()
+        errors, total = check_document(rows)
+    except (OSError, ValueError) as exc:
+        errors = [str(exc)]
+        total = 0
+
     if errors:
-        print("configuration reference drift detected:", file=sys.stderr)
+        print("configuration reference check failed:", file=sys.stderr)
         for err in errors:
             print(f"  - {err}", file=sys.stderr)
             if args.github:
@@ -719,10 +962,9 @@ def main() -> int:
         )
         return 1
 
-    total = sum(len(v) for v in documented_by_section.values())
     print(
         f"configuration reference OK ({total} documented keys checked; "
-        "types and extractable defaults validated)"
+        "nested structs, types, defaults and the v1->v2 map validated)"
     )
     return 0
 

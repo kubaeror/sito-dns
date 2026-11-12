@@ -79,7 +79,7 @@ To ensure rapid and thorough review:
 ### Prerequisites
 - Rust stable (MSRV documented in `README.md` and `rust-toolchain.toml`)
 - Components: `rustfmt`, `clippy`
-- Utilities: `cargo-deny`
+- Utilities: `cargo-deny`, `cargo-machete`, `cargo-udeps` (on the pinned nightly), `shellcheck` for installer changes, Docker for the compose/actionlint checks
 
 ### Initializing Git Hooks
 Run the hook setup script to configure pre-commit and commit message validation:
@@ -104,8 +104,27 @@ cargo test --workspace --all-features --locked
 # starts the real mTLS listener and checks /health + /api/v1/ha/status.
 sudo scripts/test-ha-ownership-root.sh
 
-# License and dependency check
+# License and dependency checks
 cargo deny check
+cargo machete
+cargo +nightly udeps --workspace --all-targets
+
+# Structural and error-handling gates
+bash scripts/check-file-size.sh
+bash scripts/check-function-size.sh
+bash scripts/check-error-swallowing.sh
+
+# Documentation contracts (nested config fields/defaults/types, v1->v2 map,
+# 2.0 breaking-change migration steps, internal links)
+python3 scripts/check_config_reference.py --github
+python3 scripts/test_check_config_reference.py
+python3 scripts/check_migration_guide.py --github
+python3 scripts/test_check_migration_guide.py
+python3 scripts/check_markdown_links.py --github
+
+# Compile the Criterion and fuzz targets (PR lanes; the long runs are nightly)
+cargo bench --workspace --all-features --locked --no-run
+cargo +nightly-2026-11-04 fuzz build
 
 # Run CLI verification
 cargo run -p sito -- --version
@@ -151,12 +170,18 @@ Local parity before pushing:
 cargo fmt --all --check
 cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 cargo test --workspace --all-features --locked
-python3 scripts/check_config_reference.py
+python3 scripts/check_config_reference.py --github
+python3 scripts/test_check_config_reference.py
+python3 scripts/check_migration_guide.py --github
+python3 scripts/test_check_migration_guide.py
+python3 scripts/check_markdown_links.py
 python3 -m py_compile scripts/ci_usage.py
 shellcheck -S warning contrib/install.sh
 docker compose -f docker-compose.yml config >/dev/null
 docker compose -f docker-compose.ha.yml config >/dev/null
 cargo deny check
+cargo machete
+cargo +nightly udeps --workspace --all-targets
 ```
 
 Scheduled fuzzing is not part of pull-request CI. The 2.0 branch has a

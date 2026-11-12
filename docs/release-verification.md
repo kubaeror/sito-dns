@@ -280,6 +280,25 @@ release until it is fixed or explicitly re-baselined on the dedicated runner
 with a reviewed reason. The committed `benches/baseline.json` is environment
 specific; the checklist records which runner produced it.
 
+## Docs and migration evidence
+
+A 2.0 release candidate must have a green docs lane. In addition to the internal
+link check, the lane runs:
+
+```bash
+python3 scripts/check_config_reference.py --github
+python3 scripts/test_check_config_reference.py
+python3 scripts/check_migration_guide.py --github
+python3 scripts/test_check_migration_guide.py
+```
+
+The configuration checker must accept every nested config struct, default,
+type and legacy raw-section map entry. The migration checker must find a
+concrete migration step for every `BC-<n>` ID in
+[`docs/2.0-public-api-diff.md`](2.0-public-api-diff.md) in
+[`docs/2.0-migration.md`](2.0-migration.md). Record the command output with the
+release checklist, alongside the fuzz and benchmark evidence.
+
 ## If verification fails
 
 - **`verify-tag` failed**: nothing was published. Delete the incorrect tag and

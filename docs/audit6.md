@@ -1,3 +1,11 @@
+> **Historical document — not evidence.** This document records the state at
+> its original commit and is kept for context only. Historical audits and plans
+> are leads; verify every claim against the current code and tests. Current
+> references: [2.0 migration guide](2.0-migration.md),
+> [config v2](config-v2.md), [2.0 public API diff](2.0-public-api-diff.md),
+> [P0/P1 test evidence](audit6-test-matrix.md) and the
+> [historical/current documentation index](history/README.md).
+
 # Audit 6 — sito-dns 2.0 Readiness Audit
 
 **Audited revision:** `acccdc4` (v1.9.3).

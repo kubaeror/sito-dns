@@ -222,8 +222,8 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
 
    To obtain the master public key for the slave configs:
    ```bash
-   # /api/v1/ha/status requires a Viewer-or-higher token or session.
-   export TOKEN='sito_...'   # Admin API token for resync; Viewer suffices for GETs
+   # All /api/v1/ha/* endpoints require an Admin token or session.
+   export TOKEN='sito_...'   # Admin API token
    curl -s -H "Authorization: Bearer $TOKEN" \
      http://192.168.1.10:8080/api/v1/ha/status | jq -r .master_pubkey
 
@@ -445,9 +445,13 @@ When a slave node fails or must be reprovisioned from bare metal:
    `Degraded`, and keep its previous configuration and file until it is
    restarted with matching values.
 
-   Create `/etc/sito/config.toml`:
+   Create `/etc/sito/config.toml`. This branch uses **config v2**; if the
+   source file is a v1 document, migrate it first with
+   `sito config migrate --from v1 --to v2 --backup` (see the
+   [2.0 migration guide](2.0-migration.md#4-config-v1--v2)). Keep the file
+   `config_version = 2` before starting the node:
    ```toml
-   config_version = 1
+   config_version = 2
 
    [server]
    role = "slave"
@@ -534,7 +538,7 @@ The `/api/v1/*` endpoints used below require authentication. Export an Admin API
 token (or use a session cookie) before running these examples:
 
 ```bash
-export TOKEN='sito_...'   # Admin token: resync requires Admin; GETs accept Viewer+
+export TOKEN='sito_...'   # Admin token: all /api/v1/ha/* endpoints require Admin
 ```
 
 1. **Check HA status on Master**:
@@ -628,3 +632,41 @@ To prevent unauthorized nodes from connecting to the master replication port and
 - Set `slave_token = "<PRE_SHARED_SECRET>"` in the `[ha]` section on both master and slave nodes.
 - The slave transmits this token in the initial `Hello` handshake over the encrypted replication channel.
 - The master validates the token and drops the connection immediately if the token is missing or mismatched.
+
+---
+
+## 7. Planned HA protocol v2 upgrade (Phase 2 — not implemented)
+
+> [!IMPORTANT]
+> This section describes the **planned** Phase 2 HA protocol v2 migration. It
+> is **not implemented** on the current 2.0.0-alpha.1 Phase 1 branch. Phase 1
+> does not change the HA wire protocol, `ha_state.toml` or
+> `ha_watermark.toml`. Do not attempt this procedure until the Phase 2 release
+> notes and a `protocol_version` field are present.
+
+The planned protocol adds `protocol_version = 2` to the handshake and to
+`ha_state.toml`/`ha_watermark.toml`. The upgrade is a coordinated cluster
+change:
+
+1. **Upgrade the master first.** The master starts on protocol v2 and rejects
+   every v1 slave with `protocol_mismatch` plus a readiness reason. Replication
+   is intentionally degraded during the window; DNS keeps answering on each
+   node from its last applied configuration.
+2. **Upgrade slaves one at a time.** A v2 slave also rejects a v1 master with
+   `protocol_mismatch`. Do not point a v2 slave at a v1 master.
+3. **Verify convergence.** Each slave must reach `Synced` with the master's
+   current term/version. `/health` stays generic; read `ready`,
+   `readiness_reason` and `diverged_reason` from `GET /api/v1/ha/status`.
+4. **Shared fields are read-only on slaves.** A local edit to a shared field
+   marks that slave `Degraded` and requires a full resync; node-local fields
+   (`[web]` identity, `[tls]`/`[acme]` paths, `[ha]`, credentials) remain
+   editable. The current Phase 1 bundle sanitizer already preserves those
+   node-local fields, but the read-only enforcement belongs to Phase 2.
+
+**Downgrade is not supported in place.** To return to 1.9.x, stop every node,
+restore the pre-upgrade backups of `config.toml`, `ha_state.toml`,
+`ha_watermark.toml` and the certificate/key material, then start the old
+binary. A v1 node must not read a v2 state/watermark file; the planned v2
+reader refuses `protocol_version = 1` with migration instructions rather than
+guessing. See the
+[2.0 migration guide](2.0-migration.md#8-ha) for the operator summary.
