@@ -5,16 +5,21 @@ use hickory_proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use sito_proto::rdata::{A, AAAA};
 use sito_proto::{decode_message, encode_message, normalize_domain};
+use sito_test_support::Clock;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 use tracing::trace;
 
 const MALFORMED_RESPONSE: &[u8] = &[0xFF, 0xFF];
+
+/// Optional clock-controlled response delay shared with the server task.
+type ResponseDelay = Arc<std::sync::Mutex<Option<(Arc<dyn Clock>, Duration)>>>;
 
 #[derive(Debug, Default, Clone)]
 pub struct MockRecordResponse {
@@ -30,17 +35,28 @@ struct MockBehavior {
     malformed: AtomicBool,
 }
 
-/// Binds UDP and TCP listeners to the same ephemeral loopback port.
+/// Binds UDP and TCP listeners to the same ephemeral loopback port and claims
+/// it in the shared process-wide port broker.
 ///
-/// The OS picks the UDP port independently of TCP, so retry when another
-/// process already holds the same number on TCP.
-async fn bind_udp_tcp_pair() -> Result<(UdpSocket, TcpListener, SocketAddr), anyhow::Error> {
+/// Claiming matters in parallel test binaries: without it, a mock upstream can
+/// steal the number a harness reserved for its DNS listener (which also binds
+/// UDP and TCP on one port).
+async fn bind_udp_tcp_pair() -> Result<(UdpSocket, TcpListener, SocketAddr, u16), anyhow::Error> {
     let mut last_error = None;
     for _ in 0..20 {
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         let addr = socket.local_addr()?;
         match TcpListener::bind(addr).await {
-            Ok(tcp_listener) => return Ok((socket, tcp_listener, addr)),
+            Ok(tcp_listener) => {
+                if sito_test_support::claim_ports(&[addr.port()]) {
+                    return Ok((socket, tcp_listener, addr, addr.port()));
+                }
+                // Another test reserved this number between bind and claim.
+                last_error = Some(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("port {} is already reserved", addr.port()),
+                ));
+            }
             Err(error) => last_error = Some(error),
         }
     }
@@ -62,27 +78,32 @@ pub struct MockDnsServer {
     query_count: Arc<AtomicUsize>,
     records: Arc<DashMap<(String, RecordType), MockRecordResponse>>,
     behavior: Arc<MockBehavior>,
+    delay: ResponseDelay,
+    reserved_ports: Vec<u16>,
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
 impl MockDnsServer {
     /// Spawns a new mock DNS server on an ephemeral UDP/TCP port.
     pub async fn spawn() -> Result<Self, anyhow::Error> {
-        let (socket, tcp_listener, addr) = bind_udp_tcp_pair().await?;
+        let (socket, tcp_listener, addr, port) = bind_udp_tcp_pair().await?;
 
         let alive = Arc::new(AtomicBool::new(true));
         let query_count = Arc::new(AtomicUsize::new(0));
         let records: Arc<DashMap<(String, RecordType), MockRecordResponse>> =
             Arc::new(DashMap::new());
         let behavior = Arc::new(MockBehavior::default());
+        let delay: ResponseDelay = Arc::new(std::sync::Mutex::new(None));
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         let alive_clone = Arc::clone(&alive);
         let query_count_clone = Arc::clone(&query_count);
         let records_clone = Arc::clone(&records);
         let behavior_clone = Arc::clone(&behavior);
+        let delay_clone = Arc::clone(&delay);
 
         tokio::spawn(async move {
+            let socket = Arc::new(socket);
             let mut buf = [0u8; 4096];
             loop {
                 tokio::select! {
@@ -105,7 +126,21 @@ impl MockDnsServer {
                         ) else {
                             continue;
                         };
-                        let _ = socket.send_to(&response, src).await;
+                        let delay = delay_clone
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        if let Some((clock, duration)) = delay {
+                            // Delay in a per-query task: a never-advanced
+                            // ManualClock must not block the receive loop.
+                            let socket = Arc::clone(&socket);
+                            tokio::spawn(async move {
+                                clock.sleep(duration).await;
+                                let _ = socket.send_to(&response, src).await;
+                            });
+                        } else {
+                            let _ = socket.send_to(&response, src).await;
+                        }
                     }
                     res = tcp_listener.accept() => {
                         let Ok((stream, _)) = res else { continue; };
@@ -132,6 +167,8 @@ impl MockDnsServer {
             query_count,
             records,
             behavior,
+            delay,
+            reserved_ports: vec![port],
             shutdown_tx: Some(shutdown_tx),
         })
     }
@@ -221,6 +258,18 @@ impl MockDnsServer {
     /// Toggles mock server availability (if false, drops all incoming UDP queries).
     pub fn set_alive(&self, alive: bool) {
         self.alive.store(alive, Ordering::SeqCst);
+    }
+
+    /// Delays every UDP response by `duration` of `clock` time.
+    ///
+    /// A [`sito_test_support::ManualClock`] turns a slow/dead upstream into a
+    /// deterministic test: the response is only released when the test calls
+    /// `advance`, with no wall-clock sleep.
+    pub fn set_response_delay(&self, clock: Arc<dyn Clock>, duration: Duration) {
+        *self
+            .delay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((clock, duration));
     }
 
     /// Number of queries received by this mock server.
@@ -337,6 +386,7 @@ async fn handle_tcp_connection(
 impl Drop for MockDnsServer {
     fn drop(&mut self) {
         self.stop();
+        sito_test_support::release_ports(&self.reserved_ports);
     }
 }
 

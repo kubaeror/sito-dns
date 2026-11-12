@@ -9,5 +9,8 @@ description = "Shared port broker and async wait helpers for sito tests"
 [dependencies]
 tokio = { workspace = true, features = ["macros", "time"] }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
 [lints]
 workspace = true

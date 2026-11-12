@@ -40,6 +40,7 @@ mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait.workspace = true
+sito-test-support.workspace = true
 rcgen.workspace = true
 time.workspace = true
 

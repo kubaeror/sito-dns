@@ -25,9 +25,11 @@ use sito_ha::{
 use sito_rewrites::RewriteTable;
 use sito_stats::{MetricsRegistry, QueryLogWriter, StatsDb};
 use sito_upstream::UpstreamManager;
-use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+use sito_test::fixtures::ha::FakeMaster;
+use sito_test::wait_for;
 
 // ---------------------------------------------------------------------------
 // Slave harness
@@ -112,17 +114,6 @@ fn signed_push(
     .expect("sign test push")
 }
 
-async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if cond() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    cond()
-}
-
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "sito_m11_ha_{label}_{}_{}",
@@ -147,22 +138,14 @@ async fn test_slave_goes_not_ready_when_master_stops_sending_frames() {
         vec![],
         &key,
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let fake_master = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-        // Authenticate/attach exactly like a real master, then go silent: the
-        // TCP connection stays open but no heartbeats or pushes arrive.
-        let _ = ws.next().await;
-        ws.send(WsMessage::Text(push.to_json().unwrap().into()))
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_secs(30)).await;
-    });
+    let fake_master = FakeMaster::start().await.unwrap();
+    fake_master.send(&push).unwrap();
+    // Authenticate/attach exactly like a real master, then go silent: the TCP
+    // connection stays open but no heartbeats or pushes arrive.
+    fake_master.stop_frames().unwrap();
 
     let ha_config = HaConfig {
-        master_url: Some(format!("ws://127.0.0.1:{port}")),
+        master_url: Some(fake_master.url()),
         master_pubkey: Some(key.public_key_hex()),
         allow_insecure_ws: true,
         ping_interval_secs: 1,
@@ -179,21 +162,21 @@ async fn test_slave_goes_not_ready_when_master_stops_sending_frames() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let worker = spawn_slave_worker(ha_config, tracker.clone(), handles, resync_rx, shutdown_rx);
 
-    assert!(
-        wait_until(
-            || tracker.get_state() == SlaveState::Synced,
-            Duration::from_secs(5)
-        )
-        .await,
-        "the slave must first sync the pushed bundle (state: {:?})",
-        tracker.get_state()
-    );
+    wait_for(
+        "the slave to sync the pushed bundle",
+        Duration::from_secs(5),
+        || async { tracker.get_state() == SlaveState::Synced },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error} (state: {:?})", tracker.get_state()));
 
-    let became_unready = wait_until(|| !tracker.readiness().ready, Duration::from_secs(8)).await;
-    assert!(
-        became_unready,
-        "a slave whose master stopped sending frames must stop being ready"
-    );
+    wait_for(
+        "the slave to lose the master heartbeat",
+        Duration::from_secs(8),
+        || async { !tracker.readiness().ready },
+    )
+    .await
+    .expect("a slave whose master stopped sending frames must stop being ready");
     let reason = tracker.readiness().reason.unwrap_or_default();
     assert!(
         reason.to_lowercase().contains("heartbeat") || reason.to_lowercase().contains("timeout"),
@@ -202,7 +185,7 @@ async fn test_slave_goes_not_ready_when_master_stops_sending_frames() {
 
     let _ = shutdown_tx.send(true);
     worker.abort();
-    fake_master.abort();
+    fake_master.stop();
 }
 
 // ---------------------------------------------------------------------------
@@ -263,23 +246,13 @@ servers = ["9.9.9.9"]
     // The master re-pushes the current bundle. The slave must not take the
     // same-version early-ACK path: it has to apply the shared config and only
     // then advertise sync.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let fake_master = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-        let _ = ws.next().await;
-        ws.send(WsMessage::Text(push.to_json().unwrap().into()))
-            .await
-            .unwrap();
-        // Read the apply ACK (a same-version early ACK is still an ACK, so the
-        // test asserts the resulting state instead of the ACK text).
-        let _ = ws.next().await;
-        tokio::time::sleep(Duration::from_secs(30)).await;
-    });
+    let fake_master = FakeMaster::start().await.unwrap();
+    fake_master.send(&push).unwrap();
+    // A same-version early ACK is still an ACK, so the test asserts the
+    // resulting state instead of the ACK text.
 
     let ha_config = HaConfig {
-        master_url: Some(format!("ws://127.0.0.1:{port}")),
+        master_url: Some(fake_master.url()),
         master_pubkey: Some(key.public_key_hex()),
         allow_insecure_ws: true,
         ping_interval_secs: 60,
@@ -297,21 +270,26 @@ servers = ["9.9.9.9"]
         shutdown_rx,
     );
 
-    assert!(
-        wait_until(
-            || restarted.get_state() == SlaveState::Synced && !restarted.has_local_config_drift(),
-            Duration::from_secs(5)
+    wait_for(
+        "the drifted slave to apply the identical push before reporting synced",
+        Duration::from_secs(5),
+        || async {
+            restarted.get_state() == SlaveState::Synced && !restarted.has_local_config_drift()
+        },
+    )
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "{error} (state: {:?}, drift: {})",
+            restarted.get_state(),
+            restarted.has_local_config_drift()
         )
-        .await,
-        "the drifted slave must apply the identical push before reporting synced (state: {:?}, drift: {})",
-        restarted.get_state(),
-        restarted.has_local_config_drift()
-    );
+    });
     assert!(restarted.readiness().ready);
 
     let _ = shutdown_tx.send(true);
     worker.abort();
-    fake_master.abort();
+    fake_master.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -368,21 +346,11 @@ servers = ["9.9.9.9"]
         "a legacy watermark must not be marked degraded before it reconnects"
     );
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let fake_master = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-        let _ = ws.next().await;
-        ws.send(WsMessage::Text(push.to_json().unwrap().into()))
-            .await
-            .unwrap();
-        let _ = ws.next().await;
-        tokio::time::sleep(Duration::from_secs(30)).await;
-    });
+    let fake_master = FakeMaster::start().await.unwrap();
+    fake_master.send(&push).unwrap();
 
     let ha_config = HaConfig {
-        master_url: Some(format!("ws://127.0.0.1:{port}")),
+        master_url: Some(fake_master.url()),
         master_pubkey: Some(key.public_key_hex()),
         allow_insecure_ws: true,
         ping_interval_secs: 60,
@@ -402,26 +370,28 @@ servers = ["9.9.9.9"]
 
     // The watermark only gains a digest when the slave actually applies the
     // same-version push; an early ACK leaves it absent.
-    let applied = wait_until(
-        || {
+    wait_for(
+        "a legacy watermark to be upgraded by a full apply",
+        Duration::from_secs(5),
+        || async {
             std::fs::read_to_string(&watermark_path)
                 .is_ok_and(|raw| raw.contains("applied_config_digest"))
                 && restarted.get_state() == SlaveState::Synced
         },
-        Duration::from_secs(5),
     )
-    .await;
-    assert!(
-        applied,
-        "a legacy watermark must be upgraded by a full apply, not an early ACK (state: {:?}, watermark: {:?})",
-        restarted.get_state(),
-        std::fs::read_to_string(&watermark_path).unwrap_or_default()
-    );
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "{error} (state: {:?}, watermark: {:?})",
+            restarted.get_state(),
+            std::fs::read_to_string(&watermark_path).unwrap_or_default()
+        )
+    });
     assert!(!restarted.requires_full_apply());
 
     let _ = shutdown_tx.send(true);
     worker.abort();
-    fake_master.abort();
+    fake_master.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -502,10 +472,13 @@ async fn test_delayed_same_version_fork_ack_after_newer_publish_is_divergence() 
         .await
         .unwrap();
 
-    assert!(
-        wait_until(|| coordinator.is_diverged(), Duration::from_secs(2)).await,
-        "a delayed fork ACK for a still-published envelope must be recorded"
-    );
+    wait_for(
+        "a delayed fork ACK to be recorded",
+        Duration::from_secs(2),
+        || async { coordinator.is_diverged() },
+    )
+    .await
+    .expect("a delayed fork ACK for a still-published envelope must be recorded");
     let reason = coordinator.diverged_reason().unwrap_or_default();
     assert!(
         reason.to_lowercase().contains("fork"),

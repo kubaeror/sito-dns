@@ -217,3 +217,25 @@ function over 200 lines fails the checker.
 | P3-4 | `test_lock_or_recover_returns_last_good_value_after_poison`, `test_poisoned_readiness_mutex_keeps_last_good_value_and_does_not_panic` | `cargo test -p sito-core sync::tests`; `cargo test -p sito-api test_poisoned_readiness_mutex` |
 | P3-3 | `scripts/find-error-swallowing.py` (statement-aware production scan), `scripts/test-error-swallowing.py` fixtures, reviewed allowlist and `docs/audit6-best-effort.md` | `python3 scripts/test-error-swallowing.py`; `bash scripts/check-error-swallowing.sh` |
 | Healthcheck split | `test_healthcheck_fails_when_ha_is_not_ready`, `test_healthcheck_passes_when_ha_is_ready`, `test_healthcheck_ha_required_without_signal_fails_closed`, `test_healthcheck_fails_when_reachable_health_is_not_ready_without_ha`, `test_healthcheck_setup_fallback_requires_the_middleware_signal` | `cargo test -p sito --lib cli::tests::test_healthcheck` |
+
+## WP-1.8 — test harness, mocks and deterministic timing
+
+WP-1.8 closes the P3-11/P3-12 test-fidelity findings. The 20-run stability
+evidence and the exact commands are recorded in
+`docs/test-harness.md` and the WP-1.8 report.
+
+| Acceptance criterion | Named test / check | Focused command |
+|---|---|---|
+| Parallel tests spawn harness instances without port collisions | `concurrent_harness_instances_get_distinct_ports_and_serve_queries` | `cargo test -p sito-test --test harness_parallel` |
+| Concurrent reservations never share a port; a released probe stays reserved | `concurrent_leases_never_return_the_same_port`, `released_probe_socket_stays_reserved_for_concurrent_tests`, `dropped_lease_returns_the_port_and_live_leases_stay_exclusive` | `cargo test -p sito-test-support --test port_broker_contract` |
+| DNS reserves one number for TCP and UDP | `udp_and_tcp_numbers_can_be_reserved_together_without_collision`; harness uses `reserve_tcp_udp`; `sito` startup tests use `reserve_tcp_udp_port` | `cargo test -p sito-test-support --test port_broker_contract udp_and_tcp`; `cargo test -p sito --lib graceful_shutdown` |
+| Deterministic clock: advance/waiters/notify, no real-time drift | `manual_clock_now_only_moves_when_advanced`, `manual_clock_sleep_only_completes_after_advance`, `manual_clock_notify_wakes_waiters_without_advancing` | `cargo test -p sito-test-support --test clock_contract` |
+| Bounded waits name the condition and budget | `wait_for_reports_label_and_timeout_on_failure`, `wait_for_succeeds_after_the_condition_becomes_true` | `cargo test -p sito-test-support --test wait_contract` |
+| Clock-driven mock upstream and HA heartbeat fixtures | `manual_clock_drives_a_deterministic_mock_upstream_delay`, `fake_master_heartbeat_is_driven_by_the_manual_clock` | `cargo test -p sito-test --test fixtures_contract` |
+| TLS valid/expired/soon-to-expire fixtures with SANs | `tls_fixtures_cover_valid_expired_and_soon_to_expire_certificates` | `cargo test -p sito-test --test fixtures_contract tls_fixtures` |
+| ACME mock CA and HTTP-01 challenge server | `test_acme_bootstrap_issuance_all_transports_and_renewal`, `http01_fixture_serves_registered_tokens_only` | `cargo test -p sito-test --test m11_acme`; `cargo test -p sito-test --test fixtures_contract http01` |
+| HA fake master frames/heartbeats/partition | `test_slave_goes_not_ready_when_master_stops_sending_frames`, `test_delayed_same_version_fork_ack_after_newer_publish_is_divergence` | `cargo test -p sito-test --test m11_ha_partition` |
+| DNSSEC signed-zone/key/denial fixtures | `signed_zone_fixture_exposes_anchor_keys_and_denial_records`, `test_m11_policy_change_rejects_in_flight_cache_insert` | `cargo test -p sito-test --test fixtures_contract signed_zone`; `cargo test -p sito-test --test m11_dnssec_security` |
+| Domain normalization property tests | `normalization_is_idempotent_and_never_panics`, `lowercase_and_one_trailing_dot_are_equivalent`, `idn_labels_round_trip_through_punycode`, `wildcard_labels_are_preserved_exactly`, `suffix_matching_is_reflexive_transitive_and_strict_only_for_children` | `cargo test -p sito-core --test domain_properties` |
+| ABP parser property tests | `arbitrary_lines_never_panic`, `parsed_canonical_matches_recomputed_canonical`, `modifier_order_does_not_change_the_canonical_form`, `badfilter_suffix_is_recognised_and_excluded_from_the_canonical_form`, `long_lines_are_skipped_without_materialising_a_rule`, `byte_budget_rejects_without_returning_partial_rules` | `cargo test -p sito-filter --test parser_properties` |
+| 20-run parallel stability | harness/m11/HA/cache plus the changed `sito --lib` and `sito-transport` suites, 20 consecutive runs, no port collisions or timing flakes | see `docs/test-harness.md#stability-evidence` |

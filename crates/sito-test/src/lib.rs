@@ -1,6 +1,7 @@
 //! Integration test harness and mock servers for sito.
 
 pub mod client;
+pub mod fixtures;
 pub mod harness;
 pub mod mock;
 
@@ -8,9 +9,10 @@ pub use client::{DotConnection, TestDnsClient};
 pub use harness::{
     ReservedPort, ReservedUdpPort, TestServerInstance, generate_expired_test_cert,
     generate_test_cert, reserve_port, reserve_port_number, reserve_udp_port,
-    reserve_udp_port_number, wait_until,
+    reserve_udp_port_number, wait_for, wait_until,
 };
 pub use mock::MockDnsServer;
+pub use sito_test_support::clock::{Clock, ManualClock, SystemClock};
 
 #[cfg(test)]
 mod tests {
@@ -134,8 +136,28 @@ mod tests {
         let ttl1 = resp1.answers[0].ttl;
         assert_eq!(ttl1, 100);
 
-        // Wait 1.1 second
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Wait for the served TTL to actually decrement instead of sleeping
+        // for a guessed duration. The upstream must still be called once.
+        let probe_client = client.clone();
+        wait_for(
+            "the cached TTL to decrement",
+            Duration::from_secs(5),
+            || {
+                let probe_client = probe_client.clone();
+                async move {
+                    probe_client
+                        .query_udp("cached.example.com", RecordType::A)
+                        .await
+                        .ok()
+                        .and_then(|response| {
+                            response.answers.first().map(|answer| answer.ttl < ttl1)
+                        })
+                        .unwrap_or(false)
+                }
+            },
+        )
+        .await
+        .expect("the cached TTL did not decrement within 5s");
 
         // 2nd query -> cache hit, TTL decremented, upstream NOT called again
         let resp2 = client
@@ -1034,7 +1056,26 @@ mod tests {
         assert_eq!(mock_upstream.query_count(), 1);
         let orig_ttl = r_udp.answers[0].ttl;
 
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let probe_client = client.clone();
+        wait_for(
+            "the cached TTL to decrement",
+            Duration::from_secs(5),
+            || {
+                let probe_client = probe_client.clone();
+                async move {
+                    probe_client
+                        .query_udp("allowed-domain.org", RecordType::A)
+                        .await
+                        .ok()
+                        .and_then(|response| {
+                            response.answers.first().map(|answer| answer.ttl < orig_ttl)
+                        })
+                        .unwrap_or(false)
+                }
+            },
+        )
+        .await
+        .expect("the cached TTL did not decrement within 5s");
 
         // Query via TCP hits cache with decremented TTL
         let r_tcp = client

@@ -622,14 +622,14 @@ mod tests {
     }
 
     async fn run_graceful_shutdown_once() -> Result<(), ()> {
-        // Find ephemeral free port
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let probe_web = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let web_port = probe_web.local_addr().unwrap().port();
-        drop(probe_web);
+        // Reserve through the shared broker: DNS binds UDP and TCP on the same
+        // number, so a UDP-only probe can collide with a parallel test.
+        let mut dns_lease = sito_test_support::reserve_tcp_udp_port().expect("reserve DNS port");
+        let port = dns_lease.port();
+        let mut web_lease = sito_test_support::reserve_port().expect("reserve web port");
+        let web_port = web_lease.port();
+        dns_lease.release_sockets();
+        web_lease.release_listener();
 
         let temp_dir = std::env::temp_dir().join(format!(
             "sito_srv_test_{}_{}_{}",
@@ -821,17 +821,18 @@ mod tests {
             )
         }
 
-        let reserve_udp_port = || {
-            let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-            port
-        };
-        let first_port = reserve_udp_port();
-        let second_port = reserve_udp_port();
-        let probe_web = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let web_port = probe_web.local_addr().unwrap().port();
-        drop(probe_web);
+        // The DNS listener binds UDP and TCP on the same number.
+        let mut first_lease =
+            sito_test_support::reserve_tcp_udp_port().expect("reserve first rebind port");
+        let first_port = first_lease.port();
+        let mut second_lease =
+            sito_test_support::reserve_tcp_udp_port().expect("reserve second rebind port");
+        let second_port = second_lease.port();
+        let mut web_lease = sito_test_support::reserve_port().expect("reserve web port");
+        let web_port = web_lease.port();
+        first_lease.release_sockets();
+        second_lease.release_sockets();
+        web_lease.release_listener();
 
         let temp_dir = std::env::temp_dir().join(format!(
             "sito_rebind_test_{}_{}",
@@ -900,8 +901,8 @@ mod tests {
 
         // Point the config at an occupied UDP port: the rebind must fail and
         // the previous listeners must be restored.
-        let blocker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let blocked_port = blocker.local_addr().unwrap().port();
+        let blocker = sito_test_support::reserve_udp_port().expect("reserve blocked port");
+        let blocked_port = blocker.port();
         config.dns.port = blocked_port;
         std::fs::write(
             &config_path,
@@ -916,7 +917,10 @@ mod tests {
 
         // A later valid change must still apply: a failed rebind must not
         // permanently orphan the listener manager.
-        let third_port = reserve_udp_port();
+        let mut third_lease =
+            sito_test_support::reserve_tcp_udp_port().expect("reserve third rebind port");
+        let third_port = third_lease.port();
+        third_lease.release_sockets();
         config.dns.port = third_port;
         std::fs::write(
             &config_path,

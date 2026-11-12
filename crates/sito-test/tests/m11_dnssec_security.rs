@@ -10,19 +10,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use hickory_proto::dnssec::PublicKey;
-use hickory_proto::dnssec::rdata::DNSSECRData;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use sito_core::config::{Config, DnssecConfig};
-use sito_dnssec::test_util::create_test_signed_domain;
 use sito_dnssec::{ChainCache, DnssecValidator};
 use sito_proto::rdata::{A, CNAME};
 use sito_proto::{decode_message, encode_message};
+use sito_test::fixtures::dnssec::SignedZone;
 use sito_test::{MockDnsServer, TestServerInstance};
-use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
 /// Upstream that answers ordinary names but black-holes DNSKEY/DS lookups.
@@ -31,9 +26,12 @@ use tokio::task::JoinHandle;
 /// wall-clock validation deadline: without it the probe future would stay
 /// pending forever.
 async fn spawn_blackholed_key_upstream() -> (SocketAddr, JoinHandle<()>) {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind mock");
+    let (socket, claim) = sito_test::fixtures::net::bind_claimed_udp()
+        .await
+        .expect("bind mock");
     let addr = socket.local_addr().expect("mock addr");
     let handle = tokio::spawn(async move {
+        let _claim = claim;
         let mut buf = [0u8; 4096];
         loop {
             let Ok((len, src)) = socket.recv_from(&mut buf).await else {
@@ -213,11 +211,10 @@ async fn test_m11_eight_hop_chain_is_bounded_end_to_end() {
 #[tokio::test]
 async fn test_m11_policy_change_rejects_in_flight_cache_insert() {
     let cache = Arc::new(ChainCache::new(None));
-    let (origin, dnskey, answer, rrsig, _signer) = create_test_signed_domain("race.example.");
-    let anchor_a = format!(
-        "race.example.:13:{}",
-        BASE64_STANDARD.encode(dnskey.public_key().public_bytes())
-    );
+    let zone = SignedZone::new("race.example.");
+    let origin = zone.origin.clone();
+    let (answer, rrsig) = zone.apex_a(Ipv4Addr::new(93, 184, 216, 34));
+    let anchor_a = zone.trust_anchor();
 
     let old_config = DnssecConfig {
         validate: true,
@@ -230,12 +227,8 @@ async fn test_m11_policy_change_rejects_in_flight_cache_insert() {
     let old_generation = cache.policy_generation();
 
     // Reload adds an unrelated anchor: the shared cache generation advances.
-    let (_other_origin, other_key, _other_signer) =
-        sito_dnssec::test_util::create_test_signer("other.example.");
-    let anchor_b = format!(
-        "other.example.:13:{}",
-        BASE64_STANDARD.encode(other_key.public_key().public_bytes())
-    );
+    let other_zone = SignedZone::new("other.example.");
+    let anchor_b = other_zone.trust_anchor();
     let new_config = DnssecConfig {
         validate: true,
         mode: "validate".to_string(),
@@ -257,11 +250,7 @@ async fn test_m11_policy_change_rejects_in_flight_cache_insert() {
             .push(Query::query(origin.clone(), RecordType::A));
         message.answers.push(answer.clone());
         message.answers.push(rrsig.clone());
-        message.additionals.push(Record::from_rdata(
-            origin.clone(),
-            300,
-            RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
-        ));
+        message.additionals.push(zone.dnskey_record());
         message
     };
 

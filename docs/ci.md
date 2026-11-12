@@ -45,6 +45,13 @@ part of the required `ci-gate` check, not separate advisory workflows.
 | Workflow files (`.github/workflows/**`) | `ci.yml`: `changes`, `docs-check`, `ci-gate`; `docs-check` calls `docs.yml` (`meta` with the Markdown link check and `actionlint`). |
 | Mixed changes | Union of the matching lanes. |
 
+The normal `test` lane also runs the bounded `proptest` suites in
+`crates/sito-core/tests/domain_properties.rs` and
+`crates/sito-filter/tests/parser_properties.rs` (96/64 cases each). They are
+deterministic and fast enough for every pull request, so they need no separate
+workflow or check; `docs/test-harness.md` documents the harness, clock, waits
+and fixtures they use.
+
 `docs/openapi.json` matches both the `docs/**` filter and the `api` filter, so
 it runs the `openapi` job and the docs lane. A change to
 `scripts/check_config_reference.py` is also matched by the docs lane and runs
