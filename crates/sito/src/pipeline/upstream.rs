@@ -174,7 +174,12 @@ impl PipelineContext<'_> {
                         if let Some(ref m) = pipeline.metrics {
                             m.inc_cache_stale_served();
                         }
-                        shape_response(query, &mut stale_resp, self.client_wants_dnssec);
+                        ResponseShaper::shape_with_payload(
+                            &mut stale_resp,
+                            query,
+                            self.dnssec_mode,
+                            self.runtime_snapshot.config.dns.edns_udp_size,
+                        );
                         stale_resp.metadata.id = query_id;
                         return QueryOutcome {
                             response: Some(stale_resp),

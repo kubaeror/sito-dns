@@ -3,14 +3,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-/// Whether a query carried the DNSSEC OK (DO) bit.
-pub(super) fn query_has_do(query: &Message) -> bool {
-    query
-        .edns
-        .as_ref()
-        .is_some_and(|edns| edns.flags().dnssec_ok)
-}
-
 /// Maximum wall-clock time the pipeline spends on DNSSEC validation and its
 /// DNSKEY/DS chain fetches for one query.
 ///
@@ -99,84 +91,6 @@ pub(super) fn error_response(query: &Message, response_code: ResponseCode) -> Me
     response.metadata.response_code = response_code;
     copy_query_response_flags(&mut response, query);
     response
-}
-
-/// Strips DNSSEC records and DO-dependent EDNS options from a response.
-///
-/// RFC 3225: clients that did not set DO must not receive RRSIG/NSEC/NSEC3/
-/// DNSKEY material. The same shaping is applied before such a response is
-/// cached so a DO=0 cache entry never carries DNSSEC data.
-pub(super) fn strip_dnssec_records(response: &mut Message) {
-    let is_dnssec_type = |record: &Record| {
-        matches!(
-            record.record_type(),
-            RecordType::RRSIG | RecordType::NSEC | RecordType::NSEC3 | RecordType::DNSKEY
-        )
-    };
-    response.answers.retain(|record| !is_dnssec_type(record));
-    response
-        .authorities
-        .retain(|record| !is_dnssec_type(record));
-    response
-        .additionals
-        .retain(|record| !is_dnssec_type(record));
-    if let Some(edns) = response.edns.as_mut() {
-        // DAU/DHU/N3U only make sense for DNSSEC-aware clients.
-        edns.options_mut().remove(EdnsCode::DAU);
-        edns.options_mut().remove(EdnsCode::DHU);
-        edns.options_mut().remove(EdnsCode::N3U);
-    }
-}
-
-/// Single response-shaping path applied to every response before it leaves the
-/// pipeline.
-///
-/// DNS responses must echo the *current* client's question and RD/CD bits, not
-/// the stored/upstream question. EDNS is rebuilt from the client request so
-/// upstream-only options (COOKIE, NSID, ECS, padding, unknown options) cannot
-/// leak to another client, and a non-EDNS client never receives an OPT record
-/// (RFC 6891 §6.1.1). DNSSEC records are removed only when the client did not
-/// request them, and the DO bit is echoed exactly.
-///
-/// The RFC 8914 Extended DNS Error option (code 15) is retained as a
-/// non-client-specific diagnostic; it may come from local validation or the
-/// upstream. Every other option is dropped because it can be client-specific
-/// (COOKIE, ECS, NSID, padding).
-pub(super) fn shape_response(query: &Message, response: &mut Message, client_wants_dnssec: bool) {
-    response.metadata.id = query.metadata.id;
-    response.metadata.op_code = query.metadata.op_code;
-    response.metadata.message_type = MessageType::Response;
-    response.metadata.authoritative = false;
-    response.metadata.recursion_desired = query.metadata.recursion_desired;
-    response.metadata.recursion_available = true;
-    response.metadata.checking_disabled = query.metadata.checking_disabled;
-    response.queries.clone_from(&query.queries);
-
-    let extended_error = response.edns.as_ref().and_then(|edns| {
-        edns.options()
-            .options
-            .iter()
-            .find(|(code, _)| u16::from(*code) == 15)
-            .map(|(_, option)| option.clone())
-    });
-
-    match &query.edns {
-        Some(client_edns) => {
-            let mut edns = Edns::new();
-            edns.set_max_payload(client_edns.max_payload());
-            edns.set_dnssec_ok(client_edns.flags().dnssec_ok);
-            if let Some(option) = extended_error {
-                edns.options_mut().insert(option);
-            }
-            response.set_edns(edns);
-        }
-        // RFC 6891: a response to a non-EDNS query must not contain an OPT RR.
-        None => response.edns = None,
-    }
-
-    if !client_wants_dnssec {
-        strip_dnssec_records(response);
-    }
 }
 
 /// Masks the host bits of an address so the cache key and the forwarded ECS

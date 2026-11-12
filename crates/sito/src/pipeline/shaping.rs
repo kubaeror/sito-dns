@@ -11,7 +11,12 @@ impl PipelineContext<'_> {
         upstream_resp: &mut Message,
         cache_status: ValidationStatus,
     ) {
-        shape_response(&self.query, upstream_resp, self.client_wants_dnssec);
+        ResponseShaper::shape_with_payload(
+            upstream_resp,
+            &self.query,
+            self.dnssec_mode,
+            self.runtime_snapshot.config.dns.edns_udp_size,
+        );
         if !self.cache_enabled
             || (upstream_resp.metadata.response_code != ResponseCode::NoError
                 && upstream_resp.metadata.response_code != ResponseCode::NXDomain)

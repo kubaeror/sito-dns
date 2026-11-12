@@ -11,6 +11,14 @@ pub use cache::{DnsCache, SingleFlightGuard};
 pub use entry::{CacheEntry, PolicyEpoch, ValidationStatus};
 pub use key::CacheKey;
 
+/// Cache-policy generation.
+///
+/// This is the same type (and counter) as the WP-1.4 [`PolicyEpoch`]:
+/// `sito-runtime::RuntimeGeneration` is also an alias of it. It is re-exported
+/// under the §10.7 interface name so cache-policy code and runtime code cannot
+/// drift onto two counters.
+pub type CachePolicyEpoch = PolicyEpoch;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,16 +482,21 @@ mod tests {
             .expect("cache hit");
         assert_eq!(status, ValidationStatus::Insecure);
 
-        // The convenience insert derives Secure from the AD bit.
-        let mut secure = answer_response(76, &qname, [192, 0, 2, 76]);
-        secure.metadata.authentic_data = true;
-        let secure_query = query_for(76, &qname);
-        cache.insert(&secure_query, &secure).await;
+        // The convenience insert must never trust an upstream AD bit: a
+        // response the resolver did not validate is stored as Unchecked.
+        let mut forged = answer_response(76, &qname, [192, 0, 2, 76]);
+        forged.metadata.authentic_data = true;
+        let forged_query = query_for(76, &qname);
+        cache.insert(&forged_query, &forged).await;
         let (_, status) = cache
-            .get_for_query_with_status(&secure_query)
+            .get_for_query_with_status(&forged_query)
             .await
             .expect("cache hit");
-        assert_eq!(status, ValidationStatus::Secure);
+        assert_eq!(
+            status,
+            ValidationStatus::Unchecked,
+            "insert() must not turn an unvalidated upstream AD bit into Secure"
+        );
     }
 
     /// P1-27: a DNSSEC policy change must invalidate validation decisions in
@@ -1323,6 +1336,181 @@ mod tests {
             cache.weighted_size(),
             0,
             "fully expired entries must not be cloned into the new generation"
+        );
+    }
+
+    /// P2-22: a hot reload that lowers `max_ttl` must immediately cap every
+    /// still-fresh entry. Waiting for the old (longer) lifespan to expire
+    /// would serve a TTL above the configured maximum.
+    #[tokio::test]
+    async fn test_update_config_reclamps_lowered_max_ttl() {
+        let mut config = make_test_config(0, 3600, 3600);
+        let cache = DnsCache::new(config.clone());
+        let qname = Name::from_str("reclamp-max.example.").unwrap();
+        let query = query_for(100, &qname);
+        let mut response = answer_response(100, &qname, [192, 0, 2, 100]);
+        response.answers[0].ttl = 300;
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Insecure)
+            .await;
+
+        config.max_ttl = 10;
+        cache.update_config(config).await;
+
+        let served = cache
+            .get_for_query(&query)
+            .await
+            .expect("entry is still within its lifespan");
+        assert!(
+            served.answers[0].ttl <= 10,
+            "a lowered max_ttl must cap the served TTL (got {})",
+            served.answers[0].ttl
+        );
+        assert!(
+            served.answers[0].ttl >= 9,
+            "the re-clamped TTL must not be zeroed while the entry is fresh"
+        );
+    }
+
+    /// P2-22: a hot reload that raises `min_ttl` must immediately raise the
+    /// served TTL of unvalidated entries instead of serving the old floor.
+    #[tokio::test]
+    async fn test_update_config_reclamps_raised_min_ttl() {
+        let mut config = make_test_config(10, 3600, 3600);
+        let cache = DnsCache::new(config.clone());
+        let qname = Name::from_str("reclamp-min.example.").unwrap();
+        let query = query_for(101, &qname);
+        let mut response = answer_response(101, &qname, [192, 0, 2, 101]);
+        response.answers[0].ttl = 10;
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Insecure)
+            .await;
+
+        config.min_ttl = 120;
+        cache.update_config(config).await;
+
+        let served = cache
+            .get_for_query(&query)
+            .await
+            .expect("entry must stay fresh");
+        assert!(
+            served.answers[0].ttl >= 119,
+            "a raised min_ttl must lift the served TTL (got {})",
+            served.answers[0].ttl
+        );
+        assert!(
+            served.answers[0].ttl <= 120,
+            "the served TTL must not exceed the raised floor"
+        );
+    }
+
+    /// Secure entries keep the `floor = 0` rule on reload: `min_ttl` must
+    /// never extend an authenticated TTL past its signed lifetime.
+    #[tokio::test]
+    async fn test_update_config_does_not_raise_secure_ttl_to_min_ttl() {
+        let mut config = make_test_config(0, 3600, 3600);
+        let cache = DnsCache::new(config.clone());
+        let qname = Name::from_str("reclamp-secure.example.").unwrap();
+        let query = query_for(102, &qname);
+        let mut response = answer_response(102, &qname, [192, 0, 2, 102]);
+        response.answers[0].ttl = 10;
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Secure)
+            .await;
+
+        config.min_ttl = 120;
+        cache.update_config(config).await;
+
+        let served = cache
+            .get_for_query(&query)
+            .await
+            .expect("entry must stay fresh");
+        assert_eq!(
+            served.answers[0].ttl, 10,
+            "a raised min_ttl must not extend a Secure TTL"
+        );
+    }
+
+    /// P2-22: a lowered `negative_ttl_max` must re-clamp negative entries,
+    /// including their SOA authority record.
+    /// P-5: `CachePolicyEpoch` is the same counter/type as the WP-1.4
+    /// `PolicyEpoch` (and therefore `RuntimeGeneration`), not a second epoch.
+    #[test]
+    fn test_cache_policy_epoch_is_policy_epoch() {
+        fn same_type(_: CachePolicyEpoch, _: PolicyEpoch) {}
+        let epoch: CachePolicyEpoch = PolicyEpoch::INITIAL;
+        same_type(epoch, epoch);
+        assert_eq!(epoch, PolicyEpoch::INITIAL);
+        assert_eq!(epoch.next(), PolicyEpoch::new(2));
+    }
+
+    /// P2-22: an entry whose original lifespan has passed is not fresh. A
+    /// raised `min_ttl` on reload must not resurrect it as a fresh entry.
+    #[tokio::test]
+    async fn test_update_config_does_not_resurrect_fully_expired_entries() {
+        let mut config = make_test_config(1, 10, 300);
+        config.serve_stale_hours = 0;
+        let cache = DnsCache::new(config.clone());
+        let qname = Name::from_str("reclamp-expired.example.").unwrap();
+        let query = query_for(104, &qname);
+        let mut response = answer_response(104, &qname, [192, 0, 2, 104]);
+        response.answers[0].ttl = 10;
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Insecure)
+            .await;
+
+        cache
+            .backdate_entry_for_test(&query, Duration::from_secs(60))
+            .await;
+
+        config.min_ttl = 3600;
+        config.max_ttl = 3600;
+        cache.update_config(config).await;
+
+        assert!(
+            cache.get_for_query(&query).await.is_none(),
+            "a fully expired entry must not be resurrected by a raised min_ttl"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_config_reclamps_negative_ttl_max() {
+        let mut config = make_test_config(10, 3600, 3600);
+        let cache = DnsCache::new(config.clone());
+        let qname = Name::from_str("reclamp-negative.example.").unwrap();
+        let query = query_for(103, &qname);
+        let mut response = Message::response(103, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.metadata.response_code = ResponseCode::NXDomain;
+        response.authorities.push(Record::from_rdata(
+            Name::from_str("example.").unwrap(),
+            600,
+            RData::SOA(SOA::new(
+                Name::from_str("ns1.example.").unwrap(),
+                Name::from_str("hostmaster.example.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                600,
+            )),
+        ));
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Insecure)
+            .await;
+
+        config.negative_ttl_max = 30;
+        cache.update_config(config).await;
+
+        let served = cache
+            .get_for_query(&query)
+            .await
+            .expect("negative entry must stay cached");
+        assert_eq!(served.metadata.response_code, ResponseCode::NXDomain);
+        assert!(
+            served.authorities[0].ttl <= 30,
+            "a lowered negative_ttl_max must cap the served SOA TTL (got {})",
+            served.authorities[0].ttl
         );
     }
 }

@@ -71,10 +71,8 @@ impl QueryHandler for DnsPipeline {
         let start = std::time::Instant::now();
 
         // The client must signal DNSSEC awareness (DO bit or AD bit) before we
-        // may assert AD on the response (RFC 6840 section 5.7).
-        let client_wants_dnssec = query_has_do(&query);
-        let client_accepts_ad = client_wants_dnssec || query.metadata.authentic_data;
-
+        // may assert AD on the response (RFC 6840 section 5.7). The shared
+        // response shaper enforces this from the query itself.
         let first_query = query.queries.first().expect("validated single question");
         let qname = first_query.name().clone();
         let qtype = first_query.query_type();
@@ -92,8 +90,6 @@ impl QueryHandler for DnsPipeline {
             qname,
             qtype,
             domain_str,
-            client_wants_dnssec,
-            client_accepts_ad,
             start,
         );
         let outcome = context.execute().instrument(span).await;

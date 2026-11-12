@@ -111,7 +111,7 @@ impl DnsPipeline {
     /// snapshot, so the epoch must too (P1-27).
     pub(super) fn cache_epoch_for(
         snapshot: &sito_runtime::RuntimeSnapshot,
-    ) -> sito_cache::PolicyEpoch {
+    ) -> sito_cache::CachePolicyEpoch {
         snapshot.generation
     }
 
@@ -542,19 +542,17 @@ impl DnsPipeline {
         &self,
         cache_query: &Message,
         validation_active: bool,
-        client_wants_dnssec: bool,
     ) -> Option<Message> {
         let (mut response, status) = self.cache.get_for_query_with_status(cache_query).await?;
         if !cache_entry_servable(status, validation_active) {
             debug!("Ignoring unchecked cache entry while DNSSEC validation is active");
             return None;
         }
-        if !status.is_secure() {
-            response.metadata.authentic_data = false;
-        }
-        if !client_wants_dnssec {
-            strip_dnssec_records(&mut response);
-        }
+        // The validation status, not the stored envelope, is the authority for
+        // AD. This restores the authenticated bit for a Secure entry that was
+        // cached through a client that did not signal DNSSEC awareness; the
+        // shaper still clears it for such clients when it is served.
+        response.metadata.authentic_data = status.is_secure();
         Some(response)
     }
 
@@ -602,11 +600,11 @@ impl DnsPipeline {
             // the shared cache must always be validated when DNSSEC is enabled
             // so a CD=1 query cannot poison cached answers for CD=0 clients.
             bg_query.metadata.checking_disabled = false;
-            let bg_wants_dnssec = query_has_do(&bg_query);
             // Same ordering rule as the query path: read the epoch before the
             // validator so a reload always wins against an in-flight refresh.
             let bg_policy_epoch = Self::cache_epoch_for(runtime_snapshot);
             let dnssec_mode = runtime_snapshot.dnssec_policy.mode();
+            let edns_udp_size = config.dns.edns_udp_size;
             let bg_validator = if dnssec_mode == sito_dnssec::DnssecMode::Disabled {
                 None
             } else {
@@ -647,7 +645,12 @@ impl DnsPipeline {
                 // Store the same client-neutral shape that the normal path
                 // caches: the current question/flags, no client-specific EDNS
                 // options, and DNSSEC material only for a DO=1 key.
-                shape_response(&bg_query, &mut resp, bg_wants_dnssec);
+                ResponseShaper::shape_with_payload(
+                    &mut resp,
+                    &bg_query,
+                    dnssec_mode,
+                    edns_udp_size,
+                );
                 if resp.metadata.response_code == ResponseCode::NoError
                     || resp.metadata.response_code == ResponseCode::NXDomain
                 {

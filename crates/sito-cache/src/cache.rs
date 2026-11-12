@@ -114,12 +114,69 @@ impl DnsCache {
     }
 
     /// Applies hot-reloaded cache settings, rebuilding the cache when
-    /// `size_mb` changes.
+    /// `size_mb` changes and re-clamping every live entry to the new TTL
+    /// policy.
+    ///
+    /// The re-clamp is immediate and does not wait for entries to expire:
+    /// a lowered `max_ttl`/`negative_ttl_max` caps what is served, and a
+    /// raised `min_ttl` raises unvalidated entries to the new floor. Secure
+    /// entries keep the `floor = 0` rule so a reload can never extend an
+    /// authenticated TTL past its signed lifetime. Entries past their old
+    /// lifespan are left to the stale path; a raised `min_ttl` must not
+    /// resurrect them as fresh.
     pub async fn update_config(&self, config: CacheConfig) {
-        if self.config.load().size_mb != config.size_mb {
+        let size_changed = self.config.load().size_mb != config.size_mb;
+        // Publish the policy before the resize so the resize uses the new
+        // stale window, then re-clamp against the same configuration.
+        self.config.store(Arc::new(config.clone()));
+        if size_changed {
             self.resize(config.size_mb as u64).await;
         }
-        self.config.store(Arc::new(config));
+        self.reclamp_entries(&config).await;
+    }
+
+    /// Rewrites every still-fresh entry so its TTLs obey `config`.
+    async fn reclamp_entries(&self, config: &CacheConfig) {
+        let cache = self.cache.load_full();
+        let stale_window_secs = config.serve_stale_hours.saturating_mul(3600);
+        let mut replacements = Vec::new();
+        let mut expired = Vec::new();
+
+        for (key, entry) in cache.iter() {
+            let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
+            let fully_expired =
+                u64::from(entry.max_lifespan_secs).saturating_add(u64::from(stale_window_secs));
+            if u64::from(elapsed_secs) >= fully_expired {
+                expired.push((*key).clone());
+                continue;
+            }
+            // Only entries still fresh under the policy they were stored with
+            // are eligible. Re-clamping a stale entry with a raised min_ttl
+            // would make data whose original lifespan passed fresh again.
+            if elapsed_secs >= entry.max_lifespan_secs {
+                continue;
+            }
+            let reclamped = reclamp_entry(&entry, config);
+            if reclamped.max_lifespan_secs <= elapsed_secs {
+                expired.push((*key).clone());
+            } else {
+                replacements.push(((*key).clone(), Arc::new(reclamped)));
+            }
+        }
+
+        let replaced = replacements.len();
+        for key in expired {
+            cache.invalidate(&key).await;
+        }
+        for (key, entry) in replacements {
+            cache.insert(key, entry).await;
+        }
+        cache.run_pending_tasks().await;
+        debug!(
+            "Re-clamped {replaced} cache entries after a cache policy reload (min_ttl={}s, \
+             max_ttl={}s, negative_ttl_max={}s, serve_stale_hours={})",
+            config.min_ttl, config.max_ttl, config.negative_ttl_max, config.serve_stale_hours
+        );
     }
 
     /// Rebuilds the underlying cache with a new capacity in megabytes,
@@ -194,7 +251,7 @@ impl DnsCache {
 
     /// Acquires the single-flight slot for the query's cache key.
     pub async fn single_flight_for_query(&self, query: &Message) -> Option<SingleFlightGuard> {
-        let key = CacheKey::from_query(query)?;
+        let key = CacheKey::for_query(query)?;
         Some(self.single_flight(key).await)
     }
 
@@ -220,7 +277,7 @@ impl DnsCache {
         &self,
         query: &Message,
     ) -> Option<(Message, ValidationStatus)> {
-        self.get_by_key_with_status(&CacheKey::from_query(query)?)
+        self.get_by_key_with_status(&CacheKey::for_query(query)?)
             .await
             .map(|(message, status, _)| (message, status))
     }
@@ -236,7 +293,7 @@ impl DnsCache {
         &self,
         query: &Message,
     ) -> Option<(Message, ValidationStatus, u64)> {
-        self.get_by_key_with_status(&CacheKey::from_query(query)?)
+        self.get_by_key_with_status(&CacheKey::for_query(query)?)
             .await
     }
 
@@ -361,7 +418,7 @@ impl DnsCache {
         &self,
         query: &Message,
     ) -> Option<(Message, ValidationStatus)> {
-        self.get_stale_by_key(&CacheKey::from_query(query)?)
+        self.get_stale_by_key(&CacheKey::for_query(query)?)
             .await
             .map(|(message, status, _)| (message, status))
     }
@@ -428,7 +485,7 @@ impl DnsCache {
 
     /// Prefetch check for `query`, honouring its DO/CD/ECS cache key.
     pub async fn should_prefetch_for_query(&self, query: &Message) -> bool {
-        match CacheKey::from_query(query) {
+        match CacheKey::for_query(query) {
             Some(key) => self.should_prefetch_by_key(&key).await,
             None => false,
         }
@@ -454,6 +511,11 @@ impl DnsCache {
 
     /// Insert a response into the cache, calculating clamped TTLs and entry weight.
     ///
+    /// The entry is always stored as [`ValidationStatus::Unchecked`]: an AD bit
+    /// supplied by an upstream is not proof that this resolver validated the
+    /// data. Callers that did validate must use [`Self::insert_with_status`] or
+    /// [`Self::insert_with_status_at_epoch`].
+    ///
     /// Only well-formed positive or negative answers are cached:
     /// * the response must be a response message whose question section is
     ///   present and matches the query,
@@ -463,12 +525,7 @@ impl DnsCache {
     ///   NODATA and require an SOA in the authority section (RFC 2308);
     ///   negative answers without an SOA are not cached.
     pub async fn insert(&self, query: &Message, response: &Message) {
-        let validation_status = if response.metadata.authentic_data {
-            ValidationStatus::Secure
-        } else {
-            ValidationStatus::Unchecked
-        };
-        self.insert_with_status(query, response, validation_status)
+        self.insert_with_status(query, response, ValidationStatus::Unchecked)
             .await;
     }
 
@@ -500,7 +557,7 @@ impl DnsCache {
         validation_status: ValidationStatus,
         policy_epoch: PolicyEpoch,
     ) -> bool {
-        let Some(key) = CacheKey::from_query(query) else {
+        let Some(key) = CacheKey::for_query(query) else {
             return false;
         };
 
@@ -755,6 +812,122 @@ impl DnsCache {
     pub fn weighted_size(&self) -> u64 {
         self.cache.load().weighted_size()
     }
+
+    /// Moves an existing entry's `stored_at` into the past (test only).
+    ///
+    /// TTL re-clamp tests need to observe an aged entry without sleeping. The
+    /// production clock is still `Instant::now()`; only `stored_at` is rewound.
+    #[cfg(test)]
+    pub(crate) async fn backdate_entry_for_test(&self, query: &Message, age: std::time::Duration) {
+        let Some(key) = CacheKey::for_query(query) else {
+            return;
+        };
+        let cache = self.cache.load_full();
+        let Some(entry) = cache.get(&key).await else {
+            return;
+        };
+        let Some(stored_at) = Instant::now().checked_sub(age) else {
+            return;
+        };
+        let mut backdated = (*entry).clone();
+        backdated.stored_at = stored_at;
+        cache.insert(key, Arc::new(backdated)).await;
+    }
+}
+
+/// Returns `entry` with its TTL vectors and lifespan re-clamped to `config`.
+///
+/// The cache does not retain the original unclamped TTL, so a re-clamp can
+/// tighten a lowered ceiling (`max_ttl`/`negative_ttl_max`) and raise an
+/// unvalidated entry to a new `min_ttl` floor, but never un-clamp a raised
+/// ceiling. That is intentional: a policy reload must not extend old data as
+/// if it had just been fetched.
+///
+/// Secure entries keep the `floor = 0` rule used by [`DnsCache::insert_with_status`]:
+/// `min_ttl` must not extend an authenticated TTL beyond its signed lifetime.
+fn reclamp_entry(entry: &CacheEntry, config: &CacheConfig) -> CacheEntry {
+    let mut reclamped = entry.clone();
+    let floor = if entry.validation_status.is_secure() {
+        0
+    } else {
+        config.min_ttl
+    };
+    let negative = entry_is_negative(entry);
+    let ceiling = if negative {
+        config.negative_ttl_max.max(config.min_ttl)
+    } else {
+        config.max_ttl.max(config.min_ttl)
+    };
+
+    if negative {
+        // RFC 2308: the negative lifespan is derived from the SOA (and, for
+        // Secure answers, the denial proof or CNAME chain). The entry stores
+        // that post-cap lifespan, not the original SOA TTL, so a reload may
+        // only lower it. Raising it to a new `min_ttl` would outlive the
+        // negative proof. Record TTLs are still raised to the new floor while
+        // the entry is served.
+        let lifespan = entry.max_lifespan_secs.min(ceiling);
+        let record_ceiling = lifespan.max(floor);
+        for (ttls, records) in [
+            (&mut reclamped.answer_ttls, &entry.answer_ttls),
+            (&mut reclamped.authority_ttls, &entry.authority_ttls),
+            (&mut reclamped.additional_ttls, &entry.additional_ttls),
+        ] {
+            *ttls = records
+                .iter()
+                .copied()
+                .map(|ttl| ttl.clamp(floor, record_ceiling))
+                .collect();
+        }
+        reclamped.max_lifespan_secs = lifespan;
+    } else {
+        for (ttls, records) in [
+            (&mut reclamped.answer_ttls, &entry.answer_ttls),
+            (&mut reclamped.authority_ttls, &entry.authority_ttls),
+            (&mut reclamped.additional_ttls, &entry.additional_ttls),
+        ] {
+            *ttls = records
+                .iter()
+                .copied()
+                .map(|ttl| ttl.clamp(floor, ceiling))
+                .collect();
+        }
+        let min_record_ttl = reclamped
+            .answer_ttls
+            .iter()
+            .chain(reclamped.authority_ttls.iter())
+            .chain(reclamped.additional_ttls.iter())
+            .copied()
+            .min()
+            .unwrap_or(config.min_ttl);
+        reclamped.max_lifespan_secs = min_record_ttl;
+    }
+
+    reclamped
+}
+
+/// Whether a cached message represents a negative answer (NXDOMAIN or NODATA).
+///
+/// Mirrors the NODATA detection in [`DnsCache::insert_with_status_at_epoch`],
+/// so a reload classifies an existing entry exactly as the insert did.
+fn entry_is_negative(entry: &CacheEntry) -> bool {
+    let message = &entry.message;
+    if message.metadata.response_code == ResponseCode::NXDomain {
+        return true;
+    }
+    if message.metadata.response_code != ResponseCode::NoError {
+        return false;
+    }
+    let Some(question) = message.queries.first() else {
+        return false;
+    };
+    let query_type = question.query_type();
+    let has_answer_for_query_type = (query_type == RecordType::ANY && !message.answers.is_empty())
+        || message
+            .answers
+            .iter()
+            .any(|record| record.record_type() == query_type);
+    !has_answer_for_query_type
 }
 
 /// Removes DNSSEC records and the AD flag from a response.

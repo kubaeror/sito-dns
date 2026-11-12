@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use sito_core::DnssecMode;
 use sito_core::client::ClientContext;
 use sito_core::config::FilteringConfig;
 
@@ -122,6 +123,20 @@ fn rewrite_rule(rcode: &str, rtype: Option<&str>, value: Option<&str>) -> DnsRew
         value: value.map(str::to_string),
         bare: false,
     }
+}
+
+/// Builds a case-preserving name. Hickory's `Name::from_str` applies IDNA and
+/// lowercases labels, which would hide a stored-vs-client question-case
+/// regression; wire labels preserve the bytes the client sent.
+fn mixed_name(name: &str) -> Name {
+    let labels: Vec<Vec<u8>> = name
+        .trim_end_matches('.')
+        .split('.')
+        .map(|label| label.as_bytes().to_vec())
+        .collect();
+    let mut name = Name::from_labels(labels).unwrap();
+    name.set_fqdn(true);
+    name
 }
 
 fn rewrite_query(name: &str, qtype: RecordType) -> Message {
@@ -1898,7 +1913,7 @@ fn test_strip_dnssec_records_for_do0_clients() {
         .insert(EdnsOption::Unknown(u16::from(EdnsCode::DAU), vec![]));
     response.set_edns(edns);
 
-    strip_dnssec_records(&mut response);
+    sito_proto::strip_dnssec_records(&mut response);
     assert_eq!(
         response.answers.len(),
         1,
@@ -1949,7 +1964,7 @@ fn test_response_shaping_strips_upstream_edns_and_opt_for_non_edns_clients() {
     response.set_edns(edns);
 
     // A non-EDNS client must never receive an OPT record or DNSSEC data.
-    shape_response(&query, &mut response, false);
+    ResponseShaper::shape(&mut response, &query, DnssecMode::Validate);
     assert!(
         response.edns.is_none(),
         "a non-EDNS client must not receive an OPT record"
@@ -1971,7 +1986,7 @@ fn test_response_shaping_strips_upstream_edns_and_opt_for_non_edns_clients() {
         .insert(EdnsOption::Unknown(12, vec![0; 8]));
     response.set_edns(edns);
 
-    shape_response(&edns_query, &mut response, false);
+    ResponseShaper::shape(&mut response, &edns_query, DnssecMode::Validate);
     let shaped = response.edns.expect("EDNS clients keep an OPT record");
     assert!(
         shaped.options().options.is_empty(),
@@ -2016,7 +2031,7 @@ fn test_response_shaping_copies_question_flags_and_do() {
         },
     ));
 
-    shape_response(&query, &mut response, true);
+    ResponseShaper::shape(&mut response, &query, DnssecMode::Validate);
     assert_eq!(
         response.metadata.id, 22,
         "the response ID must come from the current query"
@@ -2050,39 +2065,49 @@ fn test_response_shaping_copies_question_flags_and_do() {
 }
 
 /// P2-84: a cache hit must copy the current question and RD bit, and
-/// must not replay the stored entry's (absent) EDNS state to a client
-/// that sent OPT.
+/// must not replay the stored entry's ID/RD/CD/AA envelope or its upstream
+/// EDNS options to a client that sent OPT.
 #[tokio::test]
 async fn test_cache_hit_copies_current_question_and_flags() {
+    use std::sync::atomic::Ordering;
+
     let mut config = Config::default();
     config.filtering.enabled = false;
     config.dns.dnssec.validate = false;
-    let (pipeline, _calls, temp_dir) = test_pipeline(config).await;
+    let edns_udp_size = config.dns.edns_udp_size;
+    let (pipeline, calls, temp_dir) = test_pipeline(config).await;
     let client = ClientContext::new("127.0.0.1".parse().unwrap());
 
-    let stored_name = Name::from_str("cache-shape.example.").unwrap();
+    let stored_name = mixed_name("cache-shape.example.");
     let mut stored_query = Message::new(1, MessageType::Query, OpCode::Query);
     stored_query.queries.push(hickory_proto::op::Query::query(
         stored_name.clone(),
         RecordType::A,
     ));
     stored_query.metadata.checking_disabled = true;
+    stored_query.set_edns(Edns::new());
 
     let mut cached = Message::response(1, OpCode::Query);
     cached.queries = stored_query.queries.clone();
     cached.metadata.authoritative = true;
     cached.metadata.recursion_desired = false;
+    cached.metadata.authentic_data = true;
     cached.answers.push(Record::from_rdata(
         stored_name.clone(),
         300,
         RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 84))),
     ));
+    let mut stored_edns = Edns::new();
+    stored_edns
+        .options_mut()
+        .insert(EdnsOption::Unknown(10, vec![1, 2, 3, 4]));
+    cached.set_edns(stored_edns);
     pipeline
         .cache
         .insert_with_status(&stored_query, &cached, ValidationStatus::Insecure)
         .await;
 
-    let current_name = Name::from_str("CaChE-ShApE.ExAmPlE.").unwrap();
+    let current_name = mixed_name("CaChE-ShApE.ExAmPlE.");
     let mut current_query = Message::new(2, MessageType::Query, OpCode::Query);
     current_query.queries.push(hickory_proto::op::Query::query(
         current_name.clone(),
@@ -2097,6 +2122,11 @@ async fn test_cache_hit_copies_current_question_and_flags() {
         .handle(current_query, client)
         .await
         .expect("cache hit response");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "this test must exercise the cache path, not upstream"
+    );
 
     assert_eq!(
         resp.metadata.id, 2,
@@ -2112,17 +2142,214 @@ async fn test_cache_hit_copies_current_question_and_flags() {
         "RD must come from the query"
     );
     assert!(
+        !resp.metadata.authentic_data,
+        "an Insecure cache entry must not keep the stored AD bit"
+    );
+    assert!(
         resp.metadata.checking_disabled,
         "CD must come from the query"
     );
+    let edns = resp
+        .edns
+        .expect("a cache hit for an EDNS client must include OPT");
+    assert_eq!(
+        edns.max_payload(),
+        edns_udp_size,
+        "the resolver advertises its configured payload size"
+    );
     assert!(
-        resp.edns.is_some(),
-        "a cache hit for an EDNS client must include OPT"
+        edns.options().options.is_empty(),
+        "the stored upstream COOKIE must not be replayed: {:?}",
+        edns.options().options
     );
     assert_eq!(
-        resp.queries[0].name().to_string(),
-        current_name.to_string(),
+        resp.queries[0].name().to_ascii(),
+        "CaChE-ShApE.ExAmPlE.",
         "a cache hit must echo the current question, not the stored one"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// P1-13/P2-84: an upstream answer must not replay upstream ID/AA/AD or
+/// upstream EDNS options. The shared shaper is the last stage on this path.
+#[tokio::test]
+async fn test_upstream_response_is_shaped_for_client() {
+    use std::sync::atomic::Ordering;
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.dnssec.validate = false;
+    let edns_udp_size = config.dns.edns_udp_size;
+    let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let mut query = Message::new(88, MessageType::Query, OpCode::Query);
+    query.queries.push(hickory_proto::op::Query::query(
+        mixed_name("UpStReAm.Example."),
+        RecordType::A,
+    ));
+    query.metadata.recursion_desired = true;
+    let mut edns = Edns::new();
+    edns.set_max_payload(4096);
+    query.set_edns(edns);
+
+    let resp = pipeline
+        .handle(query, client)
+        .await
+        .expect("upstream answer");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    assert_eq!(resp.metadata.id, 88);
+    assert_eq!(
+        resp.queries[0].name().to_ascii(),
+        "UpStReAm.Example.",
+        "the upstream response must echo the client question"
+    );
+    assert!(resp.metadata.recursion_desired);
+    assert!(!resp.metadata.authoritative);
+    assert!(
+        !resp.metadata.authentic_data,
+        "the mock upstream forges AD; validation-disabled mode must clear it"
+    );
+    let edns = resp.edns.expect("EDNS client keeps OPT");
+    assert_eq!(edns.max_payload(), edns_udp_size);
+    assert!(
+        edns.options().options.is_empty(),
+        "upstream-only options must be stripped: {:?}",
+        edns.options().options
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// P2-84: the stale (RFC 8767) fallback is another response source; it must
+/// use the same shaper and never replay the stored question/ID/RD or OPT.
+#[tokio::test]
+async fn test_stale_response_is_shaped_for_client() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.cache.serve_stale_hours = 1;
+    config.dns.cache.min_ttl = 1;
+    config.dns.cache.max_ttl = 1;
+    config.dns.cache.negative_ttl_max = 1;
+    let edns_udp_size = config.dns.edns_udp_size;
+    let fail = std::sync::Arc::new(AtomicBool::new(true));
+    let (pipeline, _server, calls, temp_dir) =
+        test_pipeline_with_failure_toggle(config, fail).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let stored_name = mixed_name("stale-shape.example.");
+    let mut stored_query = Message::new(5, MessageType::Query, OpCode::Query);
+    stored_query.queries.push(hickory_proto::op::Query::query(
+        stored_name.clone(),
+        RecordType::A,
+    ));
+    stored_query.set_edns(Edns::new());
+    let mut cached = Message::response(5, OpCode::Query);
+    cached.queries = stored_query.queries.clone();
+    cached.metadata.authoritative = true;
+    cached.metadata.recursion_desired = false;
+    cached.metadata.authentic_data = true;
+    cached.answers.push(Record::from_rdata(
+        stored_name,
+        1,
+        RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 85))),
+    ));
+    let mut stored_edns = Edns::new();
+    stored_edns
+        .options_mut()
+        .insert(EdnsOption::Unknown(10, vec![5, 6, 7, 8]));
+    cached.set_edns(stored_edns);
+    pipeline
+        .cache
+        .insert_with_status(&stored_query, &cached, ValidationStatus::Insecure)
+        .await;
+
+    // Leave the fresh window so only the stale path can answer.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let mut query = Message::new(6, MessageType::Query, OpCode::Query);
+    query.queries.push(hickory_proto::op::Query::query(
+        mixed_name("StAlE-ShApE.Example."),
+        RecordType::A,
+    ));
+    query.metadata.recursion_desired = true;
+    query.set_edns(Edns::new());
+
+    let resp = pipeline.handle(query, client).await.expect("stale answer");
+    assert!(
+        calls.load(Ordering::SeqCst) >= 1,
+        "upstream must have failed"
+    );
+    assert_eq!(resp.metadata.id, 6);
+    assert_eq!(
+        resp.queries[0].name().to_ascii(),
+        "StAlE-ShApE.Example.",
+        "the stale path must echo the current question"
+    );
+    assert!(resp.metadata.recursion_desired);
+    assert!(!resp.metadata.authoritative);
+    assert!(
+        !resp.metadata.authentic_data,
+        "stale data must never be served as authenticated"
+    );
+    let edns = resp.edns.expect("EDNS client keeps OPT");
+    assert_eq!(edns.max_payload(), edns_udp_size);
+    assert!(
+        edns.options().options.is_empty(),
+        "the stored upstream COOKIE must not be replayed: {:?}",
+        edns.options().options
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A local `$dnsrewrite` answer is synthesized before the final shaping
+/// point; its envelope must still describe the client query.
+#[tokio::test]
+async fn test_rewrite_response_is_shaped_for_client() {
+    use std::sync::atomic::Ordering;
+
+    let mut config = Config::default();
+    config.dns.dnssec.validate = false;
+    config.filtering.custom_rules = vec!["||shape-rewrite.example^$dnsrewrite=1.2.3.4".to_string()];
+    let edns_udp_size = config.dns.edns_udp_size;
+    let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let mut query = Message::new(44, MessageType::Query, OpCode::Query);
+    query.queries.push(hickory_proto::op::Query::query(
+        mixed_name("ShApE-ReWrItE.Example."),
+        RecordType::A,
+    ));
+    query.metadata.recursion_desired = true;
+    let mut edns = Edns::new();
+    edns.options_mut()
+        .insert(EdnsOption::Unknown(10, vec![1, 2, 3, 4]));
+    query.set_edns(edns);
+
+    let resp = pipeline
+        .handle(query, client)
+        .await
+        .expect("rewrite response");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a rewrite must not query upstream"
+    );
+    assert_eq!(resp.metadata.id, 44);
+    assert_eq!(resp.queries[0].name().to_ascii(), "ShApE-ReWrItE.Example.");
+    assert!(resp.metadata.recursion_desired);
+    assert!(!resp.metadata.authoritative);
+    assert!(!resp.metadata.authentic_data);
+    let edns = resp.edns.expect("EDNS client keeps OPT");
+    assert_eq!(edns.max_payload(), edns_udp_size);
+    assert!(
+        edns.options().options.is_empty(),
+        "the client COOKIE must not be echoed by a local rewrite"
     );
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;

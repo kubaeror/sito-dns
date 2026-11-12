@@ -18,14 +18,12 @@ pub(super) struct PipelineContext<'a> {
     pub(super) qname: Name,
     pub(super) qtype: RecordType,
     pub(super) domain_str: String,
-    pub(super) client_wants_dnssec: bool,
-    pub(super) client_accepts_ad: bool,
     pub(super) start: std::time::Instant,
 
     pub(super) effective_upstream: Arc<UpstreamManager>,
     pub(super) cache_enabled: bool,
 
-    pub(super) cache_policy_epoch: Option<sito_cache::PolicyEpoch>,
+    pub(super) cache_policy_epoch: Option<sito_cache::CachePolicyEpoch>,
     pub(super) dnssec_mode: sito_dnssec::DnssecMode,
     pub(super) validation_active: bool,
     pub(super) cache_query: Option<Message>,
@@ -56,8 +54,6 @@ impl<'a> PipelineContext<'a> {
         qname: Name,
         qtype: RecordType,
         domain_str: String,
-        client_wants_dnssec: bool,
-        client_accepts_ad: bool,
         start: std::time::Instant,
     ) -> Self {
         let config = &runtime_snapshot.config;
@@ -88,8 +84,6 @@ impl<'a> PipelineContext<'a> {
             qname,
             qtype,
             domain_str,
-            client_wants_dnssec,
-            client_accepts_ad,
             start,
             effective_upstream,
             cache_enabled,

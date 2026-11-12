@@ -61,11 +61,12 @@ impl PipelineContext<'_> {
         // only when the client did not request them.
         let mut response = outcome.response;
         if let Some(resp) = response.as_mut() {
-            shape_response(&self.query, resp, self.client_wants_dnssec);
-            // Never assert AD for a client that did not signal DNSSEC awareness.
-            if !self.client_accepts_ad {
-                resp.metadata.authentic_data = false;
-            }
+            ResponseShaper::shape_with_payload(
+                resp,
+                &self.query,
+                self.dnssec_mode,
+                self.runtime_snapshot.config.dns.edns_udp_size,
+            );
         }
         response
     }

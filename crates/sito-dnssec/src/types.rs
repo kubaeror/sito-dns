@@ -4,26 +4,10 @@
 use super::*;
 
 /// DNSSEC validation mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DnssecMode {
-    /// Strict validation: bogus queries result in SERVFAIL with EDE.
-    #[default]
-    Validate,
-    /// Permissive validation: log bogus queries and clear AD bit, but return response.
-    LogOnly,
-    /// DNSSEC validation disabled.
-    Disabled,
-}
-
-impl From<&str> for DnssecMode {
-    fn from(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "log-only" | "log_only" | "log_fail" | "permissive" => Self::LogOnly,
-            "disabled" | "off" => Self::Disabled,
-            _ => Self::Validate,
-        }
-    }
-}
+///
+/// Defined in `sito-core` so `sito-proto` can shape responses without a
+/// dependency cycle; re-exported here to preserve `sito_dnssec::DnssecMode`.
+pub use sito_core::DnssecMode;
 
 /// Outcome of a DNSSEC validation check.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -22,12 +22,11 @@ impl PipelineContext<'_> {
         let runtime_snapshot = Arc::clone(&self.runtime_snapshot);
         let effective_upstream = Arc::clone(&self.effective_upstream);
         let validation_active = self.validation_active;
-        let client_wants_dnssec = self.client_wants_dnssec;
         let cname_uncloaking_active = self.cname_uncloaking_active;
         let bypass_check_needed = self.bypass_check_needed;
 
         if let Some(cached_resp) = pipeline
-            .cached_response(&cache_query, validation_active, client_wants_dnssec)
+            .cached_response(&cache_query, validation_active)
             .await
         {
             if cname_uncloaking_active
@@ -80,7 +79,7 @@ impl PipelineContext<'_> {
         // one query goes upstream (anti-stampede).
         let flight = pipeline.cache.single_flight_for_query(&cache_query).await;
         if let Some(cached_resp) = pipeline
-            .cached_response(&cache_query, validation_active, client_wants_dnssec)
+            .cached_response(&cache_query, validation_active)
             .await
         {
             // A concurrent query populated the entry while we waited.

@@ -4,10 +4,12 @@
 
 pub mod error;
 pub mod normalize;
+pub mod shaping;
 pub mod wire;
 
 pub use error::ProtoError;
 pub use normalize::{normalize_domain, normalize_domain_or_idna};
+pub use shaping::{DEFAULT_EDNS_PAYLOAD, ResponseShaper, strip_dnssec_records};
 pub use wire::{
     DOT_PADDING_BLOCK_SIZE, apply_dot_padding, client_edns_payload_size, decode_message,
     encode_message, set_edns_payload_size, synthesize_blocked_response, synthesize_cname_response,
