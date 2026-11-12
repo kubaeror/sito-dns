@@ -325,6 +325,9 @@ jobs:
       - name: Measure line coverage
         run: |
           set -o pipefail
+          # A clean checkout has no target/ yet; cargo-llvm-cov creates its own
+          # instrumented target dir, so tee would fail before the first build.
+          mkdir -p target
           cargo llvm-cov --workspace --all-features --locked \
             --summary-only \
             --fail-under-lines "${MIN_LINE_COVERAGE}" \
