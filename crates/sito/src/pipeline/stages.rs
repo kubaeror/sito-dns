@@ -603,6 +603,7 @@ impl DnsPipeline {
             // Same ordering rule as the query path: read the epoch before the
             // validator so a reload always wins against an in-flight refresh.
             let bg_policy_epoch = Self::cache_epoch_for(runtime_snapshot);
+            let bg_filter_epoch = runtime_snapshot.filter_epoch;
             let dnssec_mode = runtime_snapshot.dnssec_policy.mode();
             let edns_udp_size = config.dns.edns_udp_size;
             let bg_validator = if dnssec_mode == sito_dnssec::DnssecMode::Disabled {
@@ -655,7 +656,13 @@ impl DnsPipeline {
                     || resp.metadata.response_code == ResponseCode::NXDomain
                 {
                     bg_cache
-                        .insert_with_status_at_epoch(&bg_query, &resp, bg_status, bg_policy_epoch)
+                        .insert_with_status_at_epochs(
+                            &bg_query,
+                            &resp,
+                            bg_status,
+                            bg_policy_epoch,
+                            bg_filter_epoch,
+                        )
                         .await;
                 }
             });

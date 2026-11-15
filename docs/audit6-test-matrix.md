@@ -281,3 +281,13 @@ nightly benchmark comparison are release-checklist items, not flaky PR jobs
 | Every 2.0 breaking-change ID has a migration step and an affected doc/test | `scripts/check_migration_guide.py`; fixtures `test_missing_breaking_id_fails`, `test_empty_migration_step_fails`, `test_duplicate_breaking_id_fails` | `python3 scripts/check_migration_guide.py --github`; `python3 scripts/test_check_migration_guide.py` |
 | Historical audits are labeled as leads, current evidence docs are not | `docs/history/README.md` plus the banner in each historical audit/plan | `python3 scripts/check_markdown_links.py` |
 | Doc links and anchors resolve | `scripts/check_markdown_links.py` | `python3 scripts/check_markdown_links.py --github` |
+
+## Alpha hardening (post-2.0.0-alpha.1)
+
+| Finding / acceptance | Named test / check | Focused command |
+|---|---|---|
+| Unknown `clients.entries[].group` fails closed instead of silently using the default group | `test_unknown_client_group_is_rejected`, `test_unknown_group_is_rejected_by_migration_and_ha_parse` | `cargo test -p sito-core --test config_v2 test_unknown` |
+| Generation apply skips the inert cache re-clamp scan; cache-only reloads keep it, and the new TTL/size policy is live | `test_update_config_for_generation_leaves_entries_to_the_epoch`; existing `test_update_config_reclamps_*` | `cargo test -p sito-cache update_config` |
+| A filter-only refresh advances the filter epoch; old-filter in-flight inserts are rejected; apply/with_cache/bootstrap/replace keep it monotonic | `test_filter_epoch_rejects_old_filter_insert_and_hides_entries`, `test_filter_epoch_stale_path_rejects_old_filter`, `test_filter_refresh_does_not_advance_config_generation`, `test_apply_filter_epoch_tracks_filter_snapshot_changes`, `test_shared_cache_filter_epoch_seeding_and_monotonic_bootstrap`, `test_replace_keeps_filter_epoch_monotonic` | `cargo test -p sito-cache filter_epoch`; `cargo test -p sito-runtime filter_epoch` |
+| Listener conflict matrix models DNS `IPV6_V6ONLY`, dual-stack web `::` and IPv4-mapped web binds | `test_listener_conflicts_cover_wildcards_acme_and_dual_stack` | `cargo test -p sito-core --test config_v2 test_listener_conflicts` |
+| Public RouterOS fetch builds the client from config; no arbitrary insecure client can gain verified identity | `test_routeros_fetch_and_graceful_degradation`, `test_routeros_plaintext_and_unverified_tls_never_grant_identity` | `cargo test -p sito-routeros` |

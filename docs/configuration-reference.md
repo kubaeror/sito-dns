@@ -327,6 +327,10 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `trust_routeros_lease_names` | boolean | `false` | Trust RouterOS DHCP lease host names/comments for client identification. Off by default because lease data is client-controlled. |
 | `timezone` | string | `"local"` | Timezone used to evaluate client schedules and time-of-day rules. `"local"`/`"system"` uses the host zone (DST-aware); `"UTC"` and fixed offsets (`"+02:00"`, `"-05:30"`, `"+0530"`, `"UTC+2"`) are also accepted. IANA names are not supported (no tzdb dependency); schedules in UTC-only deployments should set this explicitly. |
 
+> Every `[[clients.entries]]` `group` must name an existing
+> `[clients.groups.<name>]` table (or be omitted / `"default"`). An unknown
+> group is a validation error, not a silent fallback to the default policy.
+
 ### `[[clients.entries]]` entries
 
 | Key | Type | Default | Description |
@@ -417,7 +421,7 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `web.enabled` | boolean | `true` | Enable the web dashboard and REST API. |
-| `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`; must be ≥ 1). |
+| `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`; must be ≥ 1). It may share a port with a DNS TCP listener only when the addresses cannot collide. DNS TCP `::` binds are v6-only (`IPV6_V6ONLY`), while the web `::` bind is dual-stack; a web `0.0.0.0`/specific IPv4 and a DNS `::` may share a port, but a web `::` conflicts with any IPv4/IPv6 DNS bind on that port. Against an IPv4 DNS bind, an IPv4-mapped web bind (`::ffff:a.b.c.d`) is compared as its IPv4 address (a mapped wildcard covers all IPv4); a native specific IPv6 web bind does not cover IPv4. |
 | `web.bind` | string (IP address) | `"127.0.0.1"` | Bind address for the web server. The admin UI is served over plain HTTP; see the exposure warning below. Migrated v1 documents keep their previous bind unless `--adopt-safe-defaults` is used. |
 | `web.metrics_auth` | boolean | `true` | Require authentication (token or session) for `/metrics`. |
 | `web.trusted_proxies`| array of IP addresses | `[]` | Individual proxy IPs trusted to supply `X-Forwarded-For`/`X-Forwarded-Proto` (CIDR is **not** supported here). |

@@ -241,6 +241,72 @@ fn test_invalid_client_cidr_ids_are_rejected() {
 }
 
 #[test]
+fn test_unknown_client_group_is_rejected() {
+    let err = Config::from_toml_str(&format!(
+        "{TEST_BASE}[clients]\n[[clients.entries]]\nname = \"phone\"\ngroup = \"kidz\"\n"
+    ))
+    .expect_err("a client entry must reference a configured group");
+    match err {
+        ConfigError::CrossSection { field, .. } => {
+            assert_eq!(field, "clients.entries[0].group");
+        }
+        other => panic!("expected CrossSection on the client group, got {other:?}"),
+    }
+
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}[clients]\n[[clients.entries]]\nname = \"phone\"\ngroup = \"kidz\"\n[clients.groups.kidz]\n"
+    ))
+    .expect("a known group must be accepted");
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}[clients]\n[[clients.entries]]\nname = \"phone\"\n"
+    ))
+    .expect("the implicit default group must be accepted");
+
+    // A non-string group is a validation error, not a silent default.
+    match Config::from_toml_str(&format!(
+        "{TEST_BASE}[clients]\n[[clients.entries]]\nname = \"phone\"\ngroup = 1\n"
+    ))
+    .expect_err("a non-string group must fail")
+    {
+        ConfigError::Validation { field, .. } => {
+            assert_eq!(field, "clients.entries[0].group");
+        }
+        other => panic!("expected Validation on the group field, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_unknown_group_is_rejected_by_migration_and_ha_parse() {
+    let v1 = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\n[[clients.entries]]\nname = \"phone\"\ngroup = \"kidz\"\n";
+    match Config::migrate_v1_to_v2(v1, &MigrationOptions::default())
+        .expect_err("migration must reject an unknown group")
+    {
+        ConfigError::Migration(message) => {
+            assert!(
+                message.contains("clients.entries[0].group") && message.contains("kidz"),
+                "migration error should name the field and group: {message}"
+            );
+        }
+        other => panic!("expected a migration validation failure, got {other:?}"),
+    }
+
+    // The HA sanitizer must not launder an unknown group: a sanitized v2
+    // document reaches the same `validate_full` path and fails closed.
+    let v2 = "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\n[[clients.entries]]\nname = \"phone\"\ngroup = \"kidz\"\n";
+    let sanitized = sito_ha_sanitize(v2);
+    assert!(
+        sanitized.contains("kidz"),
+        "the sanitizer must preserve the client group for validation"
+    );
+    match Config::from_toml_str(&sanitized).expect_err("unknown group must fail") {
+        ConfigError::CrossSection { field, .. } => {
+            assert_eq!(field, "clients.entries[0].group");
+        }
+        other => panic!("expected CrossSection on the group, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_bad_integrations_lists_are_rejected() {
     expect_cross_section(
         &format!(
@@ -788,13 +854,72 @@ fn test_listener_conflicts_cover_wildcards_acme_and_dual_stack() {
         "acme.http_port",
     );
 
-    // Dual-stack `::` overlaps IPv4 listeners on hosts without v6only.
-    expect_cross_section(
-        &format!(
-            "{TEST_BASE}[dns]\nbind = [\"::\"]\nport = 8080\n[web]\nbind = \"127.0.0.1\"\nport = 8080\n"
-        ),
-        "web.port",
-    );
+    // DNS TCP binds `::` with IPV6_V6ONLY, so a loopback IPv4 web listener on
+    // the same port is valid.
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}[dns]\nbind = [\"::\"]\nport = 8080\n[web]\nbind = \"127.0.0.1\"\nport = 8080\n"
+    ))
+    .expect("v6only DNS wildcard and IPv4 loopback web may share a port");
+
+    // The web `::` socket is dual-stack, so it conflicts with an IPv4 DNS
+    // listener; a DNS `::` (v6only) and an IPv4 web wildcard do not conflict.
+    for (dns_bind, web_bind) in [("127.0.0.1", "::"), ("0.0.0.0", "::"), ("::", "::")] {
+        expect_cross_section(
+            &format!(
+                "{TEST_BASE}[dns]\nbind = [\"{dns_bind}\"]\nport = 8080\n[web]\nbind = \"{web_bind}\"\nport = 8080\n"
+            ),
+            "web.port",
+        );
+    }
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}[dns]\nbind = [\"::\"]\nport = 8080\n[web]\nbind = \"0.0.0.0\"\nport = 8080\n"
+    ))
+    .expect("v6only DNS wildcard and IPv4 web wildcard may share a port");
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}[dns]\nbind = [\"127.0.0.1\"]\nport = 8080\n[web]\nbind = \"::1\"\nport = 8080\n"
+    ))
+    .expect("specific IPv4 DNS and specific IPv6 web may share a port");
+
+    // Equal specific addresses conflict in both families.
+    for (dns_bind, web_bind) in [("127.0.0.1", "127.0.0.1"), ("::1", "::1")] {
+        expect_cross_section(
+            &format!(
+                "{TEST_BASE}[dns]\nbind = [\"{dns_bind}\"]\nport = 8080\n[web]\nbind = \"{web_bind}\"\nport = 8080\n"
+            ),
+            "web.port",
+        );
+    }
+
+    // A native specific IPv6 web bind does not cover IPv4, so an IPv4
+    // wildcard DNS bind may share the port with it.
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}[dns]\nbind = [\"0.0.0.0\"]\nport = 8080\n[web]\nbind = \"::1\"\nport = 8080\n"
+    ))
+    .expect("a specific IPv6 web bind may share a port with an IPv4 DNS wildcard");
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}[dns]\nbind = [\"0.0.0.0\"]\nport = 8080\n[web]\nbind = \"2001:db8::1\"\nport = 8080\n"
+    ))
+    .expect("a specific IPv6 web bind may share a port with an IPv4 DNS wildcard");
+
+    // A specific IPv4-mapped web bind covers that IPv4 address (and a mapped
+    // wildcard covers every IPv4 address), while a different mapped address
+    // does not conflict.
+    for (dns_bind, web_bind) in [
+        ("127.0.0.1", "::ffff:127.0.0.1"),
+        ("127.0.0.1", "::ffff:0.0.0.0"),
+        ("0.0.0.0", "::ffff:127.0.0.1"),
+    ] {
+        expect_cross_section(
+            &format!(
+                "{TEST_BASE}[dns]\nbind = [\"{dns_bind}\"]\nport = 8080\n[web]\nbind = \"{web_bind}\"\nport = 8080\n"
+            ),
+            "web.port",
+        );
+    }
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}[dns]\nbind = [\"127.0.0.1\"]\nport = 8080\n[web]\nbind = \"::ffff:10.0.0.1\"\nport = 8080\n"
+    ))
+    .expect("a mapped address for a different IPv4 host may share the port");
 }
 
 #[test]

@@ -192,6 +192,21 @@ impl Config {
             )
         })?;
 
+        let group_names: std::collections::HashSet<String> = match table.get("groups") {
+            Some(groups) => groups
+                .as_table()
+                .ok_or_else(|| {
+                    ConfigError::validation(
+                        "clients.groups",
+                        "invalid [clients] configuration: groups must be a table",
+                    )
+                })?
+                .keys()
+                .cloned()
+                .collect(),
+            None => std::collections::HashSet::new(),
+        };
+
         let mut names = std::collections::HashSet::new();
         for (index, entry) in entries.iter().enumerate() {
             let entry = entry.as_table().ok_or_else(|| {
@@ -219,6 +234,23 @@ impl Config {
                 return Err(ConfigError::validation(
                     format!("clients.entries[{index}].name"),
                     format!("duplicate client entry name '{name}'"),
+                ));
+            }
+            let group = match entry.get("group") {
+                Some(value) => value.as_str().ok_or_else(|| {
+                    ConfigError::validation(
+                        format!("clients.entries[{index}].group"),
+                        "client group must be a string",
+                    )
+                })?,
+                None => "default",
+            };
+            if group != "default" && !group_names.contains(group) {
+                return Err(ConfigError::cross_section(
+                    format!("clients.entries[{index}].group"),
+                    format!(
+                        "client '{name}' references unknown group '{group}'; configure [clients.groups.{group}] or use group = \"default\""
+                    ),
                 ));
             }
             if let Some(ids) = entry.get("ids") {
@@ -486,7 +518,7 @@ impl Config {
         self.dns
             .bind
             .iter()
-            .any(|dns_bind| listener_binds_overlap(*dns_bind, *web_bind))
+            .any(|dns_bind| web_conflicts_with_dns_bind(*web_bind, *dns_bind))
     }
 
     /// Migrates a config v1 TOML document to validated config v2 (D4).
@@ -697,22 +729,35 @@ impl Config {
     }
 }
 
-/// Whether two listener addresses can contend for the same `addr:port`.
+/// Whether the admin web bind contends with a DNS TCP bind on one port.
 ///
-/// Equal addresses overlap, a wildcard covers every address of its family,
-/// and the IPv6 unspecified address is treated as dual-stack because a
-/// default socket accepts IPv4-mapped connections on most platforms.
-fn listener_binds_overlap(first: IpAddr, second: IpAddr) -> bool {
-    if first == second {
-        return true;
+/// The listeners do not have the same dual-stack behavior: DNS TCP sockets set
+/// `IPV6_V6ONLY` (`sito-transport/src/net.rs`), while the web socket keeps the
+/// platform default and is dual-stack when bound to `::`. Treating both as
+/// dual-stack rejected valid `dns.bind = ["::"]` + loopback-web
+/// configurations; treating both as v6-only missed a wildcard web bind over
+/// an IPv4 DNS listener.
+fn web_conflicts_with_dns_bind(web: IpAddr, dns: IpAddr) -> bool {
+    match (web, dns) {
+        (IpAddr::V4(web), IpAddr::V4(dns)) => {
+            web.is_unspecified() || dns.is_unspecified() || web == dns
+        }
+        (IpAddr::V6(web), IpAddr::V6(dns)) => {
+            // A web `::` is dual-stack and covers every IPv6 address; a DNS
+            // `::` is v6-only but still covers a specific web IPv6 address.
+            web.is_unspecified() || dns.is_unspecified() || web == dns
+        }
+        // The web `::` socket also covers IPv4; DNS `::` does not. A native
+        // specific IPv6 web bind does not cover IPv4 at all, so only mapped
+        // web addresses can conflict with an IPv4 DNS bind.
+        (IpAddr::V6(web), IpAddr::V4(dns)) => {
+            web.is_unspecified()
+                || web.to_ipv4_mapped().is_some_and(|mapped| {
+                    mapped.is_unspecified() || dns.is_unspecified() || mapped == dns
+                })
+        }
+        (IpAddr::V4(_), IpAddr::V6(_)) => false,
     }
-    let first_wildcard = first.is_unspecified() && first.is_ipv4() == second.is_ipv4();
-    let second_wildcard = second.is_unspecified() && second.is_ipv4() == first.is_ipv4();
-    let dual_stack = |addr: IpAddr| matches!(addr, IpAddr::V6(v6) if v6.is_unspecified());
-    first_wildcard
-        || second_wildcard
-        || (dual_stack(first) && second.is_ipv4())
-        || (dual_stack(second) && first.is_ipv4())
 }
 
 /// Validates a single upstream target: `host`, `ip[:port]`, `[v6][:port]` or a

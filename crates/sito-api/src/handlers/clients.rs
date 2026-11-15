@@ -1053,8 +1053,11 @@ mod tests {
         let _ = std::fs::create_dir_all(&temp_dir);
         let ctx = mock_context(&temp_dir).await;
 
-        // Seed two clients directly in the config.
+        // Seed two clients directly in the config. `kids` must exist because
+        // the config validator rejects an entry referencing an unknown group.
         let mut cfg = load_clients_config(&ctx);
+        cfg.groups
+            .insert("kids".to_string(), ClientGroupConfig::default());
         cfg.entries.push(ClientEntryConfig {
             name: "alpha".to_string(),
             ids: vec!["10.0.0.5".to_string(), "/dns-query".to_string()],
@@ -1166,6 +1169,11 @@ mod tests {
             Some("super-secret")
         );
         assert!(!cfg.entries[0].ids.iter().any(|id| id.contains("secret")));
+        // The later update moves the client to `kids`; the group must exist.
+        let mut cfg = load_clients_config(&ctx);
+        cfg.groups
+            .insert("kids".to_string(), ClientGroupConfig::default());
+        save_clients_config(&ctx, &cfg).await.unwrap();
 
         // GET must not leak the plaintext either; ?reveal=1 is Admin-only.
         let listed = get_clients(operator(), State(ctx.clone())).await.0;
