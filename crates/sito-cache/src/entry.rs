@@ -96,6 +96,11 @@ pub struct CacheEntry {
     /// matches the cache's current generation must not be served or inserted:
     /// a hot reload can swap the validator while a query is in flight.
     pub policy_epoch: u64,
+    /// Filter generation under which this entry's answer was produced. A
+    /// filter-only refresh advances the filter epoch so an in-flight query
+    /// that captured the old filter cannot repopulate the cache after the
+    /// refresh flush.
+    pub filter_epoch: u64,
     pub hits: Arc<AtomicU32>,
     pub estimated_bytes: u32,
 }

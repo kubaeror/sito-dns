@@ -26,12 +26,14 @@ impl PipelineContext<'_> {
         let cache_query = self.cache_query.as_ref().expect("cache query prepared");
         self.pipeline
             .cache
-            .insert_with_status_at_epoch(
+            .insert_with_status_at_epochs(
                 cache_query,
                 upstream_resp,
                 cache_status,
                 self.cache_policy_epoch
                     .expect("cache policy epoch prepared"),
+                self.cache_filter_epoch
+                    .expect("cache filter epoch prepared"),
             )
             .await;
         if let Some(ref m) = self.pipeline.metrics {

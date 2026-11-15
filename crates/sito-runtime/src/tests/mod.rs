@@ -49,6 +49,86 @@ fn state() -> (Arc<RuntimeState>, Arc<DnsCache>) {
     (state, cache)
 }
 
+fn runtime_over(cache: Arc<DnsCache>) -> Arc<RuntimeState> {
+    let config = Arc::new(ArcSwap::new(Arc::new(Config::default())));
+    let clients = Arc::new(ArcSwap::new(Arc::new(ClientRegistry::new(
+        ClientsConfig::default(),
+    ))));
+    let rewrites = Arc::new(ArcSwap::new(Arc::new(RewriteTable::new(
+        RewritesConfig::default(),
+    ))));
+    Arc::new(RuntimeState::new(config, clients, rewrites).with_cache(cache))
+}
+
+/// A runtime built over an existing cache must adopt its filter epoch, and a
+/// second runtime bootstrapping over that same cache must not invalidate live
+/// entries.
+#[tokio::test]
+async fn test_shared_cache_filter_epoch_seeding_and_monotonic_bootstrap() {
+    let cache = Arc::new(DnsCache::new(Config::default().dns.cache));
+    cache.set_filter_epoch(7);
+    let first = runtime_over(Arc::clone(&cache));
+    assert_eq!(first.snapshot().filter_epoch, 7);
+
+    first
+        .publish_filter(
+            Some(compiled("||shared.example^")),
+            Arc::new(GroupSnapshots::default()),
+            first.generation(),
+        )
+        .expect("publish filter");
+    let bumped = first.snapshot().filter_epoch;
+    assert_eq!(bumped, 8);
+    assert_eq!(cache.filter_epoch(), bumped);
+
+    let second = runtime_over(Arc::clone(&cache));
+    assert_eq!(second.snapshot().filter_epoch, bumped);
+    let config = Config::default();
+    second.bootstrap_components(
+        None,
+        Arc::new(GroupSnapshots::default()),
+        DnssecPolicy::from_config(&config.dns.dnssec),
+        TransportPolicy::from(&config.dns),
+    );
+    assert_eq!(
+        cache.filter_epoch(),
+        bumped,
+        "bootstrapping a second runtime must not invalidate a shared live cache"
+    );
+    assert_eq!(second.snapshot().filter_epoch, bumped);
+}
+
+/// `replace` is a public test/harness helper; it must not move the filter epoch
+/// backwards and resurrect entries from an old filter generation.
+#[tokio::test]
+async fn test_replace_keeps_filter_epoch_monotonic() {
+    let (state, cache) = state();
+    state
+        .apply(plan(5330, "||replace-a.example^"))
+        .await
+        .expect("initial apply");
+    let current = state.snapshot();
+    let epoch = current.filter_epoch;
+
+    let mut stale = (*current).clone();
+    stale.filter_epoch = 1;
+    stale.filter = Some(compiled("||replace-b.example^"));
+    state.replace(stale);
+
+    assert_eq!(
+        cache.filter_epoch(),
+        epoch + 1,
+        "a content-changing replace must advance the filter epoch"
+    );
+    assert_eq!(state.snapshot().filter_epoch, epoch + 1);
+
+    // A same-filter replace keeps the (now higher) epoch.
+    let same = (*state.snapshot()).clone();
+    state.replace(same);
+    assert_eq!(cache.filter_epoch(), epoch + 1);
+    assert_eq!(state.snapshot().filter_epoch, epoch + 1);
+}
+
 /// A reader must never observe the new config with the old filter (or the old
 /// config with the new filter). The test-only pre-publish hook holds the writer
 /// after the plan is fully staged, so the assertion does not depend on timing.
@@ -275,6 +355,40 @@ async fn test_dnssec_policy_change_rejects_in_flight_old_epoch_insert() {
     );
 }
 
+/// A config apply advances the filter epoch only when the filter/group
+/// snapshots change; the cache epoch follows the published snapshot.
+#[tokio::test]
+async fn test_apply_filter_epoch_tracks_filter_snapshot_changes() {
+    let (state, cache) = state();
+    state
+        .apply(plan(5320, "||apply-epoch-a.example^"))
+        .await
+        .expect("initial apply");
+    let first = state.snapshot();
+    let first_epoch = first.filter_epoch;
+    assert_eq!(cache.filter_epoch(), first_epoch);
+
+    // Same filter and group Arcs: a config-only apply must not advance it.
+    let mut same = plan(5321, "||apply-epoch-a.example^");
+    same.filter = first.filter.clone();
+    same.group_filters = Arc::clone(&first.group_filters);
+    state.apply(same).await.expect("same-filter apply");
+    assert_eq!(
+        state.snapshot().filter_epoch,
+        first_epoch,
+        "an unchanged filter must not advance the filter epoch"
+    );
+
+    // New compiled filter: the apply advances both the snapshot and cache.
+    state
+        .apply(plan(5322, "||apply-epoch-b.example^"))
+        .await
+        .expect("filter-changing apply");
+    let second = state.snapshot();
+    assert!(second.filter_epoch > first_epoch);
+    assert_eq!(cache.filter_epoch(), second.filter_epoch);
+}
+
 /// A filter-only refresh must not advance the config/DNSSEC generation. That is
 /// what makes a conflict after the listener/upstream commit unreachable.
 #[tokio::test]
@@ -286,6 +400,7 @@ async fn test_filter_refresh_does_not_advance_config_generation() {
         .expect("initial generation");
     let generation = state.generation();
     let applies = state.apply_count();
+    let old_filter_epoch = state.snapshot().filter_epoch;
 
     let refreshed = compiled("||refresh.example^");
     let returned = state
@@ -307,6 +422,15 @@ async fn test_filter_refresh_does_not_advance_config_generation() {
         &refreshed
     ));
     assert_eq!(cache.policy_epoch(), generation);
+    assert!(
+        state.snapshot().filter_epoch > old_filter_epoch,
+        "a filter-only refresh must advance the filter epoch"
+    );
+    assert_eq!(
+        cache.filter_epoch(),
+        state.snapshot().filter_epoch,
+        "the cache must reject inserts from the old filter generation"
+    );
 
     // A refresh compiled for an older generation is rejected instead of
     // overwriting the newer filter.

@@ -571,6 +571,91 @@ mod tests {
         assert_eq!(epoch, new_epoch.get());
     }
 
+    /// A filter-only refresh must not let an in-flight query that captured the
+    /// old filter snapshot repopulate the cache after the refresh flush.
+    #[tokio::test]
+    async fn test_filter_epoch_rejects_old_filter_insert_and_hides_entries() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("filter-epoch.example.").unwrap();
+        let query = query_for(91, &qname);
+        let response = answer_response(91, &qname, [192, 0, 2, 91]);
+
+        let old_filter = cache.filter_epoch();
+        assert!(
+            cache
+                .insert_with_status_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Unchecked,
+                    cache.policy_epoch(),
+                    old_filter,
+                )
+                .await
+        );
+        assert!(cache.get_for_query(&query).await.is_some());
+
+        cache.set_filter_epoch(old_filter + 1);
+        assert!(
+            cache.get_for_query(&query).await.is_none(),
+            "an entry from the old filter generation must be unservable"
+        );
+        assert!(
+            !cache
+                .insert_with_status_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Unchecked,
+                    cache.policy_epoch(),
+                    old_filter,
+                )
+                .await,
+            "an insert from the old filter generation must be rejected"
+        );
+
+        // A query that captured the new filter epoch inserts and serves.
+        assert!(
+            cache
+                .insert_with_status_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Unchecked,
+                    cache.policy_epoch(),
+                    old_filter + 1,
+                )
+                .await
+        );
+        assert!(cache.get_for_query(&query).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_filter_epoch_stale_path_rejects_old_filter() {
+        let mut config = make_test_config(10, 1, 1);
+        config.serve_stale_hours = 1;
+        let cache = DnsCache::new(config);
+        let qname = Name::from_str("filter-stale.example.").unwrap();
+        let query = query_for(92, &qname);
+        let response = answer_response(92, &qname, [192, 0, 2, 92]);
+        let old_filter = cache.filter_epoch();
+        assert!(
+            cache
+                .insert_with_status_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Unchecked,
+                    cache.policy_epoch(),
+                    old_filter,
+                )
+                .await
+        );
+        cache
+            .backdate_entry_for_test(&query, std::time::Duration::from_secs(5))
+            .await;
+        assert!(cache.get_stale_for_query(&query).await.is_some());
+
+        cache.set_filter_epoch(old_filter + 1);
+        assert!(cache.get_stale_for_query(&query).await.is_none());
+    }
+
     /// `min_ttl` is a cache policy floor for unvalidated data only. Raising a
     /// `Secure` TTL above the RRSIG-authenticated TTL would serve AD=1 data
     /// after its signature/TTL expired.
@@ -935,6 +1020,54 @@ mod tests {
                 .get(&qname, RecordType::A, DNSClass::IN)
                 .await
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_config_for_generation_leaves_entries_to_the_epoch() {
+        let config = make_test_config(10, 3600, 3600);
+        let cache = DnsCache::new(config.clone());
+        insert_answer(&cache, 8, "generation.test.").await;
+
+        let mut narrowed = config;
+        narrowed.min_ttl = 1;
+        narrowed.max_ttl = 1;
+        narrowed.size_mb = 1;
+        cache.update_config_for_generation(narrowed).await;
+
+        // No re-clamp scan: the old entry is still present and its served TTL
+        // is not rewritten. The generation apply advances the epoch next, which
+        // invalidates it without touching every entry.
+        let qname = Name::from_str("generation.test.").unwrap();
+        let hit = cache
+            .get(&qname, RecordType::A, DNSClass::IN)
+            .await
+            .expect("entry survives until the epoch advances");
+        assert!(
+            hit.answers[0].ttl > 1,
+            "generation update must not rewrite entries"
+        );
+
+        // The published configuration is live: a post-update insert is clamped
+        // by the new max TTL (and the resize carried the old entry over).
+        insert_answer(&cache, 9, "generation-new.test.").await;
+        let new_qname = Name::from_str("generation-new.test.").unwrap();
+        let new_hit = cache
+            .get(&new_qname, RecordType::A, DNSClass::IN)
+            .await
+            .expect("new insert under the updated policy");
+        assert_eq!(
+            new_hit.answers[0].ttl, 1,
+            "update_config_for_generation must publish the new TTL policy"
+        );
+
+        cache.advance_policy_epoch();
+        assert!(
+            cache
+                .get(&qname, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "the new epoch must hide the old entry"
         );
     }
 

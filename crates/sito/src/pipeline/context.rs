@@ -24,6 +24,7 @@ pub(super) struct PipelineContext<'a> {
     pub(super) cache_enabled: bool,
 
     pub(super) cache_policy_epoch: Option<sito_cache::CachePolicyEpoch>,
+    pub(super) cache_filter_epoch: Option<u64>,
     pub(super) dnssec_mode: sito_dnssec::DnssecMode,
     pub(super) validation_active: bool,
     pub(super) cache_query: Option<Message>,
@@ -89,6 +90,7 @@ impl<'a> PipelineContext<'a> {
             effective_upstream,
             cache_enabled,
             cache_policy_epoch: None,
+            cache_filter_epoch: None,
             dnssec_mode: sito_dnssec::DnssecMode::Disabled,
             validation_active: false,
             cache_query: None,
@@ -140,6 +142,7 @@ impl<'a> PipelineContext<'a> {
         // reload swaps the validator after this point, the captured epoch no
         // longer matches and the insert is rejected.
         self.cache_policy_epoch = Some(DnsPipeline::cache_epoch_for(&self.runtime_snapshot));
+        self.cache_filter_epoch = Some(self.runtime_snapshot.filter_epoch);
         self.dnssec_mode = self.runtime_snapshot.dnssec_policy.mode();
         self.validation_active = !self.query.metadata.checking_disabled
             && self.dnssec_mode != sito_dnssec::DnssecMode::Disabled;

@@ -150,10 +150,27 @@ fn leases_are_verified(config: &RouterOsConfig) -> bool {
     reqwest::Url::parse(&config.url).is_ok_and(|url| url.scheme() == "https")
 }
 
-/// Fetch and parse DHCP leases from RouterOS REST API.
+/// Fetch and parse DHCP leases from the RouterOS REST API.
+///
+/// The client is built from `config`, so the `verified` flag always reflects
+/// the TLS policy that actually governs the connection. A caller cannot pass
+/// an insecure client and still receive identity-capable leases; the raw
+/// client path is private and used only by the in-crate sync task/tests.
 pub async fn fetch_routeros_leases(
+    config: &RouterOsConfig,
+) -> Result<Vec<RouterOsLease>, RouterOsError> {
+    let client = build_routeros_client(config)?;
+    fetch_with_client(&client, config, leases_are_verified(config)).await
+}
+
+/// Fetch using an already-built client. Production callers must build that
+/// client from the same `config` (see [`spawn_routeros_sync`]); the explicit
+/// `verified` argument keeps the sync task and tests from re-deriving it, and
+/// this entry point is not public.
+async fn fetch_with_client(
     client: &reqwest::Client,
     config: &RouterOsConfig,
+    verified: bool,
 ) -> Result<Vec<RouterOsLease>, RouterOsError> {
     let endpoint = if config.url.ends_with("/rest/ip/dhcp-server/lease") {
         config.url.clone()
@@ -210,8 +227,7 @@ pub async fn fetch_routeros_leases(
     let body = read_capped_body(response, MAX_RESPONSE_BYTES).await?;
     let raw_leases: Vec<RawRouterOsLease> = serde_json::from_slice(&body)?;
     // Only HTTPS with certificate verification authenticates the peer; a
-    // plaintext URL or an insecure-TLS client is display-only (D10/D15).
-    let verified = leases_are_verified(config);
+    // plaintext URL or `allow_invalid_certs` is display-only (D10/D15).
     let leases = raw_leases
         .into_iter()
         .filter_map(|raw| raw.into_lease(verified))
@@ -345,7 +361,7 @@ pub fn spawn_routeros_sync(
                     }
                 }
                 _ = ticker.tick() => {
-                    match fetch_routeros_leases(&client, &config).await {
+                    match fetch_with_client(&client, &config, leases_are_verified(&config)).await {
                         Ok(leases) => {
                             info!(count = leases.len(), "Synced RouterOS DHCP leases");
                             registry.update_routeros_leases(leases);
@@ -367,6 +383,15 @@ mod tests {
     use sito_core::ClientContext;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// Test-only raw-client path; the verified flag comes from the config, so
+    /// tests cannot accidentally grant identity through an insecure client.
+    async fn fetch_with_test_client(
+        client: &reqwest::Client,
+        config: &RouterOsConfig,
+    ) -> Result<Vec<RouterOsLease>, RouterOsError> {
+        super::fetch_with_client(client, config, super::leases_are_verified(config)).await
+    }
 
     #[tokio::test]
     async fn test_routeros_fetch_and_graceful_degradation() {
@@ -436,8 +461,7 @@ mod tests {
             allow_invalid_certs: false,
         };
 
-        let client = reqwest::Client::new();
-        let leases = fetch_routeros_leases(&client, &config)
+        let leases = fetch_routeros_leases(&config)
             .await
             .expect("Fetch leases should succeed");
 
@@ -469,7 +493,7 @@ mod tests {
         assert_eq!(ctx.client_name, None);
 
         // Second request should fail with 500 BadStatus (graceful degradation)
-        let err = fetch_routeros_leases(&client, &config)
+        let err = fetch_routeros_leases(&config)
             .await
             .expect_err("Should fail with 500");
         match err {
@@ -588,7 +612,7 @@ mod tests {
         // timeout proves the setting is applied to the client that fetches.
         let client = build_routeros_client_with_timeout(&config, Duration::from_millis(100))
             .expect("client must build");
-        let err = fetch_routeros_leases(&client, &config)
+        let err = fetch_with_test_client(&client, &config)
             .await
             .expect_err("a stalled response must hit the configured timeout");
         assert!(
@@ -622,7 +646,7 @@ mod tests {
             allow_invalid_certs: false,
         };
 
-        let err = fetch_routeros_leases(&reqwest::Client::new(), &config)
+        let err = fetch_with_test_client(&reqwest::Client::new(), &config)
             .await
             .expect_err("an unresolvable password_env must be a config error");
         assert!(
@@ -669,7 +693,7 @@ mod tests {
             allow_invalid_certs: false,
         };
 
-        let err = fetch_routeros_leases(&reqwest::Client::new(), &config)
+        let err = fetch_with_test_client(&reqwest::Client::new(), &config)
             .await
             .expect_err("oversized body must be rejected");
         assert!(
@@ -702,7 +726,7 @@ mod tests {
             allow_invalid_certs: false,
         };
 
-        let err = fetch_routeros_leases(&reqwest::Client::new(), &config)
+        let err = fetch_with_test_client(&reqwest::Client::new(), &config)
             .await
             .expect_err("a configured but unresolved token_env must be an error");
         assert!(
@@ -751,7 +775,7 @@ mod tests {
             allow_invalid_certs: false,
         };
 
-        let err = fetch_routeros_leases(&reqwest::Client::new(), &config)
+        let err = fetch_with_test_client(&reqwest::Client::new(), &config)
             .await
             .expect_err("an error response must be returned as BadStatus");
         match err {
@@ -807,7 +831,7 @@ mod tests {
         // A plaintext URL has no certificate to verify, even with
         // `allow_invalid_certs = false`: the peer identity is unauthenticated.
         let client = reqwest::Client::new();
-        let plaintext = fetch_routeros_leases(&client, &base)
+        let plaintext = fetch_with_test_client(&client, &base)
             .await
             .expect("first fetch");
         assert!(
@@ -821,7 +845,7 @@ mod tests {
             allow_invalid_certs: true,
             ..base
         };
-        let unverified = fetch_routeros_leases(&client, &insecure)
+        let unverified = fetch_with_test_client(&client, &insecure)
             .await
             .expect("second fetch");
         assert!(

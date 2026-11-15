@@ -64,6 +64,10 @@ pub struct DnsCache {
     /// old-policy entries become invisible and in-flight inserts from a query
     /// that started under the old policy are rejected.
     policy_epoch: AtomicU64,
+    /// Monotonic filter generation. A filter-only refresh advances it so an
+    /// in-flight query that captured the old filter snapshot cannot insert a
+    /// filter-stale answer after the refresh flush.
+    filter_epoch: AtomicU64,
     /// Per-key single-flight locks. Weak references let finished keys be
     /// replaced lazily; waiters keep their strong reference alive.
     flights: Arc<Mutex<HashMap<CacheKey, Weak<tokio::sync::Mutex<()>>>>>,
@@ -79,6 +83,7 @@ impl DnsCache {
             config: ArcSwap::new(Arc::new(config)),
             // Start at 1 so an entry always carries a meaningful generation.
             policy_epoch: AtomicU64::new(PolicyEpoch::INITIAL.get()),
+            filter_epoch: AtomicU64::new(1),
             flights: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -113,6 +118,26 @@ impl DnsCache {
         )
     }
 
+    /// Current filter generation.
+    ///
+    /// A query captures this from `RuntimeSnapshot::filter_epoch`; it must
+    /// never read the live value when deciding whether its answer is still
+    /// valid for the filter it evaluated.
+    #[must_use]
+    pub fn filter_epoch(&self) -> u64 {
+        self.filter_epoch.load(Ordering::Acquire)
+    }
+
+    /// Publishes the filter generation prepared by the runtime.
+    ///
+    /// The runtime calls this before storing the snapshot that carries the
+    /// same `filter_epoch`; existing entries from the old generation become
+    /// unservable, and in-flight inserts that captured the old value are
+    /// rejected.
+    pub fn set_filter_epoch(&self, epoch: u64) {
+        self.filter_epoch.store(epoch, Ordering::Release);
+    }
+
     /// Applies hot-reloaded cache settings, rebuilding the cache when
     /// `size_mb` changes and re-clamping every live entry to the new TTL
     /// policy.
@@ -133,6 +158,22 @@ impl DnsCache {
             self.resize(config.size_mb as u64).await;
         }
         self.reclamp_entries(&config).await;
+    }
+
+    /// Applies hot-reloaded cache settings for a runtime generation apply.
+    ///
+    /// Unlike [`Self::update_config`], this does not scan and rewrite every
+    /// entry: the caller advances the policy epoch immediately afterwards, so
+    /// all existing entries become unservable and an O(cache) clone/insert
+    /// scan would be pure overhead. Cache-only callers that keep the epoch
+    /// (for example a future policy-only reload) must use
+    /// [`Self::update_config`] to retain the re-clamp contract.
+    pub async fn update_config_for_generation(&self, config: CacheConfig) {
+        let size_changed = self.config.load().size_mb != config.size_mb;
+        self.config.store(Arc::new(config.clone()));
+        if size_changed {
+            self.resize(config.size_mb as u64).await;
+        }
     }
 
     /// Rewrites every still-fresh entry so its TTLs obey `config`.
@@ -325,6 +366,17 @@ impl DnsCache {
             return None;
         }
 
+        if entry.filter_epoch != self.filter_epoch() {
+            trace!(
+                "Ignoring cache entry for {} from filter epoch {} (current {})",
+                key.qname,
+                entry.filter_epoch,
+                self.filter_epoch()
+            );
+            cache.invalidate(key).await;
+            return None;
+        }
+
         let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
         let max_stale_secs = entry
             .max_lifespan_secs
@@ -440,6 +492,17 @@ impl DnsCache {
             return None;
         }
 
+        if entry.filter_epoch != self.filter_epoch() {
+            trace!(
+                "Ignoring stale cache entry for {} from filter epoch {} (current {})",
+                key.qname,
+                entry.filter_epoch,
+                self.filter_epoch()
+            );
+            cache.invalidate(key).await;
+            return None;
+        }
+
         let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
         let max_stale_secs = entry
             .max_lifespan_secs
@@ -496,6 +559,9 @@ impl DnsCache {
 
         let cache = self.cache.load_full();
         if let Some(entry) = cache.get(key).await {
+            if entry.filter_epoch != self.filter_epoch() {
+                return false;
+            }
             let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
             if elapsed_secs < entry.max_lifespan_secs {
                 let remaining = entry.max_lifespan_secs - elapsed_secs;
@@ -553,6 +619,30 @@ impl DnsCache {
         response: &Message,
         validation_status: ValidationStatus,
         policy_epoch: PolicyEpoch,
+    ) -> bool {
+        self.insert_with_status_at_epochs(
+            query,
+            response,
+            validation_status,
+            policy_epoch,
+            self.filter_epoch(),
+        )
+        .await
+    }
+
+    /// Insert only when both the DNSSEC policy epoch and the filter epoch are
+    /// still current.
+    ///
+    /// The pipeline passes the policy epoch and filter epoch from the same
+    /// `RuntimeSnapshot`; a filter-only refresh advances only the filter epoch
+    /// so an in-flight query with old rules cannot repopulate the cache.
+    pub async fn insert_with_status_at_epochs(
+        &self,
+        query: &Message,
+        response: &Message,
+        validation_status: ValidationStatus,
+        policy_epoch: PolicyEpoch,
+        filter_epoch: u64,
     ) -> bool {
         let Some(key) = CacheKey::for_query(query) else {
             return false;
@@ -738,6 +828,15 @@ impl DnsCache {
             );
             return false;
         }
+        if filter_epoch != self.filter_epoch() {
+            debug!(
+                qname = %key.qname,
+                filter_epoch,
+                current = self.filter_epoch(),
+                "Discarding cache insert from an older filter generation"
+            );
+            return false;
+        }
 
         let entry = CacheEntry {
             message: response.clone(),
@@ -748,6 +847,7 @@ impl DnsCache {
             additional_ttls,
             validation_status,
             policy_epoch: policy_epoch.get(),
+            filter_epoch,
             hits: Arc::new(AtomicU32::new(0)),
             estimated_bytes,
         };

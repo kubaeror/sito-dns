@@ -228,6 +228,10 @@ pub struct RuntimeSnapshot {
     /// Global compiled filter rules. `None` means filtering is disabled for
     /// this generation.
     pub filter: Option<Arc<FilterSnapshot>>,
+    /// Filter generation. Advances on every filter-only refresh and on an
+    /// apply that changes the filter/group snapshots; cache entries carry it
+    /// so an in-flight query with old rules cannot repopulate the cache.
+    pub filter_epoch: u64,
     /// Per-client-group compiled rules, evaluated with the same generation.
     pub group_filters: Arc<GroupSnapshots>,
     /// DNSSEC policy and the validator prepared for it.
@@ -245,6 +249,10 @@ pub struct RuntimeState {
     /// cache filters entries and in-flight inserts by it. Filter-only
     /// refreshes flush entries but leave the generation/epoch unchanged.
     cache: Arc<DnsCache>,
+    /// Monotonic filter generation, independent of the config/DNSSEC
+    /// generation so a filter-only refresh cannot invalidate a staged apply's
+    /// generation check.
+    filter_epoch: AtomicU64,
     /// Mirrors for the admin UI and HA worker; the query path reads `snapshot`.
     config: Arc<ArcSwap<Config>>,
     clients: Arc<ArcSwap<ClientRegistry>>,
@@ -292,6 +300,7 @@ impl RuntimeState {
             clients: clients.load_full(),
             rewrites: rewrites.load_full(),
             filter: None,
+            filter_epoch: 1,
             group_filters: Arc::new(GroupSnapshots::default()),
             dnssec_policy: DnssecPolicy::from_config(&config_snapshot.dns.dnssec),
             cache_policy: config_snapshot.dns.cache.clone(),
@@ -300,6 +309,7 @@ impl RuntimeState {
         Self {
             snapshot: ArcSwap::from_pointee(snapshot),
             cache,
+            filter_epoch: AtomicU64::new(1),
             config,
             clients,
             rewrites,
@@ -313,15 +323,32 @@ impl RuntimeState {
 
     /// Shares the process cache so the runtime generation and the cache epoch
     /// are the same counter.
+    ///
+    /// Call this during construction, before any `apply` or `publish_filter`:
+    /// it seeds the runtime from the cache and writes the `max` back. Rebasing
+    /// an already-advanced runtime onto a cache shared with a live runtime
+    /// would raise that cache's epoch and invalidate its entries without a
+    /// matching snapshot.
     #[must_use]
     pub fn with_cache(self, cache: Arc<DnsCache>) -> Self {
         let generation = cache.policy_epoch();
         let current = self.snapshot.load_full();
+        // A runtime that already advanced must not be rebased onto a
+        // lower-epoch cache; keep the shared cache at least as new.
+        let filter_epoch = cache
+            .filter_epoch()
+            .max(self.filter_epoch.load(Ordering::Acquire));
+        cache.set_filter_epoch(filter_epoch);
         self.snapshot.store(Arc::new(RuntimeSnapshot {
             generation,
+            filter_epoch,
             ..(*current).clone()
         }));
-        Self { cache, ..self }
+        Self {
+            cache,
+            filter_epoch: AtomicU64::new(filter_epoch),
+            ..self
+        }
     }
 
     /// Installs the components that are created outside the config apply path
@@ -337,8 +364,19 @@ impl RuntimeState {
     ) {
         let _guard = self.lock();
         let current = self.snapshot.load_full();
+        // Bootstrap is startup-only: it must not invalidate a live cache that
+        // may be shared with another pipeline/runtime. Keep the counter
+        // monotonic instead of bumping it.
+        let filter_epoch = self
+            .filter_epoch
+            .load(Ordering::Acquire)
+            .max(self.cache.filter_epoch())
+            .max(current.filter_epoch);
+        self.filter_epoch.store(filter_epoch, Ordering::Release);
+        self.cache.set_filter_epoch(filter_epoch);
         self.snapshot.store(Arc::new(RuntimeSnapshot {
             filter,
+            filter_epoch,
             group_filters,
             dnssec_policy,
             transport_policy,
@@ -497,12 +535,23 @@ impl RuntimeState {
         // 4. Re-key the cache after every fallible stage succeeded. Holding the
         //    apply mutex means no other apply can interleave and leave the live
         //    cache config different from the published snapshot.
-        self.cache.update_config(plan.cache_policy.clone()).await;
+        self.cache
+            .update_config_for_generation(plan.cache_policy.clone())
+            .await;
         let generation = self.cache.advance_policy_epoch();
+        let filter_changed = !filter_ptr_eq(current.filter.as_ref(), plan.filter.as_ref())
+            || !Arc::ptr_eq(&current.group_filters, &plan.group_filters);
+        let filter_epoch = if filter_changed {
+            self.filter_epoch.fetch_add(1, Ordering::AcqRel) + 1
+        } else {
+            current.filter_epoch
+        };
+        self.cache.set_filter_epoch(filter_epoch);
 
         // 5. One publish. Queries load either `current` or `next`.
         let next = RuntimeSnapshot {
             generation,
+            filter_epoch,
             config: Arc::new(plan.config.clone()),
             clients: Arc::new(registry),
             rewrites: Arc::new(rewrites),
@@ -571,14 +620,18 @@ impl RuntimeState {
                 actual: current.generation,
             });
         }
+        let filter_epoch = self.filter_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.cache.set_filter_epoch(filter_epoch);
         let next = RuntimeSnapshot {
             filter,
+            filter_epoch,
             group_filters,
             ..(*current).clone()
         };
         self.snapshot.store(Arc::new(next));
-        // Cache entries are not tagged with the filter rules, so reclaim them
-        // explicitly; the DNSSEC epoch stays unchanged.
+        // Entries are tagged with the old filter epoch and already unservable;
+        // the flush only reclaims their memory. The DNSSEC epoch stays
+        // unchanged.
         self.cache.flush();
         Ok(current.generation)
     }
@@ -626,8 +679,23 @@ impl RuntimeState {
     ///
     /// Compatibility helper for test harnesses; production entry points use
     /// [`Self::apply`].
-    pub fn replace(&self, snapshot: RuntimeSnapshot) {
+    pub fn replace(&self, mut snapshot: RuntimeSnapshot) {
         let _guard = self.lock();
+        let current = self.snapshot.load_full();
+        // Keep the filter epoch monotonic across test/harness snapshots so a
+        // lower snapshot cannot resurrect entries from an old filter. A
+        // snapshot that changes the filter/group content also advances the
+        // epoch, because old entries were produced under different rules.
+        let floor = snapshot
+            .filter_epoch
+            .max(self.filter_epoch.load(Ordering::Acquire))
+            .max(self.cache.filter_epoch());
+        let filter_changed = !filter_ptr_eq(current.filter.as_ref(), snapshot.filter.as_ref())
+            || !Arc::ptr_eq(&current.group_filters, &snapshot.group_filters);
+        let filter_epoch = if filter_changed { floor + 1 } else { floor };
+        snapshot.filter_epoch = filter_epoch;
+        self.filter_epoch.store(filter_epoch, Ordering::Release);
+        self.cache.set_filter_epoch(filter_epoch);
         self.config.store(snapshot.config.clone());
         self.clients.store(snapshot.clients.clone());
         self.rewrites.store(snapshot.rewrites.clone());
