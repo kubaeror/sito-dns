@@ -195,13 +195,17 @@ default no-HA graph and the enabled surface on every code change:
 
 | Lane | Command | What it proves |
 |---|---|---|
-| Absence guard | `cargo tree -p sito-test --no-default-features --locked` must not contain `sito-ha` | The default test harness cannot silently acquire the HA implementation. |
+| Absence guard | `cargo tree -p sito -p sito-api -p sito-test --no-default-features --locked` must not contain `sito-ha` | The default binary, API and test harness cannot silently acquire the HA implementation. |
 | Default `sito` | `cargo test -p sito --locked` | The no-HA binary's unit tests, including config rejection, pass. |
 | HA `sito` | `cargo check -p sito --features ha --locked` | The enabled binary still compiles against `sito-ha`. |
 | Default `sito-api` | `cargo test -p sito-api --no-default-features --locked`; `cargo check -p sito-api --no-default-features --locked` | No-HA config validation and the stub routes stay green. |
 | HA `sito-api` | `cargo check -p sito-api --features ha --locked` | The real HA handlers compile. |
 | Default `sito-test` | `cargo test -p sito-test --no-default-features --locked` | Non-HA acceptance tests compile and pass. |
-| HA `sito-test` | `cargo check -p sito-test --features ha --locked` | HA acceptance tests and fixtures compile. |
+| HA `sito-test` | `cargo check -p sito-test --features ha --tests --locked` | The HA acceptance tests and fixtures compile. |
+
+`cargo check` only compiles the enabled surface; it does not run tests. The HA
+acceptance suites themselves run in the workspace `test` lane, which builds
+with `--all-features`.
 
 Coverage is deliberately split. `fmt` checks every target; the workspace `test`
 and `clippy` lanes use `--all-features`, and `bench-build`, `coverage` and the

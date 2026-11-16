@@ -19,8 +19,9 @@ This runbook provides step-by-step operational procedures for managing, maintain
 HA is an optional Cargo feature, not a runtime toggle:
 
 - **Official artifacts** (release archives and container image) are built with
-  `embed-ui,ha,mimalloc`, so HA is available. The installer does not compile
-  features; it installs those release archives.
+  `embed-ui,ha,mimalloc`, so HA is available. The installer installs those
+  release archives by default; set `SITO_INSTALL_LOCAL_BINARY=1` to install a
+  locally built `target/release/sito` instead.
 - **Source builds** must add `ha`:
   `cargo build --release --locked --features "embed-ui,ha,mimalloc"`.
   A plain `cargo build -p sito` is a no-HA binary.

@@ -220,8 +220,9 @@ jobs:
   # image opt in with `--features ha`. This lane pins both ends of that matrix:
   # the default `sito`, `sito-api` and `sito-test` builds must compile and pass
   # their tests without `sito-ha` in the graph, and `--features ha` must still
-  # check cleanly. The HA acceptance suites themselves (M8/M11) run in the
-  # `test` job, which builds `--all-features`.
+  # check cleanly, including the `sito-test` integration targets. The HA
+  # acceptance suites themselves (M8/M11) run in the `test` job, which builds
+  # `--all-features` and therefore actually executes them.
   #
   # This tests the crates whose feature graphs changed instead of repeating the
   # full `cargo test --workspace` from `test`: `fmt`, `clippy` and `test` keep
@@ -241,11 +242,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ha-matrix
-      - name: Assert the default test harness does not link sito-ha
+      - name: Assert the default workspace crates do not link sito-ha
         run: |
-          tree="$(cargo tree -p sito-test --no-default-features --locked)"
+          tree="$(cargo tree -p sito -p sito-api -p sito-test --no-default-features --locked)"
           if grep -q 'sito-ha v' <<<"${tree}"; then
-            echo "::error::sito-test must not depend on sito-ha without its ha feature"
+            echo "::error::sito, sito-api and sito-test must not depend on sito-ha without their ha feature"
             exit 1
           fi
       - name: Test the default (no-HA) sito binary
@@ -261,7 +262,7 @@ jobs:
       - name: Test the no-HA test harness
         run: cargo test -p sito-test --no-default-features --locked
       - name: Check the HA test harness
-        run: cargo check -p sito-test --features ha --locked
+        run: cargo check -p sito-test --features ha --tests --locked
 
   # Fast structural gates added by WP-1.9. They do not run the long fuzz or
   # benchmark workloads; `fuzz.yml` and `bench.yml` own the nightly/release
