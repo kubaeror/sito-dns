@@ -91,12 +91,12 @@ mod tests {
             // Default path: verify the committed snapshot without touching it.
             let committed = std::fs::read_to_string(&path).expect(
                 "docs/openapi.json is missing; regenerate with \
-                 `SITO_UPDATE_OPENAPI=1 cargo test -p sito-api`",
+                 `SITO_UPDATE_OPENAPI=1 cargo test -p sito-api --features ha`",
             );
             assert_eq!(
                 committed, json_str,
                 "docs/openapi.json is stale; regenerate with \
-                 `SITO_UPDATE_OPENAPI=1 cargo test -p sito-api`"
+                 `SITO_UPDATE_OPENAPI=1 cargo test -p sito-api --features ha`"
             );
         }
     }

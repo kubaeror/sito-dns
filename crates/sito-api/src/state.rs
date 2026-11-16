@@ -22,18 +22,19 @@ use tokio::sync::mpsc::UnboundedSender;
 ///
 /// The concrete coordinator lives in `sito-ha`; a build without the `ha`
 /// feature aliases the handle to `()` so [`ServerContext`] keeps the same
-/// field names and `Option<...>` shape in both modes. No value can be
-/// constructed in a no-HA build, which is exactly the intended invariant.
+/// field names and `Option<...>` shape in both modes. `()` is only a unit
+/// placeholder, not an HA handle: the no-HA runtime never constructs one, so
+/// these fields stay `None` and the HA routes answer 501.
 #[cfg(feature = "ha")]
 pub type MasterCoordinatorHandle = sito_ha::MasterCoordinator;
-/// Master-side HA coordinator handle (uninhabited in no-HA builds).
+/// Master-side HA coordinator handle (unit placeholder in no-HA builds).
 #[cfg(not(feature = "ha"))]
 pub type MasterCoordinatorHandle = ();
 
 /// Slave-side HA tracker handle.
 #[cfg(feature = "ha")]
 pub type SlaveTrackerHandle = sito_ha::SlaveStatusTracker;
-/// Slave-side HA tracker handle (uninhabited in no-HA builds).
+/// Slave-side HA tracker handle (unit placeholder in no-HA builds).
 #[cfg(not(feature = "ha"))]
 pub type SlaveTrackerHandle = ();
 

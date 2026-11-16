@@ -360,7 +360,7 @@ jobs:
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Regenerate the OpenAPI specification
-        run: SITO_UPDATE_OPENAPI=1 cargo test -p sito-api test_export_openapi_json
+        run: SITO_UPDATE_OPENAPI=1 cargo test -p sito-api --features ha test_export_openapi_json
       - name: Verify docs/openapi.json is up to date
         run: git diff --exit-code docs/openapi.json
 
