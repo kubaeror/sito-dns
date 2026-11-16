@@ -15,6 +15,7 @@ impl sito_core::DnssecKeyFetcher for BlockingFetcher {
         &self,
         _name: &Name,
         _rtype: RecordType,
+        _deadline: std::time::Instant,
     ) -> Result<Message, sito_core::error::UpstreamError> {
         std::future::pending::<Result<Message, sito_core::error::UpstreamError>>().await
     }

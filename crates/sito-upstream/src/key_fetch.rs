@@ -37,8 +37,23 @@ pub(crate) fn key_query(name: &Name, rtype: RecordType) -> Message {
 
 #[async_trait]
 impl DnssecKeyFetcher for UpstreamKeyFetcher {
-    async fn query(&self, name: &Name, rtype: RecordType) -> Result<Message, UpstreamError> {
-        self.manager.resolve(&key_query(name, rtype)).await
+    async fn query(
+        &self,
+        name: &Name,
+        rtype: RecordType,
+        deadline: std::time::Instant,
+    ) -> Result<Message, UpstreamError> {
+        // The deadline is shared by every fetch for one client query, so a
+        // black-holed DS/DNSKEY lookup cannot outlive the query's budget.
+        match tokio::time::timeout_at(
+            deadline.into(),
+            self.manager.resolve(&key_query(name, rtype)),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(UpstreamError::Timeout),
+        }
     }
 }
 

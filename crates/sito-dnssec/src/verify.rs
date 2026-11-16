@@ -398,16 +398,38 @@ impl DnssecValidator {
     /// Validates a response, resolving missing DNSKEY/DS records through the
     /// fetcher when the in-response chain is incomplete.
     ///
-    /// The synchronous chain walk runs first. Only an `Indeterminate` result
-    /// (signatures verified but not linked to an anchor) triggers network
-    /// fetches, bounded to a small per-query budget; fetched records are
-    /// appended temporarily for validation and removed again.
+    /// This compatibility wrapper applies [`DEFAULT_KEY_FETCH_DEADLINE`] as a
+    /// bounded per-query deadline. Callers that already have an absolute
+    /// per-query deadline should call
+    /// [`Self::validate_with_key_fetcher_deadline`] instead.
     pub async fn validate_with_key_fetcher(
         &self,
         response: &mut Message,
         upstream: Option<&str>,
         now: u32,
         fetcher: &dyn DnssecKeyFetcher,
+    ) -> ValidationOutcome {
+        let deadline = Instant::now() + DEFAULT_KEY_FETCH_DEADLINE;
+        self.validate_with_key_fetcher_deadline(response, upstream, now, fetcher, deadline)
+            .await
+    }
+
+    /// Validates a response under an absolute deadline shared by every key
+    /// fetch made for the query.
+    ///
+    /// The synchronous chain walk runs first. Only an `Indeterminate` result
+    /// (signatures verified but not linked to an anchor) triggers network
+    /// fetches, bounded to a small per-query budget; fetched records are
+    /// appended temporarily for validation and removed again. Every fetch is
+    /// passed `deadline`, so a stalled upstream cannot extend the query past
+    /// its budget.
+    pub async fn validate_with_key_fetcher_deadline(
+        &self,
+        response: &mut Message,
+        upstream: Option<&str>,
+        now: u32,
+        fetcher: &dyn DnssecKeyFetcher,
+        deadline: Instant,
     ) -> ValidationOutcome {
         // A response without RRSIGs is either a stripped-signature downgrade
         // or a legitimate unsigned delegation. Probe the delegation status
@@ -449,7 +471,10 @@ impl DnssecValidator {
                         budget_exhausted = true;
                         break;
                     }
-                    match self.prepare_unsigned_response(&lower, fetcher, now).await {
+                    match self
+                        .prepare_unsigned_response(&lower, fetcher, now, deadline)
+                        .await
+                    {
                         UnsignedProbe::Covered => {}
                         UnsignedProbe::Probed => probes += 1,
                         UnsignedProbe::Failed => {
@@ -524,11 +549,14 @@ impl DnssecValidator {
             // lookup per non-root level; a fixed budget of 6 could not reach
             // the root from a signer with three or more labels, leaving
             // otherwise valid zones Indeterminate on a cold cache.
-            let mut budget = signer
-                .num_labels()
-                .saturating_mul(2)
-                .saturating_add(1)
-                .min(31);
+            let mut budget = FetchBudget::new(
+                signer
+                    .num_labels()
+                    .saturating_mul(2)
+                    .saturating_add(1)
+                    .min(31),
+                deadline,
+            );
             let _ = fetch_zone_chain(
                 &anchors,
                 fetcher,
@@ -580,7 +608,10 @@ impl DnssecValidator {
                         post_budget_exhausted = true;
                         break;
                     }
-                    match self.prepare_unsigned_response(&lower, fetcher, now).await {
+                    match self
+                        .prepare_unsigned_response(&lower, fetcher, now, deadline)
+                        .await
+                    {
                         UnsignedProbe::Covered => {}
                         UnsignedProbe::Probed => probes += 1,
                         UnsignedProbe::Failed => {

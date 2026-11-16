@@ -32,9 +32,10 @@ pub(super) async fn validate_dnssec_with_deadline(
     // unvalidated helper records cannot leak to the client (or into a log-only
     // cached response).
     let original_additionals = response.additionals.len();
-    if let Ok(outcome) = tokio::time::timeout(
-        deadline,
-        validator.validate_with_key_fetcher(response, upstream, now, fetcher),
+    let deadline_at = std::time::Instant::now() + deadline;
+    if let Ok(outcome) = tokio::time::timeout_at(
+        tokio::time::Instant::from(deadline_at),
+        validator.validate_with_key_fetcher_deadline(response, upstream, now, fetcher, deadline_at),
     )
     .await
     {

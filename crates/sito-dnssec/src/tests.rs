@@ -8,7 +8,7 @@ use hickory_proto::rr::RecordType;
 use hickory_proto::rr::rdata::A;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn test_dnssec_secure_validation() {
@@ -192,7 +192,12 @@ impl StaticFetcher {
 
 #[async_trait::async_trait]
 impl DnssecKeyFetcher for StaticFetcher {
-    async fn query(&self, name: &Name, rtype: RecordType) -> Result<Message, UpstreamError> {
+    async fn query(
+        &self,
+        name: &Name,
+        rtype: RecordType,
+        _deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self
             .responses
@@ -964,6 +969,67 @@ async fn test_chain_fetch_resolves_ds_delegation() {
     );
 }
 
+#[test]
+fn test_fetch_budget_rejects_after_deadline_or_exhaustion() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut budget = FetchBudget::new(2, deadline);
+    assert_eq!(budget.deadline(), deadline);
+    assert!(budget.try_take());
+    assert!(budget.try_take());
+    assert!(
+        !budget.try_take(),
+        "an exhausted budget must reject further fetches"
+    );
+
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("clock arithmetic");
+    let mut budget = FetchBudget::new(3, expired);
+    assert!(budget.is_expired(), "a past deadline must be expired");
+    assert_eq!(budget.deadline(), expired);
+    assert!(
+        !budget.try_take(),
+        "an expired budget must reject fetches even with budget left"
+    );
+    assert!(
+        budget.is_expired(),
+        "the expiry check must not depend on consuming budget"
+    );
+}
+
+#[tokio::test]
+async fn test_fetch_zone_chain_expired_deadline_makes_no_fetch() {
+    let anchors = TrustAnchors::default();
+    let root = Name::root();
+    let fetcher = StaticFetcher::new();
+
+    let mut budget = FetchBudget::new(
+        4,
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("clock arithmetic"),
+    );
+    let mut visited = HashSet::new();
+    let mut response = Message::new(41, MessageType::Response, OpCode::Query);
+    let result = fetch_zone_chain(
+        &anchors,
+        &fetcher,
+        &root,
+        &mut budget,
+        &mut visited,
+        &mut response,
+    )
+    .await;
+
+    assert_eq!(result, None, "no chain progress is possible after expiry");
+    assert_eq!(fetcher.calls(), 0, "an expired deadline must not fetch");
+    assert!(
+        response.additionals.is_empty(),
+        "unexpected additionals: {:?}",
+        response.additionals
+    );
+}
+
 #[tokio::test]
 async fn test_chain_fetch_budget_for_unsigned_delegation() {
     let (origin, _zsk, zsk_signer) = create_test_signer("unsigned.example.");
@@ -1616,7 +1682,7 @@ async fn test_root_walk_matches_default_anchor() {
         fetched_dnskey_message(&root, &[root_key], None),
     );
 
-    let mut budget = 1u8;
+    let mut budget = FetchBudget::new(1, Instant::now() + Duration::from_secs(30));
     let mut visited = HashSet::new();
     let mut response = Message::new(40, MessageType::Response, OpCode::Query);
     let result = fetch_zone_chain(
@@ -4375,7 +4441,12 @@ impl NxdomainFetcher {
 
 #[async_trait::async_trait]
 impl DnssecKeyFetcher for NxdomainFetcher {
-    async fn query(&self, name: &Name, _rtype: RecordType) -> Result<Message, UpstreamError> {
+    async fn query(
+        &self,
+        name: &Name,
+        _rtype: RecordType,
+        _deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut message = Message::new(0, MessageType::Response, OpCode::Query);
         message
@@ -4404,10 +4475,98 @@ impl OfflineFetcher {
 
 #[async_trait::async_trait]
 impl DnssecKeyFetcher for OfflineFetcher {
-    async fn query(&self, _name: &Name, _rtype: RecordType) -> Result<Message, UpstreamError> {
+    async fn query(
+        &self,
+        _name: &Name,
+        _rtype: RecordType,
+        _deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(UpstreamError::Timeout)
     }
+}
+
+/// Records every deadline it is handed, then fails like an offline upstream.
+struct DeadlineRecordingFetcher {
+    deadlines: std::sync::Mutex<Vec<Instant>>,
+}
+
+impl DeadlineRecordingFetcher {
+    fn new() -> Self {
+        Self {
+            deadlines: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn deadlines(&self) -> Vec<Instant> {
+        self.deadlines.lock().expect("deadline log").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl DnssecKeyFetcher for DeadlineRecordingFetcher {
+    async fn query(
+        &self,
+        _name: &Name,
+        _rtype: RecordType,
+        deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
+        self.deadlines.lock().expect("deadline log").push(deadline);
+        Err(UpstreamError::Timeout)
+    }
+}
+
+#[tokio::test]
+async fn test_validate_with_key_fetcher_deadline_is_propagated() {
+    let qname = Name::from_str("www.deadline.example.").expect("qname");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let validator = DnssecValidator::from_config(&DnssecConfig::default());
+    let fetcher = DeadlineRecordingFetcher::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    let mut response = stripped_response(&qname);
+    let _ = validator
+        .validate_with_key_fetcher_deadline(
+            &mut response,
+            Some("deadline"),
+            now,
+            &fetcher,
+            deadline,
+        )
+        .await;
+
+    let seen = fetcher.deadlines();
+    assert!(
+        !seen.is_empty(),
+        "the chain walk must have attempted at least one fetch"
+    );
+    assert!(
+        seen.iter().all(|seen| *seen == deadline),
+        "every fetch must receive the caller's deadline: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_validate_with_key_fetcher_default_deadline_is_bounded() {
+    let qname = Name::from_str("www.default-deadline.example.").expect("qname");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let validator = DnssecValidator::from_config(&DnssecConfig::default());
+    let fetcher = DeadlineRecordingFetcher::new();
+
+    let before = Instant::now();
+    let mut response = stripped_response(&qname);
+    let _ = validator
+        .validate_with_key_fetcher(&mut response, Some("deadline"), now, &fetcher)
+        .await;
+
+    let seen = fetcher.deadlines();
+    assert!(!seen.is_empty(), "the compatibility wrapper must fetch");
+    // Scheduling slack only; the default must stay close to the call time.
+    let upper = before + DEFAULT_KEY_FETCH_DEADLINE + Duration::from_millis(100);
+    assert!(
+        seen.iter().all(|seen| *seen <= upper),
+        "the compatibility wrapper must apply a bounded default deadline: {seen:?}"
+    );
 }
 
 /// Offline policy: a never-proven zone fails closed (Bogus/SERVFAIL) and is

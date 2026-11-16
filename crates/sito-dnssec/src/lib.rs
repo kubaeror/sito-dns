@@ -21,6 +21,7 @@ pub use chain_cache::{ChainCache, ChainEntry, PolicyChange, PolicyState, ZoneSta
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -78,6 +79,55 @@ impl VerifyBudget {
         }
         self.remaining -= 1;
         true
+    }
+}
+
+/// Default wall-clock budget for one DNSSEC key-fetch pass.
+///
+/// Used by [`DnssecValidator::validate_with_key_fetcher`], which exists for
+/// callers that do not have their own per-query deadline. The resolver
+/// pipeline passes its own absolute deadline instead.
+pub const DEFAULT_KEY_FETCH_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Per-query budget for DNSSEC DS/DNSKEY fetches.
+///
+/// `remaining` bounds how many lookups one chain walk may issue; `deadline`
+/// is an absolute wall-clock bound shared by every fetch for that query. Once
+/// either limit is reached, [`Self::try_take`] refuses further fetches so the
+/// walk stops instead of issuing more network I/O.
+#[derive(Debug)]
+pub struct FetchBudget {
+    remaining: u8,
+    deadline: Instant,
+}
+
+impl FetchBudget {
+    /// Creates a budget with `remaining` fetches allowed until `deadline`.
+    pub fn new(remaining: u8, deadline: Instant) -> Self {
+        Self {
+            remaining,
+            deadline,
+        }
+    }
+
+    /// The absolute deadline every fetch must respect.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Consumes one fetch slot, returning false when the budget is exhausted
+    /// or the deadline has passed. Callers must stop fetching on false.
+    pub fn try_take(&mut self) -> bool {
+        if self.remaining == 0 || self.is_expired() {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    /// Whether the absolute deadline has passed.
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline
     }
 }
 

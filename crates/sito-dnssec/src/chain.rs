@@ -13,7 +13,7 @@ pub(super) async fn fetch_zone_chain(
     anchors: &TrustAnchors,
     fetcher: &dyn DnssecKeyFetcher,
     zone: &Name,
-    budget: &mut u8,
+    budget: &mut FetchBudget,
     visited: &mut HashSet<LowerName>,
     response: &mut Message,
 ) -> Option<()> {
@@ -22,15 +22,20 @@ pub(super) async fn fetch_zone_chain(
     let mut fetched_any = false;
 
     loop {
-        if *budget == 0 || depth > 12 {
+        if depth > 12 || budget.is_expired() {
             break;
         }
         if !visited.insert(LowerName::from(&current)) {
             break;
         }
 
-        *budget -= 1;
-        let Ok(dnskey_message) = fetcher.query(&current, RecordType::DNSKEY).await else {
+        if !budget.try_take() {
+            break;
+        }
+        let Ok(dnskey_message) = fetcher
+            .query(&current, RecordType::DNSKEY, budget.deadline())
+            .await
+        else {
             break;
         };
         append_dnssec_records(response, &dnskey_message);
@@ -44,11 +49,13 @@ pub(super) async fn fetch_zone_chain(
             break;
         }
 
-        if *budget == 0 {
+        if !budget.try_take() {
             break;
         }
-        *budget -= 1;
-        let Ok(ds_message) = fetcher.query(&current, RecordType::DS).await else {
+        let Ok(ds_message) = fetcher
+            .query(&current, RecordType::DS, budget.deadline())
+            .await
+        else {
             break;
         };
         append_dnssec_records(response, &ds_message);
@@ -452,6 +459,7 @@ impl DnssecValidator {
         name: &LowerName,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
+        deadline: Instant,
     ) -> DelegationProof {
         let cached_start = self.chain_cache.closest_signed(name, now);
         let memory_start = self.closest_signed_zone(name, now);
@@ -480,7 +488,7 @@ impl DnssecValidator {
                 // without signatures from it is already a downgrade.
                 return DelegationProof::ShouldBeSigned;
             }
-            match self.keys_for_zone(&start, fetcher, now).await {
+            match self.keys_for_zone(&start, fetcher, now, deadline).await {
                 Some((actual_zone, keys)) => (actual_zone, keys),
                 // The zone is known to be signed but its keys cannot be
                 // re-established (offline restart, expired key cache). Fail
@@ -491,7 +499,7 @@ impl DnssecValidator {
             let Some(anchor) = self.closest_anchor_zone(name) else {
                 return DelegationProof::Unknown;
             };
-            match self.seed_anchor_keys(&anchor, fetcher, now).await {
+            match self.seed_anchor_keys(&anchor, fetcher, now, deadline).await {
                 Some((keys, _expiry)) => (anchor, keys),
                 None => return DelegationProof::Unknown,
             }
@@ -525,7 +533,7 @@ impl DnssecValidator {
                 if cut == *name {
                     return DelegationProof::ShouldBeSigned;
                 }
-                match self.keys_for_zone(&cut, fetcher, now).await {
+                match self.keys_for_zone(&cut, fetcher, now, deadline).await {
                     Some((actual_zone, keys)) if actual_zone == cut => {
                         zone = actual_zone;
                         parent_keys = keys;
@@ -536,7 +544,7 @@ impl DnssecValidator {
             }
 
             let cut_name = Name::from(cut.clone());
-            let Ok(ds_response) = fetcher.query(&cut_name, RecordType::DS).await else {
+            let Ok(ds_response) = fetcher.query(&cut_name, RecordType::DS, deadline).await else {
                 return if saw_signed || start_is_signed {
                     DelegationProof::ShouldBeSigned
                 } else {
@@ -555,7 +563,7 @@ impl DnssecValidator {
                     // needed to authenticate deeper DS answers. A missing
                     // child key must not downgrade the authenticated DS.
                     match self
-                        .validate_child_dnskeys(&cut, &ds_response, fetcher, now)
+                        .validate_child_dnskeys(&cut, &ds_response, fetcher, now, deadline)
                         .await
                     {
                         Some(keys) => {
@@ -634,9 +642,13 @@ impl DnssecValidator {
         zone: &LowerName,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
+        deadline: Instant,
     ) -> Option<(Vec<DNSKEY>, u32)> {
         let zone_name = Name::from(zone.clone());
-        let message = fetcher.query(&zone_name, RecordType::DNSKEY).await.ok()?;
+        let message = fetcher
+            .query(&zone_name, RecordType::DNSKEY, deadline)
+            .await
+            .ok()?;
         let anchors = self.trust_anchors.load();
         let keys: Vec<DNSKEY> = message
             .answers
@@ -727,6 +739,7 @@ impl DnssecValidator {
         target: &LowerName,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
+        deadline: Instant,
     ) -> Option<(LowerName, Vec<DNSKEY>)> {
         let cached = self.key_cache.validated_keys(target, now);
         if !cached.is_empty() {
@@ -734,7 +747,9 @@ impl DnssecValidator {
         }
 
         let anchor = self.closest_anchor_zone(target)?;
-        let (mut keys, _) = self.seed_anchor_keys(&anchor, fetcher, now).await?;
+        let (mut keys, _) = self
+            .seed_anchor_keys(&anchor, fetcher, now, deadline)
+            .await?;
         let mut zone = anchor;
         if zone == *target {
             return Some((zone, keys));
@@ -747,13 +762,13 @@ impl DnssecValidator {
         }
         for cut in cuts {
             let cut_name = Name::from(cut.clone());
-            let Ok(ds_response) = fetcher.query(&cut_name, RecordType::DS).await else {
+            let Ok(ds_response) = fetcher.query(&cut_name, RecordType::DS, deadline).await else {
                 return None;
             };
             match ds_response_status(&ds_response, &cut_name, &zone, &keys, now) {
                 DsStatus::Signed(_) => {
                     keys = self
-                        .validate_child_dnskeys(&cut, &ds_response, fetcher, now)
+                        .validate_child_dnskeys(&cut, &ds_response, fetcher, now, deadline)
                         .await?;
                     zone = cut;
                 }
@@ -772,6 +787,7 @@ impl DnssecValidator {
         ds_message: &Message,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
+        deadline: Instant,
     ) -> Option<Vec<DNSKEY>> {
         let cut_name = Name::from(cut.clone());
         let ds_records: Vec<DS> = ds_message
@@ -792,7 +808,10 @@ impl DnssecValidator {
             return None;
         }
 
-        let message = fetcher.query(&cut_name, RecordType::DNSKEY).await.ok()?;
+        let message = fetcher
+            .query(&cut_name, RecordType::DNSKEY, deadline)
+            .await
+            .ok()?;
         let keys: Vec<DNSKEY> = message
             .answers
             .iter()
@@ -894,6 +913,7 @@ impl DnssecValidator {
         name: &LowerName,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
+        deadline: Instant,
     ) -> UnsignedProbe {
         if let Some(entry) = self.chain_cache.get(name, now) {
             let stale_unsigned =
@@ -923,7 +943,7 @@ impl DnssecValidator {
         if self.probe_backoff_active(name, now) {
             return UnsignedProbe::Failed;
         }
-        if self.probe_delegation(name, fetcher, now).await == DelegationProof::Unknown {
+        if self.probe_delegation(name, fetcher, now, deadline).await == DelegationProof::Unknown {
             self.record_probe_failure(name, now);
             UnsignedProbe::Failed
         } else {
