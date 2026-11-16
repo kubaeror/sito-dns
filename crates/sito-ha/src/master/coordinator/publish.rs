@@ -109,7 +109,17 @@ impl MasterCoordinator {
     /// before it is persisted or broadcast. An oversized bundle must be an
     /// apply error, not a config that every slave rejects forever.
     pub(super) fn ensure_push_fits(push: &HaMessage) -> Result<(), HaError> {
-        let bytes = wire_size(push);
+        // `wire_size` reports 0 for a message it cannot serialize; use the
+        // fallible length here so an impossible serialization failure cannot
+        // silently bypass the size guard.
+        let bytes = push
+            .to_json()
+            .map_err(|e| {
+                HaError::Serialization(format!(
+                    "Failed to measure the signed HA push before broadcast: {e}"
+                ))
+            })?
+            .len();
         if bytes > MAX_WS_MESSAGE_SIZE {
             return Err(HaError::BundleTooLarge {
                 bytes,

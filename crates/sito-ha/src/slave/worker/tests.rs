@@ -31,7 +31,6 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 /// `sito-api`. This stand-in mirrors the observable ordering that matters for
 /// the worker tests: apply to the live handles, persist, and roll back when the
 /// write fails.
-#[cfg(test)]
 pub(crate) mod test_support {
     use crate::slave::worker::SlaveConfigApplier;
     use sito_core::config::Config;

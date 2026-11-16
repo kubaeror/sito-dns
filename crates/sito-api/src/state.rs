@@ -599,12 +599,10 @@ impl ServerContext {
     /// Without HA there is no coordinator to publish to: this is a successful
     /// no-op so a local apply is never rolled back for an absent feature.
     #[cfg(not(feature = "ha"))]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Shared call-site signature with the HA build.
     pub async fn publish_bundle_with_retry(
         &self,
     ) -> (Result<PublishOutcome, HaError>, Option<std::time::Duration>) {
-        // Keep the shared async signature; there is nothing to await without
-        // an HA coordinator, but callers use the same `.await` in both builds.
-        std::future::ready(()).await;
         let _ = &self.master_coordinator;
         (Ok(PublishOutcome::NoSlaves), None)
     }

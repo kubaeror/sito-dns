@@ -833,9 +833,17 @@ slave_token = "cluster-token-value"
             refresh_hours: Some(12),
         }];
         config.filtering.custom_rules = vec!["||custom.example^".to_string()];
+        config.rewrites = Some(
+            toml::from_str("[rewrite]\nexample = \"target.example\"").expect("rewrites table"),
+        );
         let raw = toml::to_string_pretty(&config).expect("serialize config");
 
         let bundle = build_config_bundle(&config, &raw, 1, 0, &[]).expect("build the bundle");
+
+        assert_eq!(
+            bundle.rewrites, config.rewrites,
+            "the builder must copy the rewrites table verbatim"
+        );
 
         assert_eq!(
             bundle.lists,

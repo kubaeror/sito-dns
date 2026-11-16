@@ -402,7 +402,26 @@ where
                 let (stats, snapshot) =
                     build_stats_report(&handles.metrics, &last_stats_snapshot, window_s);
                 last_stats_snapshot = snapshot;
-                send_ha_message(&mut ws_stream, &stats, "slave", "stats report").await?;
+                // A stats report is advisory: a serialization failure must not
+                // tear down replication or clear the synchronized state. Send
+                // the bytes already produced instead of re-serializing them.
+                match stats.to_json() {
+                    Ok(json) => {
+                        send_frame(
+                            &mut ws_stream,
+                            WsMessage::Text(json.into()),
+                            "slave",
+                            "stats report",
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Failed to serialize HA stats report; skipping this interval"
+                        );
+                    }
+                }
             }
 
             msg_opt = ws_stream.next() => {

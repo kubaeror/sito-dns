@@ -366,7 +366,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
         // Cache
         .route("/cache/flush", post(cache::flush_cache))
         .route("/cache/invalidate", post(cache::invalidate_cache))
-        // High Availability (M8 stubs)
+        // High Availability (real handlers; 501 stubs in no-HA builds)
         .route("/ha/status", get(ha::get_ha_status))
         .route("/ha/slaves", get(ha::get_ha_slaves))
         .route("/ha/resync", post(ha::trigger_ha_resync))

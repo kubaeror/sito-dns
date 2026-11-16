@@ -106,9 +106,9 @@ pub(super) fn init_ha(
                 .map(|bundle| bundle.config_toml.clone());
             // Build once with the restored version: its sanitized document is
             // what the comparison consumes.
-            let mut bundle = build_bundle(restored_version)?;
+            let comparison_bundle = build_bundle(restored_version)?;
             let config_changed = restored_bundle.as_deref().is_none_or(|restored| {
-                !sito_ha::sanitized_configs_equal(restored, &bundle.config_toml)
+                !sito_ha::sanitized_configs_equal(restored, &comparison_bundle.config_toml)
             });
 
             if config_changed {
@@ -117,8 +117,11 @@ pub(super) fn init_ha(
                         "Cannot reconcile the HA bundle: persisted version {restored_version} cannot advance"
                     )
                 })?;
-                bundle.version = next_version;
-                coordinator.update_bundle(bundle)?;
+                // Rebuild at the version that will actually be signed and
+                // persisted, so the final-bundle secret scan covers exactly
+                // that document instead of a mutated copy of the comparison
+                // bundle.
+                coordinator.update_bundle(build_bundle(next_version)?)?;
                 info!(
                     version = next_version,
                     previous_version = restored_version,

@@ -17,7 +17,13 @@ where
         return None;
     };
     let Some(text) = frame_text(&frame) else {
-        warn!(peer = %peer_addr, "Timed out or connection closed before Hello received");
+        // Ping/Pong/Close and other non-text frames cannot carry the opening
+        // Hello. Report them distinctly from a timeout or closed connection so
+        // an operator can tell a protocol mismatch from a vanished peer.
+        warn!(
+            peer = %peer_addr,
+            "Unsupported frame before Hello (expected a text JSON frame): {frame:?}"
+        );
         return None;
     };
     match HaMessage::from_json(text) {
