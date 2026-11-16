@@ -348,6 +348,11 @@ pub async fn apply_and_persist_config(
     // not persisted. Do this under the apply lock so the comparison cannot
     // race a concurrent apply.
     let previous = (**ctx.config.load()).clone();
+    // Validate before the restart-only gate: a no-HA build must surface the
+    // actionable "rebuild with --features ha" error for `[ha]`/slave writes
+    // instead of a 409 that tells the operator to restart into a config the
+    // binary will refuse to load.
+    validate_full_config(candidate)?;
     ensure_no_restart_required(&previous, candidate)?;
     apply_and_persist_config_locked(ctx, candidate, filter_apply, hooks).await
 }
@@ -428,6 +433,9 @@ pub async fn apply_and_persist_document_rejecting_restart(
 ) -> Result<AppliedReport, ProblemDetails> {
     let _apply_guard = ctx.apply_lock.lock().await;
     let previous = (**ctx.config.load()).clone();
+    // See `apply_and_persist_config`: feature-support validation must win over
+    // the restart-only gate so HA pushes fail with the actionable reason.
+    validate_full_config(candidate)?;
     ensure_no_restart_required(&previous, candidate)?;
     apply_and_persist_document_locked(ctx, candidate, document, filter_apply, hooks).await
 }
@@ -2533,7 +2541,7 @@ acme_enabled = false
         let original = (**ctx.config.load()).clone();
 
         let mut candidate = original.clone();
-        candidate.server.role = "slave".to_string();
+        candidate.server.data_dir = std::path::PathBuf::from("/srv/other");
 
         let err = apply_and_persist_config(&ctx, &candidate, FilterApply::Deferred, None)
             .await
@@ -2542,15 +2550,57 @@ acme_enabled = false
         assert!(
             err.restart_required
                 .as_deref()
-                .is_some_and(|fields| fields == &["server.role".to_string()])
+                .is_some_and(|fields| fields == &["server.data_dir".to_string()])
         );
-        assert_eq!(ctx.config.load().server.role, "master");
+        assert_eq!(ctx.config.load().server.data_dir, original.server.data_dir);
         assert!(
             !ctx.config_path.exists(),
             "a rejected restart-only write must not persist a file"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A no-HA build must report the actionable feature message for `[ha]` and
+    /// slave-role writes, not a 409 telling the operator to restart into a
+    /// configuration this binary will refuse to load.
+    #[cfg(not(feature = "ha"))]
+    #[tokio::test]
+    async fn test_no_ha_config_write_rejects_ha_before_restart_gate() {
+        for (field, mutate) in [
+            (
+                "ha",
+                Box::new(|candidate: &mut Config| {
+                    candidate.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+                }) as Box<dyn Fn(&mut Config)>,
+            ),
+            (
+                "role",
+                Box::new(|candidate: &mut Config| {
+                    candidate.server.role = "slave".to_string();
+                }) as Box<dyn Fn(&mut Config)>,
+            ),
+        ] {
+            let temp_dir = crate::test_support::temp_dir(&format!("sito_cfg_no_ha_{field}"));
+            let ctx = crate::test_support::mock_context(&temp_dir).await;
+            let mut candidate = (**ctx.config.load()).clone();
+            mutate(&mut candidate);
+
+            let err = apply_and_persist_config(&ctx, &candidate, FilterApply::Deferred, None)
+                .await
+                .expect_err("a no-HA build must reject the HA configuration");
+            assert_eq!(err.status, 400, "field {field}: {err:?}");
+            assert!(
+                err.detail.contains("--features ha"),
+                "field {field}: the error must name the feature: {err:?}"
+            );
+            assert!(
+                !ctx.config_path.exists(),
+                "field {field}: a rejected no-HA write must not persist"
+            );
+
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
     }
 
     /// D11 parity: the HA push path uses the same matrix and returns 409
