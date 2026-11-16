@@ -196,7 +196,7 @@ default no-HA graph and the enabled surface on every code change:
 | Lane | Command | What it proves |
 |---|---|---|
 | Absence guard | `cargo tree -p sito-test --no-default-features --locked` must not contain `sito-ha` | The default test harness cannot silently acquire the HA implementation. |
-| Default `sito` | `cargo test -p sito --locked` | The no-HA binary's unit tests, including config rejection and the 501 stubs, pass. |
+| Default `sito` | `cargo test -p sito --locked` | The no-HA binary's unit tests, including config rejection, pass. |
 | HA `sito` | `cargo check -p sito --features ha --locked` | The enabled binary still compiles against `sito-ha`. |
 | Default `sito-api` | `cargo test -p sito-api --no-default-features --locked`; `cargo check -p sito-api --no-default-features --locked` | No-HA config validation and the stub routes stay green. |
 | HA `sito-api` | `cargo check -p sito-api --features ha --locked` | The real HA handlers compile. |

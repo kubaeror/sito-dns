@@ -273,18 +273,18 @@ nightly benchmark comparison are release-checklist items, not flaky PR jobs
 
 ## Optional HA feature matrix
 
-HA became optional after the Phase 1 work packages. The default workspace build
-does not link `sito-ha`; official release archives and the container image
+HA became optional in the post-Phase-1 HA consolidation. The default workspace
+build does not link `sito-ha`; official release archives and the container image
 explicitly build `embed-ui,ha,mimalloc`. The `ha-matrix` CI job pins both sides
 of the feature gate, including an absence guard on the default dependency graph.
 
 | Acceptance criterion | Named test / check | Focused command |
 |---|---|---|
-| Default `sito` test graph has no `sito-ha` edge | `ha-matrix` "Assert the default test harness does not link sito-ha" step | `cargo tree -p sito-test --no-default-features --locked` |
-| Default `sito` binary tests, including HA rejection and 501 stubs | `test_check_config_rejects_ha_without_feature`; `ha-matrix` default `sito` step | `cargo test -p sito --locked` |
+| Default test harness graph has no `sito-ha` edge | `ha-matrix` "Assert the default test harness does not link sito-ha" step | `cargo tree -p sito-test --no-default-features --locked` |
+| Default `sito` binary tests, including HA rejection | `test_check_config_rejects_ha_without_feature`; `ha-matrix` default `sito` step | `cargo test -p sito --locked` |
 | HA-enabled `sito` compiles | `ha-matrix` "Check the HA sito binary" step | `cargo check -p sito --features ha --locked` |
 | No-HA config validation rejects `[ha]` and replica roles | `test_rejects_ha_section_without_ha_feature`, `test_rejects_slave_role_without_ha_feature` | `cargo test -p sito-api --no-default-features --locked` |
-| No-HA HA routes return 501 with admin auth, and readiness is not gated | `test_ha_routes_return_501_without_ha_support`, `test_ha_readiness_is_ready_without_ha_support`, `test_publish_bundle_is_no_slaves_without_ha_support`, `test_healthcheck_ignores_ha_when_not_configured`, `test_ha_readiness_not_required_without_feature` | `cargo test -p sito-api --no-default-features --locked`; `cargo test -p sito --locked` |
+| No-HA HA routes return 501, handlers retain `RequireAdmin`, and readiness is not gated | `test_ha_routes_return_501_without_ha_support`, `test_ha_readiness_is_ready_without_ha_support`, `test_publish_bundle_is_no_slaves_without_ha_support`, `test_healthcheck_ignores_ha_when_not_configured`, `test_ha_readiness_not_required_without_feature` | `cargo test -p sito-api --no-default-features --locked`; `cargo test -p sito --locked` |
 | No-HA OpenAPI omits the HA paths | `test_openapi_omits_ha_paths_without_feature` | `cargo test -p sito-api --no-default-features --locked` |
 | HA-enabled API and test harness compile | `ha-matrix` `sito-api`/`sito-test` `--features ha` steps | `cargo check -p sito-api --features ha --locked`; `cargo check -p sito-test --features ha --locked` |
 | Default test harness compiles without HA | `ha-matrix` default `sito-test` step | `cargo test -p sito-test --no-default-features --locked` |

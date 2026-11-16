@@ -255,11 +255,10 @@ docker compose -f docker-compose.ha.yml config
 > through v1.9.3. The harness was removed from the 1.9.x line; the 2.0 branch
 > restored it as a nightly/release mechanism. See `fuzz/README.md`.
 
-For a local release binary (2.0 branch; the 1.9.2 release itself did not have
-the optional `ha` feature):
+For a local release binary:
 
 ```bash
-cargo build --release --locked -p sito --features "embed-ui,ha,mimalloc"
+cargo build --release --locked -p sito --features "embed-ui,mimalloc"
 ./target/release/sito --version
 ./target/release/sito check-config --config config.example.toml
 ```

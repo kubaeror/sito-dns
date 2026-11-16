@@ -623,7 +623,8 @@ covered by `SHA256SUMS`.
 ### 6.4 Reproducibility
 
 Release binaries are built in GitHub Actions with `cargo build --release
---locked`, so the dependency graph is exactly the committed `Cargo.lock`,
+--locked --features "embed-ui,ha,mimalloc"`, so the dependency graph is exactly
+the committed `Cargo.lock`,
 using the pinned Rust toolchain in `rust-toolchain.toml` and the release
 profile (`lto = "fat"`, `codegen-units = 1`, `strip = true`). Rebuilding the
 same tag locally with the same toolchain produces a functionally identical
