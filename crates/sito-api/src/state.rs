@@ -298,7 +298,7 @@ fn acme_readiness_state(
 /// in a cluster.
 #[must_use]
 pub fn ha_readiness_required(config: &Config) -> bool {
-    sito_ha::HaConfig::readiness_required(&config.server.role, config.ha.as_ref())
+    sito_ha::readiness_required(config)
 }
 
 impl ServerContext {
@@ -485,8 +485,8 @@ impl ServerContext {
         {
             return url.clone();
         }
-        if let Some(ref ha_val) = self.config.load().ha
-            && let Ok(ha_cfg) = sito_ha::HaConfig::from_toml_value(ha_val)
+        let config = self.config.load();
+        if let Ok(ha_cfg) = sito_ha::config_from_unvalidated(&config)
             && let Some(ref url) = ha_cfg.master_url
         {
             return url.clone();
@@ -585,8 +585,7 @@ impl ServerContext {
 
         // Defense in depth: refuse to broadcast a bundle that embeds a known
         // secret in plaintext.
-        if let Some(ref ha_val) = config.ha
-            && let Ok(ha_cfg) = sito_ha::HaConfig::from_toml_value(ha_val)
+        if let Ok(ha_cfg) = sito_ha::config_from_unvalidated(&config)
             && let Some(ref token) = ha_cfg.slave_token
         {
             sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])?;

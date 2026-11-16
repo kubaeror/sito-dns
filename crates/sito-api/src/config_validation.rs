@@ -68,11 +68,8 @@ pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("invalid [stats] configuration: {e}"))?;
     }
 
-    if let Some(value) = config.ha.as_ref() {
-        let ha_cfg = sito_ha::HaConfig::from_toml_value(value)
-            .map_err(|e| anyhow::anyhow!("invalid [ha] configuration: {e}"))?;
-        ha_cfg
-            .validate(&config.server.role)
+    if config.ha.is_some() {
+        sito_ha::config_from(config)
             .map_err(|e| anyhow::anyhow!("invalid [ha] configuration: {e}"))?;
     }
     Ok(())
