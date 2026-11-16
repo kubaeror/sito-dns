@@ -16,8 +16,9 @@ use crate::transport::WS_SEND_TIMEOUT;
 /// cannot be serialized.
 ///
 /// The length is the byte count of the text frame that [`send_ha_message`]
-/// will write, so the master can use it both for per-slave queue accounting and
-/// for size validation against the WebSocket message limit.
+/// will write; the master uses it for per-slave queue accounting. Size
+/// validation against the WebSocket limit uses a fallible serialization path
+/// so a serialization failure cannot be mistaken for an empty message.
 pub fn wire_size(message: &HaMessage) -> usize {
     message.to_json().map_or(0, |json| json.len())
 }

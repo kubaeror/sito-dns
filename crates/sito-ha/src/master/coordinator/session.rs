@@ -19,10 +19,22 @@ where
     let Some(text) = frame_text(&frame) else {
         // Ping/Pong/Close and other non-text frames cannot carry the opening
         // Hello. Report them distinctly from a timeout or closed connection so
-        // an operator can tell a protocol mismatch from a vanished peer.
+        // an operator can tell a protocol mismatch from a vanished peer. Log
+        // only the frame kind and size: a pre-Hello binary frame can be up to
+        // the WebSocket limit and must not be dumped into the log.
+        let (kind, len) = match &frame {
+            WsMessage::Text(text) => ("text", text.len()),
+            WsMessage::Binary(bytes) => ("binary", bytes.len()),
+            WsMessage::Ping(bytes) => ("ping", bytes.len()),
+            WsMessage::Pong(bytes) => ("pong", bytes.len()),
+            WsMessage::Close(_) => ("close", 0),
+            WsMessage::Frame(_) => ("raw", 0),
+        };
         warn!(
             peer = %peer_addr,
-            "Unsupported frame before Hello (expected a text JSON frame): {frame:?}"
+            frame_kind = kind,
+            frame_len = len,
+            "Unsupported frame before Hello (expected a text JSON frame)"
         );
         return None;
     };
