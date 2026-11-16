@@ -1,33 +1,7 @@
-//! Master listener bootstrap and per-message write deadlines.
+//! Master listener bootstrap.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
-
-/// Sends one HA message to a replica with a hard write deadline.
-///
-/// A peer that stops reading must not pin the session task (or its queue)
-/// forever; the caller closes the session on timeout.
-pub(super) async fn send_master_message<S>(
-    ws_stream: &mut tokio_tungstenite::WebSocketStream<S>,
-    message: &HaMessage,
-    context: &str,
-) -> Result<(), HaError>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let json = message.to_json()?;
-    timeout(
-        WS_SEND_TIMEOUT,
-        ws_stream.send(WsMessage::Text(json.into())),
-    )
-    .await
-    .map_err(|_| {
-        HaError::Timeout(format!(
-            "HA master {context} send timed out after {WS_SEND_TIMEOUT:?}"
-        ))
-    })?
-    .map_err(|e| HaError::Connection(format!("Failed to send {context}: {e}")))
-}
 
 /// Maximum concurrently accepted slave connections (handshake + session).
 const MAX_SLAVE_CONNECTIONS: usize = 64;

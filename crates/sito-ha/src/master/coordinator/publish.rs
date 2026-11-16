@@ -109,7 +109,7 @@ impl MasterCoordinator {
     /// before it is persisted or broadcast. An oversized bundle must be an
     /// apply error, not a config that every slave rejects forever.
     pub(super) fn ensure_push_fits(push: &HaMessage) -> Result<(), HaError> {
-        let bytes = push.to_json()?.len();
+        let bytes = wire_size(push);
         if bytes > MAX_WS_MESSAGE_SIZE {
             return Err(HaError::BundleTooLarge {
                 bytes,
@@ -332,7 +332,7 @@ impl MasterCoordinator {
     /// Returns the number of slaves for which delivery was queued (a full
     /// queue with a coalesced fallback task counts as queued).
     pub fn broadcast(&self, msg: &HaMessage) -> usize {
-        let wire_size = msg.to_json().map_or(0, |json| json.len());
+        let message_bytes = wire_size(msg);
         let mut notified = 0;
         let slaves = sito_core::sync::lock_or_recover(&self.slaves);
         let mut queued = sito_core::sync::lock_or_recover(&self.queued_bytes);
@@ -340,14 +340,14 @@ impl MasterCoordinator {
             let instance = &slave.instance;
             let session = (instance.clone(), slave.connection_id);
             let current = queued.get(&session).copied().unwrap_or(0);
-            if wire_size > 0 && current.saturating_add(wire_size) > MAX_SLAVE_QUEUE_BYTES {
+            if message_bytes > 0 && current.saturating_add(message_bytes) > MAX_SLAVE_QUEUE_BYTES {
                 // The per-slave byte budget is exhausted even though the
                 // message-count channel may still have room: coalesce instead
                 // of letting a slow peer pin tens of MiB of bundles.
                 warn!(
                     instance = %instance,
                     queued_bytes = current,
-                    message_bytes = wire_size,
+                    message_bytes,
                     limit = MAX_SLAVE_QUEUE_BYTES,
                     "HA push byte budget exhausted; scheduling coalesced delivery"
                 );
@@ -357,8 +357,8 @@ impl MasterCoordinator {
             }
             match slave.sender.try_send(msg.clone()) {
                 Ok(()) => {
-                    if wire_size > 0 {
-                        *queued.entry(session).or_insert(0) += wire_size;
+                    if message_bytes > 0 {
+                        *queued.entry(session).or_insert(0) += message_bytes;
                     }
                     notified += 1;
                 }
@@ -479,7 +479,7 @@ impl MasterCoordinator {
                 .clone()
                 .or(Some(fallback));
             if let Some(latest) = latest {
-                let size = latest.to_json().map_or(0, |json| json.len());
+                let size = wire_size(&latest);
                 // Wait only while this exact session still owns the active
                 // entry. After a reconnect the old task must not wait on,
                 // deliver to, or charge the replacement session.
@@ -555,12 +555,12 @@ impl MasterCoordinator {
                     .map(|slave| (slave.sender.clone(), slave.connection_id))
             };
             if let Some((sender, connection_id)) = target {
-                let wire_size = push.to_json().map_or(0, |json| json.len());
+                let push_bytes = wire_size(&push);
                 if let Err(e) = self.try_queue_accounted(
                     instance,
                     connection_id,
                     &sender,
-                    wire_size,
+                    push_bytes,
                     push.clone(),
                 ) {
                     warn!(

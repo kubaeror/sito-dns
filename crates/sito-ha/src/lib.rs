@@ -13,6 +13,7 @@ pub mod error;
 pub mod master;
 pub mod protocol;
 pub mod readiness;
+pub mod session;
 pub mod slave;
 pub mod transport;
 

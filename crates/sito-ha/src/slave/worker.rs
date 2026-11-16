@@ -1,6 +1,6 @@
 //! Background slave replication worker and state apply coordinator.
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
 use std::future::Future;
@@ -29,10 +29,10 @@ use crate::config::HaConfig;
 use crate::crypto::parse_public_key;
 use crate::error::HaError;
 use crate::protocol::{AckConflict, HaMessage, UpstreamReport};
+use crate::session::{frame_text, send_frame, send_ha_message};
 use crate::slave::state::{SlaveState, SlaveStatusTracker};
 use crate::transport::{
-    ExponentialBackoff, SLAVE_HANDSHAKE_TIMEOUT, WS_SEND_TIMEOUT, build_client_tls_config,
-    ws_config,
+    ExponentialBackoff, SLAVE_HANDSHAKE_TIMEOUT, build_client_tls_config, ws_config,
 };
 
 /// Applies and persists a configuration pushed by the master.
@@ -1036,12 +1036,7 @@ where
         role: Some("slave".to_string()),
         protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
     };
-    send_slave_message(
-        &mut ws_stream,
-        WsMessage::Text(hello.to_json()?.into()),
-        "Hello",
-    )
-    .await?;
+    send_ha_message(&mut ws_stream, &hello, "slave", "Hello").await?;
 
     tracker.set_state(SlaveState::HelloSent);
     info!(
@@ -1113,7 +1108,7 @@ where
                     role: Some("slave".to_string()),
                     protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
                 };
-                send_slave_message(&mut ws_stream, WsMessage::Text(hello.to_json()?.into()), "resync Hello").await?;
+                send_ha_message(&mut ws_stream, &hello, "slave", "resync Hello").await?;
             }
 
             _ = stats_ticker.tick() => {
@@ -1125,33 +1120,25 @@ where
                 let (stats, snapshot) =
                     build_stats_report(&handles.metrics, &last_stats_snapshot, window_s);
                 last_stats_snapshot = snapshot;
-                if let Ok(json) = stats.to_json() {
-                    send_slave_message(&mut ws_stream, WsMessage::Text(json.into()), "stats report").await?;
-                }
+                send_ha_message(&mut ws_stream, &stats, "slave", "stats report").await?;
             }
 
             msg_opt = ws_stream.next() => {
                 last_frame = Instant::now();
                 match msg_opt {
-                    Some(Ok(WsMessage::Text(txt))) => {
-                        handle_master_message(&txt, &mut ws_stream, tracker, handles, master_pubkey).await?;
-                        // An apply can take longer than the liveness deadline;
-                        // the frame arrived in time, so restart the clock after
-                        // processing it instead of falsely timing out.
-                        last_frame = Instant::now();
-                    }
-                    Some(Ok(WsMessage::Binary(bin))) => {
-                        if let Ok(txt) = std::str::from_utf8(&bin) {
-                            handle_master_message(txt, &mut ws_stream, tracker, handles, master_pubkey).await?;
+                    Some(Ok(frame)) => {
+                        if let Some(text) = frame_text(&frame) {
+                            handle_master_message(text, &mut ws_stream, tracker, handles, master_pubkey).await?;
+                            // An apply can take longer than the liveness deadline;
+                            // the frame arrived in time, so restart the clock after
+                            // processing it instead of falsely timing out.
                             last_frame = Instant::now();
+                        } else if let WsMessage::Ping(p) = frame {
+                            send_frame(&mut ws_stream, WsMessage::Pong(p), "slave", "Pong").await?;
+                        } else if let WsMessage::Close(_) = frame {
+                            info!("Master closed replication WebSocket connection");
+                            return Ok(());
                         }
-                    }
-                    Some(Ok(WsMessage::Ping(p))) => {
-                        send_slave_message(&mut ws_stream, WsMessage::Pong(p), "Pong").await?;
-                    }
-                    Some(Ok(WsMessage::Close(_))) => {
-                        info!("Master closed replication WebSocket connection");
-                        return Ok(());
                     }
                     Some(Err(e)) => {
                         return Err(HaError::Connection(format!("WebSocket receive error: {e}")));
@@ -1160,36 +1147,12 @@ where
                         info!("Replication connection closed by peer");
                         return Ok(());
                     }
-                    _ => {}
                 }
             }
         }
     }
 
     Ok(())
-}
-
-/// Sends one WebSocket message with a hard write deadline.
-///
-/// A slow or stalled peer must not pin the replication task (and its queues)
-/// forever; `WS_SEND_TIMEOUT` is the same budget as the connect/handshake
-/// path.
-async fn send_slave_message<S>(
-    ws_stream: &mut tokio_tungstenite::WebSocketStream<S>,
-    message: WsMessage,
-    context: &str,
-) -> Result<(), HaError>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    tokio::time::timeout(WS_SEND_TIMEOUT, ws_stream.send(message))
-        .await
-        .map_err(|_| {
-            HaError::Timeout(format!(
-                "HA slave {context} send timed out after {WS_SEND_TIMEOUT:?}"
-            ))
-        })?
-        .map_err(|e| HaError::Connection(format!("Failed to send {context}: {e}")))
 }
 
 /// Builds a window-scoped stats report from the registry and the snapshot
@@ -1244,13 +1207,13 @@ where
     let msg = HaMessage::from_json(text)?;
     macro_rules! send_ack {
         ($ack:expr) => {
-            send_slave_message(ws_stream, WsMessage::Text($ack.to_json()?.into()), "Ack").await?
+            send_ha_message(ws_stream, &$ack, "slave", "Ack").await?
         };
     }
     match msg {
         HaMessage::Ping { ts } => {
             let pong = HaMessage::Pong { ts };
-            send_slave_message(ws_stream, WsMessage::Text(pong.to_json()?.into()), "Pong").await?;
+            send_ha_message(ws_stream, &pong, "slave", "Pong").await?;
         }
         HaMessage::ConfigPush {
             ref version,
@@ -1487,6 +1450,7 @@ where
 mod tests {
     use super::*;
     use crate::bundle::build_and_sign_push;
+    use futures_util::SinkExt;
 
     #[tokio::test]
     async fn test_slave_missing_master_url_records_startup_noop() {

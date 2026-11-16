@@ -7,7 +7,7 @@
 //! Master HA coordinator managing connected replica slaves and configuration push dissemination.
 
 use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -32,7 +32,8 @@ use crate::error::HaError;
 use crate::master::tracker::{ActiveSlave, SlaveStatsSummary, SlaveSummary};
 use crate::protocol::{AckConflict, HaMessage};
 use crate::readiness::{HaReadiness, HaReadinessState};
-use crate::transport::{MAX_WS_MESSAGE_SIZE, WS_SEND_TIMEOUT, build_server_tls_config, ws_config};
+use crate::session::{frame_text, send_ha_message, wire_size};
+use crate::transport::{MAX_WS_MESSAGE_SIZE, build_server_tls_config, ws_config};
 
 pub use sito_ha_types::status::{PublishOutcome, ResyncOutcome};
 
@@ -225,7 +226,6 @@ mod session;
 mod session_state;
 mod state;
 
-use server::send_master_message;
 pub use server::spawn_master_server;
 use session_state::{HeartbeatAction, HelloFields, SessionMachine};
 

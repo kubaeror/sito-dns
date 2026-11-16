@@ -11,59 +11,39 @@ async fn read_hello<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    match tokio::time::timeout(Duration::from_secs(10), ws_stream.next()).await {
-        Ok(Some(Ok(WsMessage::Text(txt)))) => match HaMessage::from_json(&txt) {
-            Ok(HaMessage::Hello {
-                instance,
-                have_version,
-                have_term,
-                capabilities,
-                token,
-                role,
-                protocol_version,
-            }) => Some(HelloFields {
-                instance,
-                have_version,
-                have_term,
-                capabilities,
-                token,
-                role,
-                protocol_version,
-            }),
-            Ok(other) => {
-                warn!(peer = %peer_addr, "Unexpected message instead of Hello: {other:?}");
-                None
-            }
-            Err(e) => {
-                warn!(peer = %peer_addr, "Invalid Hello message JSON: {e}");
-                None
-            }
-        },
-        Ok(Some(Ok(WsMessage::Binary(bin)))) => {
-            let txt = std::str::from_utf8(&bin).ok()?;
-            match HaMessage::from_json(txt) {
-                Ok(HaMessage::Hello {
-                    instance,
-                    have_version,
-                    have_term,
-                    capabilities,
-                    token,
-                    role,
-                    protocol_version,
-                }) => Some(HelloFields {
-                    instance,
-                    have_version,
-                    have_term,
-                    capabilities,
-                    token,
-                    role,
-                    protocol_version,
-                }),
-                _ => None,
-            }
+    let Ok(Some(Ok(frame))) = tokio::time::timeout(Duration::from_secs(10), ws_stream.next()).await
+    else {
+        warn!(peer = %peer_addr, "Timed out or connection closed before Hello received");
+        return None;
+    };
+    let Some(text) = frame_text(&frame) else {
+        warn!(peer = %peer_addr, "Timed out or connection closed before Hello received");
+        return None;
+    };
+    match HaMessage::from_json(text) {
+        Ok(HaMessage::Hello {
+            instance,
+            have_version,
+            have_term,
+            capabilities,
+            token,
+            role,
+            protocol_version,
+        }) => Some(HelloFields {
+            instance,
+            have_version,
+            have_term,
+            capabilities,
+            token,
+            role,
+            protocol_version,
+        }),
+        Ok(other) => {
+            warn!(peer = %peer_addr, "Unexpected message instead of Hello: {other:?}");
+            None
         }
-        _ => {
-            warn!(peer = %peer_addr, "Timed out or connection closed before Hello received");
+        Err(e) => {
+            warn!(peer = %peer_addr, "Invalid Hello message JSON: {e}");
             None
         }
     }
@@ -99,9 +79,8 @@ impl MasterCoordinator {
             tokio::select! {
                 // Outgoing messages queued for this slave
                 Some(msg) = rx.recv() => {
-                    let wire_size = msg.to_json().map_or(0, |json| json.len());
-                    session.account_drained(wire_size);
-                    if send_master_message(&mut ws_stream, &msg, "configuration push").await.is_err() {
+                    session.account_drained(wire_size(&msg));
+                    if send_ha_message(&mut ws_stream, &msg, "master", "configuration push").await.is_err() {
                         break;
                     }
                 }
@@ -125,7 +104,7 @@ impl MasterCoordinator {
                         }
                         HeartbeatAction::Ping(ts) => {
                             let ping = HaMessage::Ping { ts };
-                            if send_master_message(&mut ws_stream, &ping, "heartbeat ping").await.is_err() {
+                            if send_ha_message(&mut ws_stream, &ping, "master", "heartbeat ping").await.is_err() {
                                 break;
                             }
                         }
@@ -135,21 +114,23 @@ impl MasterCoordinator {
                 // Incoming messages from slave
                 msg_opt = ws_stream.next() => {
                     match msg_opt {
-                        Some(Ok(WsMessage::Text(txt))) => {
-                            if !session.on_text(&txt) {
-                                break;
-                            }
-                        }
-                        Some(Ok(WsMessage::Binary(bin))) => {
-                            if let Ok(txt) = std::str::from_utf8(&bin)
-                                && !session.on_text(txt) {
+                        Some(Ok(frame)) => {
+                            if let Some(txt) = frame_text(&frame) {
+                                if !session.on_text(txt) {
                                     break;
                                 }
+                            } else {
+                                match frame {
+                                    WsMessage::Pong(_) => session.record_pong(),
+                                    WsMessage::Close(_) => {
+                                        info!(instance = %session.state.slave_instance, "Replica slave disconnected");
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
-                        Some(Ok(WsMessage::Pong(_))) => {
-                            session.record_pong();
-                        }
-                        Some(Ok(WsMessage::Close(_))) | None => {
+                        None => {
                             info!(instance = %session.state.slave_instance, "Replica slave disconnected");
                             break;
                         }
@@ -157,7 +138,6 @@ impl MasterCoordinator {
                             warn!(instance = %session.state.slave_instance, "WebSocket receive error: {e}");
                             break;
                         }
-                        _ => {}
                     }
                 }
             }
