@@ -5,6 +5,7 @@
 
 pub mod acme;
 pub mod dnssec;
+#[cfg(feature = "ha")]
 pub mod ha;
 pub mod net;
 pub mod tls;

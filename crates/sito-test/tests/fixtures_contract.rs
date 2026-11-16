@@ -240,6 +240,7 @@ async fn manual_clock_drives_a_deterministic_mock_upstream_delay() {
     decode_message(&buffer[..len]).expect("decode second response");
 }
 
+#[cfg(feature = "ha")]
 #[tokio::test]
 async fn fake_master_stops_cleanly_before_a_slave_connects() {
     use sito_test::fixtures::ha::FakeMaster;
@@ -251,6 +252,7 @@ async fn fake_master_stops_cleanly_before_a_slave_connects() {
         .expect("wait_stopped must not hang in accept()");
 }
 
+#[cfg(feature = "ha")]
 #[tokio::test]
 async fn fake_master_heartbeat_is_driven_by_the_manual_clock() {
     use futures_util::SinkExt as _;

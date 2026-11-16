@@ -18,7 +18,7 @@ sito-filter.workspace = true
 sito-dnssec.workspace = true
 sito-clients.workspace = true
 sito-rewrites.workspace = true
-sito-ha.workspace = true
+sito-ha = { workspace = true, optional = true }
 sito-test-support.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true
@@ -54,9 +54,10 @@ subtle.workspace = true
 [features]
 default = []
 embed-ui = ["sito-api/embed-ui", "sito/embed-ui"]
-# HA acceptance tests drive `sito`'s HA server paths, so they need the binary
-# feature. Enabled by `--all-features`; default workspace builds stay no-HA.
-ha = ["sito/ha"]
+# HA acceptance tests drive `sito`'s HA server paths and the `sito-ha` protocol
+# types, so they need both features. Enabled by `--all-features`; default
+# workspace builds stay no-HA and do not even link `sito-ha`.
+ha = ["dep:sito-ha", "sito/ha"]
 
 [dev-dependencies]
 criterion.workspace = true
