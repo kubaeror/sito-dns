@@ -79,7 +79,7 @@ SECTIONS: dict[int, tuple[str, list[tuple[str, str]]]] = {
             ("crates/sito-core/src/config/schema.rs", "PrivacyConfig"),
         ],
     ),
-    13: ("`[ha]`", [("crates/sito-ha/src/config.rs", "HaConfig")]),
+    13: ("`[ha]`", [("crates/sito-ha-types/src/config.rs", "HaConfig")]),
     14: ("`[integrations.mikrotik]`", [("crates/sito-clients/src/routeros.rs", "RouterOsConfig")]),
     15: (
         "`[integrations.lists]`",

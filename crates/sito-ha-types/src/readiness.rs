@@ -9,6 +9,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+/// Locks a mutex, silently recovering from poisoning.
+///
+/// The readiness flag and reason are advisory status, not safety-critical
+/// state: a panic in another replication task must not turn every later status
+/// read into a panic, so a poisoned lock keeps serving its last value.
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

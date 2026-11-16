@@ -143,6 +143,30 @@ mod tests {
         validate_typed_sections(&config).expect("valid sections");
     }
 
+    #[test]
+    fn test_validates_typed_ha_section() {
+        let mut valid =
+            Config::from_toml_str("config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n")
+                .expect("parses");
+        valid.ha = Some(
+            toml::from_str(
+                "replication_port = 8953\nallow_insecure_ws = true\nslave_token = \"secret\"\n",
+            )
+            .expect("valid [ha] table"),
+        );
+        validate_typed_sections(&valid).expect("a valid master [ha] section is accepted");
+
+        let mut invalid =
+            Config::from_toml_str("config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n")
+                .expect("parses");
+        invalid.ha = Some(
+            toml::from_str("replication_port = \"not-a-port\"\n").expect("malformed [ha] table"),
+        );
+        let err =
+            validate_typed_sections(&invalid).expect_err("a malformed [ha] section is rejected");
+        assert!(err.to_string().contains("[ha]"), "got: {err}");
+    }
+
     /// RouterOS is an optional integration. A build without the `routeros`
     /// feature must reject `integrations.mikrotik.enabled = true` instead of
     /// silently ignoring the knob at startup. The capability is exercised

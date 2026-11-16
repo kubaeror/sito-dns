@@ -84,8 +84,11 @@ pub(super) fn init_ha(
     metrics: &sito_stats::MetricsRegistry,
     shutdown_rx: &watch::Receiver<bool>,
 ) -> anyhow::Result<HaRuntime> {
-    let ha_config = sito_ha::config_from(config)
+    let ha_config = sito_ha::config_from_unvalidated(config)
         .map_err(|e| anyhow::anyhow!("Invalid HA configuration: {e}"))?;
+    ha_config
+        .validate(&config.server.role)
+        .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
 
     let (master_coordinator, slave_tracker, resync_sender, resync_receiver) = if config.server.role
         == "master"

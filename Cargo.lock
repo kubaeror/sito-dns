@@ -3324,7 +3324,6 @@ dependencies = [
  "sito-stats",
  "sito-test-support",
  "subtle",
- "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.30.0",

@@ -65,6 +65,18 @@ mod tests {
         assert!(!config.allow_unpinned_tls);
         assert!(!config.allow_insecure_ws);
 
+        let config_json = serde_json::to_string(&config).expect("serialize HaConfig");
+        assert_eq!(
+            serde_json::from_str::<HaConfig>(&config_json).expect("parse HaConfig"),
+            config
+        );
+
+        let synced_json = serde_json::to_string(&SlaveState::Synced).expect("serialize state");
+        assert_eq!(
+            serde_json::from_str::<SlaveState>(&synced_json).expect("parse state"),
+            SlaveState::Synced
+        );
+
         let bundle = ConfigBundle {
             version: 1,
             term: 2,
@@ -108,6 +120,21 @@ mod tests {
         assert_eq!(SlaveState::Synced.to_string(), "synced");
         assert!(HaReadiness::ready().ready);
         assert_eq!(PROTOCOL_VERSION, 1);
+    }
+
+    #[test]
+    fn crate_manifest_does_not_depend_on_the_runtime_implementation() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../Cargo.toml")).expect("valid crate manifest");
+        for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            assert!(
+                manifest
+                    .get(table)
+                    .and_then(toml::Value::as_table)
+                    .is_none_or(|deps| !deps.contains_key("sito-ha")),
+                "sito-ha-types must not depend on sito-ha in [{table}]"
+            );
+        }
     }
 
     #[test]

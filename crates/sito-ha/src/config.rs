@@ -59,8 +59,10 @@ slave_token = "secret"
 
     #[test]
     fn parses_and_validates_the_configured_section() {
-        let mut config = Config::default();
-        config.ha = Some(valid_master_ha());
+        let config = Config {
+            ha: Some(valid_master_ha()),
+            ..Config::default()
+        };
         let ha = config_from(&config).expect("valid master config");
         assert_eq!(ha.replication_port, 8953);
         assert_eq!(ha.slave_token.as_deref(), Some("secret"));
@@ -71,7 +73,22 @@ slave_token = "secret"
         let mut config = Config::default();
         config.server.role = "slave".to_string();
         config.ha = Some(toml::from_str("replication_port = 8953").expect("table"));
-        assert!(config_from(&config).is_err());
+        match config_from(&config) {
+            Err(HaError::Validation { field, .. }) => assert_eq!(field, "master_pubkey"),
+            other => panic!("expected a role-validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_section_is_a_validation_error() {
+        let config = Config {
+            ha: Some(toml::from_str("replication_port = \"not-a-port\"").expect("table")),
+            ..Config::default()
+        };
+        match config_from(&config) {
+            Err(HaError::Validation { field, .. }) => assert_eq!(field, "ha"),
+            other => panic!("expected a parse validation error, got {other:?}"),
+        }
     }
 
     #[test]
