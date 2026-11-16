@@ -87,6 +87,10 @@ impl VerifyBudget {
 /// Used by [`DnssecValidator::validate_with_key_fetcher`], which exists for
 /// callers that do not have their own per-query deadline. The resolver
 /// pipeline passes its own absolute deadline instead.
+///
+/// This is deliberately the same 5s as `DNSSEC_VALIDATION_DEADLINE` in
+/// `crates/sito/src/pipeline/query.rs`; keep the two in sync so the
+/// compatibility wrapper and the resolver pipeline enforce the same bound.
 pub const DEFAULT_KEY_FETCH_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Per-query budget for DNSSEC DS/DNSKEY fetches.

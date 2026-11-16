@@ -169,6 +169,7 @@ use sito_core::error::UpstreamError;
 struct StaticFetcher {
     responses: std::collections::HashMap<(LowerName, RecordType), Message>,
     calls: std::sync::atomic::AtomicUsize,
+    seen: std::sync::Mutex<Vec<(LowerName, RecordType, Instant)>>,
 }
 
 impl StaticFetcher {
@@ -176,6 +177,7 @@ impl StaticFetcher {
         Self {
             responses: std::collections::HashMap::new(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -188,6 +190,11 @@ impl StaticFetcher {
     fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Every `(name, rtype, deadline)` the fetcher was handed, in call order.
+    fn seen(&self) -> Vec<(LowerName, RecordType, Instant)> {
+        self.seen.lock().expect("fetch log").clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -196,9 +203,13 @@ impl DnssecKeyFetcher for StaticFetcher {
         &self,
         name: &Name,
         rtype: RecordType,
-        _deadline: Instant,
+        deadline: Instant,
     ) -> Result<Message, UpstreamError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.seen
+            .lock()
+            .expect("fetch log")
+            .push((LowerName::from(name), rtype, deadline));
         Ok(self
             .responses
             .get(&(LowerName::from(name), rtype))
@@ -966,6 +977,78 @@ async fn test_chain_fetch_resolves_ds_delegation() {
         response.additionals.is_empty(),
         "unexpected additionals: {:?}",
         response.additionals
+    );
+}
+
+#[tokio::test]
+async fn test_chain_fetch_passes_budget_deadline_to_fetches() {
+    use hickory_proto::dnssec::DigestType;
+    use hickory_proto::rr::RecordSet;
+
+    let (parent, parent_key, parent_signer) = create_test_signer("example.");
+    let (child, child_key, child_signer) = create_test_signer("sub.example.");
+
+    let (answer, answer_sig) = signed_a_response(&child, &child_signer);
+
+    let ds = DS::from_key(child_key.public_key(), &child, DigestType::SHA256).unwrap();
+    let ds_record = Record::from_rdata(child.clone(), 300, RData::DNSSEC(DNSSECRData::DS(ds)));
+    let mut ds_set = RecordSet::new(child.clone(), RecordType::DS, 0);
+    ds_set.insert(ds_record.clone(), 0);
+    let ds_sig = sign_test_rrset(&ds_set, &parent_signer);
+    let mut ds_message = Message::new(0, MessageType::Response, OpCode::Query);
+    ds_message.authorities.push(ds_record);
+    ds_message.authorities.push(ds_sig);
+
+    let fetcher = StaticFetcher::new()
+        .with(
+            &child,
+            RecordType::DNSKEY,
+            fetched_dnskey_message(&child, &[child_key], None),
+        )
+        .with(&child, RecordType::DS, ds_message)
+        .with(
+            &parent,
+            RecordType::DNSKEY,
+            fetched_dnskey_message(&parent, std::slice::from_ref(&parent_key), None),
+        );
+
+    let mut anchors = TrustAnchors::empty();
+    anchors.insert_with_name(parent_key.public_key(), LowerName::from(&parent));
+    let validator =
+        DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+    let mut response = Message::new(23, MessageType::Response, OpCode::Query);
+    response
+        .queries
+        .push(Query::query(child.clone(), RecordType::A));
+    response.answers.push(answer);
+    response.answers.push(answer_sig);
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcome = validator
+        .validate_with_key_fetcher_deadline(&mut response, Some("test"), now, &fetcher, deadline)
+        .await;
+
+    assert_eq!(outcome, ValidationOutcome::Secure);
+    let seen = fetcher.seen();
+    assert!(
+        seen.len() >= 2,
+        "the chain walk must issue at least two fetches: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|(_, rtype, _)| *rtype == RecordType::DNSKEY),
+        "the chain walk must fetch a DNSKEY RRset: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|(_, rtype, _)| *rtype == RecordType::DS),
+        "the chain walk must fetch a DS RRset: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .all(|(_, _, seen_deadline)| *seen_deadline == deadline),
+        "fetch_zone_chain must pass budget.deadline() to every fetch: {seen:?}"
     );
 }
 
@@ -4561,6 +4644,10 @@ async fn test_validate_with_key_fetcher_default_deadline_is_bounded() {
 
     let seen = fetcher.deadlines();
     assert!(!seen.is_empty(), "the compatibility wrapper must fetch");
+    assert!(
+        seen.iter().all(|seen| *seen >= before),
+        "the default deadline must not be in the past: {seen:?}"
+    );
     // Scheduling slack only; the default must stay close to the call time.
     let upper = before + DEFAULT_KEY_FETCH_DEADLINE + Duration::from_millis(100);
     assert!(

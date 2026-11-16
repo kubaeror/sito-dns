@@ -9,6 +9,10 @@ use super::*;
 /// The fetcher performs network I/O and an upstream can stall a response (or
 /// an attacker can black-hole DS/DNSKEY queries). A bound here keeps one query
 /// from pinning a worker for the upstream timeout times the chain depth.
+///
+/// Keep this in sync with `DEFAULT_KEY_FETCH_DEADLINE` in `sito-dnssec`
+/// (`crates/sito-dnssec/src/lib.rs`): both are 5s, and the compatibility
+/// wrapper relies on the same bound as this pipeline.
 pub(super) const DNSSEC_VALIDATION_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(5);
 

@@ -906,9 +906,11 @@ impl DnssecValidator {
     /// result is converted to the same fail-closed outcome
     /// [`Self::validate_with_key_fetcher`] produces after its fetch: Bogus with
     /// SERVFAIL and no answer. Direct library callers that want to try the
-    /// chain walk must use [`Self::validate_with_key_fetcher`]; callers that
-    /// intentionally serve unvalidated data use [`DnssecMode::LogOnly`], which
-    /// keeps `Indeterminate` with AD=0.
+    /// chain walk must use [`Self::validate_with_key_fetcher`], or
+    /// [`Self::validate_with_key_fetcher_deadline`] when they already have an
+    /// absolute per-query deadline; callers that intentionally serve
+    /// unvalidated data use [`DnssecMode::LogOnly`], which keeps
+    /// `Indeterminate` with AD=0.
     ///
     /// `validate_response_inner` returns `Indeterminate` provisionally so the
     /// chain-walking caller can still fetch keys. This entry point is the

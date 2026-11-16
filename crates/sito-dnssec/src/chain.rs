@@ -461,6 +461,13 @@ impl DnssecValidator {
         now: u32,
         deadline: Instant,
     ) -> DelegationProof {
+        // The deadline is an absolute per-query bound. `fetch_zone_chain` and
+        // the fetch helpers check it before every query, but a caller-supplied
+        // fetcher contract violation must not let this probe start work after
+        // expiry either: fail closed instead.
+        if Instant::now() >= deadline {
+            return DelegationProof::Unknown;
+        }
         let cached_start = self.chain_cache.closest_signed(name, now);
         let memory_start = self.closest_signed_zone(name, now);
         let start = match (memory_start, cached_start) {
@@ -741,6 +748,11 @@ impl DnssecValidator {
         now: u32,
         deadline: Instant,
     ) -> Option<(LowerName, Vec<DNSKEY>)> {
+        // Never start a key walk (or call the fetcher) after the shared query
+        // deadline has passed; callers treat `None` as fail-closed.
+        if Instant::now() >= deadline {
+            return None;
+        }
         let cached = self.key_cache.validated_keys(target, now);
         if !cached.is_empty() {
             return Some((target.clone(), cached));
