@@ -106,8 +106,13 @@ strip = true             # Strips symbol tables and debuginfo
 For production environments, building `sito` with the optional `mimalloc` feature eliminates memory fragmentation caused by frequent cache evictions and dynamic list compilation:
 
 ```bash
-cargo build --release --locked --features "embed-ui,mimalloc"
+cargo build --release --locked --features "embed-ui,ha,mimalloc"
 ```
+
+The official release archives and container image enable `embed-ui,ha,mimalloc`;
+`ha` is opt-in for a source build. Omit it only when you intentionally want a
+no-HA binary (it then rejects `[ha]`/replica roles and returns
+`501 ha_not_supported` from the HA API).
 
 ### 4.3 Profile-Guided Optimization (PGO)
 For environments demanding every last drop of performance, compile with PGO:
@@ -118,7 +123,7 @@ For environments demanding every last drop of performance, compile with PGO:
    ```
 2. Build instrumented binary:
    ```bash
-   cargo pgo build --release --features "mimalloc"
+   cargo pgo build --release --features "embed-ui,ha,mimalloc"
    ```
 3. Run representative benchmark load for 5 minutes:
    ```bash
@@ -128,6 +133,6 @@ For environments demanding every last drop of performance, compile with PGO:
    ```
 4. Build optimized binary with captured profile:
    ```bash
-   cargo pgo optimize --release --features "mimalloc"
+   cargo pgo optimize --release --features "embed-ui,ha,mimalloc"
    ```
 PGO provides an additional **8% to 15% throughput gain** by optimizing branch prediction and instruction cache locality for DNS query dispatch paths.

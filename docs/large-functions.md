@@ -15,9 +15,9 @@ change: state why the function cannot be split without changing behavior.
 
 | Function | File | Lines | Reason |
 |---|---|---|---|
-| `main` | `crates/sito/src/main.rs` | 335 | CLI dispatch and startup orchestration; each arm owns process-level setup/teardown. Splitting would duplicate the async runtime and error-exit handling. |
-| `run_server_with_lease` | `crates/sito/src/server/startup.rs` | 529 | Ordered startup transaction from the caller-held service lease to listener bind and watcher registration. A stage cannot be skipped or retried independently, and a failed stage must still run the corresponding cleanup. `run_server_full` is a thin convenience wrapper that acquires the lease first. |
-| `init_tls_and_acme` | `crates/sito/src/server/tls.rs` | 244 | TLS/ACME bootstrap ordering: choose material, build acceptors, bind challenge listeners, then start renewal. The fail-closed decisions depend on the preceding stage's result. |
+| `main` | `crates/sito/src/main.rs` | 336 | CLI dispatch and startup orchestration; each arm owns process-level setup/teardown. Splitting would duplicate the async runtime and error-exit handling. |
+| `run_server_with_lease` | `crates/sito/src/server/startup.rs` | 563 | Ordered startup transaction from the caller-held service lease to listener bind and watcher registration. A stage cannot be skipped or retried independently, and a failed stage must still run the corresponding cleanup. `run_server_full` is a thin convenience wrapper that acquires the lease first. |
+| `init_tls_and_acme` | `crates/sito/src/server/tls.rs` | 263 | TLS/ACME bootstrap ordering: choose material, build acceptors, bind challenge listeners, then start renewal. The fail-closed decisions depend on the preceding stage's result. |
 | `with_config_and_storage_full` | `crates/sito-api/src/auth/manager/construction.rs` | 239 | Auth manager construction loads and validates every persisted store (users, sessions, tokens) under one consistency contract; partial construction is not a valid state. |
 | `insert_with_status_at_epochs` | `crates/sito-cache/src/cache.rs` | 223 | Cache insertion and the policy/filter epoch checks must remain atomic; splitting would expose an intermediate entry without its generation guard. |
 | `ds_response_status` | `crates/sito-dnssec/src/chain.rs` | 272 | DS response classification walks answers/authorities with authenticated denial and signature checks; the classification is one decision, not independent stages. |

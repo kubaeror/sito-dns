@@ -132,9 +132,15 @@ The one-line installer and published container tags above install the **stable
 (or from a prerelease image when one is published):
 
 ```bash
-cargo build --release --locked --features "embed-ui,mimalloc"
+cargo build --release --locked --features "embed-ui,ha,mimalloc"
 sudo install -m 0755 target/release/sito /usr/local/bin/sito
 ```
+
+Official release archives and the container image enable `embed-ui,ha,mimalloc`.
+`ha` is opt-in for source builds; the command above matches the official
+feature set. Drop `ha` only for a deliberate no-HA build: it runs as a master,
+rejects `[ha]`/`server.role = "slave"`, answers `/api/v1/ha/*` with
+`501 ha_not_supported`, and omits `sito ha gen-certs`.
 
 2.0 uses config v2. A new install starts from the [safe defaults](2.0-migration.md#44-safe-defaults-vs-behavior-preserving-upgrade);
 an existing 1.9.x config must be migrated before the 2.0 binary will start:

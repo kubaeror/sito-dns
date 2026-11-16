@@ -181,8 +181,8 @@ install, use the pinned 1.9.5 installer or image above and follow the
 [2.0 migration guide](docs/2.0-migration.md) when moving to 2.0.
 
 ```bash
-# Build release binary with embedded Web UI and mimalloc allocator
-cargo build --release --locked --features "embed-ui,mimalloc"
+# Build release binary with embedded Web UI, HA replication and mimalloc allocator
+cargo build --release --locked --features "embed-ui,ha,mimalloc"
 
 # Verify configuration (if an existing config.toml is provided)
 ./target/release/sito check-config --config /etc/sito/config.toml
@@ -195,6 +195,12 @@ cargo build --release --locked --features "embed-ui,mimalloc"
 # once), binds the panel to loopback, and does not enable admin/adminadmin:
 ./target/release/sito --no-setup
 ```
+
+The command above matches the official release archives and container image,
+which are built with `embed-ui,ha,mimalloc`. HA is **opt-in** for source builds:
+omit `ha` if you intentionally want a no-HA binary. A no-HA `sito` still runs as
+a master, but rejects `[ha]` and `server.role = "slave"` and answers
+`/api/v1/ha/*` with `501 ha_not_supported`; `sito ha gen-certs` is not present.
 
 ### 🧙 First-Time Setup Wizard
 On a fresh installation without a configuration file, **sito** starts in **setup-pending mode** on port `8080` (DNS listener ports 53/853/443 remain closed until initial setup is confirmed).
