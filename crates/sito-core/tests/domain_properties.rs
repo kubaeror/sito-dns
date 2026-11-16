@@ -23,7 +23,15 @@ fn ascii_label() -> impl Strategy<Value = String> {
 }
 
 fn ascii_domain() -> impl Strategy<Value = String> {
-    proptest::collection::vec(ascii_label(), 1..=4).prop_map(|labels| labels.join("."))
+    proptest::collection::vec(ascii_label(), 1..=4)
+        .prop_map(|labels| labels.join("."))
+        // The parser applies IDNA to operator-facing domains. A synthetic label
+        // starting with the reserved `xn--` prefix but not valid punycode is
+        // correctly rejected, so generating one would test the generator's
+        // invalid input rather than normalization.
+        .prop_filter("labels must not use the reserved IDNA xn-- prefix", |domain| {
+            !domain.split('.').any(|label| label.starts_with("xn--"))
+        })
 }
 
 fn wildcard_label() -> impl Strategy<Value = String> {
@@ -31,7 +39,12 @@ fn wildcard_label() -> impl Strategy<Value = String> {
 }
 
 fn wildcard_domain() -> impl Strategy<Value = String> {
-    proptest::collection::vec(wildcard_label(), 1..=4).prop_map(|labels| labels.join("."))
+    proptest::collection::vec(wildcard_label(), 1..=4)
+        .prop_map(|labels| labels.join("."))
+        .prop_filter(
+            "labels must not use the reserved IDNA xn-- prefix",
+            |domain| !domain.split('.').any(|label| label.starts_with("xn--")),
+        )
 }
 
 /// Labels drawn from a small IDN alphabet. The strategy avoids combining
