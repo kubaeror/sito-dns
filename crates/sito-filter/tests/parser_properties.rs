@@ -17,6 +17,13 @@ fn property_config(cases: u32) -> ProptestConfig {
 fn ascii_domain() -> impl Strategy<Value = String> {
     proptest::collection::vec("[a-z0-9]([a-z0-9-]{0,10}[a-z0-9])?", 1..=3)
         .prop_map(|labels| labels.join("."))
+        // The parser applies IDNA to operator-facing domains. A synthetic label
+        // that starts with the reserved `xn--` prefix but is not valid punycode
+        // is correctly rejected, so generating one would test the generator's
+        // invalid input rather than the modifier-ordering property.
+        .prop_filter("labels must not use the reserved IDNA xn-- prefix", |domain| {
+            !domain.split('.').any(|label| label.starts_with("xn--"))
+        })
 }
 
 /// One modifier in wire order and its expected canonical representation.
