@@ -17,9 +17,10 @@ pub mod slave;
 pub mod transport;
 
 pub use bundle::{
-    AppliedWatermark, ConfigBundle, FilterListMetadata, build_and_sign_push, config_digest,
-    push_payload_hash, sanitize_config_for_bundle, scan_for_secrets, substitute_secrets,
-    verify_and_unpack_push, verify_and_unpack_push_with_watermark, watermark_covers,
+    AppliedWatermark, ConfigBundle, FilterListMetadata, build_and_sign_push, build_config_bundle,
+    config_digest, push_payload_hash, sanitize_config_for_bundle, sanitized_configs_equal,
+    scan_for_secrets, substitute_secrets, verify_and_unpack_push,
+    verify_and_unpack_push_with_watermark, watermark_covers,
 };
 pub use config::{HaConfig, config_from, config_from_unvalidated, readiness_required};
 pub use crypto::{

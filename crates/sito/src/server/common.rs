@@ -91,16 +91,6 @@ pub(super) fn canonical_config_path(path: &Path) -> PathBuf {
     }
 }
 
-/// Compares two sanitized bundle documents semantically, falling back to byte
-/// comparison when either side is not valid TOML. Used at master startup to
-/// decide whether `config.toml` still matches the persisted bundle.
-pub(super) fn sanitized_configs_equal(a: &str, b: &str) -> bool {
-    match (a.parse::<toml::Table>(), b.parse::<toml::Table>()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
-}
-
 /// Opens the stats database and initializes metrics, query logging, upstreams,
 /// cache and the filter engine together with their background tasks.
 /// Maps the filter crate's status into the metrics crate's primitive view

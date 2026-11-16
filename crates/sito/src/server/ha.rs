@@ -132,49 +132,24 @@ pub(super) fn init_ha(
                 )
             })?,
         };
-        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&initial_toml).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to sanitize '{}' for the HA bundle: {e}",
-                config_path.display()
-            )
-        })?;
-        if sanitized_toml.trim().is_empty() {
-            anyhow::bail!(
-                "Refusing to publish an empty initial HA bundle derived from '{}'",
-                config_path.display()
-            );
-        }
-        if let Some(ref token) = ha_config.slave_token
-            && let Err(e) = sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])
-        {
-            anyhow::bail!("Refusing to publish HA bundle with a leaked secret: {e}");
-        }
-        let list_metadata: Vec<sito_ha::FilterListMetadata> = config
-            .filtering
-            .lists
-            .iter()
-            .map(|l| sito_ha::FilterListMetadata {
-                name: l.name.clone(),
-                url: l.url.clone(),
-                enabled: l.enabled,
-                refresh_hours: l.refresh_hours,
-            })
-            .collect();
+        let known_secrets: Vec<&str> = ha_config.slave_token.as_deref().into_iter().collect();
 
         // Runs on every startup and on an explicit reconciliation: the bundle
         // is always built from the configuration currently on disk.
-        let build_bundle = |version: u64| -> sito_ha::ConfigBundle {
-            #[allow(clippy::cast_sign_loss)]
-            sito_ha::ConfigBundle {
+        let build_bundle = |version: u64| -> anyhow::Result<sito_ha::ConfigBundle> {
+            sito_ha::build_config_bundle(
+                config,
+                &initial_toml,
                 version,
-                term: coordinator.get_current_term(),
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-                config_toml: sanitized_toml.clone(),
-                custom_rules: config.filtering.custom_rules.clone(),
-                rewrites: config.rewrites.clone(),
-                clients: config.clients.clone(),
-                lists: list_metadata.clone(),
-            }
+                coordinator.get_current_term(),
+                &known_secrets,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to build the HA bundle from '{}': {e}",
+                    config_path.display()
+                )
+            })
         };
 
         if let Some(restored_version) = restored_version {
@@ -189,9 +164,12 @@ pub(super) fn init_ha(
                 .unwrap()
                 .as_ref()
                 .map(|bundle| bundle.config_toml.clone());
-            let config_changed = restored_bundle
-                .as_deref()
-                .is_none_or(|restored| !sanitized_configs_equal(restored, &sanitized_toml));
+            // Build once with the restored version: its sanitized document is
+            // what the comparison consumes.
+            let mut bundle = build_bundle(restored_version)?;
+            let config_changed = restored_bundle.as_deref().is_none_or(|restored| {
+                !sito_ha::sanitized_configs_equal(restored, &bundle.config_toml)
+            });
 
             if config_changed {
                 let next_version = restored_version.checked_add(1).ok_or_else(|| {
@@ -199,7 +177,8 @@ pub(super) fn init_ha(
                         "Cannot reconcile the HA bundle: persisted version {restored_version} cannot advance"
                     )
                 })?;
-                coordinator.update_bundle(build_bundle(next_version))?;
+                bundle.version = next_version;
+                coordinator.update_bundle(bundle)?;
                 info!(
                     version = next_version,
                     previous_version = restored_version,
@@ -212,7 +191,7 @@ pub(super) fn init_ha(
                 );
             }
         } else {
-            coordinator.update_bundle(build_bundle(1))?;
+            coordinator.update_bundle(build_bundle(1)?)?;
             info!("Published initial HA configuration bundle version 1");
         }
 

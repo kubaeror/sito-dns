@@ -560,36 +560,15 @@ impl ServerContext {
                 )));
             }
         };
-        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&raw_toml)?;
-        if sanitized_toml.trim().is_empty() {
-            return Err(HaError::Validation {
-                field: "config_toml".to_string(),
-                reason: format!(
-                    "Refusing to publish an empty HA bundle derived from '{}'; \
-                     check the configuration before retrying",
-                    self.config_path.display()
-                ),
-            });
-        }
-        let list_metadata = config
-            .filtering
-            .lists
-            .iter()
-            .map(|l| sito_ha::FilterListMetadata {
-                name: l.name.clone(),
-                url: l.url.clone(),
-                enabled: l.enabled,
-                refresh_hours: l.refresh_hours,
-            })
-            .collect();
-
         // Defense in depth: refuse to broadcast a bundle that embeds a known
-        // secret in plaintext.
-        if let Ok(ha_cfg) = sito_ha::config_from_unvalidated(&config)
-            && let Some(ref token) = ha_cfg.slave_token
-        {
-            sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])?;
-        }
+        // secret in plaintext. Keep the parsed HA config alive so its token can
+        // be borrowed for the builder's final-bundle scan.
+        let ha_cfg = sito_ha::config_from_unvalidated(&config).ok();
+        let known_secrets: Vec<&str> = ha_cfg
+            .as_ref()
+            .and_then(|ha| ha.slave_token.as_deref())
+            .into_iter()
+            .collect();
 
         let new_version = coordinator
             .get_current_version()
@@ -600,17 +579,24 @@ impl ServerContext {
                     "Refusing to publish HA bundle: the configuration version sequence is exhausted"
                         .to_string(),
             })?;
-        #[allow(clippy::cast_sign_loss)]
-        let bundle = sito_ha::ConfigBundle {
-            version: new_version,
-            term: coordinator.get_current_term(),
-            timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            config_toml: sanitized_toml,
-            custom_rules: config.filtering.custom_rules.clone(),
-            rewrites: config.rewrites.clone(),
-            clients: sanitize_clients_for_bundle(config.clients.as_ref()),
-            lists: list_metadata,
-        };
+        let bundle = sito_ha::build_config_bundle(
+            &config,
+            &raw_toml,
+            new_version,
+            coordinator.get_current_term(),
+            &known_secrets,
+        )
+        .map_err(|e| match e {
+            // Preserve the variant; add the source path only to validation
+            // failures so operators can find the offending file.
+            HaError::Validation { field, reason } if field == "config_toml" => {
+                HaError::Validation {
+                    field,
+                    reason: format!("{reason} (source: '{}')", self.config_path.display()),
+                }
+            }
+            other => other,
+        })?;
 
         match coordinator.publish_bundle_async(bundle).await {
             Ok(outcome) => {
@@ -674,16 +660,6 @@ impl ServerContext {
         });
         Some(initial_delay)
     }
-}
-
-/// Strips `client_id_secrets` from the structured `[clients]` value before it
-/// is replicated. The raw `config_toml` is sanitized by the HA crate; the
-/// structured field must be sanitized here for the same reason.
-#[must_use]
-pub fn sanitize_clients_for_bundle(clients: Option<&toml::Value>) -> Option<toml::Value> {
-    let mut table = clients?.as_table()?.clone();
-    table.remove("client_id_secrets");
-    Some(toml::Value::Table(table))
 }
 
 /// Helper function to publish an updated configuration bundle to replica slaves.
@@ -772,33 +748,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_sanitize_clients_for_bundle_strips_shared_secrets() {
-        let clients: toml::Value = toml::from_str(
-            r#"
-            [client_id_secrets]
-            "phone" = "super-secret"
-            [[entries]]
-            name = "phone"
-            ids = ["10.0.0.5"]
-            "#,
-        )
-        .unwrap();
-
-        let sanitized = sanitize_clients_for_bundle(Some(&clients)).expect("table");
-        assert!(
-            sanitized.get("client_id_secrets").is_none(),
-            "structured HA clients must not carry shared secrets: {sanitized}"
-        );
-        assert!(
-            sanitized.get("entries").is_some(),
-            "non-secret client fields must survive"
-        );
-        assert!(!sanitized.to_string().contains("super-secret"));
-
-        assert!(sanitize_clients_for_bundle(None).is_none());
     }
 
     /// D12: an ACME deployment with neither a port 80 listener nor a TCP 443
