@@ -22,6 +22,7 @@ use crate::error::ProblemDetails;
 use crate::state::ServerContext;
 use sito_core::config::Config;
 use sito_filter::PreparedFilterSnapshot;
+use sito_ha_types::PublishOutcome;
 use sito_runtime::{ApplyError, ApplyPlan, DnssecPolicy, RuntimeGeneration, TransportPolicy};
 use sito_upstream::{BootstrapResolver, PreparedUpstream};
 use std::any::Any;
@@ -131,21 +132,21 @@ pub struct HaPublishReport {
 
 impl HaPublishReport {
     #[must_use]
-    pub fn from_outcome(outcome: sito_ha::PublishOutcome) -> Self {
+    pub fn from_outcome(outcome: PublishOutcome) -> Self {
         match outcome {
-            sito_ha::PublishOutcome::Published { .. } => Self {
+            PublishOutcome::Published { .. } => Self {
                 status: "published".to_string(),
                 error: None,
                 retry_at: None,
             },
-            sito_ha::PublishOutcome::NoSlaves => Self {
+            PublishOutcome::NoSlaves => Self {
                 status: "no_slaves".to_string(),
                 error: None,
                 retry_at: None,
             },
             // Callers normally treat this as an apply error before building a
             // report; keep a faithful representation for completeness.
-            sito_ha::PublishOutcome::TooLarge { bytes, limit } => Self {
+            PublishOutcome::TooLarge { bytes, limit } => Self {
                 status: "failed".to_string(),
                 error: Some(format!(
                     "configuration bundle is {bytes} bytes, above the {limit}-byte replication limit"
@@ -519,7 +520,7 @@ async fn apply_and_persist_document_locked(
 
     let (publish_result, retry_delay) = ctx.publish_bundle_with_retry().await;
     match publish_result {
-        Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
+        Ok(PublishOutcome::TooLarge { bytes, limit }) => {
             // An oversized bundle is the one HA failure that is an apply
             // error: the configuration cannot be replicated at all. Roll both
             // the live configuration and the persisted document back (D8) and
@@ -648,13 +649,14 @@ pub async fn apply_config_document_event(
             // edit changed the document, the applied-config digest no longer
             // matches and the node must stop reporting `Synced` instead of
             // silently serving drift until the next push.
+            #[cfg(feature = "ha")]
             if let Some(ref tracker) = ctx.slave_tracker
                 && let Err(e) = tracker.verify_applied_config(&current)
             {
                 tracing::warn!(error = %e, "Failed to verify the applied HA configuration digest");
             }
             match ctx.publish_bundle().await {
-                Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
+                Ok(PublishOutcome::TooLarge { bytes, limit }) => {
                     if let Err(e) =
                         apply_full_config_locked(ctx, &previous, filter_apply, hooks).await
                     {

@@ -17,7 +17,9 @@ use sito_core::config::Config;
 /// This is the dependent-crate half of the single validator: it first runs
 /// [`sito_core::config::Config::validate_full`] (so every entry point applies
 /// the same core rules) and then deserializes the sections whose types live
-/// in `sito-clients`, `sito-rewrites` and `sito-ha`.
+/// in `sito-clients`, `sito-rewrites` and, when the `ha` feature is enabled,
+/// `sito-ha`. A build without `ha` rejects the `[ha]` section and the replica
+/// role here with a rebuild instruction instead of silently ignoring them.
 ///
 /// # Errors
 ///
@@ -69,8 +71,25 @@ pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
     }
 
     if config.ha.is_some() {
+        #[cfg(feature = "ha")]
         sito_ha::config_from(config)
             .map_err(|e| anyhow::anyhow!("invalid [ha] configuration: {e}"))?;
+        #[cfg(not(feature = "ha"))]
+        return Err(anyhow::anyhow!(
+            "invalid [ha] configuration: this build of sito was compiled without high-availability \
+             support; rebuild with `cargo build -p sito --features ha` (official artifacts enable it) \
+             or remove the [ha] section"
+        ));
+    }
+
+    #[cfg(not(feature = "ha"))]
+    if config.server.role == "slave" {
+        return Err(anyhow::anyhow!(
+            "invalid [server] configuration: server.role = \"slave\" requires high-availability \
+             support, which this build of sito was compiled without; rebuild with \
+             `cargo build -p sito --features ha` (official artifacts enable it) or remove the role = \
+             \"slave\" setting"
+        ));
     }
     Ok(())
 }
@@ -143,6 +162,7 @@ mod tests {
         validate_typed_sections(&config).expect("valid sections");
     }
 
+    #[cfg(feature = "ha")]
     #[test]
     fn test_validates_typed_ha_section() {
         let mut valid =
@@ -165,6 +185,53 @@ mod tests {
         let err =
             validate_typed_sections(&invalid).expect_err("a malformed [ha] section is rejected");
         assert!(err.to_string().contains("[ha]"), "got: {err}");
+    }
+
+    /// A build without the `ha` feature cannot honour `[ha]` or a replica
+    /// role. Both are rejected with the rebuild instruction instead of being
+    /// silently accepted and ignored at runtime.
+    #[cfg(not(feature = "ha"))]
+    #[test]
+    fn test_rejects_ha_section_without_ha_feature() {
+        let mut config =
+            Config::from_toml_str("config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n")
+                .expect("parses");
+        config.ha = Some(
+            toml::from_str("replication_port = 8953\n").expect("valid [ha] table for the test"),
+        );
+
+        let err = validate_typed_sections(&config)
+            .expect_err("a no-HA build must reject the [ha] section");
+        let message = err.to_string();
+        assert!(
+            message.contains("[ha]"),
+            "the error must name the rejected section: {message}"
+        );
+        assert!(
+            message.contains("--features ha"),
+            "the error must tell the operator how to enable HA: {message}"
+        );
+    }
+
+    #[cfg(not(feature = "ha"))]
+    #[test]
+    fn test_rejects_slave_role_without_ha_feature() {
+        let mut config =
+            Config::from_toml_str("config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n")
+                .expect("parses");
+        config.server.role = "slave".to_string();
+
+        let err = validate_typed_sections(&config)
+            .expect_err("a no-HA build must reject the replica role");
+        let message = err.to_string();
+        assert!(
+            message.contains("server.role") && message.contains("slave"),
+            "the error must name the rejected field and value: {message}"
+        );
+        assert!(
+            message.contains("--features ha"),
+            "the error must tell the operator how to enable HA: {message}"
+        );
     }
 
     /// RouterOS is an optional integration. A build without the `routeros`

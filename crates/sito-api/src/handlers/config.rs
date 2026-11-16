@@ -697,7 +697,7 @@ pub async fn reload_config(
     let mut report = report;
     let (publish_result, retry_delay) = ctx.publish_bundle_with_retry().await;
     match publish_result {
-        Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
+        Ok(sito_ha_types::PublishOutcome::TooLarge { bytes, limit }) => {
             // The document is already on disk; refuse to serve an
             // unreplicable configuration and roll the live apply back.
             if let Err(e) =

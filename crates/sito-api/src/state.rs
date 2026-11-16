@@ -6,6 +6,7 @@ use sito_cache::DnsCache;
 use sito_clients::ClientRegistry;
 use sito_core::config::Config;
 use sito_filter::HostsFilterEngine;
+use sito_ha_types::{HaError, HaReadiness, PublishOutcome};
 use sito_rewrites::RewriteTable;
 use sito_stats::{MetricsRegistry, QueryLogSender, StatsDb};
 use sito_transport::{AcmeServiceConfig, CertificateValidity, CertificateValidityCache};
@@ -16,6 +17,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Master-side HA coordinator handle.
+///
+/// The concrete coordinator lives in `sito-ha`; a build without the `ha`
+/// feature aliases the handle to `()` so [`ServerContext`] keeps the same
+/// field names and `Option<...>` shape in both modes. No value can be
+/// constructed in a no-HA build, which is exactly the intended invariant.
+#[cfg(feature = "ha")]
+pub type MasterCoordinatorHandle = sito_ha::MasterCoordinator;
+/// Master-side HA coordinator handle (uninhabited in no-HA builds).
+#[cfg(not(feature = "ha"))]
+pub type MasterCoordinatorHandle = ();
+
+/// Slave-side HA tracker handle.
+#[cfg(feature = "ha")]
+pub type SlaveTrackerHandle = sito_ha::SlaveStatusTracker;
+/// Slave-side HA tracker handle (uninhabited in no-HA builds).
+#[cfg(not(feature = "ha"))]
+pub type SlaveTrackerHandle = ();
 
 /// Shared application state container across all REST API handlers.
 #[derive(Clone)]
@@ -38,8 +58,8 @@ pub struct ServerContext {
     pub start_time: Instant,
     /// Pending backup restorations awaiting confirmation token: token -> (toml_content, expires_at).
     pub restore_tokens: Arc<Mutex<HashMap<String, (String, Instant)>>>,
-    pub master_coordinator: Option<sito_ha::MasterCoordinator>,
-    pub slave_tracker: Option<sito_ha::SlaveStatusTracker>,
+    pub master_coordinator: Option<MasterCoordinatorHandle>,
+    pub slave_tracker: Option<SlaveTrackerHandle>,
     pub resync_sender: Option<tokio::sync::mpsc::Sender<()>>,
     pub setup_pending: Arc<AtomicBool>,
     /// Server-owned readiness (listeners/TLS) published by the DNS startup
@@ -297,8 +317,17 @@ fn acme_readiness_state(
 /// while still failing closed for a master with a listener or a slave enrolled
 /// in a cluster.
 #[must_use]
+#[cfg(feature = "ha")]
 pub fn ha_readiness_required(config: &Config) -> bool {
     sito_ha::readiness_required(config)
+}
+
+/// A build without `sito-ha` never makes replication part of the node's role,
+/// so health and the healthcheck must not gate on it.
+#[must_use]
+#[cfg(not(feature = "ha"))]
+pub fn ha_readiness_required(_config: &Config) -> bool {
+    false
 }
 
 impl ServerContext {
@@ -308,7 +337,8 @@ impl ServerContext {
     /// is, a missing runtime or an unready listener/worker is reported with a
     /// reason instead of silently treating the node as healthy.
     #[must_use]
-    pub fn ha_readiness(&self, config: &Config) -> sito_ha::HaReadiness {
+    #[cfg(feature = "ha")]
+    pub fn ha_readiness(&self, config: &Config) -> HaReadiness {
         // A role with no `[ha]` section is simply not an HA deployment. A
         // master that *did* configure `[ha]` but explicitly disabled the
         // listener (`replication_port = 0`) still has a meaningful state: the
@@ -321,12 +351,12 @@ impl ServerContext {
             {
                 return coordinator.readiness();
             }
-            return sito_ha::HaReadiness::ready();
+            return HaReadiness::ready();
         }
         match config.server.role.as_str() {
             "master" => self.master_coordinator.as_ref().map_or_else(
                 || {
-                    sito_ha::HaReadiness::not_ready(
+                    HaReadiness::not_ready(
                         "master coordinator is not initialized; replication cannot run",
                     )
                 },
@@ -334,14 +364,25 @@ impl ServerContext {
             ),
             "slave" => self.slave_tracker.as_ref().map_or_else(
                 || {
-                    sito_ha::HaReadiness::not_ready(
+                    HaReadiness::not_ready(
                         "slave tracker is not initialized; replication cannot run",
                     )
                 },
                 sito_ha::SlaveStatusTracker::readiness,
             ),
-            _ => sito_ha::HaReadiness::ready(),
+            _ => HaReadiness::ready(),
         }
+    }
+
+    /// Without HA support there is no coordinator that could be unready.
+    #[must_use]
+    #[cfg(not(feature = "ha"))]
+    pub fn ha_readiness(&self, _config: &Config) -> HaReadiness {
+        // The handles are `Option<()>` in this build; no coordinator or
+        // tracker can exist, so readiness is always the disabled/ready state.
+        let _ = &self.master_coordinator;
+        let _ = &self.slave_tracker;
+        HaReadiness::ready()
     }
 
     /// Current ACME readiness.
@@ -479,6 +520,7 @@ impl ServerContext {
     }
 
     /// Resolves the URL of the master node for redirect headers (`X-Dnsd-Master`).
+    #[cfg(feature = "ha")]
     pub fn resolve_master_url(&self) -> String {
         if let Some(ref tracker) = self.slave_tracker
             && let Some(ref url) = tracker.master_url
@@ -496,6 +538,24 @@ impl ServerContext {
         String::new()
     }
 
+    /// Resolves the URL of the master node for redirect headers (`X-Dnsd-Master`).
+    ///
+    /// Without `sito-ha` no slave tracker exists, but the raw `[ha]` section
+    /// still carries the operator's `master_url`. Parsing the portable type
+    /// keeps the header behavior unchanged even for a config the validator
+    /// would reject before startup.
+    #[cfg(not(feature = "ha"))]
+    pub fn resolve_master_url(&self) -> String {
+        let config = self.config.load();
+        if let Some(value) = config.ha.as_ref()
+            && let Ok(ha_cfg) = sito_ha_types::HaConfig::from_toml_value(value)
+            && let Some(ref url) = ha_cfg.master_url
+        {
+            return url.clone();
+        }
+        String::new()
+    }
+
     /// Publishes an updated HA configuration bundle to all connected replica slaves,
     /// incrementing the configuration version monotonic counter.
     ///
@@ -504,7 +564,10 @@ impl ServerContext {
     /// `TooLarge` because it is a configuration error the caller must surface
     /// (and roll back). A failed publish is also recorded in HA readiness and
     /// a bounded background retry is scheduled.
-    pub async fn publish_bundle(&self) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
+    ///
+    /// A build without the `ha` feature has no coordinator and returns
+    /// [`PublishOutcome::NoSlaves`] without touching the filesystem.
+    pub async fn publish_bundle(&self) -> Result<PublishOutcome, HaError> {
         self.publish_bundle_with_retry().await.0
     }
 
@@ -514,12 +577,10 @@ impl ServerContext {
     /// `None` means no new retry loop was started (no HA coordinator, or one is
     /// already running with its own backoff schedule). Callers that expose a
     /// `retry_at` timestamp must omit it in that case instead of guessing.
+    #[cfg(feature = "ha")]
     pub async fn publish_bundle_with_retry(
         &self,
-    ) -> (
-        Result<sito_ha::PublishOutcome, sito_ha::HaError>,
-        Option<std::time::Duration>,
-    ) {
+    ) -> (Result<PublishOutcome, HaError>, Option<std::time::Duration>) {
         let result = self.publish_bundle_inner().await;
         let mut retry_delay = None;
         if let Err(e) = &result {
@@ -534,11 +595,23 @@ impl ServerContext {
         (result, retry_delay)
     }
 
-    async fn publish_bundle_inner(&self) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
-        use sito_ha::HaError;
+    /// Without HA there is no coordinator to publish to: this is a successful
+    /// no-op so a local apply is never rolled back for an absent feature.
+    #[cfg(not(feature = "ha"))]
+    pub async fn publish_bundle_with_retry(
+        &self,
+    ) -> (Result<PublishOutcome, HaError>, Option<std::time::Duration>) {
+        // Keep the shared async signature; there is nothing to await without
+        // an HA coordinator, but callers use the same `.await` in both builds.
+        std::future::ready(()).await;
+        let _ = &self.master_coordinator;
+        (Ok(PublishOutcome::NoSlaves), None)
+    }
 
+    #[cfg(feature = "ha")]
+    async fn publish_bundle_inner(&self) -> Result<PublishOutcome, HaError> {
         let Some(ref coordinator) = self.master_coordinator else {
-            return Ok(sito_ha::PublishOutcome::NoSlaves);
+            return Ok(PublishOutcome::NoSlaves);
         };
 
         let config = self.config.load();
@@ -625,6 +698,7 @@ impl ServerContext {
     ///
     /// Returns the initial delay only when this call started a new loop;
     /// `None` means an existing loop owns the schedule (or HA is not active).
+    #[cfg(feature = "ha")]
     fn schedule_publish_retry(&self) -> Option<std::time::Duration> {
         let coordinator = self.master_coordinator.as_ref()?;
         if !coordinator.begin_publish_retry() {
@@ -663,9 +737,7 @@ impl ServerContext {
 }
 
 /// Helper function to publish an updated configuration bundle to replica slaves.
-pub async fn publish_bundle(
-    ctx: &ServerContext,
-) -> Result<sito_ha::PublishOutcome, sito_ha::HaError> {
+pub async fn publish_bundle(ctx: &ServerContext) -> Result<PublishOutcome, HaError> {
     ctx.publish_bundle().await
 }
 
@@ -695,15 +767,80 @@ impl axum::extract::FromRef<ServerContext> for MetricsRegistry {
     }
 }
 
+#[cfg(all(test, not(feature = "ha")))]
+mod no_ha_tests {
+    use super::*;
+    use sito_ha_types::PublishOutcome;
+
+    /// A build without `sito-ha` has no coordinator, so publication is a
+    /// successful no-op: callers must not roll back a local apply or schedule
+    /// a retry loop that can never succeed.
+    #[tokio::test]
+    async fn test_publish_bundle_is_no_slaves_without_ha_support() {
+        let temp_dir = crate::test_support::temp_dir("sito_no_ha_publish");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let (result, retry_delay) = ctx.publish_bundle_with_retry().await;
+        assert_eq!(
+            result.expect("publication without HA must succeed"),
+            PublishOutcome::NoSlaves
+        );
+        assert_eq!(
+            retry_delay, None,
+            "without HA there is no retry loop to report"
+        );
+        assert_eq!(
+            ctx.publish_bundle()
+                .await
+                .expect("publication without HA must succeed"),
+            PublishOutcome::NoSlaves
+        );
+        assert_eq!(
+            publish_bundle(&ctx)
+                .await
+                .expect("the free helper must behave like the method"),
+            PublishOutcome::NoSlaves
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// HA is not part of this build, so readiness must report the feature as
+    /// disabled/ready instead of failing on a missing coordinator.
+    #[tokio::test]
+    async fn test_ha_readiness_is_ready_without_ha_support() {
+        let temp_dir = crate::test_support::temp_dir("sito_no_ha_readiness");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let mut config = (*ctx.config.load_full()).clone();
+        config.server.role = "master".to_string();
+        config.ha =
+            Some(toml::from_str("replication_port = 8953").expect("valid [ha] table for the test"));
+
+        assert!(
+            !ha_readiness_required(&config),
+            "a build without HA must never gate health on replication"
+        );
+        assert_eq!(
+            ctx.ha_readiness(&config),
+            sito_ha_types::HaReadiness::ready()
+        );
+        assert!(ctx.health_report().ready);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "ha")]
     use std::time::Duration;
 
     /// Deferred D4b review: `publish_bundle_with_retry` must report the delay
     /// only for a newly started retry loop. A second failure while that loop is
     /// still active returns `None`, so the REST `retry_at` is omitted instead
     /// of advertising a duplicate schedule.
+    #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_publish_bundle_with_retry_reports_only_new_loop_delay() {
         let temp_dir = crate::test_support::temp_dir("sito_ha_retry_report");

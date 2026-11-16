@@ -28,7 +28,8 @@ sito-runtime.workspace = true
 sito-clients.workspace = true
 sito-core.workspace = true
 sito-filter.workspace = true
-sito-ha.workspace = true
+sito-ha = { workspace = true, optional = true }
+sito-ha-types.workspace = true
 sito-proto.workspace = true
 sito-rewrites.workspace = true
 sito-stats.workspace = true
@@ -49,6 +50,10 @@ askama = { workspace = true, optional = true }
 
 [features]
 default = []
+# High-availability replication: compiles in `sito-ha` and the full HA API
+# handlers. Without it the HA routes stay mounted as stable 501 responses and
+# `[ha]`/replica configurations are rejected at validation time.
+ha = ["dep:sito-ha"]
 embed-ui = ["dep:rust-embed", "dep:mime_guess", "dep:askama"]
 # Enabled by the optional `sito/routeros` feature. It does not pull the
 # integration crate into sito-api; it only tells configuration validation that

@@ -3195,6 +3195,7 @@ dependencies = [
  "sito-core",
  "sito-filter",
  "sito-ha",
+ "sito-ha-types",
  "sito-proto",
  "sito-rewrites",
  "sito-runtime",

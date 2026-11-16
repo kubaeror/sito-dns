@@ -8,7 +8,7 @@
 use crate::state::AcmeReadiness;
 use serde::{Deserialize, Serialize};
 use sito_filter::{FilterState, FilterStatus};
-use sito_ha::HaReadiness;
+use sito_ha_types::HaReadiness;
 use std::sync::{Arc, Mutex};
 use utoipa::ToSchema;
 

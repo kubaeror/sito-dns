@@ -59,6 +59,7 @@ mod tests {
     /// `git diff --exit-code docs/openapi.json`). Without the variable the
     /// test still guards drift by comparing the generated specification with
     /// the committed file.
+    #[cfg(feature = "ha")]
     #[test]
     fn test_export_openapi_json() {
         let openapi = ApiDoc::openapi();
@@ -98,6 +99,28 @@ mod tests {
                  `SITO_UPDATE_OPENAPI=1 cargo test -p sito-api`"
             );
         }
+    }
+
+    /// The no-HA build advertises the same API minus the HA paths: the 501
+    /// stubs are intentional runtime behavior, not documented operations.
+    #[cfg(not(feature = "ha"))]
+    #[test]
+    fn test_openapi_omits_ha_paths_without_feature() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).expect("valid OpenAPI JSON");
+        for path in [
+            "/api/v1/ha/status",
+            "/api/v1/ha/slaves",
+            "/api/v1/ha/resync",
+        ] {
+            assert!(
+                openapi["paths"].get(path).is_none(),
+                "{path} must not be documented when the ha feature is off"
+            );
+        }
+        assert!(
+            openapi["paths"].get("/api/v1/status").is_some(),
+            "non-HA paths must remain documented"
+        );
     }
 
     #[test]
