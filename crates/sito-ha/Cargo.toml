@@ -13,6 +13,7 @@ sito-clients.workspace = true
 sito-rewrites.workspace = true
 sito-runtime.workspace = true
 sito-stats.workspace = true
+sito-ha-types.workspace = true
 
 arc-swap.workspace = true
 base64.workspace = true
@@ -27,7 +28,6 @@ rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 subtle.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "time", "sync", "fs", "net", "io-util"] }
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true

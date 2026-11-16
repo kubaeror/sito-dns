@@ -557,6 +557,14 @@ key before any retention task starts.
 
 ## 13. `[ha]` — High-Availability Master/Slave Replication
 
+> **Optional build feature.** `[ha]` is only usable in a build compiled with the
+> `ha` feature. Official release archives and the container image include it;
+> the default source build does not. A no-HA build rejects `[ha]` and
+> `server.role = "slave"` at startup, `check-config`, API writes and restore
+> with an error naming the `ha` feature, and its `/api/v1/ha/*` routes return
+> `501 ha_not_supported`. Build HA from source with
+> `cargo build -p sito --features ha`.
+
 ```toml
 [ha]
 replication_port = 8953

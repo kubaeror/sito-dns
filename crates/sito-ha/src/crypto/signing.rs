@@ -8,6 +8,8 @@ use tracing::warn;
 
 use crate::error::HaError;
 
+pub use sito_ha_types::parse_public_key;
+
 /// An Ed25519 signing key used by the master node to sign configuration bundles.
 pub struct Ed25519SigningKey {
     key_pair: Ed25519KeyPair,
@@ -156,30 +158,6 @@ fn enforce_private_permissions(path: &Path) -> Result<(), HaError> {
         let _ = path;
     }
     Ok(())
-}
-
-/// Parses an Ed25519 public key from either 64-char hex or 44-char base64 string.
-pub fn parse_public_key(input: &str) -> Result<[u8; 32], HaError> {
-    let trimmed = input.trim();
-    if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        let decoded = hex::decode(trimmed)
-            .map_err(|e| HaError::Crypto(format!("Invalid hex public key: {e}")))?;
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&decoded);
-        return Ok(out);
-    }
-
-    if let Ok(decoded) = BASE64_STANDARD.decode(trimmed)
-        && decoded.len() == 32
-    {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&decoded);
-        return Ok(out);
-    }
-
-    Err(HaError::Crypto(format!(
-        "Invalid Ed25519 public key format (expected 32-byte hex or base64): '{trimmed}'"
-    )))
 }
 
 /// Verifies an Ed25519 signature over `data` using the given 32-byte public key.

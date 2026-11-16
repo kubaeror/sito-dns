@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::master::tracker::ActiveSlave;
+use futures_util::SinkExt;
 
 fn test_coordinator() -> MasterCoordinator {
     let key = Arc::new(Ed25519SigningKey::generate().unwrap());

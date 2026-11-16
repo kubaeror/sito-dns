@@ -184,6 +184,7 @@ impl sito_api::config_apply::ConfigApplyHooks for ServerApplyHooks {
 /// The applier's readiness gate is opened here, immediately before spawning, so
 /// a push can never be acknowledged while listener/rate-limit components are
 /// still uninitialized. Master roles have no pending receiver and are a no-op.
+#[cfg(feature = "ha")]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_slave_worker_after_listeners(
     ha_runtime: &mut HaRuntime,

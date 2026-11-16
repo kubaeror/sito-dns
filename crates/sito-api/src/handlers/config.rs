@@ -536,7 +536,7 @@ token = "ha-token"
             State(ctx.clone()),
             Extension(ApplyHooks::default()),
             Json(UpdateConfigRequest {
-                config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n[upstream]\nservers = [\"1.1.1.1\"]\n"
+                config_toml: "config_version = 2\n[server]\nrole = \"master\"\ndata_dir = \"/srv/other\"\n[upstream]\nservers = [\"1.1.1.1\"]\n"
                     .to_string(),
             }),
         )
@@ -546,7 +546,7 @@ token = "ha-token"
         assert!(
             err.restart_required
                 .as_deref()
-                .is_some_and(|fields| fields.contains(&"server.role".to_string())),
+                .is_some_and(|fields| fields.contains(&"server.data_dir".to_string())),
             "409 must carry restart_required: {err:?}"
         );
         assert_eq!(
@@ -554,7 +554,42 @@ token = "ha-token"
             original,
             "a restart-only write must not be persisted"
         );
-        assert_eq!(ctx.config.load().server.role, "master");
+        assert_eq!(
+            ctx.config.load().server.data_dir,
+            Config::from_toml_str(original).unwrap().server.data_dir
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A no-HA build must reject an HA config write with the feature message,
+    /// not a 409 that tells the operator to restart into an unloadable config.
+    #[cfg(not(feature = "ha"))]
+    #[tokio::test]
+    async fn test_update_config_no_ha_feature_is_bad_request() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_put_no_ha");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        for document in [
+            "config_version = 2\n[server]\nrole = \"master\"\n[upstream]\nservers = [\"1.1.1.1\"]\n[ha]\nreplication_port = 8953\n",
+            "config_version = 2\n[server]\nrole = \"slave\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+        ] {
+            let err = update_config(
+                admin(),
+                State(ctx.clone()),
+                Extension(ApplyHooks::default()),
+                Json(UpdateConfigRequest {
+                    config_toml: document.to_string(),
+                }),
+            )
+            .await
+            .expect_err("a no-HA build must reject HA configuration writes");
+            assert_eq!(err.status, 400, "{err:?}");
+            assert!(
+                err.detail.contains("--features ha"),
+                "the error must name the feature: {err:?}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -697,7 +732,7 @@ pub async fn reload_config(
     let mut report = report;
     let (publish_result, retry_delay) = ctx.publish_bundle_with_retry().await;
     match publish_result {
-        Ok(sito_ha::PublishOutcome::TooLarge { bytes, limit }) => {
+        Ok(sito_ha_types::PublishOutcome::TooLarge { bytes, limit }) => {
             // The document is already on disk; refuse to serve an
             // unreplicable configuration and roll the live apply back.
             if let Err(e) =

@@ -216,6 +216,54 @@ jobs:
       - name: Test the benchmark regression gate
         run: python3 scripts/test_check_bench_regression.py
 
+  # The default workspace build is HA-free; release archives and the container
+  # image opt in with `--features ha`. This lane pins both ends of that matrix:
+  # the default `sito`, `sito-api` and `sito-test` builds must compile and pass
+  # their tests without `sito-ha` in the graph, and `--features ha` must still
+  # check cleanly, including the `sito-test` integration targets. The HA
+  # acceptance suites themselves (M8/M11) run in the `test` job, which builds
+  # `--all-features` and therefore actually executes them.
+  #
+  # This tests the crates whose feature graphs changed instead of repeating the
+  # full `cargo test --workspace` from `test`: `fmt`, `clippy` and `test` keep
+  # the whole workspace covered, while these crates own the no-HA code paths a
+  # default build ships.
+  ha-matrix:
+    name: ha-matrix
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.force == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ha-matrix
+      - name: Assert the default workspace crates do not link sito-ha
+        run: |
+          tree="$(cargo tree -p sito -p sito-api -p sito-test --no-default-features --locked)"
+          if grep -q 'sito-ha v' <<<"${tree}"; then
+            echo "::error::sito, sito-api and sito-test must not depend on sito-ha without their ha feature"
+            exit 1
+          fi
+      - name: Test the default (no-HA) sito binary
+        run: cargo test -p sito --locked
+      - name: Check the HA sito binary
+        run: cargo check -p sito --features ha --locked
+      - name: Test the no-HA API surface
+        run: cargo test -p sito-api --no-default-features --locked
+      - name: Check the no-HA API surface
+        run: cargo check -p sito-api --no-default-features --locked
+      - name: Check the HA API surface
+        run: cargo check -p sito-api --features ha --locked
+      - name: Test the no-HA test harness
+        run: cargo test -p sito-test --no-default-features --locked
+      - name: Check the HA test harness
+        run: cargo check -p sito-test --features ha --tests --locked
+
   # Fast structural gates added by WP-1.9. They do not run the long fuzz or
   # benchmark workloads; `fuzz.yml` and `bench.yml` own the nightly/release
   # runs.
@@ -360,7 +408,7 @@ jobs:
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Regenerate the OpenAPI specification
-        run: SITO_UPDATE_OPENAPI=1 cargo test -p sito-api test_export_openapi_json
+        run: SITO_UPDATE_OPENAPI=1 cargo test -p sito-api --features ha test_export_openapi_json
       - name: Verify docs/openapi.json is up to date
         run: git diff --exit-code docs/openapi.json
 
@@ -476,7 +524,7 @@ jobs:
   ci-gate:
     name: ci-gate
     if: always()
-    needs: [changes, fmt, clippy, test, build, openapi, contrib, docs-check, container-check, security-check, bench-build, fuzz-build, hygiene, coverage]
+    needs: [changes, fmt, clippy, test, build, openapi, contrib, docs-check, container-check, security-check, bench-build, fuzz-build, hygiene, coverage, ha-matrix]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

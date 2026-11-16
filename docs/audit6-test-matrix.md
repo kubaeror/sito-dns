@@ -271,6 +271,27 @@ manifest checker is the cheap PR-side guard. The 24-hour clean run and the
 nightly benchmark comparison are release-checklist items, not flaky PR jobs
 (D14/P-7).
 
+## Optional HA feature matrix
+
+HA became optional in the post-Phase-1 HA consolidation. The default workspace
+build does not link `sito-ha`; official release archives and the container image
+explicitly build `embed-ui,ha,mimalloc`. The `ha-matrix` CI job pins both sides
+of the feature gate, including an absence guard on the default dependency graph.
+
+| Acceptance criterion | Named test / check | Focused command |
+|---|---|---|
+| Default test harness graph has no `sito-ha` edge | `ha-matrix` "Assert the default dependency graph does not link sito-ha" step | `cargo tree -p sito -p sito-api -p sito-test --no-default-features --locked` |
+| Default `sito` binary tests, including HA rejection | `test_check_config_rejects_ha_without_feature`; `ha-matrix` default `sito` step | `cargo test -p sito --locked` |
+| HA-enabled `sito` compiles | `ha-matrix` "Check the HA sito binary" step | `cargo check -p sito --features ha --locked` |
+| No-HA config validation rejects `[ha]` and replica roles | `test_rejects_ha_section_without_ha_feature`, `test_rejects_slave_role_without_ha_feature` | `cargo test -p sito-api --no-default-features --locked` |
+| No-HA HA routes return 501, handlers retain `RequireAdmin`, and readiness is not gated | `test_ha_routes_return_501_without_ha_support`, `test_ha_readiness_is_ready_without_ha_support`, `test_publish_bundle_is_no_slaves_without_ha_support`, `test_healthcheck_ignores_ha_when_not_configured`, `test_ha_readiness_not_required_without_feature` | `cargo test -p sito-api --no-default-features --locked`; `cargo test -p sito --locked` |
+| No-HA OpenAPI omits the HA paths | `test_openapi_omits_ha_paths_without_feature` | `cargo test -p sito-api --no-default-features --locked` |
+| HA-enabled API and test harness compile | `ha-matrix` `sito-api`/`sito-test` `--features ha` steps | `cargo check -p sito-api --features ha --locked`; `cargo check -p sito-test --features ha --tests --locked` |
+| Default test harness compiles without HA | `ha-matrix` default `sito-test` step | `cargo test -p sito-test --no-default-features --locked` |
+| Portable contract crate stays independent of the implementation | `crate_manifest_does_not_depend_on_the_runtime_implementation`, `contract_types_serialize_and_parse_without_runtime_dependencies` | `cargo test -p sito-ha-types --locked` |
+| HA acceptance tests are explicitly opt-in | `m8_acceptance` and `m11_ha_partition` are `#![cfg(feature = "ha")]`; `fixtures::ha` is feature-gated | `cargo test -p sito-test --features ha --test m8_acceptance --test m11_ha_partition` |
+| All-features lanes lint and instrument HA code | `clippy`, `bench-build`, `coverage` use `--all-features`; release builds use `embed-ui,ha,mimalloc` | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`; `cargo test --workspace --all-features --locked` |
+
 ## WP-1.10 — docs structure and migration guide
 
 | Acceptance criterion | Named check | Focused command |

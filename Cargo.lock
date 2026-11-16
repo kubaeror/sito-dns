@@ -3195,6 +3195,7 @@ dependencies = [
  "sito-core",
  "sito-filter",
  "sito-ha",
+ "sito-ha-types",
  "sito-proto",
  "sito-rewrites",
  "sito-runtime",
@@ -3318,17 +3319,29 @@ dependencies = [
  "sito-clients",
  "sito-core",
  "sito-filter",
+ "sito-ha-types",
  "sito-rewrites",
  "sito-runtime",
  "sito-stats",
  "sito-test-support",
  "subtle",
- "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.30.0",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "sito-ha-types"
+version = "2.0.0-alpha.1"
+dependencies = [
+ "base64 0.23.1",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

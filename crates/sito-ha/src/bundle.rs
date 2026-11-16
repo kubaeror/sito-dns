@@ -2,91 +2,14 @@
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-use serde::{Deserialize, Serialize};
+use sito_core::config::Config;
 use std::collections::HashMap;
 
 use crate::crypto::{Ed25519SigningKey, verify_ed25519_signature};
 use crate::error::HaError;
 use crate::protocol::HaMessage;
 
-/// Metadata for a filter list subscription included in the bundle.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FilterListMetadata {
-    pub name: String,
-    pub url: String,
-    pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refresh_hours: Option<u64>,
-}
-
-/// A complete replicable configuration bundle.
-///
-/// Contains the complete state of the master node without [ha] and instance_name,
-/// and with all secrets redacted with `${SECRET:name}` placeholders.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ConfigBundle {
-    pub version: u64,
-    /// Cluster epoch/term that produced this bundle.
-    ///
-    /// Missing in bundles signed before terms existed, which are interpreted as
-    /// term 0 for backwards compatibility. A term increase is an explicit
-    /// operator promotion; a stale master from an older term can never
-    /// overwrite a newer slave, regardless of its version counter.
-    #[serde(default)]
-    pub term: u64,
-    pub timestamp: u64,
-    pub config_toml: String,
-    #[serde(default)]
-    pub custom_rules: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rewrites: Option<toml::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clients: Option<toml::Value>,
-    #[serde(default)]
-    pub lists: Vec<FilterListMetadata>,
-}
-
-impl ConfigBundle {
-    /// Serializes the bundle to a canonical JSON string.
-    pub fn to_json(&self) -> Result<String, HaError> {
-        serde_json::to_string(self)
-            .map_err(|e| HaError::Serialization(format!("Failed to serialize bundle: {e}")))
-    }
-
-    /// Deserializes a bundle from a JSON string.
-    pub fn from_json(s: &str) -> Result<Self, HaError> {
-        serde_json::from_str(s)
-            .map_err(|e| HaError::Serialization(format!("Failed to parse bundle JSON: {e}")))
-    }
-
-    /// Strips secret material from the structured fields in place.
-    ///
-    /// The `config_toml` string is sanitized by [`sanitize_config_for_bundle`],
-    /// but the structured `clients` value travels alongside it and must be
-    /// sanitized identically: per-client shared secrets (`client_id_secrets`)
-    /// are node-local (DoH path / DoT SNI credentials) and must never be
-    /// replicated.
-    pub fn strip_structured_secrets(&mut self) {
-        if let Some(ref mut clients) = self.clients {
-            strip_client_id_secrets(clients);
-        }
-    }
-
-    /// Returns a copy with all structured secret material stripped.
-    #[must_use]
-    pub fn sanitized(&self) -> Self {
-        let mut bundle = self.clone();
-        bundle.strip_structured_secrets();
-        bundle
-    }
-}
-
-/// Removes the `client_id_secrets` table from a structured `[clients]` value.
-fn strip_client_id_secrets(clients: &mut toml::Value) {
-    if let toml::Value::Table(table) = clients {
-        table.remove("client_id_secrets");
-    }
-}
+pub use sito_ha_types::bundle::{AppliedWatermark, ConfigBundle, FilterListMetadata};
 
 /// Builds a sanitized TOML string from a master configuration TOML string.
 ///
@@ -146,6 +69,82 @@ pub fn sanitize_config_for_bundle(master_toml: &str) -> Result<String, HaError> 
     }
 
     toml::to_string_pretty(&table).map_err(|e| HaError::Serialization(e.to_string()))
+}
+
+/// Builds the replicable [`ConfigBundle`] for a master configuration.
+///
+/// This is the single construction path shared by master startup (initial
+/// publish/reconciliation) and the REST publish path, so both produce the same
+/// wire shape:
+/// - the raw TOML is sanitized with [`sanitize_config_for_bundle`];
+/// - an empty sanitized document is rejected rather than broadcast;
+/// - structured `clients.client_id_secrets` are stripped;
+/// - filter list metadata, custom rules, rewrites and clients are copied from
+///   the effective configuration;
+/// - the final bundle JSON is scanned for `known_secrets`, so material in
+///   `custom_rules` or other structured fields is caught too.
+pub fn build_config_bundle(
+    config: &Config,
+    raw_toml: &str,
+    version: u64,
+    term: u64,
+    known_secrets: &[&str],
+) -> Result<ConfigBundle, HaError> {
+    let sanitized_toml = sanitize_config_for_bundle(raw_toml)?;
+    if sanitized_toml.trim().is_empty() {
+        return Err(HaError::Validation {
+            field: "config_toml".to_string(),
+            reason:
+                "Refusing to publish an empty HA bundle; check the configuration before retrying"
+                    .to_string(),
+        });
+    }
+
+    let lists = config
+        .filtering
+        .lists
+        .iter()
+        .map(|list| FilterListMetadata {
+            name: list.name.clone(),
+            url: list.url.clone(),
+            enabled: list.enabled,
+            refresh_hours: list.refresh_hours,
+        })
+        .collect();
+
+    #[allow(clippy::cast_sign_loss)]
+    let mut bundle = ConfigBundle {
+        version,
+        term,
+        timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        config_toml: sanitized_toml,
+        custom_rules: config.filtering.custom_rules.clone(),
+        rewrites: config.rewrites.clone(),
+        clients: config.clients.clone(),
+        lists,
+    };
+    bundle.strip_structured_secrets();
+
+    // Scan the serialized bundle, not only `config_toml`: custom rules and
+    // other structured fields can carry secret material as well.
+    let bundle_json = bundle.to_json()?;
+    scan_for_secrets(&bundle_json, known_secrets)?;
+
+    Ok(bundle)
+}
+
+/// Compares two sanitized bundle documents semantically, falling back to byte
+/// comparison when either side is not valid TOML.
+///
+/// Master startup uses this to decide whether `config.toml` still matches the
+/// persisted bundle, so a formatting-only rewrite does not churn the version
+/// sequence.
+#[must_use]
+pub fn sanitized_configs_equal(a: &str, b: &str) -> bool {
+    match (a.parse::<toml::Table>(), b.parse::<toml::Table>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// Scans a serialized bundle or string for accidental plaintext secret leakage.
@@ -234,52 +233,6 @@ pub fn substitute_secrets<S: ::std::hash::BuildHasher>(
     }
 
     Ok(result)
-}
-
-/// Persisted applied-version watermark for a slave node.
-///
-/// Written atomically (0600) after a push has been applied and its
-/// configuration persisted, before the slave acknowledges it. On startup the
-/// slave restores this record so a restart cannot replay an older signed
-/// bundle or overwrite the applied configuration with stale content.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AppliedWatermark {
-    /// Configuration version of the last successfully applied bundle.
-    pub version: u64,
-    /// Cluster epoch/term of that bundle. Missing in watermark files written
-    /// before terms existed, which are interpreted as term 0.
-    #[serde(default)]
-    pub term: u64,
-    /// BLAKE3 hash of the signed bundle payload that produced `version`.
-    pub payload_hash: String,
-    /// Unix milliseconds at which the bundle was applied.
-    pub timestamp: u64,
-    /// Set when a same-version payload-hash mismatch proved that this node and
-    /// its master are on different forks. All same-term pushes are rejected
-    /// until an explicit higher-term promotion arrives.
-    #[serde(default)]
-    pub forked: bool,
-    /// Version at which the fork was detected.
-    #[serde(default)]
-    pub forked_at_version: u64,
-    /// BLAKE3 digest of the exact `config.toml` document this node persisted
-    /// when it applied the bundle.
-    ///
-    /// On restart the digest is compared with the on-disk document. A mismatch
-    /// means a local edit/revert changed the configuration while the process
-    /// was stopped (or the file watcher applied one while running) and the
-    /// slave must re-apply the master's bundle instead of early-ACKing
-    /// `Synced`. Missing in watermarks written before this field existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_config_digest: Option<String>,
-}
-
-impl AppliedWatermark {
-    /// Returns the normalized (prefix-free) payload hash.
-    #[must_use]
-    pub fn normalized_hash(&self) -> &str {
-        self.payload_hash.trim_start_matches("blake3:")
-    }
 }
 
 /// Computes the BLAKE3 digest of a configuration document as normalized hex.
@@ -836,6 +789,170 @@ password = "mikrotik_secret_password"
         )
         .unwrap_err();
         assert!(matches!(err, HaError::Validation { .. }));
+    }
+
+    #[test]
+    fn build_config_bundle_sanitizes_ha_and_marks_the_replica_slave() {
+        let raw = r#"
+config_version = 2
+
+[server]
+role = "master"
+instance_name = "master-prod"
+
+[ha]
+replication_port = 8953
+slave_token = "cluster-token-value"
+"#;
+        let config = sito_core::config::Config::from_toml_str(raw).expect("valid master config");
+
+        let bundle = build_config_bundle(&config, raw, 7, 3, &["cluster-token-value"])
+            .expect("build the bundle");
+
+        assert_eq!(bundle.version, 7);
+        assert_eq!(bundle.term, 3);
+        assert!(bundle.timestamp > 0, "timestamp must be populated");
+        assert!(!bundle.config_toml.contains("[ha]"));
+        assert!(!bundle.config_toml.contains("replication_port"));
+        assert!(!bundle.config_toml.contains("master-prod"));
+        assert!(bundle.config_toml.contains("role = \"slave\""));
+
+        let parsed = sito_core::config::Config::from_toml_str(&bundle.config_toml)
+            .expect("sanitized bundle must parse as config v2");
+        assert_eq!(parsed.server.role, "slave");
+        assert!(parsed.ha.is_none());
+    }
+
+    #[test]
+    fn build_config_bundle_maps_filter_lists_and_custom_rules() {
+        let mut config = sito_core::config::Config::default();
+        config.filtering.lists = vec![sito_core::config::FilterListConfig {
+            name: "Ads".to_string(),
+            url: "https://example.com/ads.txt".to_string(),
+            enabled: true,
+            refresh_hours: Some(12),
+        }];
+        config.filtering.custom_rules = vec!["||custom.example^".to_string()];
+        config.rewrites = Some(
+            toml::from_str("[rewrite]\nexample = \"target.example\"").expect("rewrites table"),
+        );
+        let raw = toml::to_string_pretty(&config).expect("serialize config");
+
+        let bundle = build_config_bundle(&config, &raw, 1, 0, &[]).expect("build the bundle");
+
+        assert_eq!(
+            bundle.rewrites, config.rewrites,
+            "the builder must copy the rewrites table verbatim"
+        );
+
+        assert_eq!(
+            bundle.lists,
+            vec![FilterListMetadata {
+                name: "Ads".to_string(),
+                url: "https://example.com/ads.txt".to_string(),
+                enabled: true,
+                refresh_hours: Some(12),
+            }]
+        );
+        assert_eq!(bundle.custom_rules, vec!["||custom.example^".to_string()]);
+    }
+
+    #[test]
+    fn build_config_bundle_strips_structured_client_secrets() {
+        let clients = toml::from_str::<toml::Value>(
+            r#"
+[client_id_secrets]
+phone = "super-secret-client-value"
+
+[[entries]]
+name = "phone"
+ids = ["10.0.0.5"]
+"#,
+        )
+        .expect("structured clients");
+        let config = sito_core::config::Config {
+            clients: Some(clients),
+            ..Default::default()
+        };
+        let raw = toml::to_string_pretty(&config).expect("serialize config");
+
+        let bundle = build_config_bundle(&config, &raw, 1, 0, &[]).expect("build the bundle");
+
+        let clients = bundle
+            .clients
+            .as_ref()
+            .expect("structured clients are replicated");
+        assert!(
+            clients.get("client_id_secrets").is_none(),
+            "structured clients must not carry shared secrets: {clients}"
+        );
+        assert!(
+            clients.get("entries").is_some(),
+            "non-secret client fields must survive"
+        );
+        assert!(
+            !bundle
+                .to_json()
+                .expect("json")
+                .contains("super-secret-client-value")
+        );
+    }
+
+    #[test]
+    fn build_config_bundle_rejects_an_empty_document() {
+        let config = sito_core::config::Config::default();
+
+        let err = build_config_bundle(&config, "   \n", 1, 0, &[])
+            .expect_err("an empty sanitized document must be rejected");
+
+        match err {
+            HaError::Validation { field, reason } => {
+                assert_eq!(field, "config_toml");
+                assert!(
+                    reason.contains("empty"),
+                    "reason must be explicit: {reason}"
+                );
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_config_bundle_scans_the_final_bundle_json_for_secrets() {
+        // The secret is only in the structured `custom_rules` field, not in the
+        // raw TOML: scanning the final bundle JSON is what must catch it.
+        let raw = "config_version = 2\n[server]\nrole = \"master\"\n";
+        let mut config =
+            sito_core::config::Config::from_toml_str(raw).expect("valid master config");
+        config.filtering.custom_rules = vec!["secret-in-custom-rules-1234".to_string()];
+
+        let err = build_config_bundle(&config, raw, 1, 0, &["secret-in-custom-rules-1234"])
+            .expect_err("a known secret in the final bundle must fail the build");
+
+        assert!(
+            matches!(err, HaError::SecretLeak { .. }),
+            "expected a secret-leak error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sanitized_configs_equal_ignores_formatting_but_detects_value_changes() {
+        let a = "config_version = 2\n[server]\nrole = \"slave\"\n";
+        let b =
+            "# a reformatted document\nconfig_version = 2\n\n[server]\nrole    =    \"slave\"\n";
+
+        assert!(
+            sanitized_configs_equal(a, b),
+            "formatting-only differences must compare equal"
+        );
+        assert!(
+            !sanitized_configs_equal(a, "config_version = 2\n[server]\nrole = \"master\"\n"),
+            "a value change must be detected"
+        );
+
+        // Byte fallback when either side is not valid TOML.
+        assert!(sanitized_configs_equal("not toml", "not toml"));
+        assert!(!sanitized_configs_equal("not toml", "other"));
     }
 
     /// WP-1.3/D11: the sanitizer output is a valid config v2 document. A v2

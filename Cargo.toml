@@ -15,6 +15,7 @@ members = [
     "crates/sito-api",
     "crates/sito-stats",
     "crates/sito-ha",
+    "crates/sito-ha-types",
     "crates/sito-test",
     "crates/sito-test-support",
     "crates/sito-runtime",
@@ -105,6 +106,7 @@ sito-api = { path = "crates/sito-api", version = "2.0.0-alpha.1" }
 sito-stats = { path = "crates/sito-stats", version = "2.0.0-alpha.1" }
 sito-runtime = { path = "crates/sito-runtime", version = "2.0.0-alpha.1" }
 sito-ha = { path = "crates/sito-ha", version = "2.0.0-alpha.1" }
+sito-ha-types = { path = "crates/sito-ha-types", version = "2.0.0-alpha.1" }
 sito-test = { path = "crates/sito-test", version = "2.0.0-alpha.1" }
 sito-test-support = { path = "crates/sito-test-support", version = "2.0.0-alpha.1" }
 

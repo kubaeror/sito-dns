@@ -14,6 +14,36 @@ This runbook provides step-by-step operational procedures for managing, maintain
 - **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master.
 - **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master stores the latest report per slave and exposes it through `GET /api/v1/ha/slaves`; replica counters are **not** merged into the master's own Prometheus registry. Scrape each replica's `/metrics` endpoint separately (labels such as `sito_ha_config_version{instance="..."}` identify the node).
 
+### Build prerequisites and the optional HA module
+
+HA is an optional Cargo feature, not a runtime toggle:
+
+- **Official artifacts** (release archives and container image) are built with
+  `embed-ui,ha,mimalloc`, so HA is available. The installer installs those
+  release archives by default; set `SITO_INSTALL_LOCAL_BINARY=1` to install a
+  locally built `target/release/sito` instead.
+- **Source builds** must add `ha`:
+  `cargo build --release --locked --features "embed-ui,ha,mimalloc"`.
+  A plain `cargo build -p sito` is a no-HA binary.
+- `sito-ha-types` is always compiled and owns the portable `[ha]` config,
+  status and protocol types. `sito-ha` is the implementation behind the feature
+  and re-exports the historical `sito_ha::*` paths.
+- `sito ha gen-certs` exists **only** in an HA build. A no-HA binary reports an
+  unknown `ha` subcommand; verify with `sito ha gen-certs --help` before
+  provisioning certificates.
+
+A no-HA binary still runs as a **master**, but it is fail-closed:
+
+| Surface | No-HA behavior |
+|---|---|
+| Startup, `sito check-config`, API config writes, restore | Rejects `[ha]` and `server.role = "slave"` with an error naming the missing feature. |
+| `GET /api/v1/ha/status`, `GET /api/v1/ha/slaves`, `POST /api/v1/ha/resync` | Return **501** with `ha_not_supported`; normal admin authentication still applies. |
+| `/health`, `/api/v1/status` | HA is not part of the node's role and never gates readiness. |
+| `[ha]` in `config.toml` | Not usable. Rebuild with `ha` or remove the section. |
+
+This only affects source builds that omit the feature. A cluster running the
+official binaries is unaffected.
+
 ### Certificate ownership and the runtime user
 
 `sito ha gen-certs` writes private keys mode `0600`. The HA listener runs
@@ -84,6 +114,11 @@ certificate text or configuration values. The container healthcheck and
 | `ha` | Yes | `ha_not_ready` (including master-loss and publish failure) |
 | `filter` | Yes only when no usable snapshot exists | `filter_unavailable`/`filter_loading` when `unavailable=true`; `filter_degraded` for a retained snapshot, a rejected live apply, or a recorded last error |
 | `stats` | **No** — advisory only | `stats_unavailable` |
+
+In a build without the `ha` feature, the `ha` component is never part of the
+node's role: it reports no reason and cannot block `ready`. A `[ha]` section or
+`role = "slave"` cannot start at all in that build (see the build prerequisites
+above).
 
 A partial filter snapshot (some lists failed, a group lost a rule class, or
 regex patterns were dropped) keeps `ready` true and reports `filter_degraded`:

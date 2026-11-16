@@ -3,66 +3,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-/// Builds per-client upstream managers, reusing existing managers by key so a
-/// hot reload does not re-resolve unchanged upstream scopes.
-pub(crate) async fn build_scoped_upstreams(
-    config: &Config,
-    clients: &sito_clients::ClientsConfig,
-    existing: &HashMap<String, Arc<UpstreamManager>>,
-) -> anyhow::Result<HashMap<String, Arc<UpstreamManager>>> {
-    // Build from the current config on every call. Capturing a startup resolver
-    // here would leave scoped upstreams on old bootstrap/allow_private_targets
-    // settings after a hot reload.
-    let bootstrap = BootstrapResolver::from_config(&config.upstream);
-    let mut scoped: HashMap<String, Arc<UpstreamManager>> = HashMap::new();
-    for entry in &clients.entries {
-        if entry.use_global_upstreams {
-            continue;
-        }
-        // Validation rejects this, but never let a hand-built registry or an
-        // older persisted document fall through to the global upstreams: a
-        // scoped client with no scope is a policy bypass.
-        let Some(ref servers) = entry.upstreams else {
-            anyhow::bail!(
-                "Client '{}' sets use_global_upstreams = false but has no per-client upstreams",
-                entry.name
-            );
-        };
-        if servers.is_empty() {
-            anyhow::bail!(
-                "Client '{}' sets use_global_upstreams = false but its upstream list is empty",
-                entry.name
-            );
-        }
-        let key = sito_runtime::scoped_upstream_key(config, servers);
-        if scoped.contains_key(&key) {
-            continue;
-        }
-        if let Some(manager) = existing.get(&key) {
-            scoped.insert(key, manager.clone());
-            continue;
-        }
-        let mut upstream_cfg = config.upstream.clone();
-        upstream_cfg.servers.clone_from(servers);
-        upstream_cfg.per_domain.clear();
-        let manager = UpstreamManager::from_config(&upstream_cfg, &bootstrap)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to initialize per-client upstreams for client '{}': {e}",
-                    entry.name
-                )
-            })?;
-        info!(
-            client = %entry.name,
-            servers = ?servers,
-            "Initialized per-client upstream scope"
-        );
-        scoped.insert(key, Arc::new(manager));
-    }
-    Ok(scoped)
-}
-
 /// High-availability role setup produced by [`init_ha`].
 pub(super) struct HaRuntime {
     pub(super) config: sito_ha::HaConfig,
@@ -84,17 +24,8 @@ pub(super) fn init_ha(
     metrics: &sito_stats::MetricsRegistry,
     shutdown_rx: &watch::Receiver<bool>,
 ) -> anyhow::Result<HaRuntime> {
-    let ha_config: sito_ha::HaConfig = config
-        .ha
-        .as_ref()
-        .map(sito_ha::HaConfig::from_toml_value)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("Invalid HA configuration: {e}"))?
-        .unwrap_or_else(|| sito_ha::HaConfig {
-            replication_port: 0,
-            ..Default::default()
-        });
-
+    let ha_config = sito_ha::config_from_unvalidated(config)
+        .map_err(|e| anyhow::anyhow!("Invalid HA configuration: {e}"))?;
     ha_config
         .validate(&config.server.role)
         .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
@@ -141,49 +72,24 @@ pub(super) fn init_ha(
                 )
             })?,
         };
-        let sanitized_toml = sito_ha::sanitize_config_for_bundle(&initial_toml).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to sanitize '{}' for the HA bundle: {e}",
-                config_path.display()
-            )
-        })?;
-        if sanitized_toml.trim().is_empty() {
-            anyhow::bail!(
-                "Refusing to publish an empty initial HA bundle derived from '{}'",
-                config_path.display()
-            );
-        }
-        if let Some(ref token) = ha_config.slave_token
-            && let Err(e) = sito_ha::scan_for_secrets(&sanitized_toml, &[token.as_str()])
-        {
-            anyhow::bail!("Refusing to publish HA bundle with a leaked secret: {e}");
-        }
-        let list_metadata: Vec<sito_ha::FilterListMetadata> = config
-            .filtering
-            .lists
-            .iter()
-            .map(|l| sito_ha::FilterListMetadata {
-                name: l.name.clone(),
-                url: l.url.clone(),
-                enabled: l.enabled,
-                refresh_hours: l.refresh_hours,
-            })
-            .collect();
+        let known_secrets: Vec<&str> = ha_config.slave_token.as_deref().into_iter().collect();
 
         // Runs on every startup and on an explicit reconciliation: the bundle
         // is always built from the configuration currently on disk.
-        let build_bundle = |version: u64| -> sito_ha::ConfigBundle {
-            #[allow(clippy::cast_sign_loss)]
-            sito_ha::ConfigBundle {
+        let build_bundle = |version: u64| -> anyhow::Result<sito_ha::ConfigBundle> {
+            sito_ha::build_config_bundle(
+                config,
+                &initial_toml,
                 version,
-                term: coordinator.get_current_term(),
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-                config_toml: sanitized_toml.clone(),
-                custom_rules: config.filtering.custom_rules.clone(),
-                rewrites: config.rewrites.clone(),
-                clients: config.clients.clone(),
-                lists: list_metadata.clone(),
-            }
+                coordinator.get_current_term(),
+                &known_secrets,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to build the HA bundle from '{}': {e}",
+                    config_path.display()
+                )
+            })
         };
 
         if let Some(restored_version) = restored_version {
@@ -198,9 +104,12 @@ pub(super) fn init_ha(
                 .unwrap()
                 .as_ref()
                 .map(|bundle| bundle.config_toml.clone());
-            let config_changed = restored_bundle
-                .as_deref()
-                .is_none_or(|restored| !sanitized_configs_equal(restored, &sanitized_toml));
+            // Build once with the restored version: its sanitized document is
+            // what the comparison consumes.
+            let comparison_bundle = build_bundle(restored_version)?;
+            let config_changed = restored_bundle.as_deref().is_none_or(|restored| {
+                !sito_ha::sanitized_configs_equal(restored, &comparison_bundle.config_toml)
+            });
 
             if config_changed {
                 let next_version = restored_version.checked_add(1).ok_or_else(|| {
@@ -208,7 +117,11 @@ pub(super) fn init_ha(
                         "Cannot reconcile the HA bundle: persisted version {restored_version} cannot advance"
                     )
                 })?;
-                coordinator.update_bundle(build_bundle(next_version))?;
+                // Rebuild at the version that will actually be signed and
+                // persisted, so the final-bundle secret scan covers exactly
+                // that document instead of a mutated copy of the comparison
+                // bundle.
+                coordinator.update_bundle(build_bundle(next_version)?)?;
                 info!(
                     version = next_version,
                     previous_version = restored_version,
@@ -221,7 +134,7 @@ pub(super) fn init_ha(
                 );
             }
         } else {
-            coordinator.update_bundle(build_bundle(1))?;
+            coordinator.update_bundle(build_bundle(1)?)?;
             info!("Published initial HA configuration bundle version 1");
         }
 

@@ -117,6 +117,19 @@ protocol conformance. `MockHttp01Server` is a plain HTTP responder for
 `/.well-known/acme-challenge/{token}`. `FakeMaster` does not implement the
 master state machine either: tests drive exact frames at exact moments.
 
+HA fixtures and acceptance tests are feature-gated. `fixtures::ha::FakeMaster`,
+`tests/m8_acceptance.rs`, `tests/m11_ha_partition.rs` and the HA cases in
+`tests/fixtures_contract.rs` only compile with `--features ha`; the default
+`sito-test` build does not link `sito-ha`. Run them with:
+
+```bash
+cargo test -p sito-test --features ha --test fixtures_contract
+cargo test -p sito-test --features ha --test m8_acceptance --test m11_ha_partition
+```
+
+`--all-features` also enables HA. A plain `cargo test -p sito-test` intentionally
+skips these suites.
+
 ## Property tests
 
 `proptest` is a dev-dependency of `sito-core` and `sito-filter` (workspace
@@ -158,9 +171,10 @@ The WP-1.8 report records the exact 20-run command for the harness/m11/HA
 suite and two full-workspace runs. To repeat locally:
 
 ```bash
-cargo test -p sito-test --test harness_parallel --test fixtures_contract \
-  --test m11_acme --test m11_ha_partition --test m11_dnssec_security \
-  --test m11_bind_defaults --test m11_no_setup -- --test-threads=8
+cargo test -p sito-test --features ha --test harness_parallel \
+  --test fixtures_contract --test m11_acme --test m11_ha_partition \
+  --test m11_dnssec_security --test m11_bind_defaults --test m11_no_setup \
+  -- --test-threads=8
 cargo test -p sito-test-support --tests -- --test-threads=8
 cargo test -p sito-cache -- --test-threads=8
 cargo test -p sito-ha -- --test-threads=8

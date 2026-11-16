@@ -59,6 +59,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// A binary built without the `ha` feature must fail `check-config` for a
+    /// document that configures HA. The dependency crate already rejects it;
+    /// this pins the end-to-end CLI path operators and packaging scripts use.
+    #[cfg(not(feature = "ha"))]
+    #[test]
+    fn test_check_config_rejects_ha_without_feature() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_check_cfg_no_ha_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let ha_path = temp_dir.join("ha.toml");
+        std::fs::write(
+            &ha_path,
+            "config_version = 2\n[server]\nrole = \"master\"\n[ha]\nreplication_port = 8953\n",
+        )
+        .unwrap();
+        let err = run_check_config(&ha_path).expect_err("a no-HA build must reject [ha]");
+        let message = err.to_string();
+        assert!(
+            message.contains("[ha]"),
+            "the error must name the rejected section: {message}"
+        );
+        assert!(
+            message.contains("--features ha"),
+            "the error must tell the operator how to enable HA: {message}"
+        );
+
+        let slave_path = temp_dir.join("slave.toml");
+        std::fs::write(
+            &slave_path,
+            "config_version = 2\n[server]\nrole = \"slave\"\n",
+        )
+        .unwrap();
+        let err =
+            run_check_config(&slave_path).expect_err("a no-HA build must reject role = slave");
+        let message = err.to_string();
+        assert!(
+            message.contains("server.role") && message.contains("slave"),
+            "the error must name the rejected field and value: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// The same HA document must stay valid when the binary includes the
+    /// feature: `check-config` behaviour with HA on is unchanged.
+    #[cfg(feature = "ha")]
+    #[test]
+    fn test_check_config_accepts_ha_with_feature() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_check_cfg_ha_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let ha_path = temp_dir.join("ha.toml");
+        std::fs::write(
+            &ha_path,
+            "config_version = 2\n[server]\nrole = \"master\"\n[ha]\nreplication_port = 8953\nallow_insecure_ws = true\nslave_token = \"secret\"\n",
+        )
+        .unwrap();
+        run_check_config(&ha_path).expect("an HA-enabled build must accept a valid [ha] section");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[tokio::test]
     async fn test_pipeline_blocking_caching_and_upstream() {
         let temp_dir = std::env::temp_dir().join(format!("sito_pipe_test_{}", std::process::id()));

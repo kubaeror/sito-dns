@@ -30,7 +30,7 @@ INPUTS = (
     "crates/sito-clients/src/routeros.rs",
     "crates/sito-clients/src/runtime_lists.rs",
     "crates/sito-rewrites/src/config.rs",
-    "crates/sito-ha/src/config.rs",
+    "crates/sito-ha-types/src/config.rs",
 )
 
 

@@ -10,7 +10,7 @@ benchmarks, the action pin policy, and the monthly runner-minute budget.
 
 | Workflow | File | Triggers | Purpose |
 |---|---|---|---|
-| **CI** | `ci.yml` | `pull_request` to `main`, `push` to `main`, `merge_group`, `workflow_dispatch` (`full`) | Classifies the change set and runs `fmt`, `clippy`, `test`, the three-target `build` matrix, `openapi`, `contrib`, `bench-build`, `fuzz-build`, `hygiene` (machete/udeps), `coverage`, and the reusable `docs-check`, `container-check`, `security-check` lanes. Publishes the single required check `ci-gate`. |
+| **CI** | `ci.yml` | `pull_request` to `main`, `push` to `main`, `merge_group`, `workflow_dispatch` (`full`) | Classifies the change set and runs `fmt`, `clippy`, `test`, the three-target `build` matrix, `ha-matrix`, `openapi`, `contrib`, `bench-build`, `fuzz-build`, `hygiene` (machete/udeps), `coverage`, and the reusable `docs-check`, `container-check`, `security-check` lanes. Publishes the single required check `ci-gate`. |
 | **Docs** | `docs.yml` | `workflow_call` from CI, `push` to `main` on docs/workflow paths, `workflow_dispatch` | Runs the configuration-reference nested/default/type/map check, the migration-guide breaking-change check, the internal Markdown link checker, and the pinned `actionlint` container for `.github/workflows/**`. |
 | **Container** | `container.yml` | `workflow_call` from CI and Weekly, `push` to `main` on container paths, `workflow_dispatch` | Validates both Compose files, builds/smoke-tests the development `Dockerfile`, and builds `Dockerfile.release` with stub binaries. |
 | **Security** | `security.yml` | `workflow_call` from CI and Weekly, `push` to `main`, `workflow_dispatch` | Runs `cargo-deny check`. |
@@ -38,7 +38,7 @@ part of the required `ci-gate` check, not separate advisory workflows.
 | Change | Lanes that run |
 |---|---|
 | Docs only (`docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates) | `ci.yml`: `changes`, `docs-check`, `security-check`, `ci-gate`. `docs-check` calls `docs.yml`, which runs `meta` (config-reference nested/default/type/map checks when the reference or checker changes; the migration-guide breaking-change check; and the internal link check over the repository's tracked Markdown). `security-check` calls `security.yml` (`cargo-deny`) on every PR/merge group, including docs-only changes. No Rust or Docker lanes. The `docs/openapi.json` exception below runs `openapi`. |
-| Code (`crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`, structural-size scripts, `benches/**`, `fuzz/Cargo.toml`, `fuzz/fuzz_targets/**`, `fuzz/corpus/**`, `fuzz/dictionaries/**`, `fuzz/.gitignore`, and `docs/large-functions.md`) | `ci.yml`: `changes`, `fmt`, `clippy`, `test`, `build` (x86_64, aarch64, armv7), `bench-build`, `fuzz-build`, `hygiene`, `coverage`, `security-check`, `ci-gate`. |
+| Code (`crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`, structural-size scripts, `benches/**`, `fuzz/Cargo.toml`, `fuzz/fuzz_targets/**`, `fuzz/corpus/**`, `fuzz/dictionaries/**`, `fuzz/.gitignore`, and `docs/large-functions.md`) | `ci.yml`: `changes`, `fmt`, `clippy`, `test`, `build` (x86_64, aarch64, armv7), `ha-matrix`, `bench-build`, `fuzz-build`, `hygiene`, `coverage`, `security-check`, `ci-gate`. |
 | OpenAPI spec only (`docs/openapi.json` without crate changes) | `ci.yml`: `changes`, `openapi`, `ci-gate`; `docs-check` also runs because the path is under `docs/`. |
 | API crate (`crates/sito-api/**`) | Full code lane. `openapi` is skipped because `test` already regenerates and diffs the spec. |
 | Contrib/scripts (`contrib/**`, `scripts/**`) | `ci.yml`: `changes`, `contrib`, `ci-gate`. `contrib` runs `shellcheck` on the installer and release helpers, the AdGuard converter fixture test, and the release-helper tests. The `test` lane runs the fuzz-manifest and benchmark-regression script tests when `scripts/**` changes. |
@@ -107,8 +107,8 @@ A docs-only pull request therefore costs roughly the two small `ci.yml` jobs
 
 The heavy `ci.yml` jobs run on a push to `main` when their path filter matches,
 so `main` itself is continuously verified: `fmt`, `clippy`, `test`, `build`
-(three targets), `bench-build`, `fuzz-build`, `hygiene`, `coverage`, and
-`ci-gate`. This satisfies the WP-1.9 requirement that tests/clippy/fmt/deny run
+(three targets), `ha-matrix`, `bench-build`, `fuzz-build`, `hygiene`, `coverage`,
+and `ci-gate`. This satisfies the WP-1.9 requirement that tests/clippy/fmt/deny run
 on `main` and on pull requests. The path-filtered `docs.yml`, `container.yml`,
 and `security.yml` workflows also run on `main` pushes when their paths match.
 
@@ -144,8 +144,9 @@ overrides force the heavy `ci.yml` jobs even when the classifier says `code` or
   selected ref, not a run of the pull request payload.
 
 The override applies to the code jobs (`fmt`, `clippy`, `test`, `build`,
-`openapi`, `contrib`, `bench-build`, `fuzz-build`, `hygiene`, `coverage`) and
-to the reusable gate jobs `docs-check`, `container-check`, and `security-check`.
+`ha-matrix`, `openapi`, `contrib`, `bench-build`, `fuzz-build`, `hygiene`,
+`coverage`) and to the reusable gate jobs `docs-check`, `container-check`, and
+`security-check`.
 It only matters for pull-request and `workflow_dispatch` runs. A push to `main`
 already runs the same path-filtered heavy jobs, so `force` does not change a
 main-push run. The classifier reads
@@ -184,6 +185,38 @@ and threshold cases. The function check reads `docs/large-functions.md`; a
 function over 200 lines without a matching `(file, function)` row fails CI.
 Changes to either script, the helper, or the exception list are classified as
 code changes so the test lane re-runs them.
+
+## HA feature matrix
+
+`sito`, `sito-api` and `sito-test` make HA optional. The default source build
+does **not** link `sito-ha`; the workspace `test` and `clippy` lanes use
+`--all-features` and therefore also cover HA. The `ha-matrix` job pins the
+default no-HA graph and the enabled surface on every code change:
+
+| Lane | Command | What it proves |
+|---|---|---|
+| Absence guard | `cargo tree -p sito -p sito-api -p sito-test --no-default-features --locked` must not contain `sito-ha` | The default binary, API and test harness cannot silently acquire the HA implementation. |
+| Default `sito` | `cargo test -p sito --locked` | The no-HA binary's unit tests, including config rejection, pass. |
+| HA `sito` | `cargo check -p sito --features ha --locked` | The enabled binary still compiles against `sito-ha`. |
+| Default `sito-api` | `cargo test -p sito-api --no-default-features --locked`; `cargo check -p sito-api --no-default-features --locked` | No-HA config validation and the stub routes stay green. |
+| HA `sito-api` | `cargo check -p sito-api --features ha --locked` | The real HA handlers compile. |
+| Default `sito-test` | `cargo test -p sito-test --no-default-features --locked` | Non-HA acceptance tests compile and pass. |
+| HA `sito-test` | `cargo check -p sito-test --features ha --tests --locked` | The HA acceptance tests and fixtures compile. |
+
+`cargo check` only compiles the enabled surface; it does not run tests. The HA
+acceptance suites themselves run in the workspace `test` lane, which builds
+with `--all-features`.
+
+Coverage is deliberately split. `fmt` checks every target; the workspace `test`
+and `clippy` lanes use `--all-features`, and `bench-build`, `coverage` and the
+release image use `--all-features` (or the explicit `embed-ui,ha,mimalloc` set),
+so feature-gated HA code is linted and exercised there. The `ha-matrix` job is
+the only lane that proves the default graph has no `sito-ha` edge while also
+compiling both sides of the feature gate. Official release archives and the
+container image build `embed-ui,ha,mimalloc`; the `Dockerfile` comments record
+that this preserves feature parity with those archives. The internal
+`sito-api/ha` feature is an implementation detail of `sito/ha`; enabling it
+directly without `sito/ha` is unsupported.
 
 ## Error-swallowing allowlist
 
@@ -287,9 +320,10 @@ regenerate the baseline to make a real regression pass.
 ## Required check and branch protection
 
 `ci-gate` is the single check that should be required for `main`. It depends on
-`changes`, `fmt`, `clippy`, `test`, `build`, `openapi`, `contrib`, `docs-check`,
-`container-check`, `security-check`, `bench-build`, `fuzz-build`, `hygiene`, and
-`coverage` and fails if any of them reports `failure` or `cancelled`. Jobs that
+`changes`, `fmt`, `clippy`, `test`, `build`, `ha-matrix`, `openapi`, `contrib`,
+`docs-check`, `container-check`, `security-check`, `bench-build`, `fuzz-build`,
+`hygiene`, and `coverage` and fails if any of them reports `failure` or
+`cancelled`. Jobs that
 were skipped because their paths did not change count as success, which is what
 lets a docs-only PR merge without a Rust run. Requiring every individual job
 instead would make docs-only PRs wait on checks that are intentionally absent.
@@ -349,7 +383,7 @@ the workflow before any asset is built. The order is deliberate:
 1. **`verify-tag`** — checks the tag against the workspace version.
 2. **`build-binaries`** — builds `x86_64-unknown-linux-gnu`,
    `aarch64-unknown-linux-gnu`, and `armv7-unknown-linux-gnueabihf` with the
-   `embed-ui,mimalloc` features, runs `shellcheck` on the installer, packages
+   `embed-ui,ha,mimalloc` features, runs `shellcheck` on the installer, packages
    each archive with `LICENSE`, `README.md`, `config.example.toml`, the
    systemd unit, and `contrib/install.sh`, and records per-archive SHA-256
    checksums.
@@ -500,7 +534,7 @@ Approximate runner-minutes per run (sum of billed jobs; parallel jobs count sepa
 | Activity | Typical minutes |
 |---|---|
 | Docs-only PR (`changes` + `ci-gate` + docs `meta` + `cargo-deny`) | 2–4 |
-| Code PR (`changes`, `fmt`, `clippy`, `test`, `build` ×3, `ci-gate`) | 20–25 |
+| Code PR (`changes`, `fmt`, `clippy`, `test`, `build` ×3, `ha-matrix`, `ci-gate`) | 20–25 |
 | Code PR extra lanes (`bench-build`, `fuzz-build`, `hygiene`, `coverage`) | 30–45 |
 | OpenAPI-only PR | 2–3 |
 | Contrib-only PR | 1–2 |

@@ -297,12 +297,12 @@ impl MasterCoordinator {
                     .map(|s| s.sender.clone())
             };
             if let Some(sender) = sender {
-                let wire_size = push.to_json().map_or(0, |json| json.len());
+                let push_bytes = wire_size(push);
                 if let Err(e) = self.try_queue_accounted(
                     slave_instance,
                     connection_id,
                     &sender,
-                    wire_size,
+                    push_bytes,
                     push.clone(),
                 ) {
                     warn!(

@@ -13,9 +13,13 @@ use crate::auth::client_ip::resolve_client_ip;
 use crate::auth::session::extract_session_cookie;
 use crate::auth::token::Role;
 use crate::error::ProblemDetails;
+#[cfg(feature = "ha")]
+use crate::handlers::ha;
+#[cfg(not(feature = "ha"))]
+use crate::handlers::ha_stub as ha;
 use crate::handlers::{
-    auth_handlers, cache, clients, config, filtering, ha, metrics, querylog, rewrites, stats,
-    status, update, upstream,
+    auth_handlers, cache, clients, config, filtering, metrics, querylog, rewrites, stats, status,
+    update, upstream,
 };
 use crate::openapi::ApiDoc;
 use crate::state::ServerContext;
@@ -362,7 +366,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
         // Cache
         .route("/cache/flush", post(cache::flush_cache))
         .route("/cache/invalidate", post(cache::invalidate_cache))
-        // High Availability (M8 stubs)
+        // High Availability (real handlers; 501 stubs in no-HA builds)
         .route("/ha/status", get(ha::get_ha_status))
         .route("/ha/slaves", get(ha::get_ha_slaves))
         .route("/ha/resync", post(ha::trigger_ha_resync))
@@ -461,6 +465,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    #[cfg(feature = "ha")]
     use std::sync::Arc;
 
     async fn health_body(ctx: ServerContext) -> (StatusCode, serde_json::Value) {
@@ -511,6 +516,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_health_unavailable_when_ha_is_broken() {
         let temp_dir = crate::test_support::temp_dir("sito_health_ha");
@@ -527,6 +533,60 @@ mod tests {
         );
         assert_eq!(body, serde_json::json!({ "status": "unavailable" }));
 
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}
+
+/// A build without `sito-ha` still mounts `/api/v1/ha/*` for discoverability,
+/// but every handler reports the stable `501 ha_not_supported` response behind
+/// the same admin authorization as a feature-enabled build.
+#[cfg(all(test, not(feature = "ha")))]
+mod no_ha_tests {
+    use super::*;
+    use crate::auth::rbac::RequireAdmin;
+
+    fn admin() -> RequireAdmin {
+        RequireAdmin(crate::auth::AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+        })
+    }
+
+    fn assert_ha_not_supported(problem: &ProblemDetails) {
+        assert_eq!(problem.status, StatusCode::NOT_IMPLEMENTED.as_u16());
+        assert!(
+            problem.detail.contains("ha_not_supported"),
+            "the response must carry the stable reason code: {problem:?}"
+        );
+        assert!(
+            problem.detail.contains("--features ha"),
+            "the response must tell the operator how to enable HA: {problem:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ha_routes_return_501_without_ha_support() {
+        let temp_dir = crate::test_support::temp_dir("sito_no_ha_routes");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let status = ha::get_ha_status(admin(), State(ctx.clone()))
+            .await
+            .expect_err("HA status must be unsupported without the feature");
+        assert_ha_not_supported(&status);
+
+        let slaves = ha::get_ha_slaves(admin(), State(ctx.clone()))
+            .await
+            .expect_err("HA slaves must be unsupported without the feature");
+        assert_ha_not_supported(&slaves);
+
+        let resync = ha::trigger_ha_resync(admin(), State(ctx.clone()))
+            .await
+            .expect_err("HA resync must be unsupported without the feature");
+        assert_ha_not_supported(&resync);
+
+        // The stubs are wired into the same full router as the HA build.
+        let _router = create_router(ctx);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

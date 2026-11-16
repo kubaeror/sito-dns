@@ -265,12 +265,12 @@ impl<'a> SessionMachine<'a> {
                 cur_v,
                 "Pushing current configuration bundle to newly connected slave"
             );
-            let wire_size = push.to_json().map_or(0, |json| json.len());
+            let push_bytes = wire_size(push);
             if let Err(e) = self.coordinator.try_queue_accounted(
                 slave_instance,
                 connection_id,
                 &tx,
-                wire_size,
+                push_bytes,
                 push.clone(),
             ) {
                 warn!(instance = %slave_instance, error = %e, "Initial HA push could not be queued; coalescing");

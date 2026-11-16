@@ -1,42 +1,13 @@
 //! In-memory tracking of connected replica slaves.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::protocol::HaMessage;
 
-/// Summary of a connected slave exposed via `/api/v1/ha/slaves` REST API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SlaveSummary {
-    pub instance: String,
-    pub remote_addr: String,
-    pub synced_version: u64,
-    pub lag: u64,
-    /// True when this slave reported a version above the master's current one.
-    /// A diverged slave silently ignores every push until the sequence is
-    /// recovered above its version, so its `lag` is pinned to 0 and must not be
-    /// read as "in sync".
-    pub diverged: bool,
-    pub last_ping_secs_ago: u64,
-    pub connected_at: String,
-    pub last_stats: Option<SlaveStatsSummary>,
-}
-
-/// Aggregated stats snapshot reported by a slave node for its last reporting
-/// window.
-///
-/// `window_s` is the actual length of that window and `queries`/`blocked` are
-/// the activity observed in it (deltas, not lifetime totals).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SlaveStatsSummary {
-    pub window_s: u64,
-    pub queries: u64,
-    pub blocked: u64,
-    pub upstreams_count: usize,
-}
+pub use sito_ha_types::status::{SlaveStatsSummary, SlaveSummary};
 
 /// Full tracking state of an active slave connection on the master.
 pub struct ActiveSlave {

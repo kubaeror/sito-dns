@@ -547,12 +547,18 @@ async fn test_acceptance_m10_restore_preview_is_masked() {
         .1
         .token;
 
-    let secret_toml = r#"
+    // A no-HA build rejects any `[ha]` section during restore validation, so
+    // only include the HA token in builds that can honour it. The masking path
+    // for the other secret shapes is exercised in both modes.
+    let ha_section = if cfg!(feature = "ha") {
+        "[ha]\nreplication_port = 0\nslave_token = \"supersecret-token-value\"\n"
+    } else {
+        "\n"
+    };
+    let secret_toml = format!(
+        r#"
 config_version = 2
-[ha]
-replication_port = 0
-slave_token = "supersecret-token-value"
-
+{ha_section}
 [tls]
 key = "private-key-material"
 cert = "public-cert.pem"
@@ -563,8 +569,9 @@ password = "inline-secret-token"
 
 [clients.client_id_secrets]
 phone = "table-secret-value"
-"#;
-    let archive = sito_api::handlers::config::create_backup_archive(secret_toml).unwrap();
+"#
+    );
+    let archive = sito_api::handlers::config::create_backup_archive(&secret_toml).unwrap();
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/config/restore")
@@ -575,6 +582,7 @@ phone = "table-secret-value"
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = body_string(res).await;
+    #[cfg(feature = "ha")]
     assert!(
         !body.contains("supersecret-token-value"),
         "slave token leaked: {body}"

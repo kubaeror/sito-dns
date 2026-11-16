@@ -101,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
+            #[cfg(feature = "ha")]
             Commands::Ha { command } => match command {
                 sito::cli::HaCommands::GenCerts {
                     dir,

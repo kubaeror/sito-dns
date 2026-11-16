@@ -25,7 +25,7 @@ sito-clients.workspace = true
 sito-core.workspace = true
 sito-dnssec.workspace = true
 sito-filter.workspace = true
-sito-ha.workspace = true
+sito-ha = { workspace = true, optional = true }
 sito-proto.workspace = true
 sito-rewrites.workspace = true
 sito-routeros = { workspace = true, optional = true }
@@ -47,6 +47,11 @@ time.workspace = true
 [features]
 default = []
 embed-ui = ["sito-api/embed-ui"]
+# High-availability replication. Official release archives and the container
+# image enable it explicitly; a build without it runs as a normal master,
+# rejects `[ha]`/`role = "slave"` in `check-config`, and answers the HA API
+# routes with 501.
+ha = ["dep:sito-ha", "sito-api/ha"]
 mimalloc = ["dep:mimalloc"]
 # Optional experimental MikroTik RouterOS DHCP lease synchronization. Not part
 # of the default build: `cargo build -p sito --features routeros`.

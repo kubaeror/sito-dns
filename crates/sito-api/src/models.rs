@@ -628,8 +628,8 @@ pub struct HaSlaveSummary {
     pub last_stats: Option<HaSlaveStatsSummary>,
 }
 
-impl From<sito_ha::SlaveSummary> for HaSlaveSummary {
-    fn from(s: sito_ha::SlaveSummary) -> Self {
+impl From<sito_ha_types::SlaveSummary> for HaSlaveSummary {
+    fn from(s: sito_ha_types::SlaveSummary) -> Self {
         Self {
             instance: s.instance,
             remote_addr: s.remote_addr,

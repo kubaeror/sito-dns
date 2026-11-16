@@ -2,7 +2,7 @@
 
 use utoipa::OpenApi;
 
-/// Root OpenAPI documentation specification for the sito administration API.
+/// Documentation shared by every build.
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -41,9 +41,6 @@ use utoipa::OpenApi;
         crate::handlers::upstream::test_upstream_servers,
         crate::handlers::cache::flush_cache,
         crate::handlers::cache::invalidate_cache,
-        crate::handlers::ha::get_ha_status,
-        crate::handlers::ha::get_ha_slaves,
-        crate::handlers::ha::trigger_ha_resync,
         crate::handlers::auth_handlers::login,
         crate::handlers::auth_handlers::verify_totp,
         crate::handlers::auth_handlers::logout,
@@ -119,10 +116,6 @@ use utoipa::OpenApi;
             crate::models::CreateUserRequest,
             crate::models::UpdateUserRequest,
             crate::models::ChangePasswordRequest,
-            crate::models::HaStatusResponse,
-            crate::models::HaSlaveSummary,
-            crate::models::HaSlaveStatsSummary,
-            crate::models::HaResyncResponse,
             crate::auth::token::Role,
             crate::auth::token::CreateTokenResponse,
             crate::auth::totp::TotpSetupResponse,
@@ -145,8 +138,7 @@ use utoipa::OpenApi;
         (name = "Upstream", description = "Upstream DNS resolvers and latency probing"),
         (name = "Cache", description = "Response cache operations"),
         (name = "Config", description = "Configuration persistence, hot-reload, backup and restore"),
-        (name = "Auth", description = "Authentication, sessions, TOTP 2FA, and API tokens"),
-        (name = "HA", description = "High Availability replication (Phase M8)")
+        (name = "Auth", description = "Authentication, sessions, TOTP 2FA, and API tokens")
     ),
     info(
         title = "sito DNS Administrative API",
@@ -155,4 +147,39 @@ use utoipa::OpenApi;
         license(name = "GPL-3.0-only")
     )
 )]
+struct BaseApiDoc;
+
+/// HA paths and schemas, compiled only when replication support is present.
+#[cfg(feature = "ha")]
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        crate::handlers::ha::get_ha_status,
+        crate::handlers::ha::get_ha_slaves,
+        crate::handlers::ha::trigger_ha_resync,
+    ),
+    components(
+        schemas(
+            crate::models::HaStatusResponse,
+            crate::models::HaSlaveSummary,
+            crate::models::HaSlaveStatsSummary,
+            crate::models::HaResyncResponse,
+        )
+    ),
+    tags(
+        (name = "HA", description = "High Availability replication (Phase M8)")
+    )
+)]
+struct HaApiDoc;
+
+/// Root OpenAPI documentation specification for the sito administration API.
 pub struct ApiDoc;
+
+impl OpenApi for ApiDoc {
+    fn openapi() -> utoipa::openapi::OpenApi {
+        let document = BaseApiDoc::openapi();
+        #[cfg(feature = "ha")]
+        let document = document.merge_from(HaApiDoc::openapi());
+        document
+    }
+}
