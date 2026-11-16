@@ -24,7 +24,7 @@ change: state why the function cannot be split without changing behavior.
 | `validate_with_key_fetcher` | `crates/sito-dnssec/src/verify.rs` | 209 | Validation + bounded fetch loop with a shared budget and deadline; the loop owns the decision state across iterations. |
 | `build_validated_key_set` | `crates/sito-dnssec/src/verify.rs` | 240 | Builds one authenticated DNSKEY set from a chain; partial sets are invalid, so the construction is intentionally a single function. |
 | `fetch_or_cached` | `crates/sito-filter/src/subscription.rs` | 371 | HTTP/cache fetch with conditional requests, size caps, and atomic cache writes; the error and cache-update paths share one bounded reader. |
-| `apply_config_push` | `crates/sito-ha/src/slave/worker.rs` | 260 | Slave apply transaction: verify, persist, apply, ACK or mark degraded. Partial application must not ACK, so the sequence is one function. |
+| `apply_config_push` | `crates/sito-ha/src/slave/worker/apply.rs` | 260 | Slave apply transaction: verify, persist, apply, ACK or mark degraded. Partial application must not ACK, so the sequence is one function. |
 | `obtain_or_renew_certificate_for_transports` | `crates/sito-transport/src/acme.rs` | 212 | ACME order/renewal sequence with challenge selection and post-issuance reload; the reload must observe the certificate produced by the order. |
 | `start_doh3_listener_with_limits` | `crates/sito-transport/src/doh3.rs` | 529 | DoH3 listener setup and per-connection loop share admission limits; the connection lifecycle spans handshake, request admission, body cap and stream handling. |
 | `start_doq_listener` | `crates/sito-transport/src/doq.rs` | 314 | DoQ listener setup and stream admission are one bounded-resource contract; limits are applied before any read. |
