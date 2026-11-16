@@ -5581,3 +5581,78 @@ fn test_qtype_cname_positive_answer_is_not_negative() {
         "the same response is NODATA for QTYPE=A"
     );
 }
+
+#[test]
+fn trust_chain_state_maps_to_validation_decision() {
+    assert_eq!(
+        ValidationDecision::from(TrustChainState::Signed),
+        ValidationDecision::Secure
+    );
+    assert_eq!(
+        ValidationDecision::from(TrustChainState::Unsigned),
+        ValidationDecision::Insecure
+    );
+    assert_eq!(
+        ValidationDecision::from(TrustChainState::Unknown),
+        ValidationDecision::Indeterminate
+    );
+
+    match ValidationDecision::from(TrustChainState::Bogus) {
+        ValidationDecision::Bogus { reason, ede_code } => {
+            assert!(!reason.is_empty(), "a bogus chain must carry a reason");
+            assert_eq!(ede_code, EDE_DNSSEC_BOGUS);
+        }
+        other => panic!("a bogus chain must map to Bogus, got {other:?}"),
+    }
+}
+
+#[test]
+fn trust_chain_decision_preserves_bogus_reason_and_ede() {
+    let outcome = ValidationOutcome::Bogus {
+        reason: "signature expired".to_string(),
+        ede_code: EDE_SIGNATURE_EXPIRED,
+    };
+
+    let decision = ValidationDecision::from_outcome(&outcome);
+    assert_eq!(
+        decision,
+        ValidationDecision::Bogus {
+            reason: "signature expired".to_string(),
+            ede_code: EDE_SIGNATURE_EXPIRED,
+        }
+    );
+    assert_eq!(decision.to_outcome(), outcome);
+
+    let converted = ValidationOutcome::from(decision);
+    assert_eq!(converted, outcome);
+}
+
+#[test]
+fn trust_chain_nta_bypass_maps_to_insecure() {
+    assert_eq!(
+        ValidationDecision::from_outcome(&ValidationOutcome::NtaBypass),
+        ValidationDecision::Insecure
+    );
+    assert_eq!(
+        ValidationDecision::Insecure.to_outcome(),
+        ValidationOutcome::Insecure
+    );
+}
+
+#[test]
+fn trust_chain_validation_decision_round_trips() {
+    for outcome in [
+        ValidationOutcome::Secure,
+        ValidationOutcome::Insecure,
+        ValidationOutcome::Indeterminate,
+    ] {
+        let decision = ValidationDecision::from_outcome(&outcome);
+        assert_eq!(decision.to_outcome(), outcome);
+        assert_eq!(ValidationOutcome::from(decision.clone()), outcome);
+        assert_eq!(
+            ValidationDecision::from_outcome(&ValidationOutcome::from(decision)).to_outcome(),
+            outcome,
+            "outcome -> decision -> outcome -> decision -> outcome must be stable"
+        );
+    }
+}
