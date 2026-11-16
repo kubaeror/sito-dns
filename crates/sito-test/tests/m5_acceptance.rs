@@ -136,8 +136,6 @@ async fn test_acceptance_m5_openapi_contract() {
         "/api/v1/upstream",
         "/api/v1/upstream/test",
         "/api/v1/cache/flush",
-        "/api/v1/ha/status",
-        "/api/v1/ha/resync",
         "/api/v1/auth/login",
         "/api/v1/config",
         "/api/v1/config/reload",
@@ -151,6 +149,22 @@ async fn test_acceptance_m5_openapi_contract() {
             openapi.paths.paths.contains_key(path),
             "OpenAPI schema missing required endpoint: {path}"
         );
+    }
+
+    // HA paths are only documented when this build can serve them; a no-HA
+    // build keeps the routes mounted as 501 stubs without advertising them.
+    for path in ["/api/v1/ha/status", "/api/v1/ha/resync"] {
+        if cfg!(feature = "ha") {
+            assert!(
+                openapi.paths.paths.contains_key(path),
+                "OpenAPI schema missing required endpoint: {path}"
+            );
+        } else {
+            assert!(
+                !openapi.paths.paths.contains_key(path),
+                "a no-HA build must not document {path}"
+            );
+        }
     }
 
     // Verify docs/openapi.json exists and is valid JSON matching ApiDoc
@@ -343,7 +357,7 @@ async fn test_acceptance_m5_rbac_matrix() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // 5. HA status: returns 200 OK for Admin per M8 implementation
+    // 5. HA status: 200 OK with a role in HA builds, stable 501 otherwise.
     let (status, body) = call_route(
         app.clone(),
         "GET",
@@ -352,8 +366,16 @@ async fn test_acceptance_m5_rbac_matrix() {
         "",
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("\"role\""));
+    if cfg!(feature = "ha") {
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"role\""));
+    } else {
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            body.contains("ha_not_supported"),
+            "no-HA HA route must report the stable stub: {body}"
+        );
+    }
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

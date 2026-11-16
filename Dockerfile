@@ -52,10 +52,12 @@ ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
 WORKDIR /src
 COPY . .
 # mimalloc is enabled for every architecture (amd64, arm64, armv7), matching
-# the release archives built by .github/workflows/release.yml.
+# the release archives built by .github/workflows/release.yml. `ha` keeps the
+# official image byte-for-byte feature-parity with those archives: the image
+# supports HA clustering exactly as it did before HA became optional.
 RUN RUST_TARGET="$(cat /rust-target)" && \
     cargo build --release --locked -p sito \
-        --features "embed-ui,mimalloc" \
+        --features "embed-ui,ha,mimalloc" \
         --target "${RUST_TARGET}" && \
     cp "target/${RUST_TARGET}/release/sito" /sito
 # Create the data directory with nonroot ownership. Docker initialises fresh

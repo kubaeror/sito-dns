@@ -203,14 +203,25 @@ pub async fn run_server_with_lease(
         .with_stats(querylog_sender.clone(), metrics.clone()),
     );
 
-    // Initialize High Availability (HA) clustering subsystem per role
+    // Initialize High Availability (HA) clustering subsystem per role. Without
+    // the `ha` feature the process runs as a normal master: the API keeps the
+    // same handle fields at `None` and answers the HA routes with 501.
+    #[cfg(feature = "ha")]
     let mut ha_runtime = init_ha(&config, &config_path_buf, &metrics, &shutdown_rx)?;
+    #[cfg(feature = "ha")]
     let _ha_config = ha_runtime.config.clone();
+    #[cfg(feature = "ha")]
     let (master_coordinator, slave_tracker, resync_sender) = (
         ha_runtime.coordinator.clone(),
         ha_runtime.tracker.clone(),
         ha_runtime.resync_sender.clone(),
     );
+    #[cfg(not(feature = "ha"))]
+    let (master_coordinator, slave_tracker, resync_sender): (
+        Option<sito_api::state::MasterCoordinatorHandle>,
+        Option<sito_api::state::SlaveTrackerHandle>,
+        Option<tokio::sync::mpsc::Sender<()>>,
+    ) = (None, None, None);
 
     // Administrative REST API server
     let auth_cfg = config.get_auth_config();
@@ -286,8 +297,8 @@ pub async fn run_server_with_lease(
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
-        master_coordinator: master_coordinator.clone(),
-        slave_tracker: slave_tracker.clone(),
+        master_coordinator,
+        slave_tracker,
         resync_sender,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(setup_pending)),
         readiness: readiness.clone(),
@@ -509,6 +520,7 @@ pub async fn run_server_with_lease(
                 .await?;
                 *listener_manager.lock().await = Some(manager);
                 readiness.set_listeners_ready();
+                #[cfg(feature = "ha")]
                 spawn_slave_worker_after_listeners(
                     &mut ha_runtime,
                     &server_ctx,
@@ -556,6 +568,7 @@ pub async fn run_server_with_lease(
         .await?;
         *listener_manager.lock().await = Some(manager);
         readiness.set_listeners_ready();
+        #[cfg(feature = "ha")]
         spawn_slave_worker_after_listeners(
             &mut ha_runtime,
             &server_ctx,

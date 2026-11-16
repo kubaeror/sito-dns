@@ -4,7 +4,11 @@
 //! - docs/phases/m8-ha.md
 //! - docs/dns-server-plan-detailed.md (section 11, 12.1, 14.2, 17.3, 18.4)
 //! - docs/adr/0002-ha-master-slave-push-no-raft.md
+//!
+//! These tests drive the production `sito::server::HaConfigApplier`, which only
+//! exists when the binary is built with the `ha` feature.
 
+#![cfg(feature = "ha")]
 #![allow(clippy::pedantic)]
 #![allow(clippy::unwrap_used)]
 

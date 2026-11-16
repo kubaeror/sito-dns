@@ -3,66 +3,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
-/// Builds per-client upstream managers, reusing existing managers by key so a
-/// hot reload does not re-resolve unchanged upstream scopes.
-pub(crate) async fn build_scoped_upstreams(
-    config: &Config,
-    clients: &sito_clients::ClientsConfig,
-    existing: &HashMap<String, Arc<UpstreamManager>>,
-) -> anyhow::Result<HashMap<String, Arc<UpstreamManager>>> {
-    // Build from the current config on every call. Capturing a startup resolver
-    // here would leave scoped upstreams on old bootstrap/allow_private_targets
-    // settings after a hot reload.
-    let bootstrap = BootstrapResolver::from_config(&config.upstream);
-    let mut scoped: HashMap<String, Arc<UpstreamManager>> = HashMap::new();
-    for entry in &clients.entries {
-        if entry.use_global_upstreams {
-            continue;
-        }
-        // Validation rejects this, but never let a hand-built registry or an
-        // older persisted document fall through to the global upstreams: a
-        // scoped client with no scope is a policy bypass.
-        let Some(ref servers) = entry.upstreams else {
-            anyhow::bail!(
-                "Client '{}' sets use_global_upstreams = false but has no per-client upstreams",
-                entry.name
-            );
-        };
-        if servers.is_empty() {
-            anyhow::bail!(
-                "Client '{}' sets use_global_upstreams = false but its upstream list is empty",
-                entry.name
-            );
-        }
-        let key = sito_runtime::scoped_upstream_key(config, servers);
-        if scoped.contains_key(&key) {
-            continue;
-        }
-        if let Some(manager) = existing.get(&key) {
-            scoped.insert(key, manager.clone());
-            continue;
-        }
-        let mut upstream_cfg = config.upstream.clone();
-        upstream_cfg.servers.clone_from(servers);
-        upstream_cfg.per_domain.clear();
-        let manager = UpstreamManager::from_config(&upstream_cfg, &bootstrap)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to initialize per-client upstreams for client '{}': {e}",
-                    entry.name
-                )
-            })?;
-        info!(
-            client = %entry.name,
-            servers = ?servers,
-            "Initialized per-client upstream scope"
-        );
-        scoped.insert(key, Arc::new(manager));
-    }
-    Ok(scoped)
-}
-
 /// High-availability role setup produced by [`init_ha`].
 pub(super) struct HaRuntime {
     pub(super) config: sito_ha::HaConfig,

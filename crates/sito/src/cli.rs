@@ -154,6 +154,7 @@ pub enum Commands {
         force: bool,
     },
     /// High Availability clustering management
+    #[cfg(feature = "ha")]
     Ha {
         #[command(subcommand)]
         command: HaCommands,
@@ -252,6 +253,7 @@ pub enum ConfigCommands {
     },
 }
 
+#[cfg(feature = "ha")]
 #[derive(Subcommand, Debug)]
 pub enum HaCommands {
     /// Generate self-signed CA and mTLS certificate/key pairs with BLAKE3 fingerprint pinning
@@ -548,7 +550,9 @@ pub async fn run_clear_query_log(
 /// Whether the configuration makes HA replication part of this node's role.
 ///
 /// Mirrors the server's readiness gate so the healthcheck fails closed only
-/// when `[ha]` is actually part of the deployment.
+/// when `[ha]` is actually part of the deployment. A build without the `ha`
+/// feature never gates on replication: it cannot run HA at all and rejects
+/// `[ha]`/`role = "slave"` during validation.
 #[must_use]
 pub fn ha_readiness_required(config: &Config) -> bool {
     sito_api::state::ha_readiness_required(config)
@@ -1063,6 +1067,7 @@ pub fn prepare_no_setup_bootstrap(
 /// `uid`/`gid` transfer every generated certificate and private key to the
 /// unprivileged HA runtime user. They must be provided together; clap enforces
 /// this for the CLI and the check below covers programmatic callers.
+#[cfg(feature = "ha")]
 pub fn run_ha_gen_certs(
     dir: &Path,
     master: bool,
@@ -1853,6 +1858,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ha")]
     #[test]
     fn test_cli_ha_gen_certs_uid_gid() {
         let cli = Cli::try_parse_from([
@@ -1892,7 +1898,7 @@ mod tests {
         assert!(err.to_string().contains("--gid"), "unexpected error: {err}");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(feature = "ha", unix))]
     #[test]
     fn test_run_ha_gen_certs_applies_uid_gid() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -2222,6 +2228,7 @@ mod tests {
             .expect("a DNS-only node must stay healthy without an HA check");
     }
 
+    #[cfg(feature = "ha")]
     #[test]
     fn test_ha_readiness_required_from_config() {
         let mut cfg = Config::default();
@@ -2245,6 +2252,23 @@ mod tests {
         assert!(ha_readiness_required(&cfg));
 
         cfg.ha = None;
+        assert!(!ha_readiness_required(&cfg));
+    }
+
+    /// A build without `ha` never makes replication part of the node's role,
+    /// even when the raw document still carries `[ha]` (the validator rejects
+    /// such a document before startup), so the healthcheck never gates on it.
+    #[cfg(not(feature = "ha"))]
+    #[test]
+    fn test_ha_readiness_not_required_without_feature() {
+        let mut cfg = Config::default();
+        cfg.server.role = "master".to_string();
+        assert!(!ha_readiness_required(&cfg));
+        cfg.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+        assert!(!ha_readiness_required(&cfg));
+
+        cfg.server.role = "slave".to_string();
+        cfg.ha = Some(toml::from_str("master_url = \"wss://10.0.0.1:8953\"").unwrap());
         assert!(!ha_readiness_required(&cfg));
     }
 

@@ -33,6 +33,7 @@ use sito_upstream::{BootstrapResolver, UpstreamManager};
 use crate::pipeline::DnsPipeline;
 
 mod common;
+#[cfg(feature = "ha")]
 mod ha;
 mod listeners;
 mod runtime;
@@ -43,6 +44,7 @@ mod watcher;
 
 #[allow(clippy::wildcard_imports)]
 pub use common::*;
+#[cfg(feature = "ha")]
 #[allow(clippy::wildcard_imports)]
 pub use ha::*;
 #[allow(clippy::wildcard_imports)]

@@ -4,6 +4,11 @@
 //! These tests exercise the observable behaviour (readiness, divergence and
 //! publish outcomes), not private helpers, so they stay honest when the
 //! internal HA state machine is reshaped in 2.0.
+//!
+//! They populate `ServerContext` with real HA handles, which only exist when
+//! the binary is built with the `ha` feature.
+
+#![cfg(feature = "ha")]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

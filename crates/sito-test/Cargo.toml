@@ -54,6 +54,9 @@ subtle.workspace = true
 [features]
 default = []
 embed-ui = ["sito-api/embed-ui", "sito/embed-ui"]
+# HA acceptance tests drive `sito`'s HA server paths, so they need the binary
+# feature. Enabled by `--all-features`; default workspace builds stay no-HA.
+ha = ["sito/ha"]
 
 [dev-dependencies]
 criterion.workspace = true

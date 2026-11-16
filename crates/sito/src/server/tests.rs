@@ -139,6 +139,7 @@ fn test_scoped_upstream_key_includes_inherited_settings() {
 
 /// I5 regression: the production `init_ha` call site records the
 /// `replication_disabled` no-op for a master with a zero replication port.
+#[cfg(feature = "ha")]
 #[tokio::test]
 async fn test_init_ha_records_master_replication_disabled_noop() {
     let dir = std::env::temp_dir().join(format!("sito_init_ha_{}", rand::random::<u32>()));
@@ -169,6 +170,7 @@ async fn test_init_ha_records_master_replication_disabled_noop() {
 /// resume the old bundle and never compare it with `config.toml`, leaving
 /// every slave on stale configuration. A changed config must republish at
 /// `N + 1`; an unchanged config must resume the existing sequence.
+#[cfg(feature = "ha")]
 #[tokio::test]
 async fn test_master_restart_republishes_changed_config() {
     let dir =
