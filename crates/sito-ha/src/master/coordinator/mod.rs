@@ -34,6 +34,8 @@ use crate::protocol::{AckConflict, HaMessage};
 use crate::readiness::{HaReadiness, HaReadinessState};
 use crate::transport::{MAX_WS_MESSAGE_SIZE, WS_SEND_TIMEOUT, build_server_tls_config, ws_config};
 
+pub use sito_ha_types::status::{PublishOutcome, ResyncOutcome};
+
 /// Maximum number of published envelopes kept for delayed ACK binding.
 ///
 /// A slave may acknowledge a bundle after the master has published newer
@@ -59,18 +61,6 @@ const MAX_HANDSHAKES_PER_IP: usize = 8;
 /// connection id keeps the old session's bytes from being charged to (or
 /// subtracted from) the new session.
 type SessionKey = (String, u64);
-
-/// Outcome of publishing a configuration bundle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PublishOutcome {
-    /// The bundle was persisted and queued for at least one connected slave.
-    Published { version: u64, term: u64 },
-    /// The bundle was persisted but no slave is currently connected.
-    NoSlaves,
-    /// The signed envelope exceeds the WebSocket message limit and was not
-    /// persisted or broadcast.
-    TooLarge { bytes: usize, limit: usize },
-}
 
 /// A published envelope retained for delayed ACK binding.
 ///
@@ -106,19 +96,6 @@ struct PersistedMasterState {
 /// gigantic version: values above this bound are rejected without touching the
 /// master's counter or persisted state.
 pub const MAX_PEER_VERSION_LEAD: u64 = 1_000_000;
-
-/// Outcome of a manual resynchronization request, surfaced honestly by the
-/// `/ha/resync` API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResyncOutcome {
-    /// Version of the replicated configuration bundle.
-    pub version: u64,
-    /// Whether an active bundle exists to re-push. When false the request was
-    /// accepted but there is nothing to replicate yet.
-    pub active_bundle: bool,
-    /// Connected slaves for which a push was queued (or coalesced).
-    pub slaves_notified: usize,
-}
 
 /// Test-only hook invoked inside the blocking state writer before the file is
 /// written. It receives the version of the bundle being persisted so a test can

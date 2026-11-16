@@ -1,7 +1,6 @@
 //! High Availability slave state machine representation.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,33 +8,7 @@ use std::sync::{Arc, Mutex};
 use crate::bundle::AppliedWatermark;
 use crate::error::HaError;
 
-/// Lifecycle states of a replica slave node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SlaveState {
-    /// Actively attempting to connect to the master WebSocket endpoint.
-    Connecting,
-    /// Connected and waiting for synchronization response after sending `Hello`.
-    HelloSent,
-    /// Synchronized with master; operating normally.
-    Synced,
-    /// Staging and atomically applying a received configuration push.
-    Applying,
-    /// Operating with previous working configuration after an apply failure.
-    Degraded,
-}
-
-impl std::fmt::Display for SlaveState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Connecting => write!(f, "connecting"),
-            Self::HelloSent => write!(f, "hello_sent"),
-            Self::Synced => write!(f, "synced"),
-            Self::Applying => write!(f, "applying"),
-            Self::Degraded => write!(f, "degraded"),
-        }
-    }
-}
+pub use sito_ha_types::status::SlaveState;
 
 /// Shared runtime state of the slave HA controller.
 #[derive(Debug, Clone)]

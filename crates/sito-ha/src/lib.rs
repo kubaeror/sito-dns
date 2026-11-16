@@ -21,7 +21,7 @@ pub use bundle::{
     push_payload_hash, sanitize_config_for_bundle, scan_for_secrets, substitute_secrets,
     verify_and_unpack_push, verify_and_unpack_push_with_watermark, watermark_covers,
 };
-pub use config::HaConfig;
+pub use config::{HaConfig, config_from, config_from_unvalidated, readiness_required};
 pub use crypto::{
     CertOwnership, Ed25519SigningKey, GeneratedCerts, compute_blake3_fingerprint,
     generate_ha_certs, generate_ha_certs_with_options, generate_ha_certs_with_sans,

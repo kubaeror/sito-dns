@@ -13,6 +13,7 @@ sito-clients.workspace = true
 sito-rewrites.workspace = true
 sito-runtime.workspace = true
 sito-stats.workspace = true
+sito-ha-types.workspace = true
 
 arc-swap.workspace = true
 base64.workspace = true
