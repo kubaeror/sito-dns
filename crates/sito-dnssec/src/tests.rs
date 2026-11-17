@@ -5660,10 +5660,13 @@ async fn test_stripped_signed_qtype_cname_is_bogus() {
         .validate_with_key_fetcher(&mut response, Some("stripped"), now, &offline)
         .await;
 
-    assert!(
-        matches!(outcome, ValidationOutcome::Bogus { .. }),
-        "a stripped signed CNAME must fail closed: {outcome:?}"
-    );
+    match outcome {
+        ValidationOutcome::Bogus { reason, .. } => assert!(
+            reason.contains("Missing RRSIG for zone previously proven signed"),
+            "the stripped CNAME must fail for the signed-zone reason, got: {reason}"
+        ),
+        other => panic!("a stripped signed CNAME must fail closed: {other:?}"),
+    }
     assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
     assert!(!response.metadata.authentic_data, "Bogus must clear AD");
     assert!(
