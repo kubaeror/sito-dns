@@ -4805,6 +4805,16 @@ async fn test_dname_unknown_rdata_fails_closed() {
         !decoded.metadata.authentic_data,
         "a DNAME response must never be served with AD=1"
     );
+    assert!(
+        decoded.answers.is_empty(),
+        "a fail-closed DNAME response must not serve the uninterpretable answer: {:?}",
+        decoded.answers
+    );
+    assert_eq!(
+        validator.metrics.get_validations("bogus"),
+        1,
+        "the DNAME fail-closed outcome must be recorded as Bogus once"
+    );
 }
 
 /// RFC 4035 3.2.3: AD must not be set when the Answer/Authority sections
@@ -5579,6 +5589,87 @@ fn test_qtype_cname_positive_answer_is_not_negative() {
     assert!(
         is_negative_response(&response, &qname, RecordType::A),
         "the same response is NODATA for QTYPE=A"
+    );
+}
+
+/// A signed CNAME RRset answers QTYPE=CNAME positively. The validator must
+/// verify its RRSIG and return Secure/AD=1 instead of treating it as a
+/// negative answer or requiring a denial proof.
+#[test]
+fn test_signed_qtype_cname_answer_is_secure() {
+    use hickory_proto::rr::RecordSet;
+    use hickory_proto::rr::rdata::CNAME;
+
+    let (origin, dnskey, signer) = create_test_signer("signed-cname.example.");
+    let target = Name::from_str("target.example.").expect("target");
+    let answer = Record::from_rdata(origin.clone(), 300, RData::CNAME(CNAME(target)));
+    let mut set = RecordSet::new(origin.clone(), RecordType::CNAME, 0);
+    set.insert(answer.clone(), 0);
+    let signature = sign_test_rrset(&set, &signer);
+
+    let mut trust_anchors = TrustAnchors::empty();
+    trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+    let validator =
+        DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(trust_anchors);
+
+    let mut response = Message::new(20, MessageType::Response, OpCode::Query);
+    response
+        .queries
+        .push(Query::query(origin.clone(), RecordType::CNAME));
+    response.answers.push(answer);
+    response.answers.push(signature);
+    response.additionals.push(Record::from_rdata(
+        origin,
+        300,
+        RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)),
+    ));
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let outcome = validator.validate_response(&mut response, Some("1.1.1.1"), now);
+
+    assert_eq!(
+        outcome,
+        ValidationOutcome::Secure,
+        "a signed CNAME answering QTYPE=CNAME must be Secure: {outcome:?}"
+    );
+    assert!(response.metadata.authentic_data);
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(validator.metrics.get_validations("secure"), 1);
+}
+
+/// Stripping the RRSIG from a signed QTYPE=CNAME answer without an
+/// authenticated unsigned-delegation proof must fail closed: Bogus,
+/// SERVFAIL, no AD and no answers served.
+#[tokio::test]
+async fn test_stripped_signed_qtype_cname_is_bogus() {
+    use hickory_proto::rr::rdata::CNAME;
+
+    let (validator, origin, _key, _signer) = signed_zone_validator("stripped-cname.example.");
+    let target = Name::from_str("target.example.").expect("target");
+    let mut response = Message::new(21, MessageType::Response, OpCode::Query);
+    response
+        .queries
+        .push(Query::query(origin.clone(), RecordType::CNAME));
+    response
+        .answers
+        .push(Record::from_rdata(origin, 300, RData::CNAME(CNAME(target))));
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let offline = OfflineFetcher::new();
+    let outcome = validator
+        .validate_with_key_fetcher(&mut response, Some("stripped"), now, &offline)
+        .await;
+
+    assert!(
+        matches!(outcome, ValidationOutcome::Bogus { .. }),
+        "a stripped signed CNAME must fail closed: {outcome:?}"
+    );
+    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    assert!(!response.metadata.authentic_data, "Bogus must clear AD");
+    assert!(
+        response.answers.is_empty(),
+        "Bogus must not serve the stripped CNAME: {:?}",
+        response.answers
     );
 }
 
