@@ -471,6 +471,10 @@ impl MetricsRegistry {
     }
 
     /// Publishes the cumulative DNSSEC validation outcome counters.
+    ///
+    /// This is the outcome view. It is independent of
+    /// `sito_dnssec_bogus_total{upstream}`, which counts bogus answers per
+    /// upstream; the two families overlap conceptually and must not be summed.
     pub fn set_dnssec_validations(
         &self,
         secure: u64,
@@ -501,6 +505,11 @@ impl MetricsRegistry {
         self.cache_stale_served.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a bogus answer per upstream.
+    ///
+    /// This per-upstream view is independent of
+    /// `sito_dnssec_validations_total{result="bogus"}`; the two families
+    /// overlap and must not be summed.
     pub fn inc_dnssec_bogus(&self, upstream: &str) {
         let mut map = sito_core::sync::lock_or_recover(&self.dnssec_bogus);
         *map.entry(upstream.to_string()).or_insert(0) += 1;
@@ -1161,7 +1170,9 @@ impl MetricsRegistry {
     /// DNSSEC, client, and DoH bypass families.
     fn render_dnssec_client_family(&self, out: &mut String) {
         // 11a. sito_dnssec_validations_total
-        out.push_str("# HELP sito_dnssec_validations_total Total DNSSEC validation outcomes\n");
+        out.push_str(
+            "# HELP sito_dnssec_validations_total Total DNSSEC validation outcomes (NTA bypasses excluded)\n",
+        );
         out.push_str("# TYPE sito_dnssec_validations_total counter\n");
         for (result, value) in [
             ("secure", &self.dnssec_validations_secure),
@@ -1567,27 +1578,26 @@ mod tests {
         reg.set_dnssec_fetch_failures(5, 4);
 
         let rendered = reg.render_prometheus();
+        // Compare whole lines so a value such as `7` cannot also satisfy a
+        // prefix of `70`.
+        let assert_line = |line: &str| {
+            assert!(
+                rendered.lines().any(|rendered_line| rendered_line == line),
+                "missing metric line {line:?}:\n{rendered}"
+            );
+        };
         for (result, value) in [
             ("secure", 7),
             ("insecure", 3),
             ("bogus", 2),
             ("indeterminate", 1),
         ] {
-            assert!(
-                rendered.contains(&format!(
-                    "sito_dnssec_validations_total{{result=\"{result}\"}} {value}"
-                )),
-                "missing validation series for {result}:\n{rendered}"
-            );
+            assert_line(&format!(
+                "sito_dnssec_validations_total{{result=\"{result}\"}} {value}"
+            ));
         }
-        assert!(
-            rendered.contains("sito_dnssec_fetch_failures_total{kind=\"budget\"} 5"),
-            "missing fetch-budget failure series:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("sito_dnssec_fetch_failures_total{kind=\"deadline\"} 4"),
-            "missing fetch-deadline failure series:\n{rendered}"
-        );
+        assert_line("sito_dnssec_fetch_failures_total{kind=\"budget\"} 5");
+        assert_line("sito_dnssec_fetch_failures_total{kind=\"deadline\"} 4");
     }
 
     #[test]
@@ -1813,7 +1823,7 @@ sito_filter_compile_seconds_bucket{le="5"} 0
 sito_filter_compile_seconds_bucket{le="+Inf"} 0
 sito_filter_compile_seconds_sum 0
 sito_filter_compile_seconds_count 0
-# HELP sito_dnssec_validations_total Total DNSSEC validation outcomes
+# HELP sito_dnssec_validations_total Total DNSSEC validation outcomes (NTA bypasses excluded)
 # TYPE sito_dnssec_validations_total counter
 sito_dnssec_validations_total{result="secure"} 7
 sito_dnssec_validations_total{result="insecure"} 3

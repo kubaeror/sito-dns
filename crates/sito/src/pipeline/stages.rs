@@ -593,6 +593,7 @@ impl DnsPipeline {
         {
             let bg_upstream = Arc::clone(effective_upstream);
             let bg_cache = Arc::clone(&self.cache);
+            let bg_metrics = self.metrics.clone();
             // Start from the cache query so ECS policy and DO are identical to
             // the entry being refreshed.
             let mut bg_query = cache_query.clone();
@@ -637,6 +638,22 @@ impl DnsPipeline {
                         DNSSEC_VALIDATION_DEADLINE,
                     )
                     .await;
+                    // Publish the validator's cumulative counters after the
+                    // background pass. These setters replace the gauge values,
+                    // so the foreground's own update is refreshed rather than
+                    // double counted.
+                    if let Some(metrics) = &bg_metrics {
+                        metrics.set_dnssec_validations(
+                            validator.metrics.get_validations("secure"),
+                            validator.metrics.get_validations("insecure"),
+                            validator.metrics.get_validations("bogus"),
+                            validator.metrics.get_validations("indeterminate"),
+                        );
+                        metrics.set_dnssec_fetch_failures(
+                            validator.metrics.fetch_budget_exhausted(),
+                            validator.metrics.fetch_deadline_exceeded(),
+                        );
+                    }
                     validation_status(Some(&outcome))
                 } else {
                     // No local validation ran: never trust an upstream AD bit.

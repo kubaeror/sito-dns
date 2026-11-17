@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use super::chain::TrustChain;
 use super::test_util::*;
 use super::*;
 use hickory_proto::op::{MessageType, OpCode, Query};
@@ -1297,6 +1298,55 @@ fn test_fetch_budget_denials_record_matching_metric() {
     );
     assert_eq!(metrics.fetch_deadline_exceeded(), 1);
     assert_eq!(metrics.fetch_budget_exhausted(), 0);
+}
+
+/// The absolute deadline wins even when the count budget is also zero: the
+/// refusal must be attributed to the deadline, not to count exhaustion.
+#[test]
+fn test_fetch_budget_deadline_precedence_when_count_also_exhausted() {
+    let metrics = Arc::new(DnssecMetrics::new());
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("clock arithmetic");
+    let mut budget = FetchBudget::with_metrics(0, expired, Arc::clone(&metrics));
+
+    assert!(
+        !budget.try_take(),
+        "an expired deadline must reject fetches even with no count budget"
+    );
+    assert_eq!(metrics.fetch_deadline_exceeded(), 1);
+    assert_eq!(metrics.fetch_budget_exhausted(), 0);
+}
+
+/// A production-shaped [`TrustChain`] must attribute its refusals to the
+/// validator's metrics, not only to the local `FetchBudget`.
+#[tokio::test]
+async fn test_trust_chain_with_metrics_counts_exhausted_budget() {
+    let metrics = Arc::new(DnssecMetrics::new());
+    let validator = d05_validator(None);
+    let fetcher = StaticFetcher::new();
+    let mut chain = TrustChain::with_metrics(
+        Instant::now() + Duration::from_secs(60),
+        0,
+        Arc::clone(&metrics),
+    );
+
+    let mut response = Message::new(0, MessageType::Response, OpCode::Query);
+    let progressed = chain
+        .fetch_path(&validator, &fetcher, &Name::root(), &mut response)
+        .await;
+
+    assert!(
+        !progressed,
+        "an exhausted chain budget must not make progress"
+    );
+    assert_eq!(metrics.fetch_budget_exhausted(), 1);
+    assert_eq!(metrics.fetch_deadline_exceeded(), 0);
+    assert_eq!(
+        fetcher.calls(),
+        0,
+        "an exhausted budget must stop before any network fetch"
+    );
 }
 
 #[tokio::test]
