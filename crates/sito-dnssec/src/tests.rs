@@ -5791,9 +5791,6 @@ const HOSTILE_SIGNERS: [&str; 4] = [
 /// Old per-signer maximum (`labels * 2 + 1`, capped at 31) for a 15-label
 /// signer.
 const HOSTILE_CHAIN_CAP: u8 = 31;
-/// The single bounded delegation probe that still runs after an unproven
-/// chain; routing it through the shared budget is Task 4.
-const HOSTILE_PROBE_ALLOWANCE: usize = 1;
 
 /// A hostile message carrying several deep signers in disjoint zones must not
 /// multiply cold-start fetches: one shared budget bounds the walk to the old
@@ -5820,9 +5817,8 @@ async fn trust_chain_hostile_multi_signer_response_stays_within_global_cap() {
     );
 }
 
-/// The same hostile response through the validator must stay within the shared
-/// chain budget plus the single bounded delegation probe that still runs after
-/// an unproven chain (probe routing is Task 4).
+/// The same hostile response through the validator must stay within the one
+/// documented per-query fetch cap, which now also covers the bounded probes.
 #[tokio::test]
 async fn trust_chain_validate_bounds_hostile_multi_signer_fetches() {
     let qname = Name::from_str("www.hostile.example.").expect("qname");
@@ -5839,10 +5835,10 @@ async fn trust_chain_validate_bounds_hostile_multi_signer_fetches() {
 
     // Old per-signer budgets allowed 4 x 26 chain fetches for this response.
     assert!(
-        fetcher.calls() <= usize::from(HOSTILE_CHAIN_CAP) + HOSTILE_PROBE_ALLOWANCE,
+        fetcher.calls() <= usize::from(MAX_FETCHES_PER_QUERY),
         "a multi-signer response must not multiply cold-start fetches: {} > {}",
         fetcher.calls(),
-        usize::from(HOSTILE_CHAIN_CAP) + HOSTILE_PROBE_ALLOWANCE
+        MAX_FETCHES_PER_QUERY
     );
     assert!(
         fetcher.calls() > 0,
@@ -5856,5 +5852,239 @@ async fn trust_chain_validate_bounds_hostile_multi_signer_fetches() {
     assert!(
         !response.metadata.authentic_data,
         "an unproven chain must not set AD"
+    );
+}
+
+/// Answers the anchor DNSKEY with an anchored self-signed RRset and every DS
+/// query with a signed in-zone NSEC denial. A cold-start probe therefore walks
+/// all `MAX_CHAIN_CUTS` cuts, spending `MAX_CHAIN_CUTS + 1` fetches per
+/// distinct probe name.
+struct DeepSignedDenialFetcher {
+    parent: Name,
+    next: Name,
+    key: DNSKEY,
+    signer: hickory_proto::dnssec::DnssecSigner,
+    calls: std::sync::atomic::AtomicUsize,
+    seen: std::sync::Mutex<Vec<(LowerName, RecordType, Instant)>>,
+}
+
+impl DeepSignedDenialFetcher {
+    fn new(parent: &Name, key: DNSKEY, signer: hickory_proto::dnssec::DnssecSigner) -> Self {
+        let next = Name::from_str(&format!("zzz.{}", parent.to_ascii())).expect("next name");
+        Self {
+            parent: parent.clone(),
+            next,
+            key,
+            signer,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn seen(&self) -> Vec<(LowerName, RecordType, Instant)> {
+        self.seen.lock().expect("fetch log").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl DnssecKeyFetcher for DeepSignedDenialFetcher {
+    async fn query(
+        &self,
+        name: &Name,
+        rtype: RecordType,
+        deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.seen
+            .lock()
+            .expect("fetch log")
+            .push((LowerName::from(name), rtype, deadline));
+        match rtype {
+            RecordType::DNSKEY => Ok(anchored_dnskey_message(name, &self.key, &self.signer)),
+            RecordType::DS => Ok(signed_nsec_response(
+                &self.parent,
+                name,
+                &self.next,
+                &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+                name,
+                &self.key,
+                &self.signer,
+                ResponseCode::NoError,
+            )),
+            _ => Ok(Message::new(0, MessageType::Response, OpCode::Query)),
+        }
+    }
+}
+
+/// A name deep enough below `origin` to exceed `MAX_CHAIN_CUTS`.
+fn deep_probe_name(origin: &Name, index: usize) -> Name {
+    Name::from_str(&format!("t{index}.a.b.c.d.e.f.g.h.{}", origin.to_ascii()))
+        .expect("deep probe name")
+}
+
+/// A CNAME fan-out must draw from the same budget as the cold-start walk:
+/// after the probes spend most of it, the signer walk only gets the remainder.
+#[tokio::test]
+async fn trust_chain_probe_fanout_leaves_only_remainder_for_cold_start() {
+    let (origin, key, signer) = create_test_signer("probe-budget.example.");
+    let validator = d05_validator(None);
+    validator.add_trust_anchor(&key, LowerName::from(&origin));
+    let fetcher = StaticFetcher::new().with(
+        &origin,
+        RecordType::DNSKEY,
+        anchored_dnskey_message(&origin, &key, &signer),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let cap = 5u8;
+    let mut chain = TrustChain::new(deadline, cap);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    for label in ["a", "b"] {
+        let name = Name::from_str(&format!("{label}.probe-budget.example.")).expect("probe name");
+        let probe = chain
+            .probe_unsigned(&validator, &fetcher, &LowerName::from(&name), now)
+            .await;
+        assert!(
+            matches!(probe, UnsignedProbe::Probed | UnsignedProbe::Failed),
+            "a cold probe must run or fail closed: {probe:?}"
+        );
+    }
+    assert_eq!(
+        fetcher.calls(),
+        4,
+        "two cold probes spend the anchor DNSKEY plus one DS lookup each"
+    );
+
+    let mut response = Message::new(60, MessageType::Response, OpCode::Query);
+    let signer_name = Name::from_str("c.probe-budget.example.").expect("signer name");
+    let _ = chain
+        .fetch_path(&validator, &fetcher, &signer_name, &mut response)
+        .await;
+
+    assert_eq!(
+        fetcher.calls(),
+        usize::from(cap),
+        "the signer walk must only get the remainder of the shared budget"
+    );
+}
+
+/// Repeated deep delegation probes share one budget and cannot exceed the
+/// documented total, even when each probe would walk every cut.
+#[tokio::test]
+async fn trust_chain_deep_probes_cannot_exceed_total_cap() {
+    let (origin, key, signer) = create_test_signer("deep-cap.example.");
+    let validator = d05_validator(None);
+    validator.add_trust_anchor(&key, LowerName::from(&origin));
+    let fetcher = DeepSignedDenialFetcher::new(&origin, key, signer);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut chain = TrustChain::new(deadline, MAX_FETCHES_PER_QUERY);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    let mut probes = Vec::new();
+    for index in 0..10 {
+        let name = LowerName::from(&deep_probe_name(&origin, index));
+        probes.push(chain.probe_unsigned(&validator, &fetcher, &name, now).await);
+    }
+
+    assert!(
+        fetcher.calls() <= usize::from(MAX_FETCHES_PER_QUERY),
+        "deep probes must share one cap: {} > {}",
+        fetcher.calls(),
+        MAX_FETCHES_PER_QUERY
+    );
+    assert!(
+        fetcher.calls() > MAX_CHAIN_CUTS,
+        "the deep probes must actually walk cuts"
+    );
+    assert!(
+        probes
+            .iter()
+            .any(|probe| matches!(probe, UnsignedProbe::Failed)),
+        "an exhausted probe budget must fail closed: {probes:?}"
+    );
+}
+
+/// Probe fetches must receive the caller's absolute deadline, not a fresh
+/// per-probe timeout.
+#[tokio::test]
+async fn trust_chain_probe_fetches_see_caller_deadline() {
+    let (origin, key, _signer) = create_test_signer("deadline-probe.example.");
+    let validator = d05_validator(None);
+    validator.add_trust_anchor(&key, LowerName::from(&origin));
+    let fetcher = DeadlineRecordingFetcher::new();
+    let deadline = Instant::now() + Duration::from_secs(55);
+    let mut chain = TrustChain::new(deadline, 3);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    let name = Name::from_str("www.deadline-probe.example.").expect("probe name");
+    let _ = chain
+        .probe_unsigned(&validator, &fetcher, &LowerName::from(&name), now)
+        .await;
+    let mut response = Message::new(61, MessageType::Response, OpCode::Query);
+    let signer_name = Name::from_str("a.deadline-probe.example.").expect("signer name");
+    let _ = chain
+        .fetch_path(&validator, &fetcher, &signer_name, &mut response)
+        .await;
+
+    let seen = fetcher.deadlines();
+    assert!(
+        !seen.is_empty(),
+        "the probe and chain walk must attempt fetches"
+    );
+    assert!(
+        seen.iter().all(|observed| *observed == deadline),
+        "every probe and chain fetch must see the caller's deadline: {seen:?}"
+    );
+}
+
+/// A validator-level CNAME fan-out that drains the shared probe budget must
+/// still fail closed: Bogus/SERVFAIL or Indeterminate, never Secure/AD.
+#[tokio::test]
+async fn trust_chain_probe_budget_exhaustion_still_fails_closed() {
+    let (origin, key, signer) = create_test_signer("probe-failclosed.example.");
+    let validator = d05_validator(None);
+    validator.add_trust_anchor(&key, LowerName::from(&origin));
+    let fetcher = DeepSignedDenialFetcher::new(&origin, key, signer);
+    let qname = deep_probe_name(&origin, 0);
+    let targets: Vec<Name> = (1..=8)
+        .map(|index| deep_probe_name(&origin, index))
+        .collect();
+    let mut response = stripped_cname_chain_response(&qname, &targets);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    let outcome = validator
+        .validate_with_key_fetcher_deadline(&mut response, Some("probe"), now, &fetcher, deadline)
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            ValidationOutcome::Bogus { .. } | ValidationOutcome::Indeterminate
+        ),
+        "probe budget exhaustion must fail closed: {outcome:?}"
+    );
+    assert!(
+        !response.metadata.authentic_data,
+        "budget exhaustion must never set AD"
+    );
+    assert!(
+        fetcher.calls() <= usize::from(MAX_FETCHES_PER_QUERY),
+        "the validator must share the probe budget with the chain walk: {} > {}",
+        fetcher.calls(),
+        MAX_FETCHES_PER_QUERY
+    );
+    let seen = fetcher.seen();
+    assert!(
+        !seen.is_empty(),
+        "the probe fan-out must have attempted fetches"
+    );
+    assert!(
+        seen.iter().all(|(_, _, observed)| *observed == deadline),
+        "every probe fetch must see the caller's deadline: {seen:?}"
     );
 }

@@ -150,6 +150,21 @@ const PROBE_BACKOFF_SECS: u32 = 30;
 /// already covered by cached/in-memory evidence do not consume the budget.
 /// A chain that needs more probes fails closed instead of amplifying fetches.
 const MAX_CNAME_PROBES: usize = 8;
+/// Largest cold-start DNSKEY/DS allowance the old per-signer design gave one
+/// RRSIG signer (`labels * 2 + 1`, capped at 31). A single signer's walk can
+/// never exceed this before reaching the root or its depth bound.
+const MAX_SIGNER_CHAIN_FETCHES: u8 = 31;
+/// Hard cap on DS/DNSKEY fetches one client query may issue across the early
+/// CNAME probes, the cold-start signer walk and the post-fetch probes.
+///
+/// The split preserves the old cold-start allowance after the bounded probes:
+/// up to `2 * MAX_CNAME_PROBES` (16) fetches belong to the early probes (a
+/// cold anchor DNSKEY plus one DS lookup each) and up to
+/// `MAX_SIGNER_CHAIN_FETCHES` (31) to the signer walk, for one documented
+/// total of 47. All of them draw from the same [`FetchBudget`], so a probe
+/// fan-out leaves the cold-start walk only the remainder instead of
+/// multiplying the query's fetch work.
+const MAX_FETCHES_PER_QUERY: u8 = MAX_SIGNER_CHAIN_FETCHES + 2 * MAX_CNAME_PROBES as u8;
 /// Accepted clock skew around RRSIG inception/expiration (RFC 4035 5.3.1).
 const MAX_CLOCK_SKEW: u32 = 300;
 /// Minimum accepted RSA modulus size in bits (RFC 8624 3.1).

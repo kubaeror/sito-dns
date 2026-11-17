@@ -436,6 +436,12 @@ impl DnssecValidator {
         // regardless of prior signed-zone evidence: only an authenticated DS
         // denial may downgrade it to Insecure, otherwise `validate_response`
         // keeps the fail-closed Bogus decision.
+        // One fetch budget covers every DS/DNSKEY lookup this query makes:
+        // the early CNAME probes, the cold-start signer walk and the
+        // post-fetch probes all draw from it, so a probe fan-out can only
+        // shorten the walk that follows. The deadline is the caller's own
+        // absolute bound, never a fresh per-probe timeout.
+        let mut chain = TrustChain::new(deadline, MAX_FETCHES_PER_QUERY);
         let mut probe_failed = false;
         let mut budget_exhausted = false;
         let mut has_rrsigs = true;
@@ -471,10 +477,7 @@ impl DnssecValidator {
                         budget_exhausted = true;
                         break;
                     }
-                    match self
-                        .prepare_unsigned_response(&lower, fetcher, now, deadline)
-                        .await
-                    {
+                    match chain.probe_unsigned(self, fetcher, &lower, now).await {
                         UnsignedProbe::Covered => {}
                         UnsignedProbe::Probed => probes += 1,
                         UnsignedProbe::Failed => {
@@ -542,27 +545,11 @@ impl DnssecValidator {
             return self.indeterminate_outcome(response, upstream);
         }
 
-        // Reaching the root costs one DNSKEY lookup per label plus one DS
-        // lookup per non-root level; a fixed budget of 6 could not reach
-        // the root from a signer with three or more labels, leaving
-        // otherwise valid zones Indeterminate on a cold cache. The largest
-        // per-signer allowance (`labels * 2 + 1`, capped at 31) becomes one
-        // global budget shared by every signer, so a multi-signer response
-        // cannot multiply cold-start fetch work. A single signer therefore
-        // keeps exactly its old allowance.
-        let remaining = signers
-            .iter()
-            .take(4)
-            .map(|signer| {
-                signer
-                    .num_labels()
-                    .saturating_mul(2)
-                    .saturating_add(1)
-                    .min(31)
-            })
-            .max()
-            .unwrap_or(0);
-        let mut chain = TrustChain::new(deadline, remaining);
+        // The shared budget was sized for the largest old per-signer allowance
+        // (`MAX_SIGNER_CHAIN_FETCHES`) plus the bounded CNAME probe share, so
+        // reaching the root from any signer still fits. Multi-signer responses
+        // cannot multiply cold-start fetch work: every signer draws from the
+        // same budget the probes already used.
         for signer in signers.iter().take(4) {
             let _ = chain.fetch_path(self, fetcher, signer, response).await;
         }
@@ -607,10 +594,7 @@ impl DnssecValidator {
                         post_budget_exhausted = true;
                         break;
                     }
-                    match self
-                        .prepare_unsigned_response(&lower, fetcher, now, deadline)
-                        .await
-                    {
+                    match chain.probe_unsigned(self, fetcher, &lower, now).await {
                         UnsignedProbe::Covered => {}
                         UnsignedProbe::Probed => probes += 1,
                         UnsignedProbe::Failed => {
