@@ -119,7 +119,7 @@ serve_stale_hours = 12
 | `max_ttl` | integer | `86400` | Maximum TTL (seconds) to assign to cached answers (caps excessively high upstream TTLs). |
 | `negative_ttl_max` | integer | `3600` | Maximum TTL (seconds) for negative caching (NXDOMAIN / NODATA). |
 | `prefetch` | boolean | `true` | When `true`, automatically re-resolves frequently requested domains before TTL expires. |
-| `serve_stale_hours` | integer | `12` | Hours to serve expired cache records as fallback when upstreams are unreachable. Stale answers are served with all DNSSEC records removed and AD=0; while DNSSEC validation is active, entries cached without validation (`Unchecked`) or with an inconclusive result (`Indeterminate`) are not served. |
+| `serve_stale_hours` | integer | `12` | Hours to serve expired cache records as fallback when upstreams are unreachable. Stale answers are served with all DNSSEC records removed and AD=0; while DNSSEC validation is active, entries cached without validation (`Unchecked`), with an inconclusive result (`Indeterminate`) or as a fail-closed `Bogus` SERVFAIL are not served. |
 
 ---
 

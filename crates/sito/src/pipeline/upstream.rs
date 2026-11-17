@@ -79,19 +79,9 @@ impl PipelineContext<'_> {
                     );
                 }
 
-                // DNSSEC validation
-                let dnssec_outcome = self
-                    .validate_upstream_response(&mut upstream_resp, &upstream_name)
-                    .await;
-                let dnssec_str = dnssec_outcome
-                    .as_ref()
-                    .map(sito_dnssec::ValidationOutcome::as_str);
-                let cache_status = validation_status(dnssec_outcome.as_ref());
-
-                // Shape before caching so the stored entry never carries
-                // upstream-only EDNS options; a DO=0 client never receives
-                // DNSSEC records and the stripped form is what is cached.
-                self.shape_and_insert(&mut upstream_resp, cache_status)
+                // DNSSEC validation, shaping, and cache insertion.
+                let dnssec_str = self
+                    .validate_and_cache_upstream(&mut upstream_resp, &upstream_name)
                     .await;
 
                 QueryOutcome {

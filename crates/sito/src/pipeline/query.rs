@@ -178,6 +178,12 @@ pub(super) fn build_upstream_query(
 }
 
 /// Maps a DNSSEC validation outcome onto the status stored in the cache.
+///
+/// Strict-mode Bogus is handled before this mapping: it is a SERVFAIL and is
+/// stored through `insert_validation_failure_at_epochs` as
+/// [`ValidationStatus::Bogus`]. Every other Bogus occurrence is log-only, where
+/// the answer is kept with AD=0 and must remain unservable as
+/// [`ValidationStatus::Indeterminate`].
 pub(super) fn validation_status(
     outcome: Option<&sito_dnssec::ValidationOutcome>,
 ) -> ValidationStatus {
@@ -199,15 +205,16 @@ pub(super) fn validation_status(
 /// `Unchecked` entries (CD=1 / validation disabled) must never be served when
 /// a CD=0 query expects the resolver to have validated the answer.
 /// `Indeterminate` is not an authenticated decision either: in log-only mode a
-/// Bogus result is recorded that way, and strict mode answers it with SERVFAIL
-/// rather than serving the data. Only an authenticated `Secure`/`Insecure`
-/// decision may be served; both are returned with AD cleared when not
-/// `Secure`.
+/// Bogus result is recorded that way. A cached `Bogus` entry is different: it
+/// is a fail-closed SERVFAIL with no answer data, so serving it is safe and
+/// avoids re-querying an upstream that already produced a Bogus answer. Only
+/// an authenticated `Secure`/`Insecure` decision may be served with data; both
+/// are returned with AD cleared when not `Secure`.
 pub(super) fn cache_entry_servable(status: ValidationStatus, validation_active: bool) -> bool {
     !validation_active
         || matches!(
             status,
-            ValidationStatus::Secure | ValidationStatus::Insecure
+            ValidationStatus::Secure | ValidationStatus::Insecure | ValidationStatus::Bogus
         )
 }
 
@@ -215,8 +222,9 @@ pub(super) fn cache_entry_servable(status: ValidationStatus, validation_active: 
 /// active.
 ///
 /// Stale answers are not revalidated, so only authenticated cache decisions
-/// (`Secure`/`Insecure`) may be served. An `Indeterminate` entry is
-/// inconclusive by definition — in log-only mode even Bogus data is recorded
+/// (`Secure`/`Insecure`) may be served. A `Bogus` entry is a fail-closed
+/// SERVFAIL and is never reused from the stale path; an `Indeterminate` entry
+/// is inconclusive by definition — in log-only mode even Bogus data is recorded
 /// that way — and `Unchecked` means no local validation ran at all. Neither
 /// may be handed to a CD=0 client that relies on the resolver. Stale answers
 /// are always sanitized to AD=0 before they leave the cache.

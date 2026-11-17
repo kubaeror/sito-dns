@@ -1591,6 +1591,245 @@ async fn test_stale_indeterminate_entry_is_not_served_under_validation() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// Builds a pipeline whose mock upstream answers every query with a signed A
+/// RRset whose signature inception is beyond the accepted clock skew, so
+/// validation reaches a deterministic `Bogus` decision without a key fetch.
+///
+/// Returns the pipeline, the upstream call counter, the temp dir, and the
+/// qname that the mock answers.
+async fn test_pipeline_with_bogus_signed_upstream(
+    mut config: Config,
+    mode: DnssecMode,
+) -> (
+    DnsPipeline,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::path::PathBuf,
+    Name,
+) {
+    use hickory_proto::dnssec::TrustAnchors;
+    use hickory_proto::dnssec::rdata::{DNSSECRData, RRSIG};
+    use hickory_proto::rr::{DNSClass, LowerName, RecordData, RecordSet};
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+    use std::sync::atomic::AtomicUsize;
+
+    let (origin, dnskey, signer) = sito_dnssec::test_util::create_test_signer("bogus.example.");
+    let qname = Name::from_str("bogus.example.").unwrap();
+    let answer = Record::from_rdata(
+        qname.clone(),
+        300,
+        RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 200))),
+    );
+    let mut set = RecordSet::new(qname.clone(), RecordType::A, 300);
+    set.insert(answer.clone(), 0);
+    // Signature window starts after `now + MAX_CLOCK_SKEW`: the validator
+    // fails closed as Bogus without needing DNSKEY/DS fetches.
+    let inception = time::OffsetDateTime::now_utc() + time::Duration::seconds(400);
+    let rrsig =
+        RRSIG::from_rrset(&set, DNSClass::IN, inception, &signer).expect("sign future-dated rrset");
+    let signature = Record::from_rdata(qname.clone(), 300, rrsig.into_rdata());
+    let mut template = Message::new(0, MessageType::Response, OpCode::Query);
+    template.metadata.response_code = ResponseCode::NoError;
+    template.answers = vec![answer, signature];
+    template.additionals.push(Record::from_rdata(
+        origin.clone(),
+        300,
+        RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+    ));
+
+    let mock_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_socket.local_addr().unwrap();
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let call_counter = std::sync::Arc::clone(&calls);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((len, src)) = mock_socket.recv_from(&mut buf).await {
+            if let Ok(query) = sito_proto::decode_message(&buf[..len]) {
+                call_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut resp = template.clone();
+                resp.metadata.id = query.metadata.id;
+                resp.queries = query.queries.clone();
+                if let Ok(encoded) = sito_proto::encode_message(&resp) {
+                    let _ = mock_socket.send_to(&encoded, src).await;
+                }
+            }
+        }
+    });
+
+    config.filtering.enabled = false;
+    config.dns.dnssec.mode = match mode {
+        DnssecMode::Validate => "validate",
+        DnssecMode::LogOnly => "log_only",
+        DnssecMode::Disabled => "disabled",
+    }
+    .to_string();
+    config.dns.dnssec.validate = true;
+    config.upstream.servers = vec![mock_addr.to_string()];
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+    let mut anchors = TrustAnchors::empty();
+    anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+    let validator = DnssecValidator::new(mode, Vec::new()).with_trust_anchors(anchors);
+    let (pipeline, temp_dir) =
+        build_test_pipeline_with_validator(config, upstream, validator).await;
+    (pipeline, calls, temp_dir, qname)
+}
+
+/// A strict-mode Bogus result is a fail-closed SERVFAIL. It is cached as
+/// `ValidationStatus::Bogus` for a short window, and a repeated query within
+/// that window is answered from the cache without another upstream call.
+#[tokio::test]
+async fn test_strict_bogus_servfail_is_cached_and_served_without_upstream() {
+    use std::sync::atomic::Ordering;
+
+    let (pipeline, calls, temp_dir, qname) =
+        test_pipeline_with_bogus_signed_upstream(Config::default(), DnssecMode::Validate).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let first_query = do_query(20, &qname);
+    let first = pipeline
+        .handle(first_query.clone(), client.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.metadata.response_code, ResponseCode::ServFail);
+    assert!(
+        first.answers.is_empty(),
+        "a Bogus answer must never be served as data"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let (cached, status) = pipeline
+        .cache
+        .get_for_query_with_status(&first_query)
+        .await
+        .expect("a strict Bogus SERVFAIL must be cached");
+    assert_eq!(status, ValidationStatus::Bogus);
+    assert_eq!(cached.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(cached.answers.len(), 0);
+
+    let second = pipeline.handle(do_query(21, &qname), client).await.unwrap();
+    assert_eq!(second.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(second.answers.len(), 0);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the second identical query must be served from the cached Bogus SERVFAIL"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// In log-only mode a Bogus result keeps the answer as an unservable
+/// `Indeterminate` entry: it may be cached, but a validating client forces a
+/// re-resolution instead of receiving the unvalidated data.
+#[tokio::test]
+async fn test_log_only_bogus_is_cached_as_indeterminate_and_not_served() {
+    use std::sync::atomic::Ordering;
+
+    let (pipeline, calls, temp_dir, qname) =
+        test_pipeline_with_bogus_signed_upstream(Config::default(), DnssecMode::LogOnly).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let first_query = do_query(22, &qname);
+    let first = pipeline
+        .handle(first_query.clone(), client.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.metadata.response_code, ResponseCode::NoError);
+    assert!(!first.answers.is_empty(), "log-only keeps the answer");
+    assert!(!first.metadata.authentic_data);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let (_, status) = pipeline
+        .cache
+        .get_for_query_with_status(&first_query)
+        .await
+        .expect("the log-only answer must still be cached");
+    assert_eq!(status, ValidationStatus::Indeterminate);
+
+    let second = pipeline.handle(do_query(23, &qname), client).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(
+        !second.metadata.authentic_data,
+        "log-only data must never assert AD"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+#[test]
+fn test_cache_servability_distinguishes_bogus_from_indeterminate() {
+    assert!(
+        cache_entry_servable(ValidationStatus::Bogus, true),
+        "a cached Bogus SERVFAIL is fail-closed and servable"
+    );
+    assert!(!cache_entry_servable(ValidationStatus::Indeterminate, true));
+    assert!(!stale_cache_entry_servable(ValidationStatus::Bogus, true));
+    assert!(!stale_cache_entry_servable(
+        ValidationStatus::Indeterminate,
+        true
+    ));
+    assert!(stale_cache_entry_servable(ValidationStatus::Secure, true));
+    assert!(stale_cache_entry_servable(ValidationStatus::Insecure, true));
+}
+
+/// A stale `Bogus` entry is a fail-closed SERVFAIL, not reusable data. Even
+/// when the upstream is down, a validating client must get a fresh SERVFAIL
+/// rather than a stale cached validation failure.
+#[tokio::test]
+async fn test_stale_bogus_entry_is_not_served_under_validation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.cache.serve_stale_hours = 1;
+    config.dns.cache.min_ttl = 1;
+    config.dns.cache.max_ttl = 1;
+    config.dns.cache.negative_ttl_max = 1;
+    let fail = std::sync::Arc::new(AtomicBool::new(true));
+    let (pipeline, _server, calls, temp_dir) =
+        test_pipeline_with_failure_toggle(config, fail).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    let name = Name::from_str("stale-bogus.example.").unwrap();
+    let query = do_query(19, &name);
+
+    let mut servfail = Message::response(19, OpCode::Query);
+    servfail.queries = query.queries.clone();
+    servfail.metadata.response_code = ResponseCode::ServFail;
+    assert!(
+        pipeline
+            .cache
+            .insert_validation_failure_at_epochs(
+                &query,
+                &servfail,
+                ValidationStatus::Bogus,
+                pipeline.cache.policy_epoch(),
+                pipeline.cache.filter_epoch(),
+                1,
+            )
+            .await
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let resp = pipeline.handle(query, client).await.unwrap();
+    assert_eq!(
+        resp.metadata.response_code,
+        ResponseCode::ServFail,
+        "a stale Bogus entry must not be served to a validating client"
+    );
+    assert!(
+        resp.answers.is_empty(),
+        "the rejected stale failure must not leak records"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 /// Stale `Insecure` data is an authenticated unsigned decision and remains
 /// RFC 8767-servable, with AD cleared.
 #[tokio::test]

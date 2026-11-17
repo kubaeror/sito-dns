@@ -1163,7 +1163,9 @@ The safety gate is the only work done before the 2.0 refactor. It closes all P0 
 **Files:** `sito-dnssec/src/chain_cache.rs`, `sito-cache/src/{entry,cache}.rs`, `sito/src/pipeline.rs`.
 **Steps:**
 - [ ] Add `DnssecPolicyEpoch` to cache entries; flush/reject on validator/anchor change.
-- [ ] Cache `Bogus`/`Indeterminate` with explicit policy and short TTL; never serve stale Indeterminate.
+- [x] Cache strict-mode `Bogus` SERVFAILs for 5 s (`DNSSEC_BOGUS_CACHE_TTL`)
+  and cap log-only `Indeterminate` entries at 30 s
+  (`DNSSEC_INDETERMINATE_CACHE_TTL`); never serve stale `Bogus`/`Indeterminate`.
 - [ ] Add metrics for `Secure/Insecure/Bogus/Indeterminate`, key fetch budget, deadline failures.
 - **Acceptance:** policy-change race test passes; stale cache never serves unvalidated data.
 **Estimate:** M.

@@ -56,4 +56,43 @@ impl PipelineContext<'_> {
         }
         Some(outcome)
     }
+
+    /// Validates an upstream response, then shapes and caches it under the
+    /// decision it produced.
+    ///
+    /// Strict-mode Bogus is stored through the fail-closed failure insert as a
+    /// SERVFAIL; log-only Bogus keeps the answer and is cached as unservable
+    /// `Indeterminate` by the normal insert. Returns the metric/log label for
+    /// the decision.
+    pub(super) async fn validate_and_cache_upstream(
+        &mut self,
+        upstream_resp: &mut Message,
+        upstream_name: &str,
+    ) -> Option<&'static str> {
+        let dnssec_outcome = self
+            .validate_upstream_response(upstream_resp, upstream_name)
+            .await;
+        let dnssec_str = dnssec_outcome
+            .as_ref()
+            .map(sito_dnssec::ValidationOutcome::as_str);
+        let cache_status = validation_status(dnssec_outcome.as_ref());
+        // Strict mode converts Bogus into a fail-closed SERVFAIL with no
+        // answer data. Cache that decision explicitly: it is not an RFC 2308
+        // negative answer. LogOnly keeps the answer and is cached as
+        // unservable `Indeterminate` by the normal path.
+        let strict_bogus = matches!(
+            dnssec_outcome.as_ref(),
+            Some(sito_dnssec::ValidationOutcome::Bogus { .. })
+        ) && self.dnssec_mode == sito_dnssec::DnssecMode::Validate;
+
+        // Shape before caching so the stored entry never carries
+        // upstream-only EDNS options; a DO=0 client never receives DNSSEC
+        // records and the stripped form is what is cached.
+        if strict_bogus {
+            self.shape_and_insert_bogus(upstream_resp).await;
+        } else {
+            self.shape_and_insert(upstream_resp, cache_status).await;
+        }
+        dnssec_str
+    }
 }

@@ -56,16 +56,21 @@ impl std::fmt::Display for PolicyEpoch {
 /// DNSSEC validation state recorded when a response was cached.
 ///
 /// The status lets the pipeline decide whether a cached entry may be served
-/// when validation is active: `Insecure`/`Indeterminate` are legitimate
-/// answers for unsigned or inconclusive data (served with AD=0), while
-/// `Unchecked` means no local validation ran at all and must never be served
-/// to a client that relies on the resolver's validation.
+/// when validation is active: `Secure`/`Insecure` are legitimate answers for
+/// signed or unsigned data (served with AD=0 unless `Secure`), `Bogus` is a
+/// fail-closed SERVFAIL decision that carries no answer data, and
+/// `Indeterminate` is an inconclusive result that must not be served to a
+/// validating client. `Unchecked` means no local validation ran at all and
+/// must never be served to a client that relies on the resolver's validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ValidationStatus {
     /// Signature chain validated to a trust anchor (AD may be set).
     Secure,
     /// Authenticated proof that the data is unsigned (AD=0).
     Insecure,
+    /// Signature validation failed; the cached response is a SERVFAIL and
+    /// must be served fail-closed (never as answer data).
+    Bogus,
     /// Validation was inconclusive (AD=0).
     Indeterminate,
     /// No local validation was performed (CD=1 or validation disabled).

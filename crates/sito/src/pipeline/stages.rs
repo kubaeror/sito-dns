@@ -532,8 +532,8 @@ impl DnsPipeline {
 
     /// Cache lookup honouring the stored validation status.
     ///
-    /// While local validation is active, only an authenticated
-    /// `Secure`/`Insecure` decision may be served. `Unchecked` (CD=1 or
+    /// While local validation is active, `Secure`/`Insecure` decisions and a
+    /// fail-closed `Bogus` SERVFAIL may be served. `Unchecked` (CD=1 or
     /// validation disabled) and `Indeterminate` (inconclusive, or Bogus in
     /// log-only mode) entries force an upstream re-resolution so strict mode
     /// can fail closed. `Insecure` answers are served with AD=0; DO=0 clients

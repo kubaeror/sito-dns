@@ -20,6 +20,26 @@ use crate::key::CacheKey;
 /// TTL (seconds) clamped onto records served from stale cache per RFC 8767 §5.
 const STALE_SERVE_TTL: u32 = 30;
 
+/// Lifespan (seconds) of a cached strict-mode DNSSEC `Bogus` SERVFAIL.
+///
+/// A Bogus decision is fail-closed and carries no answer data, but it is still
+/// a transient judgement about current chain/key material. Keeping the window
+/// short bounds how long a transient validation failure can suppress a name
+/// after the underlying problem clears. RFC 2308 negative caching does not
+/// apply because SERVFAIL is not a cacheable RCODE there, so this entry is
+/// created only through
+/// [`DnsCache::insert_validation_failure_at_epochs`].
+pub const DNSSEC_BOGUS_CACHE_TTL: u32 = 5;
+
+/// Maximum lifespan (seconds) of a cached `Indeterminate` validation result.
+///
+/// In log-only mode an inconclusive (or Bogus) answer is recorded as
+/// `Indeterminate`. It is never served to a validating client and must not
+/// linger for the full record TTL, because the resolver's validation state can
+/// change independently of the answer data. The insert caps both the entry
+/// lifespan and its record TTLs to this window.
+pub const DNSSEC_INDETERMINATE_CACHE_TTL: u32 = 30;
+
 /// Builds a moka cache with the given capacity in megabytes.
 fn build_cache(size_mb: u64) -> Cache<CacheKey, Arc<CacheEntry>> {
     Cache::builder()
@@ -562,6 +582,16 @@ impl DnsCache {
             if entry.filter_epoch != self.filter_epoch() {
                 return false;
             }
+            // Prefetch exists to refresh usable data before it expires. A
+            // Bogus SERVFAIL is fail-closed and an Indeterminate answer is
+            // unservable to validating clients; re-resolving them in the
+            // background would defeat the short negative-cache window.
+            if matches!(
+                entry.validation_status,
+                ValidationStatus::Bogus | ValidationStatus::Indeterminate
+            ) {
+                return false;
+            }
             let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
             if elapsed_secs < entry.max_lifespan_secs {
                 let remaining = entry.max_lifespan_secs - elapsed_secs;
@@ -652,6 +682,17 @@ impl DnsCache {
         if !config.enabled {
             return false;
         }
+        // A Bogus decision is fail-closed: the response must be a SERVFAIL
+        // with no answer data, which only the dedicated failure insert can
+        // produce. Allowing it here would let ordinary answer data be served
+        // behind a Bogus status.
+        if validation_status == ValidationStatus::Bogus {
+            trace!(
+                "Not caching Bogus status for {} through the normal insert path",
+                key.qname
+            );
+            return false;
+        }
 
         let Some(first_query) = query.queries.first() else {
             return false;
@@ -735,7 +776,7 @@ impl DnsCache {
             config.min_ttl
         };
 
-        let max_lifespan_secs = if is_negative {
+        let mut max_lifespan_secs = if is_negative {
             // RFC 2308 requires a SOA record owned by an ancestor of the query
             // name (or of a CNAME target on the chain) to derive the negative
             // TTL. A SOA for an unrelated zone is out of bailiwick and must not
@@ -812,6 +853,23 @@ impl DnsCache {
             }
         };
 
+        // Log-only mode records an inconclusive/Bogus answer as
+        // `Indeterminate`. It is unservable to a validating client, and the
+        // resolver's validation state can change independently of the answer,
+        // so neither the entry nor any record TTL may outlive the short
+        // DNSSEC_INDETERMINATE_CACHE_TTL window.
+        if validation_status == ValidationStatus::Indeterminate {
+            let cap = max_lifespan_secs.min(DNSSEC_INDETERMINATE_CACHE_TTL);
+            max_lifespan_secs = cap;
+            for ttl in answer_ttls
+                .iter_mut()
+                .chain(authority_ttls.iter_mut())
+                .chain(additional_ttls.iter_mut())
+            {
+                *ttl = (*ttl).min(cap);
+            }
+        }
+
         let serialized_len = encode_message(response).map_or(256, |b| b.len());
         let estimated_bytes = (serialized_len + key.qname.len() + 128) as u32;
 
@@ -855,6 +913,129 @@ impl DnsCache {
         trace!(
             "Caching response for {} with lifespan {}s (weight: {}B)",
             key.qname, max_lifespan_secs, estimated_bytes
+        );
+        self.cache.load_full().insert(key, Arc::new(entry)).await;
+        true
+    }
+
+    /// Insert a fail-closed DNSSEC validation failure as a cache entry.
+    ///
+    /// Strict `Validate` mode turns a Bogus result into a SERVFAIL with no
+    /// answer data. SERVFAIL is not cacheable under RFC 2308, so the normal
+    /// insert path rejects it; this method stores the fail-closed response
+    /// explicitly so repeated queries for a Bogus name do not keep hitting
+    /// upstreams for the short [`DNSSEC_BOGUS_CACHE_TTL`] window.
+    ///
+    /// The response must be a `SERVFAIL` with an empty answer section and a
+    /// question matching `query`. The entry has no record TTLs and a lifespan
+    /// of exactly `ttl_secs`. It is accepted only for [`ValidationStatus::Bogus`]
+    /// (or `Indeterminate`, so tests can construct the log-only shape); both
+    /// epochs must still be current.
+    ///
+    /// Returns `true` when the entry was stored.
+    pub async fn insert_validation_failure_at_epochs(
+        &self,
+        query: &Message,
+        response: &Message,
+        validation_status: ValidationStatus,
+        policy_epoch: PolicyEpoch,
+        filter_epoch: u64,
+        ttl_secs: u32,
+    ) -> bool {
+        if !matches!(
+            validation_status,
+            ValidationStatus::Bogus | ValidationStatus::Indeterminate
+        ) {
+            return false;
+        }
+        let Some(key) = CacheKey::for_query(query) else {
+            return false;
+        };
+        let config = self.config.load();
+        if !config.enabled {
+            return false;
+        }
+        let Some(first_query) = query.queries.first() else {
+            return false;
+        };
+        if response.metadata.message_type != MessageType::Response {
+            return false;
+        }
+        if response.metadata.truncation {
+            return false;
+        }
+        if response.metadata.response_code != ResponseCode::ServFail {
+            trace!(
+                "Not caching validation failure for {} without a SERVFAIL response",
+                key.qname
+            );
+            return false;
+        }
+        if !response.answers.is_empty() {
+            warn!(
+                qname = %key.qname,
+                "Refusing to cache a validation failure that carries answer data"
+            );
+            return false;
+        }
+        let Some(response_question) = response.queries.first() else {
+            trace!(
+                "Not caching validation failure without a question section for {}",
+                key.qname
+            );
+            return false;
+        };
+        let matches = response_question.name() == first_query.name()
+            && response_question.query_type() == first_query.query_type()
+            && response_question.query_class() == first_query.query_class();
+        if !matches {
+            warn!(
+                qname = %key.qname,
+                "Refusing to cache validation failure with a mismatched question section"
+            );
+            return false;
+        }
+
+        // Same generation contract as a normal insert: a failure decision
+        // belongs to the policy/filter snapshot that produced it.
+        if policy_epoch != self.policy_epoch() {
+            debug!(
+                qname = %key.qname,
+                policy_epoch = %policy_epoch,
+                current = %self.policy_epoch(),
+                "Discarding validation-failure insert from an older DNSSEC policy generation"
+            );
+            return false;
+        }
+        if filter_epoch != self.filter_epoch() {
+            debug!(
+                qname = %key.qname,
+                filter_epoch,
+                current = self.filter_epoch(),
+                "Discarding validation-failure insert from an older filter generation"
+            );
+            return false;
+        }
+
+        let serialized_len = encode_message(response).map_or(256, |b| b.len());
+        let estimated_bytes = (serialized_len + key.qname.len() + 128) as u32;
+        let entry = CacheEntry {
+            message: response.clone(),
+            stored_at: Instant::now(),
+            max_lifespan_secs: ttl_secs,
+            answer_ttls: Vec::new(),
+            authority_ttls: Vec::new(),
+            additional_ttls: Vec::new(),
+            validation_status,
+            policy_epoch: policy_epoch.get(),
+            filter_epoch,
+            hits: Arc::new(AtomicU32::new(0)),
+            estimated_bytes,
+        };
+
+        trace!(
+            "Caching DNSSEC {:?} SERVFAIL for {} with lifespan {}s (weight: {}B)",
+            validation_status, key.qname, ttl_secs, estimated_bytes
         );
         self.cache.load_full().insert(key, Arc::new(entry)).await;
         true
@@ -998,6 +1179,31 @@ fn reclamp_entry(entry: &CacheEntry, config: &CacheConfig) -> CacheEntry {
             .min()
             .unwrap_or(config.min_ttl);
         reclamped.max_lifespan_secs = min_record_ttl;
+    }
+
+    // Preserve the fail-closed/longevity bounds across a policy reload. A
+    // raised `min_ttl` or a classification change must not extend a Bogus
+    // SERVFAIL or an inconclusive `Indeterminate` answer beyond its short
+    // window.
+    match reclamped.validation_status {
+        ValidationStatus::Bogus => {
+            reclamped.max_lifespan_secs = reclamped.max_lifespan_secs.min(DNSSEC_BOGUS_CACHE_TTL);
+        }
+        ValidationStatus::Indeterminate => {
+            let cap = reclamped
+                .max_lifespan_secs
+                .min(DNSSEC_INDETERMINATE_CACHE_TTL);
+            reclamped.max_lifespan_secs = cap;
+            for ttl in reclamped
+                .answer_ttls
+                .iter_mut()
+                .chain(reclamped.authority_ttls.iter_mut())
+                .chain(reclamped.additional_ttls.iter_mut())
+            {
+                *ttl = (*ttl).min(cap);
+            }
+        }
+        ValidationStatus::Secure | ValidationStatus::Insecure | ValidationStatus::Unchecked => {}
     }
 
     reclamped
