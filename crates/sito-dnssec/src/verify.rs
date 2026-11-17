@@ -441,7 +441,8 @@ impl DnssecValidator {
         // post-fetch probes all draw from it, so a probe fan-out can only
         // shorten the walk that follows. The deadline is the caller's own
         // absolute bound, never a fresh per-probe timeout.
-        let mut chain = TrustChain::new(deadline, MAX_FETCHES_PER_QUERY);
+        let mut chain =
+            TrustChain::with_metrics(deadline, MAX_FETCHES_PER_QUERY, Arc::clone(&self.metrics));
         let mut probe_failed = false;
         let mut budget_exhausted = false;
         let mut has_rrsigs = true;

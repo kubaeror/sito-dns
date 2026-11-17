@@ -43,6 +43,16 @@ impl PipelineContext<'_> {
                 validator.metrics.key_cache_hits(),
                 validator.metrics.key_cache_misses(),
             );
+            m.set_dnssec_validations(
+                validator.metrics.get_validations("secure"),
+                validator.metrics.get_validations("insecure"),
+                validator.metrics.get_validations("bogus"),
+                validator.metrics.get_validations("indeterminate"),
+            );
+            m.set_dnssec_fetch_failures(
+                validator.metrics.fetch_budget_exhausted(),
+                validator.metrics.fetch_deadline_exceeded(),
+            );
         }
         Some(outcome)
     }

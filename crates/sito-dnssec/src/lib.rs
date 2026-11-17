@@ -103,6 +103,8 @@ pub const DEFAULT_KEY_FETCH_DEADLINE: Duration = Duration::from_secs(5);
 pub struct FetchBudget {
     remaining: u8,
     deadline: Instant,
+    /// Optional validation metrics that receive a counter for every refusal.
+    metrics: Option<Arc<DnssecMetrics>>,
 }
 
 impl FetchBudget {
@@ -111,6 +113,19 @@ impl FetchBudget {
         Self {
             remaining,
             deadline,
+            metrics: None,
+        }
+    }
+
+    /// Creates a budget that records every refusal in `metrics`.
+    ///
+    /// Production validation uses this so an exhausted count budget and an
+    /// expired deadline are visible and distinguishable in telemetry.
+    pub fn with_metrics(remaining: u8, deadline: Instant, metrics: Arc<DnssecMetrics>) -> Self {
+        Self {
+            remaining,
+            deadline,
+            metrics: Some(metrics),
         }
     }
 
@@ -121,8 +136,21 @@ impl FetchBudget {
 
     /// Consumes one fetch slot, returning false when the budget is exhausted
     /// or the deadline has passed. Callers must stop fetching on false.
+    ///
+    /// A refusal is attributed to exactly one cause: the absolute deadline
+    /// takes precedence over count exhaustion because it invalidates the
+    /// fetch regardless of how much count budget is left.
     pub fn try_take(&mut self) -> bool {
-        if self.remaining == 0 || self.is_expired() {
+        if self.is_expired() {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_fetch_deadline_exceeded();
+            }
+            return false;
+        }
+        if self.remaining == 0 {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_fetch_budget_exhausted();
+            }
             return false;
         }
         self.remaining -= 1;

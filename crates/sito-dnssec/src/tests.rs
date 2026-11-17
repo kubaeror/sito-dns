@@ -1270,6 +1270,35 @@ fn test_fetch_budget_rejects_after_deadline_or_exhaustion() {
     );
 }
 
+/// A denial must be attributed to exactly one cause: count exhaustion or the
+/// absolute deadline. The other counter must stay untouched so operators can
+/// tell a too-small budget from a stalled upstream.
+#[test]
+fn test_fetch_budget_denials_record_matching_metric() {
+    let metrics = Arc::new(DnssecMetrics::new());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut budget = FetchBudget::with_metrics(1, deadline, Arc::clone(&metrics));
+    assert!(budget.try_take());
+    assert!(
+        !budget.try_take(),
+        "the count budget must reject the second fetch"
+    );
+    assert_eq!(metrics.fetch_budget_exhausted(), 1);
+    assert_eq!(metrics.fetch_deadline_exceeded(), 0);
+
+    let metrics = Arc::new(DnssecMetrics::new());
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("clock arithmetic");
+    let mut budget = FetchBudget::with_metrics(3, expired, Arc::clone(&metrics));
+    assert!(
+        !budget.try_take(),
+        "an expired deadline must reject fetches even with budget left"
+    );
+    assert_eq!(metrics.fetch_deadline_exceeded(), 1);
+    assert_eq!(metrics.fetch_budget_exhausted(), 0);
+}
+
 #[tokio::test]
 async fn test_fetch_zone_chain_expired_deadline_makes_no_fetch() {
     let anchors = TrustAnchors::default();

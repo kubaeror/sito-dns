@@ -295,6 +295,12 @@ pub struct MetricsRegistry {
     cache_size_bytes: Arc<AtomicI64>,
     dnssec_key_cache_hits: Arc<AtomicU64>,
     dnssec_key_cache_misses: Arc<AtomicU64>,
+    dnssec_validations_secure: Arc<AtomicU64>,
+    dnssec_validations_insecure: Arc<AtomicU64>,
+    dnssec_validations_bogus: Arc<AtomicU64>,
+    dnssec_validations_indeterminate: Arc<AtomicU64>,
+    dnssec_fetch_budget_failures: Arc<AtomicU64>,
+    dnssec_fetch_deadline_failures: Arc<AtomicU64>,
     cache_stale_served: Arc<AtomicU64>,
     dnssec_bogus: Arc<Mutex<BTreeMap<String, u64>>>,
     clients_identified: Arc<CounterMap<u32>>,
@@ -364,6 +370,12 @@ impl MetricsRegistry {
             cache_size_bytes: Arc::new(AtomicI64::new(0)),
             dnssec_key_cache_hits: Arc::new(AtomicU64::new(0)),
             dnssec_key_cache_misses: Arc::new(AtomicU64::new(0)),
+            dnssec_validations_secure: Arc::new(AtomicU64::new(0)),
+            dnssec_validations_insecure: Arc::new(AtomicU64::new(0)),
+            dnssec_validations_bogus: Arc::new(AtomicU64::new(0)),
+            dnssec_validations_indeterminate: Arc::new(AtomicU64::new(0)),
+            dnssec_fetch_budget_failures: Arc::new(AtomicU64::new(0)),
+            dnssec_fetch_deadline_failures: Arc::new(AtomicU64::new(0)),
             cache_stale_served: Arc::new(AtomicU64::new(0)),
             dnssec_bogus: Arc::new(Mutex::new(BTreeMap::new())),
             clients_identified: Arc::new(RwLock::new(HashMap::new())),
@@ -456,6 +468,33 @@ impl MetricsRegistry {
         self.dnssec_key_cache_hits.store(hits, Ordering::Relaxed);
         self.dnssec_key_cache_misses
             .store(misses, Ordering::Relaxed);
+    }
+
+    /// Publishes the cumulative DNSSEC validation outcome counters.
+    pub fn set_dnssec_validations(
+        &self,
+        secure: u64,
+        insecure: u64,
+        bogus: u64,
+        indeterminate: u64,
+    ) {
+        self.dnssec_validations_secure
+            .store(secure, Ordering::Relaxed);
+        self.dnssec_validations_insecure
+            .store(insecure, Ordering::Relaxed);
+        self.dnssec_validations_bogus
+            .store(bogus, Ordering::Relaxed);
+        self.dnssec_validations_indeterminate
+            .store(indeterminate, Ordering::Relaxed);
+    }
+
+    /// Publishes the cumulative DNSSEC key-fetch refusal counters,
+    /// distinguishing count-budget exhaustion from an expired deadline.
+    pub fn set_dnssec_fetch_failures(&self, budget: u64, deadline: u64) {
+        self.dnssec_fetch_budget_failures
+            .store(budget, Ordering::Relaxed);
+        self.dnssec_fetch_deadline_failures
+            .store(deadline, Ordering::Relaxed);
     }
 
     pub fn inc_cache_stale_served(&self) {
@@ -1121,6 +1160,22 @@ impl MetricsRegistry {
 
     /// DNSSEC, client, and DoH bypass families.
     fn render_dnssec_client_family(&self, out: &mut String) {
+        // 11a. sito_dnssec_validations_total
+        out.push_str("# HELP sito_dnssec_validations_total Total DNSSEC validation outcomes\n");
+        out.push_str("# TYPE sito_dnssec_validations_total counter\n");
+        for (result, value) in [
+            ("secure", &self.dnssec_validations_secure),
+            ("insecure", &self.dnssec_validations_insecure),
+            ("bogus", &self.dnssec_validations_bogus),
+            ("indeterminate", &self.dnssec_validations_indeterminate),
+        ] {
+            let _ = writeln!(
+                out,
+                "sito_dnssec_validations_total{{result=\"{result}\"}} {}",
+                value.load(Ordering::Relaxed)
+            );
+        }
+
         // 11. sito_dnssec_bogus_total
         out.push_str("# HELP sito_dnssec_bogus_total Total DNSSEC bogus responses detected\n");
         out.push_str("# TYPE sito_dnssec_bogus_total counter\n");
@@ -1138,6 +1193,22 @@ impl MetricsRegistry {
                 }
             }
         }
+
+        // 11b. sito_dnssec_fetch_failures_total
+        out.push_str(
+            "# HELP sito_dnssec_fetch_failures_total Total DNSSEC key fetches refused by budget or deadline\n",
+        );
+        out.push_str("# TYPE sito_dnssec_fetch_failures_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_dnssec_fetch_failures_total{{kind=\"budget\"}} {}",
+            self.dnssec_fetch_budget_failures.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "sito_dnssec_fetch_failures_total{{kind=\"deadline\"}} {}",
+            self.dnssec_fetch_deadline_failures.load(Ordering::Relaxed)
+        );
 
         // 12. sito_clients_identified_total
         out.push_str("# HELP sito_clients_identified_total Total clients successfully identified by method\n");
@@ -1486,6 +1557,39 @@ fn escape_label_value(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// DNSSEC outcomes and fetch-budget/deadline refusals must be exposed as
+    /// stable counter families so an operator can alert on validation failures
+    /// separately from upstream stalls.
+    #[test]
+    fn test_dnssec_validation_and_fetch_failure_metrics_render() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.set_dnssec_validations(7, 3, 2, 1);
+        reg.set_dnssec_fetch_failures(5, 4);
+
+        let rendered = reg.render_prometheus();
+        for (result, value) in [
+            ("secure", 7),
+            ("insecure", 3),
+            ("bogus", 2),
+            ("indeterminate", 1),
+        ] {
+            assert!(
+                rendered.contains(&format!(
+                    "sito_dnssec_validations_total{{result=\"{result}\"}} {value}"
+                )),
+                "missing validation series for {result}:\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("sito_dnssec_fetch_failures_total{kind=\"budget\"} 5"),
+            "missing fetch-budget failure series:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("sito_dnssec_fetch_failures_total{kind=\"deadline\"} 4"),
+            "missing fetch-deadline failure series:\n{rendered}"
+        );
+    }
+
     #[test]
     fn test_metrics_registry_contains_table_14_2() {
         let reg = MetricsRegistry::new("0.1.0", "abc1234");
@@ -1500,6 +1604,8 @@ mod tests {
         reg.inc_cache_stale_served();
         reg.inc_dnssec_bogus("tls://dns.quad9.net");
         reg.set_dnssec_key_cache(7, 3);
+        reg.set_dnssec_validations(7, 3, 2, 1);
+        reg.set_dnssec_fetch_failures(5, 4);
         reg.inc_clients_identified("ip");
         reg.inc_doh_bypass_blocked();
         reg.set_ha_slaves_connected(2);
@@ -1525,6 +1631,10 @@ mod tests {
         assert!(rendered.contains("sito_dnssec_bogus_total"));
         assert!(rendered.contains("sito_dnssec_key_cache_hits_total 7"));
         assert!(rendered.contains("sito_dnssec_key_cache_misses_total 3"));
+        assert!(rendered.contains("sito_dnssec_validations_total{result=\"secure\"} 7"));
+        assert!(rendered.contains("sito_dnssec_validations_total{result=\"indeterminate\"} 1"));
+        assert!(rendered.contains("sito_dnssec_fetch_failures_total{kind=\"budget\"} 5"));
+        assert!(rendered.contains("sito_dnssec_fetch_failures_total{kind=\"deadline\"} 4"));
         assert!(rendered.contains("sito_clients_identified_total"));
         assert!(rendered.contains("sito_doh_bypass_blocked_total"));
         assert!(rendered.contains("sito_ha_slaves_connected"));
@@ -1556,6 +1666,8 @@ mod tests {
         reg.inc_cache_stale_served();
         reg.inc_dnssec_bogus("tls://dns.quad9.net");
         reg.set_dnssec_key_cache(7, 3);
+        reg.set_dnssec_validations(7, 3, 2, 1);
+        reg.set_dnssec_fetch_failures(5, 4);
         reg.inc_clients_identified("ip");
         reg.inc_doh_bypass_blocked();
         reg.set_ha_slaves_connected(2);
@@ -1701,9 +1813,19 @@ sito_filter_compile_seconds_bucket{le="5"} 0
 sito_filter_compile_seconds_bucket{le="+Inf"} 0
 sito_filter_compile_seconds_sum 0
 sito_filter_compile_seconds_count 0
+# HELP sito_dnssec_validations_total Total DNSSEC validation outcomes
+# TYPE sito_dnssec_validations_total counter
+sito_dnssec_validations_total{result="secure"} 7
+sito_dnssec_validations_total{result="insecure"} 3
+sito_dnssec_validations_total{result="bogus"} 2
+sito_dnssec_validations_total{result="indeterminate"} 1
 # HELP sito_dnssec_bogus_total Total DNSSEC bogus responses detected
 # TYPE sito_dnssec_bogus_total counter
 sito_dnssec_bogus_total{upstream="tls://dns.quad9.net"} 1
+# HELP sito_dnssec_fetch_failures_total Total DNSSEC key fetches refused by budget or deadline
+# TYPE sito_dnssec_fetch_failures_total counter
+sito_dnssec_fetch_failures_total{kind="budget"} 5
+sito_dnssec_fetch_failures_total{kind="deadline"} 4
 # HELP sito_clients_identified_total Total clients successfully identified by method
 # TYPE sito_clients_identified_total counter
 sito_clients_identified_total{method="ip"} 1

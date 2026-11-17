@@ -90,9 +90,22 @@ pub(super) struct TrustChain {
 impl TrustChain {
     /// Creates a chain context bounded by one absolute `deadline` and at most
     /// `remaining` DNSKEY/DS fetches.
+    #[cfg(test)]
     pub(super) fn new(deadline: Instant, remaining: u8) -> Self {
         Self {
             budget: FetchBudget::new(remaining, deadline),
+            visited: HashSet::new(),
+        }
+    }
+
+    /// Creates a chain context whose refusals are recorded in `metrics`.
+    pub(super) fn with_metrics(
+        deadline: Instant,
+        remaining: u8,
+        metrics: Arc<DnssecMetrics>,
+    ) -> Self {
+        Self {
+            budget: FetchBudget::with_metrics(remaining, deadline, metrics),
             visited: HashSet::new(),
         }
     }

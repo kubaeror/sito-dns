@@ -151,7 +151,7 @@ pub fn apply_ede(response: &mut Message, code: u16, extra_text: &str) {
 }
 
 /// Telemetry metrics for DNSSEC validation.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct DnssecMetrics {
     pub secure_total: AtomicU64,
     pub insecure_total: AtomicU64,
@@ -165,6 +165,13 @@ pub struct DnssecMetrics {
     /// Cryptographic RRSIG verification attempts made while validating
     /// responses (bounded per response; see `MAX_VERIFICATIONS_PER_RESPONSE`).
     pub signature_verifications: AtomicU64,
+    /// Key-fetch requests refused because the per-query fetch count was
+    /// exhausted. A denial is attributed to exactly one cause: count or
+    /// deadline.
+    pub fetch_budget_exhausted: AtomicU64,
+    /// Key-fetch requests refused because the absolute per-query deadline
+    /// passed before the fetch could start.
+    pub fetch_deadline_exceeded: AtomicU64,
     pub bogus_by_upstream_reason: DashMap<(String, String), AtomicU64>,
 }
 
@@ -223,6 +230,28 @@ impl DnssecMetrics {
     #[must_use]
     pub fn signature_verifications(&self) -> u64 {
         self.signature_verifications.load(Ordering::Relaxed)
+    }
+
+    /// Records a key-fetch request refused for count-budget exhaustion.
+    pub(crate) fn record_fetch_budget_exhausted(&self) {
+        self.fetch_budget_exhausted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a key-fetch request refused after the absolute deadline.
+    pub(crate) fn record_fetch_deadline_exceeded(&self) {
+        self.fetch_deadline_exceeded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative key-fetch refusals caused by count-budget exhaustion.
+    #[must_use]
+    pub fn fetch_budget_exhausted(&self) -> u64 {
+        self.fetch_budget_exhausted.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative key-fetch refusals caused by the absolute deadline.
+    #[must_use]
+    pub fn fetch_deadline_exceeded(&self) -> u64 {
+        self.fetch_deadline_exceeded.load(Ordering::Relaxed)
     }
 
     pub fn record_bogus(&self, upstream: Option<&str>, reason: &str) {
