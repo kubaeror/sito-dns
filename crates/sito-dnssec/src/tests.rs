@@ -721,6 +721,196 @@ fn signed_optout_nxdomain(
     msg
 }
 
+/// Parts of an RFC 5155 §8.4 NSEC3 NXDOMAIN proof. Tests omit one part to
+/// prove the validator rejects an incomplete (never Secure) proof.
+#[derive(Clone, Copy, Debug)]
+enum Nsec3NxPart {
+    ClosestEncloser,
+    NextCloserCover,
+    WildcardCover,
+}
+
+/// Builds a signed NSEC3 NXDOMAIN response for `qname` directly below
+/// `origin`, including only the requested proof parts.
+fn signed_nsec3_nxdomain(
+    origin: &Name,
+    qname: &Name,
+    key: &DNSKEY,
+    signer: &hickory_proto::dnssec::DnssecSigner,
+    parts: &[Nsec3NxPart],
+    encloser_types: &[RecordType],
+) -> Message {
+    use data_encoding::BASE32_DNSSEC;
+    use hickory_proto::dnssec::Nsec3HashAlgorithm;
+    use hickory_proto::dnssec::rdata::NSEC3;
+    use hickory_proto::rr::RecordSet;
+
+    let alg = Nsec3HashAlgorithm::SHA1;
+    let hash = |name: &Name| alg.hash(&[], name, 0).expect("hash").as_ref().to_vec();
+    let step = |bytes: &[u8], up: bool| {
+        let mut out = bytes.to_vec();
+        for byte in out.iter_mut().rev() {
+            if up {
+                *byte = byte.wrapping_add(1);
+                if *byte != 0 {
+                    break;
+                }
+            } else {
+                *byte = byte.wrapping_sub(1);
+                if *byte != u8::MAX {
+                    break;
+                }
+            }
+        }
+        out
+    };
+
+    let mut message = Message::new(27, MessageType::Response, OpCode::Query);
+    message
+        .queries
+        .push(Query::query(qname.clone(), RecordType::A));
+    message.metadata.response_code = ResponseCode::NXDomain;
+
+    let mut push = |owner_hash: &[u8], next_hash: Vec<u8>, types: &[RecordType]| {
+        let nsec3 = NSEC3::new(alg, false, 0, Vec::new(), next_hash, types.iter().copied());
+        let owner = Name::from_ascii(format!(
+            "{}.{}",
+            BASE32_DNSSEC.encode(owner_hash),
+            origin.to_ascii()
+        ))
+        .expect("NSEC3 owner");
+        let record =
+            Record::from_rdata(owner.clone(), 300, RData::DNSSEC(DNSSECRData::NSEC3(nsec3)));
+        let mut set = RecordSet::new(owner, RecordType::NSEC3, 0);
+        set.insert(record.clone(), 0);
+        message.authorities.push(record);
+        message.authorities.push(sign_test_rrset(&set, signer));
+    };
+
+    for part in parts {
+        let types = [RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3];
+        match part {
+            Nsec3NxPart::ClosestEncloser => {
+                let encloser = hash(origin);
+                push(&encloser, step(&encloser, true), encloser_types);
+            }
+            Nsec3NxPart::NextCloserCover => {
+                let next_closer = hash(qname);
+                push(&step(&next_closer, false), step(&next_closer, true), &types);
+            }
+            Nsec3NxPart::WildcardCover => {
+                let wildcard =
+                    Name::from_ascii(format!("*.{}", origin.to_ascii())).expect("wildcard");
+                let wildcard_hash = hash(&wildcard);
+                push(
+                    &step(&wildcard_hash, false),
+                    step(&wildcard_hash, true),
+                    &types,
+                );
+            }
+        }
+    }
+
+    message.additionals.push(Record::from_rdata(
+        origin.clone(),
+        300,
+        RData::DNSSEC(DNSSECRData::DNSKEY(key.clone())),
+    ));
+    message
+}
+
+fn nsec3_nxdomain_validator(origin: &Name, key: &DNSKEY) -> DnssecValidator {
+    let mut anchors = TrustAnchors::empty();
+    anchors.insert_with_name(key.public_key(), LowerName::from(origin));
+    DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors)
+}
+
+/// Asserts that an NSEC3 NXDOMAIN proof built from `parts` is rejected by the
+/// full validation path (Bogus/SERVFAIL), never served as Secure.
+fn assert_nsec3_nxdomain_rejected(parts: &[Nsec3NxPart], encloser_types: &[RecordType]) {
+    let (origin, dnskey, signer) = create_test_signer("example.");
+    let qname = Name::from_str("missing.example.").unwrap();
+    let validator = nsec3_nxdomain_validator(&origin, &dnskey);
+    let mut msg = signed_nsec3_nxdomain(&origin, &qname, &dnskey, &signer, parts, encloser_types);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    let outcome = validator.validate_response(&mut msg, Some("nsec3"), now);
+    assert!(
+        matches!(outcome, ValidationOutcome::Bogus { .. }),
+        "an incomplete NSEC3 NXDOMAIN proof must be Bogus: {outcome:?}"
+    );
+    assert_eq!(msg.metadata.response_code, ResponseCode::ServFail);
+    assert!(!msg.metadata.authentic_data);
+}
+
+#[test]
+fn test_nsec3_nxdomain_complete_proof_is_secure() {
+    let (origin, dnskey, signer) = create_test_signer("example.");
+    let qname = Name::from_str("missing.example.").unwrap();
+    let validator = nsec3_nxdomain_validator(&origin, &dnskey);
+    let mut msg = signed_nsec3_nxdomain(
+        &origin,
+        &qname,
+        &dnskey,
+        &signer,
+        &[
+            Nsec3NxPart::ClosestEncloser,
+            Nsec3NxPart::NextCloserCover,
+            Nsec3NxPart::WildcardCover,
+        ],
+        &[RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3],
+    );
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    let outcome = validator.validate_response(&mut msg, Some("nsec3"), now);
+    assert_eq!(outcome, ValidationOutcome::Secure);
+    assert!(msg.metadata.authentic_data);
+}
+
+#[test]
+fn test_nsec3_nxdomain_missing_closest_encloser_is_bogus() {
+    // RFC 5155 §8.3: without an exact-match NSEC3 for the closest encloser
+    // there is no proof at all.
+    assert_nsec3_nxdomain_rejected(
+        &[Nsec3NxPart::NextCloserCover, Nsec3NxPart::WildcardCover],
+        &[RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3],
+    );
+}
+
+#[test]
+fn test_nsec3_nxdomain_missing_next_closer_cover_is_bogus() {
+    // RFC 5155 §8.3: the closest encloser does not deny the next closer name
+    // without a covering NSEC3.
+    assert_nsec3_nxdomain_rejected(
+        &[Nsec3NxPart::ClosestEncloser, Nsec3NxPart::WildcardCover],
+        &[RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3],
+    );
+}
+
+#[test]
+fn test_nsec3_nxdomain_missing_wildcard_cover_is_bogus() {
+    // RFC 5155 §8.4: without a wildcard denial the name could have been
+    // synthesized from a wildcard.
+    assert_nsec3_nxdomain_rejected(
+        &[Nsec3NxPart::ClosestEncloser, Nsec3NxPart::NextCloserCover],
+        &[RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3],
+    );
+}
+
+#[test]
+fn test_nsec3_nxdomain_closest_encloser_without_soa_is_bogus() {
+    // RFC 5155 §7.1: the apex NSEC3 must carry the SOA bit. A closest-encloser
+    // bitmap that does not describe the apex must not complete the proof.
+    assert_nsec3_nxdomain_rejected(
+        &[
+            Nsec3NxPart::ClosestEncloser,
+            Nsec3NxPart::NextCloserCover,
+            Nsec3NxPart::WildcardCover,
+        ],
+        &[RecordType::A, RecordType::RRSIG],
+    );
+}
+
 #[test]
 fn test_nxdomain_optout_nsec3_is_insecure() {
     let (origin, dnskey, signer) = create_test_signer("example.");
@@ -1602,6 +1792,134 @@ fn test_cross_zone_ds_is_rejected() {
 
     assert!(matches!(outcome, ValidationOutcome::Bogus { .. }));
     assert!(!msg.metadata.authentic_data);
+}
+
+/// RFC 6840 §4.1: only a signature from the parent zone authenticates a DS
+/// RRset. A valid signature from the DS owner (the child zone) or from a
+/// sibling/unrelated zone must leave the delegation status `Unknown`, even
+/// when that signer's key is in the candidate set.
+///
+/// `test_cross_zone_ds_is_rejected` covers the full-response variant; this
+/// locks the delegation probe itself.
+#[test]
+fn test_ds_status_accepts_only_parent_zone_signer() {
+    let (parent, parent_key, parent_signer) = create_test_signer("example.");
+    let (cut, child_key, child_signer) = create_test_signer("child.example.");
+    let (_, sibling_key, sibling_signer) = create_test_signer("sibling.example.");
+    let parent_zone = LowerName::from(&parent);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    // Control: the parent signature authenticates the delegation.
+    let control = signed_ds_message(&cut, &parent_signer, &child_key);
+    assert!(
+        matches!(
+            ds_response_status(
+                &control,
+                &cut,
+                &parent_zone,
+                std::slice::from_ref(&parent_key),
+                now
+            ),
+            DsStatus::Signed(_)
+        ),
+        "the parent signature must authenticate the delegation"
+    );
+
+    // DS owner/child signer: rejected even though its key is a candidate.
+    let child_signed = signed_ds_message(&cut, &child_signer, &child_key);
+    assert!(
+        matches!(
+            ds_response_status(
+                &child_signed,
+                &cut,
+                &parent_zone,
+                &[parent_key.clone(), child_key.clone()],
+                now
+            ),
+            DsStatus::Unknown
+        ),
+        "a DS signed by its owner (the child zone) must not authenticate"
+    );
+
+    // Sibling signer: rejected even though its key is a candidate.
+    let sibling_signed = signed_ds_message(&cut, &sibling_signer, &child_key);
+    assert!(
+        matches!(
+            ds_response_status(
+                &sibling_signed,
+                &cut,
+                &parent_zone,
+                &[parent_key, sibling_key],
+                now
+            ),
+            DsStatus::Unknown
+        ),
+        "a DS signed by an unrelated/sibling zone must not authenticate"
+    );
+}
+
+/// RFC 6840 §4.1 delegation filtering: once `child.signed.example.` is an
+/// authenticated signed cut, the anchored parent key is no longer
+/// authoritative below it. A grandparent-signed DS for `x.child...` (below the
+/// cut) or a DS *at* the ancestor cut must not authenticate the deeper cut.
+#[tokio::test]
+async fn test_ds_below_ancestor_cut_does_not_authenticate_deeper_cut() {
+    let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+    let (child_origin, child_key, child_signer) = create_test_signer("child.signed.example.");
+    let (deeper_origin, deeper_key, _) = create_test_signer("x.child.signed.example.");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    let anchor_dnskey = anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer);
+    let child_ds = signed_ds_message(&child_origin, &parent_signer, &child_key);
+    let child_dnskey = anchored_dnskey_message(&child_origin, &child_key, &child_signer);
+
+    // A valid DS RRset for the deeper name, but signed by the grandparent (the
+    // anchor zone), which stops being authoritative at the child cut.
+    let below_cut = signed_ds_message(&deeper_origin, &parent_signer, &deeper_key);
+    // A DS at the ancestor cut itself must not widen the proof either.
+    let at_cut = child_ds.clone();
+
+    for (label, ds_response) in [
+        ("below the cut", below_cut),
+        ("at the ancestor cut", at_cut),
+    ] {
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+        let fetcher = StaticFetcher::new()
+            .with(&parent_origin, RecordType::DNSKEY, anchor_dnskey.clone())
+            .with(&child_origin, RecordType::DS, child_ds.clone())
+            .with(&child_origin, RecordType::DNSKEY, child_dnskey.clone())
+            .with(&deeper_origin, RecordType::DS, ds_response);
+
+        let mut response = stripped_response(&deeper_origin);
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a DS {label} must not authenticate the deeper cut: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            validator.signed_zone_contains(&LowerName::from(&child_origin), now),
+            "the fixture must establish the child cut as signed"
+        );
+        assert!(
+            !validator
+                .signed_zones
+                .contains_key(&LowerName::from(&deeper_origin)),
+            "a DS {label} must not mark the deeper cut signed"
+        );
+        assert!(
+            validator
+                .chain_cache()
+                .get(&LowerName::from(&deeper_origin), now)
+                .is_none(),
+            "a DS {label} must not persist the deeper cut as Signed"
+        );
+    }
 }
 
 #[test]
