@@ -75,6 +75,60 @@ pub(super) async fn fetch_zone_chain(
     fetched_any.then_some(())
 }
 
+/// Shared fetch context for one cold-start trust-chain walk.
+///
+/// A response may carry RRSIGs from several signer zones. Sharing one budget
+/// and one visited set across those signers stops a hostile message from
+/// multiplying cold-start DNSKEY/DS fetches: the budget is sized to the largest
+/// allowance the old per-signer design gave, so a single-signer response
+/// behaves exactly as before.
+pub(super) struct TrustChain {
+    budget: FetchBudget,
+    visited: HashSet<LowerName>,
+}
+
+impl TrustChain {
+    /// Creates a chain context bounded by one absolute `deadline` and at most
+    /// `remaining` DNSKEY/DS fetches.
+    pub(super) fn new(deadline: Instant, remaining: u8) -> Self {
+        Self {
+            budget: FetchBudget::new(remaining, deadline),
+            visited: HashSet::new(),
+        }
+    }
+
+    /// The shared budget, exposed for assertions and diagnostics.
+    #[cfg(test)]
+    pub(super) fn budget(&self) -> &FetchBudget {
+        &self.budget
+    }
+
+    /// Extends the trust chain from `signer` towards the anchors, appending
+    /// fetched DNSKEY/DS records to `response`.
+    ///
+    /// Returns true when at least one lookup succeeded. The budget and visited
+    /// zones are shared with every earlier `fetch_path` call on this context.
+    pub(super) async fn fetch_path(
+        &mut self,
+        validator: &DnssecValidator,
+        fetcher: &dyn DnssecKeyFetcher,
+        signer: &Name,
+        response: &mut Message,
+    ) -> bool {
+        let anchors = validator.trust_anchors.load();
+        fetch_zone_chain(
+            &anchors,
+            fetcher,
+            signer,
+            &mut self.budget,
+            &mut self.visited,
+            response,
+        )
+        .await
+        .is_some()
+    }
+}
+
 /// Delegation status inferred from a DS response.
 pub(super) enum DsStatus {
     /// The DS RRset is present and authenticated: the child zone is signed.

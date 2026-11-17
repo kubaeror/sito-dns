@@ -542,30 +542,29 @@ impl DnssecValidator {
             return self.indeterminate_outcome(response, upstream);
         }
 
-        let anchors = self.trust_anchors.load();
-        let mut visited = HashSet::new();
-        for signer in signers.iter().take(4) {
-            // Reaching the root costs one DNSKEY lookup per label plus one DS
-            // lookup per non-root level; a fixed budget of 6 could not reach
-            // the root from a signer with three or more labels, leaving
-            // otherwise valid zones Indeterminate on a cold cache.
-            let mut budget = FetchBudget::new(
+        // Reaching the root costs one DNSKEY lookup per label plus one DS
+        // lookup per non-root level; a fixed budget of 6 could not reach
+        // the root from a signer with three or more labels, leaving
+        // otherwise valid zones Indeterminate on a cold cache. The largest
+        // per-signer allowance (`labels * 2 + 1`, capped at 31) becomes one
+        // global budget shared by every signer, so a multi-signer response
+        // cannot multiply cold-start fetch work. A single signer therefore
+        // keeps exactly its old allowance.
+        let remaining = signers
+            .iter()
+            .take(4)
+            .map(|signer| {
                 signer
                     .num_labels()
                     .saturating_mul(2)
                     .saturating_add(1)
-                    .min(31),
-                deadline,
-            );
-            let _ = fetch_zone_chain(
-                &anchors,
-                fetcher,
-                signer,
-                &mut budget,
-                &mut visited,
-                response,
-            )
-            .await;
+                    .min(31)
+            })
+            .max()
+            .unwrap_or(0);
+        let mut chain = TrustChain::new(deadline, remaining);
+        for signer in signers.iter().take(4) {
+            let _ = chain.fetch_path(self, fetcher, signer, response).await;
         }
 
         // This is the post-fetch pass: the "relevant RRSIG is present but not

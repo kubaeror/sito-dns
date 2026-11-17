@@ -5656,3 +5656,205 @@ fn trust_chain_validation_decision_round_trips() {
         );
     }
 }
+
+/// Several RRSIG signers must draw from one shared budget. The empty-message
+/// fetcher makes every walk stop after its DNSKEY+DS pair, so three signers
+/// would issue six fetches if each had its own budget.
+#[tokio::test]
+async fn trust_chain_shares_one_fetch_budget_across_signers() {
+    let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+    let fetcher = StaticFetcher::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let remaining = 5;
+    let mut chain = TrustChain::new(deadline, remaining);
+    let mut response = Message::new(51, MessageType::Response, OpCode::Query);
+
+    for signer in ["one.example.", "two.example.", "three.example."] {
+        let signer = Name::from_str(signer).expect("signer");
+        let _ = chain
+            .fetch_path(&validator, &fetcher, &signer, &mut response)
+            .await;
+    }
+
+    assert_eq!(
+        fetcher.calls(),
+        usize::from(remaining),
+        "signers must share one budget instead of multiplying cold-start fetches"
+    );
+}
+
+/// The deadline handed to `TrustChain` is the caller's absolute `Instant` and
+/// must reach every fetch, not just the first signer's.
+#[tokio::test]
+async fn trust_chain_passes_caller_deadline_to_every_fetch() {
+    let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+    let fetcher = StaticFetcher::new();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut chain = TrustChain::new(deadline, 10);
+    let mut response = Message::new(52, MessageType::Response, OpCode::Query);
+
+    assert_eq!(
+        chain.budget().deadline(),
+        deadline,
+        "the shared budget must carry the caller's absolute deadline"
+    );
+    for signer in ["one.example.", "two.example."] {
+        let signer = Name::from_str(signer).expect("signer");
+        let _ = chain
+            .fetch_path(&validator, &fetcher, &signer, &mut response)
+            .await;
+    }
+
+    let seen = fetcher.seen();
+    assert!(!seen.is_empty(), "the walk must attempt fetches");
+    assert!(
+        seen.iter()
+            .all(|(_, _, seen_deadline)| *seen_deadline == deadline),
+        "every fetch through TrustChain must see the caller's deadline: {seen:?}"
+    );
+}
+
+/// Fetcher that answers every DS query with a DS record at that exact name and
+/// every DNSKEY query with an empty message, so a chain walk keeps descending
+/// to the root and issues the maximum number of fetches.
+struct AlwaysDsFetcher {
+    key: DNSKEY,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl AlwaysDsFetcher {
+    fn new(key: DNSKEY) -> Self {
+        Self {
+            key,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl DnssecKeyFetcher for AlwaysDsFetcher {
+    async fn query(
+        &self,
+        name: &Name,
+        rtype: RecordType,
+        _deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
+        use hickory_proto::dnssec::DigestType;
+
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        if rtype == RecordType::DS
+            && let Ok(ds) = DS::from_key(self.key.public_key(), name, DigestType::SHA256)
+        {
+            message.authorities.push(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DS(ds)),
+            ));
+        }
+        Ok(message)
+    }
+}
+
+/// Builds a positive A response whose RRset carries one RRSIG per entry in
+/// `signers`. Each signer is a 15-label zone in a disjoint tree: a cold-start
+/// walk from each would cost 26 fetches if budgets were per-signer.
+fn hostile_multi_signer_response(qname: &Name, signers: &[&str]) -> (Message, Vec<Name>) {
+    let mut response = Message::new(53, MessageType::Response, OpCode::Query);
+    response
+        .queries
+        .push(Query::query(qname.clone(), RecordType::A));
+    let mut signer_names = Vec::with_capacity(signers.len());
+    for (index, signer_name) in signers.iter().enumerate() {
+        let (origin, _, signer) = create_test_signer(signer_name);
+        let (answer, signature) = signed_a_response(qname, &signer);
+        if index == 0 {
+            response.answers.push(answer);
+        }
+        response.answers.push(signature);
+        signer_names.push(origin);
+    }
+    (response, signer_names)
+}
+
+const HOSTILE_SIGNERS: [&str; 4] = [
+    "a.b.c.d.e.f.g.h.i.j.k.l.m.n.one.",
+    "a.b.c.d.e.f.g.h.i.j.k.l.m.n.two.",
+    "a.b.c.d.e.f.g.h.i.j.k.l.m.n.three.",
+    "a.b.c.d.e.f.g.h.i.j.k.l.m.n.four.",
+];
+
+/// Old per-signer maximum (`labels * 2 + 1`, capped at 31) for a 15-label
+/// signer.
+const HOSTILE_CHAIN_CAP: u8 = 31;
+/// The single bounded delegation probe that still runs after an unproven
+/// chain; routing it through the shared budget is Task 4.
+const HOSTILE_PROBE_ALLOWANCE: usize = 1;
+
+/// A hostile message carrying several deep signers in disjoint zones must not
+/// multiply cold-start fetches: one shared budget bounds the walk to the old
+/// per-signer maximum (31) instead of 4 x 26.
+#[tokio::test]
+async fn trust_chain_hostile_multi_signer_response_stays_within_global_cap() {
+    let qname = Name::from_str("www.hostile.example.").expect("qname");
+    let (mut response, signers) = hostile_multi_signer_response(&qname, &HOSTILE_SIGNERS);
+    let (_, fetcher_key, _) = create_test_signer("fetcher.example.");
+    let fetcher = AlwaysDsFetcher::new(fetcher_key);
+    let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+
+    let mut chain = TrustChain::new(Instant::now() + Duration::from_secs(30), HOSTILE_CHAIN_CAP);
+    for signer in &signers {
+        let _ = chain
+            .fetch_path(&validator, &fetcher, signer, &mut response)
+            .await;
+    }
+
+    assert_eq!(
+        fetcher.calls(),
+        usize::from(HOSTILE_CHAIN_CAP),
+        "the shared budget, not the signer count, must bound the walk"
+    );
+}
+
+/// The same hostile response through the validator must stay within the shared
+/// chain budget plus the single bounded delegation probe that still runs after
+/// an unproven chain (probe routing is Task 4).
+#[tokio::test]
+async fn trust_chain_validate_bounds_hostile_multi_signer_fetches() {
+    let qname = Name::from_str("www.hostile.example.").expect("qname");
+    let (mut response, _) = hostile_multi_signer_response(&qname, &HOSTILE_SIGNERS);
+    let (_, fetcher_key, _) = create_test_signer("fetcher.example.");
+    let fetcher = AlwaysDsFetcher::new(fetcher_key);
+    let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcome = validator
+        .validate_with_key_fetcher_deadline(&mut response, Some("hostile"), now, &fetcher, deadline)
+        .await;
+
+    // Old per-signer budgets allowed 4 x 26 chain fetches for this response.
+    assert!(
+        fetcher.calls() <= usize::from(HOSTILE_CHAIN_CAP) + HOSTILE_PROBE_ALLOWANCE,
+        "a multi-signer response must not multiply cold-start fetches: {} > {}",
+        fetcher.calls(),
+        usize::from(HOSTILE_CHAIN_CAP) + HOSTILE_PROBE_ALLOWANCE
+    );
+    assert!(
+        fetcher.calls() > 0,
+        "the hostile signers must still trigger the chain walk"
+    );
+    assert_ne!(
+        outcome,
+        ValidationOutcome::Secure,
+        "junk DS records must never produce AD=1"
+    );
+    assert!(
+        !response.metadata.authentic_data,
+        "an unproven chain must not set AD"
+    );
+}
