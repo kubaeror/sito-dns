@@ -58,8 +58,10 @@ pub enum TrustChainState {
 /// Unlike [`ValidationOutcome`], this carries no `NtaBypass` variant: by the
 /// time a decision is made, an NTA has already been folded into `Insecure`.
 /// `ValidationOutcome` remains the wire/metrics type until call sites are
-/// migrated, so conversions in both directions are lossless for every outcome
-/// that maps onto a decision.
+/// migrated. The conversions are lossless except for that one mapping:
+/// `NtaBypass` -> `Insecure`. Every other outcome round-trips unchanged,
+/// including the Bogus reason and EDE code; not every mapped outcome is
+/// lossless.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationDecision {
     /// Valid signature chain to a trust anchor (AD=1).
@@ -151,6 +153,13 @@ pub fn apply_ede(response: &mut Message, code: u16, extra_text: &str) {
 }
 
 /// Telemetry metrics for DNSSEC validation.
+///
+/// These are per-validator absolute snapshots, not process-global totals. A
+/// DNSSEC policy reload builds a new validator whose counters start at zero,
+/// and a validation that started under the old generation can finish late and
+/// publish an older (lower) snapshot after the new validator has published.
+/// The exposition setters replace values rather than add to them, and
+/// Prometheus interprets a decrease as a counter reset.
 #[derive(Debug, Default)]
 pub struct DnssecMetrics {
     pub secure_total: AtomicU64,
@@ -170,7 +179,10 @@ pub struct DnssecMetrics {
     /// deadline.
     pub fetch_budget_exhausted: AtomicU64,
     /// Key-fetch requests refused because the absolute per-query deadline
-    /// passed before the fetch could start.
+    /// passed before the fetch could start, whether at `try_take` or at an
+    /// early `is_expired` guard. A fetcher's own `UpstreamError::Timeout` is a
+    /// result, not a refusal, and is not counted here; it surfaces through the
+    /// separate upstream/bogus error metrics.
     pub fetch_deadline_exceeded: AtomicU64,
     pub bogus_by_upstream_reason: DashMap<(String, String), AtomicU64>,
 }

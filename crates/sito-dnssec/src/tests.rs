@@ -1349,6 +1349,86 @@ async fn test_trust_chain_with_metrics_counts_exhausted_budget() {
     );
 }
 
+/// An already-expired deadline is refused at the walk's early `is_expired`
+/// guard, before `try_take` is reached. That early refusal is still a deadline
+/// refusal and must be visible as `fetch_deadline_exceeded`, with the count
+/// budget counter untouched.
+#[tokio::test]
+async fn test_trust_chain_with_metrics_counts_early_deadline_refusal() {
+    let metrics = Arc::new(DnssecMetrics::new());
+    let validator = d05_validator(None);
+    let fetcher = StaticFetcher::new();
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("clock arithmetic");
+    let mut chain = TrustChain::with_metrics(expired, MAX_FETCHES_PER_QUERY, Arc::clone(&metrics));
+
+    let mut response = Message::new(0, MessageType::Response, OpCode::Query);
+    let progressed = chain
+        .fetch_path(&validator, &fetcher, &Name::root(), &mut response)
+        .await;
+
+    assert!(
+        !progressed,
+        "an expired deadline must not make chain progress"
+    );
+    assert_eq!(metrics.fetch_deadline_exceeded(), 1);
+    assert_eq!(
+        metrics.fetch_budget_exhausted(),
+        0,
+        "an expired deadline must not be attributed to count exhaustion"
+    );
+    assert_eq!(
+        fetcher.calls(),
+        0,
+        "an expired deadline must stop before any network fetch"
+    );
+}
+
+/// The same early refusal is recorded for the delegation probe and the key
+/// walk, not only for `fetch_zone_chain`.
+#[tokio::test]
+async fn test_probe_and_key_walk_count_early_deadline_refusal() {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("clock arithmetic");
+    let name = Name::from_str("www.expired.example.").expect("name");
+    let lower = LowerName::from(&name);
+    let validator = d05_validator(None);
+    let fetcher = StaticFetcher::new();
+
+    let metrics = Arc::new(DnssecMetrics::new());
+    let mut chain = TrustChain::with_metrics(expired, MAX_FETCHES_PER_QUERY, Arc::clone(&metrics));
+    let probe = chain
+        .probe_unsigned(&validator, &fetcher, &lower, now)
+        .await;
+    assert!(
+        matches!(probe, UnsignedProbe::Failed),
+        "an expired deadline must fail the probe closed: {probe:?}"
+    );
+    assert_eq!(metrics.fetch_deadline_exceeded(), 1);
+    assert_eq!(metrics.fetch_budget_exhausted(), 0);
+
+    let metrics = Arc::new(DnssecMetrics::new());
+    let mut budget =
+        FetchBudget::with_metrics(MAX_FETCHES_PER_QUERY, expired, Arc::clone(&metrics));
+    assert!(
+        validator
+            .keys_for_zone(&lower, &fetcher, now, &mut budget)
+            .await
+            .is_none(),
+        "an expired deadline must not start the key walk"
+    );
+    assert_eq!(metrics.fetch_deadline_exceeded(), 1);
+    assert_eq!(metrics.fetch_budget_exhausted(), 0);
+    assert_eq!(
+        fetcher.calls(),
+        0,
+        "no early-deadline guard may reach the fetcher"
+    );
+}
+
 #[tokio::test]
 async fn test_fetch_zone_chain_expired_deadline_makes_no_fetch() {
     let anchors = TrustAnchors::default();
@@ -1940,7 +2020,9 @@ fn test_ds_status_accepts_only_parent_zone_signer() {
 /// RFC 6840 §4.1 delegation filtering: once `child.signed.example.` is an
 /// authenticated signed cut, the anchored parent key is no longer
 /// authoritative below it. A grandparent-signed DS for `x.child...` (below the
-/// cut) or a DS *at* the ancestor cut must not authenticate the deeper cut.
+/// cut) must not authenticate the deeper cut, and neither may a DS RRset owned
+/// by an unrelated name (here the ancestor cut's own DS) supplied as the
+/// deeper name's answer.
 #[tokio::test]
 async fn test_ds_below_ancestor_cut_does_not_authenticate_deeper_cut() {
     let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
@@ -1955,12 +2037,13 @@ async fn test_ds_below_ancestor_cut_does_not_authenticate_deeper_cut() {
     // A valid DS RRset for the deeper name, but signed by the grandparent (the
     // anchor zone), which stops being authoritative at the child cut.
     let below_cut = signed_ds_message(&deeper_origin, &parent_signer, &deeper_key);
-    // A DS at the ancestor cut itself must not widen the proof either.
-    let at_cut = child_ds.clone();
+    // A DS RRset owned by an unrelated name (the ancestor cut itself, not the
+    // queried deeper name) must not widen the proof either.
+    let unrelated_ds_owner = child_ds.clone();
 
     for (label, ds_response) in [
         ("below the cut", below_cut),
-        ("at the ancestor cut", at_cut),
+        ("for an unrelated DS owner", unrelated_ds_owner),
     ] {
         let validator = d05_validator(None);
         validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
@@ -5046,7 +5129,9 @@ async fn test_validate_with_key_fetcher_default_deadline_is_bounded() {
         "the default deadline must not be in the past: {seen:?}"
     );
     // Scheduling slack only; the default must stay close to the call time.
-    let upper = before + DEFAULT_KEY_FETCH_DEADLINE + Duration::from_millis(100);
+    // One second absorbs a loaded CI runner descheduling the task between the
+    // `before` timestamp and the wrapper's deadline construction.
+    let upper = before + DEFAULT_KEY_FETCH_DEADLINE + Duration::from_secs(1);
     assert!(
         seen.iter().all(|seen| *seen <= upper),
         "the compatibility wrapper must apply a bounded default deadline: {seen:?}"
@@ -6533,7 +6618,8 @@ async fn trust_chain_probe_fetches_see_caller_deadline() {
 }
 
 /// A validator-level CNAME fan-out that drains the shared probe budget must
-/// still fail closed: Bogus/SERVFAIL or Indeterminate, never Secure/AD.
+/// still fail closed in strict mode: Bogus/SERVFAIL, never Indeterminate or
+/// Secure/AD. The fixture deterministically spends the full documented cap.
 #[tokio::test]
 async fn trust_chain_probe_budget_exhaustion_still_fails_closed() {
     let (origin, key, signer) = create_test_signer("probe-failclosed.example.");
@@ -6553,21 +6639,22 @@ async fn trust_chain_probe_budget_exhaustion_still_fails_closed() {
         .await;
 
     assert!(
-        matches!(
-            outcome,
-            ValidationOutcome::Bogus { .. } | ValidationOutcome::Indeterminate
-        ),
-        "probe budget exhaustion must fail closed: {outcome:?}"
+        matches!(outcome, ValidationOutcome::Bogus { .. }),
+        "strict-mode probe budget exhaustion must be Bogus: {outcome:?}"
+    );
+    assert_eq!(
+        response.metadata.response_code,
+        ResponseCode::ServFail,
+        "strict-mode Bogus must become SERVFAIL"
     );
     assert!(
         !response.metadata.authentic_data,
         "budget exhaustion must never set AD"
     );
-    assert!(
-        fetcher.calls() <= usize::from(MAX_FETCHES_PER_QUERY),
-        "the validator must share the probe budget with the chain walk: {} > {}",
+    assert_eq!(
         fetcher.calls(),
-        MAX_FETCHES_PER_QUERY
+        usize::from(MAX_FETCHES_PER_QUERY),
+        "the fixture must deterministically spend the exact documented cap"
     );
     let seen = fetcher.seen();
     assert!(

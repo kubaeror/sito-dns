@@ -437,7 +437,7 @@ impl DnssecValidator {
         // denial may downgrade it to Insecure, otherwise `validate_response`
         // keeps the fail-closed Bogus decision.
         // One fetch budget covers every DS/DNSKEY lookup this query makes:
-        // the early CNAME probes, the cold-start signer walk and the
+        // the early CNAME probes, every cold-start signer walk and the
         // post-fetch probes all draw from it, so a probe fan-out can only
         // shorten the walk that follows. The deadline is the caller's own
         // absolute bound, never a fresh per-probe timeout.

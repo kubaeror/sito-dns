@@ -22,7 +22,11 @@ pub(super) async fn fetch_zone_chain(
     let mut fetched_any = false;
 
     loop {
-        if depth > 12 || budget.is_expired() {
+        if depth > 12 {
+            break;
+        }
+        if budget.is_expired() {
+            budget.record_deadline_refusal();
             break;
         }
         if !visited.insert(LowerName::from(&current)) {
@@ -75,13 +79,15 @@ pub(super) async fn fetch_zone_chain(
     fetched_any.then_some(())
 }
 
-/// Shared fetch context for one cold-start trust-chain walk.
+/// Shared fetch context for one client response/query.
 ///
 /// A response may carry RRSIGs from several signer zones. Sharing one budget
 /// and one visited set across those signers stops a hostile message from
-/// multiplying cold-start DNSKEY/DS fetches: the budget is sized to the largest
-/// allowance the old per-signer design gave, so a single-signer response
-/// behaves exactly as before.
+/// multiplying cold-start DNSKEY/DS fetches. The budget spans every probe and
+/// signer walk for the response, not one chain walk: a single signer with
+/// early probes can see a shorter walk than the full per-signer allowance. It
+/// is sized to the largest total allowance the old per-signer design gave, so
+/// a single-signer response without probes behaves as before.
 pub(super) struct TrustChain {
     budget: FetchBudget,
     visited: HashSet<LowerName>,
@@ -143,10 +149,13 @@ impl TrustChain {
 
     /// Probes one unsigned CNAME/delegation hop.
     ///
-    /// The probe draws from the same budget as every earlier probe and the
-    /// cold-start signer walk, so a CNAME fan-out can only shorten the later
-    /// walk; it can never add fetches on top of it. Exhaustion fails closed
-    /// through [`UnsignedProbe::Failed`].
+    /// The probe draws from the same budget as every other probe and signer
+    /// walk for this response/query, so a CNAME fan-out can only shorten the
+    /// later walk; it can never add fetches on top of it. Exhaustion fails
+    /// closed, usually through [`UnsignedProbe::Failed`]. When signed evidence
+    /// already exists along the delegation path, the same refusal is reported
+    /// as [`UnsignedProbe::Probed`] because the probe established
+    /// `ShouldBeSigned` before the budget ran out.
     pub(super) async fn probe_unsigned(
         &mut self,
         validator: &DnssecValidator,
@@ -549,8 +558,10 @@ impl DnssecValidator {
         // The deadline is an absolute per-query bound. Every fetch below is
         // taken from the shared budget first, but a caller-supplied fetcher
         // contract violation must not let this probe start work after expiry
-        // either: fail closed instead.
+        // either: fail closed instead, recording the deadline refusal for the
+        // same metric as an expired `try_take`.
         if budget.is_expired() {
+            budget.record_deadline_refusal();
             return DelegationProof::Unknown;
         }
         let cached_start = self.chain_cache.closest_signed(name, now);
@@ -849,8 +860,11 @@ impl DnssecValidator {
         budget: &mut FetchBudget,
     ) -> Option<(LowerName, Vec<DNSKEY>)> {
         // Never start a key walk (or call the fetcher) after the shared query
-        // deadline has passed; callers treat `None` as fail-closed.
+        // deadline has passed; callers treat `None` as fail-closed. Record the
+        // refusal so an early-deadline bailout is visible as
+        // `fetch_deadline_exceeded`, just like an expired `try_take`.
         if budget.is_expired() {
+            budget.record_deadline_refusal();
             return None;
         }
         let cached = self.key_cache.validated_keys(target, now);

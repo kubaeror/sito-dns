@@ -95,10 +95,14 @@ pub const DEFAULT_KEY_FETCH_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Per-query budget for DNSSEC DS/DNSKEY fetches.
 ///
-/// `remaining` bounds how many lookups one chain walk may issue; `deadline`
-/// is an absolute wall-clock bound shared by every fetch for that query. Once
-/// either limit is reached, [`Self::try_take`] refuses further fetches so the
-/// walk stops instead of issuing more network I/O.
+/// One budget covers every DS/DNSKEY lookup made for a client response/query,
+/// not one chain walk: the early CNAME/delegation probes, every cold-start
+/// signer walk and the post-fetch probes all draw from it. `remaining` bounds
+/// the total count and `deadline` is the absolute wall-clock bound shared by
+/// every fetch. Once either limit is reached, [`Self::try_take`] refuses
+/// further fetches so validation stops instead of issuing more network I/O.
+/// A signer walk that runs after early probes therefore sees a shorter budget
+/// than the full allowance.
 #[derive(Debug)]
 pub struct FetchBudget {
     remaining: u8,
@@ -140,6 +144,10 @@ impl FetchBudget {
     /// A refusal is attributed to exactly one cause: the absolute deadline
     /// takes precedence over count exhaustion because it invalidates the
     /// fetch regardless of how much count budget is left.
+    ///
+    /// This counts budget decisions only, not fetcher results. An upstream
+    /// `UpstreamError::Timeout` is a fetcher outcome, not a refusal, and is
+    /// covered by the separate upstream/bogus error metrics instead.
     pub fn try_take(&mut self) -> bool {
         if self.is_expired() {
             if let Some(metrics) = &self.metrics {
@@ -155,6 +163,20 @@ impl FetchBudget {
         }
         self.remaining -= 1;
         true
+    }
+
+    /// Records a refusal at an early `is_expired()` guard, before
+    /// [`Self::try_take`] is reached.
+    ///
+    /// Walk and probe entry points check the deadline up front so a caller
+    /// contract violation (or a deadline that expired between stages) cannot
+    /// start new work. That refusal is the same deadline cause as a
+    /// `try_take` refusal and must be visible in the same metric. Counts
+    /// nothing when no metrics are attached.
+    pub(crate) fn record_deadline_refusal(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_fetch_deadline_exceeded();
+        }
     }
 
     /// Whether the absolute deadline has passed.
@@ -183,15 +205,16 @@ const MAX_CNAME_PROBES: usize = 8;
 /// never exceed this before reaching the root or its depth bound.
 const MAX_SIGNER_CHAIN_FETCHES: u8 = 31;
 /// Hard cap on DS/DNSKEY fetches one client query may issue across the early
-/// CNAME probes, the cold-start signer walk and the post-fetch probes.
+/// CNAME probes, the cold-start signer walks and the post-fetch probes.
 ///
-/// The split preserves the old cold-start allowance after the bounded probes:
-/// up to `2 * MAX_CNAME_PROBES` (16) fetches belong to the early probes (a
-/// cold anchor DNSKEY plus one DS lookup each) and up to
-/// `MAX_SIGNER_CHAIN_FETCHES` (31) to the signer walk, for one documented
-/// total of 47. All of them draw from the same [`FetchBudget`], so a probe
-/// fan-out leaves the cold-start walk only the remainder instead of
-/// multiplying the query's fetch work.
+/// The total is `MAX_SIGNER_CHAIN_FETCHES + 2 * MAX_CNAME_PROBES` (31 + 16),
+/// where the second term is the worst-case probe share: one anchor DNSKEY plus
+/// one DS lookup per probe. It is a single hard cap, not a reservation split:
+/// deep probes draw from the signer share too, so 47 does not guarantee that a
+/// cold-start signer walk still has 31 fetches left after a deep probe fan-out;
+/// it only guarantees the query never exceeds 47. All callers draw from the
+/// same [`FetchBudget`], so a probe fan-out shortens the walk that follows
+/// instead of multiplying the query's fetch work.
 const MAX_FETCHES_PER_QUERY: u8 = MAX_SIGNER_CHAIN_FETCHES + 2 * MAX_CNAME_PROBES as u8;
 /// Accepted clock skew around RRSIG inception/expiration (RFC 4035 5.3.1).
 const MAX_CLOCK_SKEW: u32 = 300;
