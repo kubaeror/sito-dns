@@ -469,8 +469,10 @@ mod tests {
 
     #[test]
     fn test_config_validation_caps_refresh_hours() {
-        let mut config = ListCategoriesConfig::default();
-        config.refresh_hours = 0;
+        let mut config = ListCategoriesConfig {
+            refresh_hours: 0,
+            ..ListCategoriesConfig::default()
+        };
         assert!(config.validate().is_err(), "global zero must be rejected");
         config.refresh_hours = sito_core::config::MAX_REFRESH_HOURS + 1;
         assert!(
