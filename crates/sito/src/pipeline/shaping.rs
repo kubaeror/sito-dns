@@ -64,7 +64,7 @@ impl PipelineContext<'_> {
             return;
         }
         let cache_query = self.cache_query.as_ref().expect("cache query prepared");
-        cache_bogus_failure(
+        let inserted = cache_bogus_failure(
             &self.pipeline.cache,
             cache_query,
             upstream_resp,
@@ -74,6 +74,9 @@ impl PipelineContext<'_> {
                 .expect("cache filter epoch prepared"),
         )
         .await;
+        if !inserted {
+            warn!("Failed to cache a strict Bogus SERVFAIL as a fail-closed entry");
+        }
         if let Some(ref m) = self.pipeline.metrics {
             m.set_cache_size_bytes(
                 i64::try_from(self.pipeline.cache.weighted_size()).unwrap_or(i64::MAX),

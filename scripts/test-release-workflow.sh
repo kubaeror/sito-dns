@@ -74,7 +74,9 @@ expect_job_match "${RELEASE}" "release-gate" 'statuses: read' "release-gate job 
 expect_job_absent "${RELEASE}" "release-gate" 'continue-on-error' "release-gate cannot continue on error"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate\]' "build job depends on the release gate"
 expect_absent "${RELEASE}" 'test-hooks' "release workflow never enables test hooks"
+expect_absent "${RELEASE}" '--all-features' "release workflow never builds with all features"
 expect_absent "${ROOT}/Dockerfile" 'test-hooks' "release image never enables test hooks"
+expect_absent "${ROOT}/Dockerfile" '--all-features' "release image never builds with all features"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate, build-binaries\]' "publish job depends on the release gate"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate, build-binaries, sbom-and-release, artifact-e2e\]' "image job depends on the release gate"
 

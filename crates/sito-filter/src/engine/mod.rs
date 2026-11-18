@@ -279,13 +279,14 @@ fn reschedule_due(
             .iter()
             .find(|l| &l.name == name)
             .map_or(global_hours, |l| effective_hours(l, global_hours));
-        match refresh_deadline(now, hours) {
-            Some(deadline) => {
-                next_due.insert(name.clone(), deadline);
-            }
-            None => {
-                next_due.remove(name);
-            }
+        if let Some(deadline) = refresh_deadline(now, hours) {
+            next_due.insert(name.clone(), deadline);
+        } else {
+            next_due.remove(name);
+            warn!(
+                list = %name,
+                "No representable refresh deadline; removing the list from the refresh schedule"
+            );
         }
     }
 }
@@ -314,6 +315,10 @@ fn refresh_schedule(
             let Some(deadline) = refresh_deadline(now, hours) else {
                 // An unrepresentable deadline must not be stored as a past
                 // instant: that would make the list due on every pass.
+                warn!(
+                    list = %list.name,
+                    "No representable refresh deadline; skipping the list this cycle"
+                );
                 continue;
             };
             next_due.insert(list.name.clone(), deadline);
