@@ -62,6 +62,12 @@ impl PipelineContext<'_> {
             return;
         }
         let cache_query = self.cache_query.as_ref().expect("cache query prepared");
+        // A cached SERVFAIL is replayed as-is. Never let a failure entry carry
+        // authority or additional data: those sections can hold SOA/NSEC/RRSIG
+        // or helper records that would leak through a different query path.
+        // EDNS (including the EDE diagnostic) stays on the message.
+        upstream_resp.authorities.clear();
+        upstream_resp.additionals.clear();
         self.pipeline
             .cache
             .insert_validation_failure_at_epochs(

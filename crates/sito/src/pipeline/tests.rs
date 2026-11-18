@@ -1699,6 +1699,18 @@ async fn test_strict_bogus_servfail_is_cached_and_served_without_upstream() {
         first.answers.is_empty(),
         "a Bogus answer must never be served as data"
     );
+    assert!(
+        first.authorities.is_empty(),
+        "a Bogus SERVFAIL must not carry authority data"
+    );
+    assert!(
+        first.additionals.is_empty(),
+        "a Bogus SERVFAIL must not carry additional data"
+    );
+    assert!(
+        !first.metadata.authentic_data,
+        "a Bogus SERVFAIL must never assert AD"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     let (cached, status) = pipeline
@@ -1709,10 +1721,34 @@ async fn test_strict_bogus_servfail_is_cached_and_served_without_upstream() {
     assert_eq!(status, ValidationStatus::Bogus);
     assert_eq!(cached.metadata.response_code, ResponseCode::ServFail);
     assert_eq!(cached.answers.len(), 0);
+    assert!(
+        cached.authorities.is_empty(),
+        "the cached Bogus entry must not carry authority data"
+    );
+    assert!(
+        cached.additionals.is_empty(),
+        "the cached Bogus entry must not carry additional data"
+    );
+    assert!(
+        !cached.metadata.authentic_data,
+        "the cached Bogus entry must never assert AD"
+    );
 
     let second = pipeline.handle(do_query(21, &qname), client).await.unwrap();
     assert_eq!(second.metadata.response_code, ResponseCode::ServFail);
     assert_eq!(second.answers.len(), 0);
+    assert!(
+        second.authorities.is_empty(),
+        "a replayed Bogus SERVFAIL must not carry authority data"
+    );
+    assert!(
+        second.additionals.is_empty(),
+        "a replayed Bogus SERVFAIL must not carry additional data"
+    );
+    assert!(
+        !second.metadata.authentic_data,
+        "a served Bogus SERVFAIL must never assert AD"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -1776,9 +1812,34 @@ fn test_cache_servability_distinguishes_bogus_from_indeterminate() {
     assert!(stale_cache_entry_servable(ValidationStatus::Insecure, true));
 }
 
+/// Sentinel EDE text attached to a cached Bogus entry in the stale-path test.
+const STALE_BOGUS_SENTINEL: &str = "stale-bogus-sentinel";
+
+/// Whether a response carries an RFC 8914 EDE option whose payload contains
+/// `needle` (the two-byte info-code prefix is included in the payload).
+fn ede_contains_text(response: &Message, needle: &str) -> bool {
+    response.edns.as_ref().is_some_and(|edns| {
+        edns.options().options.iter().any(|(code, option)| {
+            u16::from(*code) == 15
+                && matches!(
+                    option,
+                    EdnsOption::Unknown(_, data)
+                        if data
+                            .windows(needle.len())
+                            .any(|window| window == needle.as_bytes())
+                )
+        })
+    })
+}
+
 /// A stale `Bogus` entry is a fail-closed SERVFAIL, not reusable data. Even
-/// when the upstream is down, a validating client must get a fresh SERVFAIL
-/// rather than a stale cached validation failure.
+/// when the upstream is down, a validating client must get a freshly
+/// synthesized SERVFAIL rather than a stale cached validation failure.
+///
+/// The cached failure carries a sentinel EDE text. The stale cache lookup can
+/// still see it (proving the entry is present and stale), but the pipeline's
+/// answer must not contain that sentinel, which distinguishes a freshly
+/// synthesized SERVFAIL from a replay of the cached entry.
 #[tokio::test]
 async fn test_stale_bogus_entry_is_not_served_under_validation() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1799,6 +1860,11 @@ async fn test_stale_bogus_entry_is_not_served_under_validation() {
     let mut servfail = Message::response(19, OpCode::Query);
     servfail.queries = query.queries.clone();
     servfail.metadata.response_code = ResponseCode::ServFail;
+    sito_dnssec::apply_ede(
+        &mut servfail,
+        sito_dnssec::EDE_DNSSEC_BOGUS,
+        STALE_BOGUS_SENTINEL,
+    );
     assert!(
         pipeline
             .cache
@@ -1815,6 +1881,23 @@ async fn test_stale_bogus_entry_is_not_served_under_validation() {
 
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
+    // The entry is still visible to the raw stale lookup, including the
+    // sentinel, so the pipeline must reject it explicitly.
+    let (stale, stale_status) = pipeline
+        .cache
+        .get_stale_for_query_with_status(&query)
+        .await
+        .expect("the stale Bogus entry must still be present for this test");
+    assert_eq!(stale_status, ValidationStatus::Bogus);
+    assert!(
+        ede_contains_text(&stale, STALE_BOGUS_SENTINEL),
+        "the stale lookup must expose the cached sentinel EDE"
+    );
+    assert!(
+        !stale_cache_entry_servable(ValidationStatus::Bogus, true),
+        "a stale Bogus entry must never be servable under validation"
+    );
+
     let resp = pipeline.handle(query, client).await.unwrap();
     assert_eq!(
         resp.metadata.response_code,
@@ -1824,6 +1907,10 @@ async fn test_stale_bogus_entry_is_not_served_under_validation() {
     assert!(
         resp.answers.is_empty(),
         "the rejected stale failure must not leak records"
+    );
+    assert!(
+        !ede_contains_text(&resp, STALE_BOGUS_SENTINEL),
+        "the response must be a freshly synthesized SERVFAIL, not the cached stale entry"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 

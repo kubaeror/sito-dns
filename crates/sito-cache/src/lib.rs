@@ -1157,7 +1157,29 @@ mod tests {
         let response = servfail_response(111, &query);
 
         let old_epoch = cache.policy_epoch();
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Bogus,
+                    old_epoch,
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a current-epoch Bogus failure must be cached"
+        );
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_some(),
+            "the current-epoch failure must be visible"
+        );
+
         cache.advance_policy_epoch();
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "advancing the policy epoch must hide the existing failure entry"
+        );
 
         assert!(
             !cache
@@ -1177,8 +1199,25 @@ mod tests {
             "the rejected failure must not become visible"
         );
 
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a failure from the current filter generation must be cached"
+        );
         let old_filter = cache.filter_epoch();
         cache.set_filter_epoch(old_filter + 1);
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "advancing the filter epoch must hide the existing failure entry"
+        );
         assert!(
             !cache
                 .insert_validation_failure_at_epochs(
@@ -1235,6 +1274,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_validation_failure_ttl_is_clamped_to_status_window() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+
+        // The caller asks for an hour; the cache must enforce the 5 s Bogus
+        // window itself rather than trusting the call site constant.
+        let bogus_name = Name::from_str("bogus-oversized-ttl.example.").unwrap();
+        let bogus_query = query_for(115, &bogus_name);
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &bogus_query,
+                    &servfail_response(115, &bogus_query),
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    3600,
+                )
+                .await
+        );
+        cache
+            .backdate_entry_for_test(&bogus_query, Duration::from_secs(4))
+            .await;
+        assert!(
+            cache
+                .get_for_query_with_status(&bogus_query)
+                .await
+                .is_some(),
+            "the oversized Bogus request must still serve inside 5 s"
+        );
+        cache
+            .backdate_entry_for_test(
+                &bogus_query,
+                Duration::from_secs(u64::from(DNSSEC_BOGUS_CACHE_TTL)),
+            )
+            .await;
+        assert!(
+            cache
+                .get_for_query_with_status(&bogus_query)
+                .await
+                .is_none(),
+            "an oversized Bogus ttl must be clamped to DNSSEC_BOGUS_CACHE_TTL"
+        );
+
+        let indeterminate_name = Name::from_str("indeterminate-oversized-ttl.example.").unwrap();
+        let indeterminate_query = query_for(116, &indeterminate_name);
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &indeterminate_query,
+                    &servfail_response(116, &indeterminate_query),
+                    ValidationStatus::Indeterminate,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    3600,
+                )
+                .await,
+            "the dedicated path accepts Indeterminate so tests can exercise the cap"
+        );
+        cache
+            .backdate_entry_for_test(&indeterminate_query, Duration::from_secs(29))
+            .await;
+        assert!(
+            cache
+                .get_for_query_with_status(&indeterminate_query)
+                .await
+                .is_some(),
+            "the oversized Indeterminate request must still serve inside 30 s"
+        );
+        cache
+            .backdate_entry_for_test(
+                &indeterminate_query,
+                Duration::from_secs(u64::from(DNSSEC_INDETERMINATE_CACHE_TTL)),
+            )
+            .await;
+        assert!(
+            cache
+                .get_for_query_with_status(&indeterminate_query)
+                .await
+                .is_none(),
+            "an oversized Indeterminate ttl must be clamped to DNSSEC_INDETERMINATE_CACHE_TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validation_failure_rejects_mismatched_question() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("bogus-question.example.").unwrap();
+        let query = query_for(117, &qname);
+        let other = Name::from_str("other-question.example.").unwrap();
+        let mismatched = servfail_response(117, &query_for(117, &other));
+
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &mismatched,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a failure response for a different question must never be cached"
+        );
+        assert!(cache.get_for_query_with_status(&query).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_indeterminate_reclamp_never_extends_past_original_lifespan() {
+        let cache = DnsCache::new(make_test_config(1, 3600, 1800));
+        let qname = Name::from_str("indeterminate-reclamp.example.").unwrap();
+        let query = query_for(118, &qname);
+        let mut response = answer_response(118, &qname, [192, 0, 2, 118]);
+        response.answers[0].ttl = 5;
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Indeterminate)
+            .await;
+
+        // A raised min_ttl must not stretch the 5 s lifespan the entry was
+        // stored with (the re-clamp may tighten, never extend).
+        let mut raised = make_test_config(20, 3600, 1800);
+        raised.min_ttl = 20;
+        cache.update_config(raised).await;
+
+        cache
+            .backdate_entry_for_test(&query, Duration::from_secs(6))
+            .await;
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "a min_ttl increase must not extend an Indeterminate entry past \
+             its original lifespan"
+        );
+    }
+
+    #[tokio::test]
     async fn test_bogus_validation_failure_requires_servfail_without_answers() {
         let cache = DnsCache::new(make_test_config(10, 3600, 1800));
         let qname = Name::from_str("bogus-shape.example.").unwrap();
@@ -1258,6 +1432,46 @@ mod tests {
                 )
                 .await,
             "a failure entry must never carry answer data"
+        );
+
+        let mut with_authority = servfail_response(113, &query);
+        with_authority.authorities.push(Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 113))),
+        ));
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &with_authority,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a failure entry must never carry authority data"
+        );
+
+        let mut with_additional = servfail_response(113, &query);
+        with_additional.additionals.push(Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 113))),
+        ));
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &with_additional,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a failure entry must never carry additional data"
         );
 
         let noerror = answer_response(113, &qname, [192, 0, 2, 113]);

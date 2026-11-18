@@ -40,6 +40,20 @@ pub const DNSSEC_BOGUS_CACHE_TTL: u32 = 5;
 /// lifespan and its record TTLs to this window.
 pub const DNSSEC_INDETERMINATE_CACHE_TTL: u32 = 30;
 
+/// Lifespan bound for a fail-closed (`Bogus`) or inconclusive
+/// (`Indeterminate`) entry, or `None` for an ordinary validation status.
+///
+/// The insert path clamps to this value, and the read/re-clamp paths apply the
+/// same bound defensively so the short windows are cache invariants rather
+/// than a convention enforced only at the call site.
+fn failure_lifespan_cap(status: ValidationStatus) -> Option<u32> {
+    match status {
+        ValidationStatus::Bogus => Some(DNSSEC_BOGUS_CACHE_TTL),
+        ValidationStatus::Indeterminate => Some(DNSSEC_INDETERMINATE_CACHE_TTL),
+        ValidationStatus::Secure | ValidationStatus::Insecure | ValidationStatus::Unchecked => None,
+    }
+}
+
 /// Builds a moka cache with the given capacity in megabytes.
 fn build_cache(size_mb: u64) -> Cache<CacheKey, Arc<CacheEntry>> {
     Cache::builder()
@@ -397,10 +411,16 @@ impl DnsCache {
             return None;
         }
 
-        let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
-        let max_stale_secs = entry
+        // Defense in depth for the fail-closed/inconclusive windows: even an
+        // entry that reached the cache without the insert-time clamp (for
+        // example one copied by a resize from an older generation) must not
+        // outlive the status-bound lifespan.
+        let lifespan_secs = entry
             .max_lifespan_secs
-            .saturating_add(config.serve_stale_hours.saturating_mul(3600));
+            .min(failure_lifespan_cap(entry.validation_status).unwrap_or(u32::MAX));
+        let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
+        let max_stale_secs =
+            lifespan_secs.saturating_add(config.serve_stale_hours.saturating_mul(3600));
 
         if elapsed_secs >= max_stale_secs {
             trace!(
@@ -411,10 +431,10 @@ impl DnsCache {
             return None;
         }
 
-        if elapsed_secs >= entry.max_lifespan_secs {
+        if elapsed_secs >= lifespan_secs {
             trace!(
                 "Cache entry for {} expired for normal queries (elapsed: {}s, lifespan: {}s)",
-                key.qname, elapsed_secs, entry.max_lifespan_secs
+                key.qname, elapsed_secs, lifespan_secs
             );
             return None;
         }
@@ -446,7 +466,7 @@ impl DnsCache {
         debug!(
             "Cache hit for {} (remaining min TTL: {}s)",
             key.qname,
-            entry.max_lifespan_secs.saturating_sub(elapsed_secs)
+            lifespan_secs.saturating_sub(elapsed_secs)
         );
         Some((response, entry.validation_status, entry.policy_epoch))
     }
@@ -479,10 +499,12 @@ impl DnsCache {
     /// Retrieve a stale response together with the validation status recorded
     /// when it was cached.
     ///
-    /// The pipeline uses the status to apply the same
-    /// [`ValidationStatus::Unchecked`] gate as fresh cache hits: stale data is
-    /// not revalidated, so an entry cached without local validation must not
-    /// be served while validation is active.
+    /// The pipeline uses the status to apply the same gate as fresh cache
+    /// hits: stale data is not revalidated, so callers must reject
+    /// [`ValidationStatus::Bogus`], [`ValidationStatus::Indeterminate`] and
+    /// [`ValidationStatus::Unchecked`] entries when validation is active —
+    /// only `Secure`/`Insecure` are servable. This method itself does not
+    /// filter on the status.
     pub async fn get_stale_for_query_with_status(
         &self,
         query: &Message,
@@ -926,11 +948,17 @@ impl DnsCache {
     /// explicitly so repeated queries for a Bogus name do not keep hitting
     /// upstreams for the short [`DNSSEC_BOGUS_CACHE_TTL`] window.
     ///
-    /// The response must be a `SERVFAIL` with an empty answer section and a
-    /// question matching `query`. The entry has no record TTLs and a lifespan
-    /// of exactly `ttl_secs`. It is accepted only for [`ValidationStatus::Bogus`]
-    /// (or `Indeterminate`, so tests can construct the log-only shape); both
-    /// epochs must still be current.
+    /// The response must be a `SERVFAIL` with empty answer, authority and
+    /// additional sections and a question matching `query`. The entry has no
+    /// record TTLs and a lifespan of `ttl_secs` clamped to
+    /// [`DNSSEC_BOGUS_CACHE_TTL`] (`Bogus`) or
+    /// [`DNSSEC_INDETERMINATE_CACHE_TTL`] (`Indeterminate`); callers may pass a
+    /// shorter TTL but never extend the window. Other statuses are rejected.
+    ///
+    /// `Indeterminate` is accepted only so tests can construct the log-only
+    /// shape through this dedicated path; production log-only answers use the
+    /// normal [`Self::insert_with_status`] path, which applies the same
+    /// lifespan cap. Both epochs must still be current.
     ///
     /// Returns `true` when the entry was stored.
     pub async fn insert_validation_failure_at_epochs(
@@ -942,12 +970,10 @@ impl DnsCache {
         filter_epoch: u64,
         ttl_secs: u32,
     ) -> bool {
-        if !matches!(
-            validation_status,
-            ValidationStatus::Bogus | ValidationStatus::Indeterminate
-        ) {
+        let Some(window_cap) = failure_lifespan_cap(validation_status) else {
             return false;
-        }
+        };
+        let lifespan_secs = ttl_secs.min(window_cap);
         let Some(key) = CacheKey::for_query(query) else {
             return false;
         };
@@ -975,6 +1001,13 @@ impl DnsCache {
             warn!(
                 qname = %key.qname,
                 "Refusing to cache a validation failure that carries answer data"
+            );
+            return false;
+        }
+        if !response.authorities.is_empty() || !response.additionals.is_empty() {
+            warn!(
+                qname = %key.qname,
+                "Refusing to cache a validation failure that carries authority or additional data"
             );
             return false;
         }
@@ -1022,7 +1055,7 @@ impl DnsCache {
         let entry = CacheEntry {
             message: response.clone(),
             stored_at: Instant::now(),
-            max_lifespan_secs: ttl_secs,
+            max_lifespan_secs: lifespan_secs,
             answer_ttls: Vec::new(),
             authority_ttls: Vec::new(),
             additional_ttls: Vec::new(),
@@ -1034,8 +1067,8 @@ impl DnsCache {
         };
 
         trace!(
-            "Caching DNSSEC {:?} SERVFAIL for {} with lifespan {}s (weight: {}B)",
-            validation_status, key.qname, ttl_secs, estimated_bytes
+            "Caching DNSSEC {:?} SERVFAIL for {} with lifespan {}s (requested {}, weight: {}B)",
+            validation_status, key.qname, lifespan_secs, ttl_secs, estimated_bytes
         );
         self.cache.load_full().insert(key, Arc::new(entry)).await;
         true
@@ -1183,15 +1216,21 @@ fn reclamp_entry(entry: &CacheEntry, config: &CacheConfig) -> CacheEntry {
 
     // Preserve the fail-closed/longevity bounds across a policy reload. A
     // raised `min_ttl` or a classification change must not extend a Bogus
-    // SERVFAIL or an inconclusive `Indeterminate` answer beyond its short
-    // window.
+    // SERVFAIL or an inconclusive `Indeterminate` answer beyond either its
+    // original lifespan or its short status window. The original lifespan is
+    // an upper bound because the re-clamp has no way to know how much of the
+    // window the entry was already intended to consume.
     match reclamped.validation_status {
         ValidationStatus::Bogus => {
-            reclamped.max_lifespan_secs = reclamped.max_lifespan_secs.min(DNSSEC_BOGUS_CACHE_TTL);
+            reclamped.max_lifespan_secs = reclamped
+                .max_lifespan_secs
+                .min(entry.max_lifespan_secs)
+                .min(DNSSEC_BOGUS_CACHE_TTL);
         }
         ValidationStatus::Indeterminate => {
             let cap = reclamped
                 .max_lifespan_secs
+                .min(entry.max_lifespan_secs)
                 .min(DNSSEC_INDETERMINATE_CACHE_TTL);
             reclamped.max_lifespan_secs = cap;
             for ttl in reclamped
