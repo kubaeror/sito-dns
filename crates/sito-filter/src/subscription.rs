@@ -9,7 +9,7 @@
 
 use crate::downloader::{
     DEFAULT_DOWNLOAD_TIMEOUT, DEFAULT_MAX_LIST_BYTES, MAX_METADATA_BYTES, cache_key_for_list,
-    cache_path_for_list, read_cache_verified, save_to_cache, write_atomic,
+    cache_path_for_list, metadata_url_matches, read_cache_verified, save_to_cache, write_atomic,
 };
 use crate::error::FilterError;
 use reqwest::StatusCode;
@@ -43,11 +43,6 @@ pub struct ListMetadata {
     /// changing a list's URL under the same name cannot serve stale rules.
     #[serde(default)]
     pub url: Option<String>,
-}
-
-/// Returns true when cached metadata describes `url`.
-fn metadata_url_matches(meta: &ListMetadata, url: &str) -> bool {
-    meta.url.as_deref() == Some(url)
 }
 
 /// Generates the file path for storing subscription metadata.
@@ -201,8 +196,9 @@ async fn quarantine_cache(cache_path: &Path, meta_path: &Path, list_name: &str, 
 
 /// Quarantines a cache pair whose metadata does not describe `expected_url`.
 ///
-/// The quarantine reason distinguishes a URL-provenance miss from a corrupt
-/// cache; both drop the same pair and reset the caller's conditional state.
+/// The quarantine reason and warning distinguish metadata without a recorded
+/// source URL (legacy) from metadata that names a different URL; both drop the
+/// same pair and reset the caller's conditional state.
 async fn quarantine_url_mismatch(
     cache_path: &Path,
     meta_path: &Path,
@@ -210,19 +206,37 @@ async fn quarantine_url_mismatch(
     meta: &ListMetadata,
     expected_url: &str,
 ) {
-    quarantine_cache(
-        cache_path,
-        meta_path,
-        list_name,
-        "cached URL does not match the configured list URL",
-    )
-    .await;
-    warn!(
-        list = %list_name,
-        cached_url = meta.url.as_deref().unwrap_or("<unknown>"),
-        expected_url = %expected_url,
-        "Cached blocklist belongs to a different URL; refusing to reuse it"
-    );
+    match meta.url.as_deref() {
+        None => {
+            quarantine_cache(
+                cache_path,
+                meta_path,
+                list_name,
+                "cached blocklist has no recorded source URL (legacy)",
+            )
+            .await;
+            warn!(
+                list = %list_name,
+                expected_url = %expected_url,
+                "Cached blocklist has no recorded source URL (legacy); refusing to reuse it"
+            );
+        }
+        Some(cached_url) => {
+            quarantine_cache(
+                cache_path,
+                meta_path,
+                list_name,
+                "cached URL does not match the configured list URL",
+            )
+            .await;
+            warn!(
+                list = %list_name,
+                cached_url = %cached_url,
+                expected_url = %expected_url,
+                "Cached blocklist belongs to a different source URL; refusing to reuse it"
+            );
+        }
+    }
 }
 
 /// Reads a verified blocklist from disk cache, returning `error` when
@@ -733,7 +747,7 @@ impl SubscriptionFetcher {
                                 warn!(
                                     list = %list_name,
                                     error = %e,
-                                    "Cache missing despite HTTP 304; retrying without conditional headers"
+                                    "Cached blocklist unusable despite HTTP 304; retrying without conditional headers"
                                 );
                                 last_error = Some(e);
                                 conditional = None;

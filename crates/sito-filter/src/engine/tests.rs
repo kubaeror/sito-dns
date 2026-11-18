@@ -548,7 +548,9 @@ fn test_refresh_deadline_is_bounded() {
 }
 
 /// A per-list override wins over the global interval; a list without one uses
-/// the global interval (also for unknown names).
+/// the global interval. The helper ignores `enabled` (the schedule loop filters
+/// enabled lists itself), and `reschedule_due` falls back to the global
+/// interval for a name that is no longer configured.
 #[test]
 fn test_effective_hours_per_list_and_global() {
     let config = FilteringConfig {
@@ -566,17 +568,48 @@ fn test_effective_hours_per_list_and_global() {
                 enabled: true,
                 refresh_hours: None,
             },
+            FilterListConfig {
+                name: "off".to_string(),
+                url: "https://example.com/off.txt".to_string(),
+                enabled: false,
+                refresh_hours: Some(5),
+            },
         ],
         ..Default::default()
     };
+    let list = |name: &str| {
+        config
+            .lists
+            .iter()
+            .find(|l| l.name == name)
+            .expect("test list must exist")
+    };
 
-    assert_eq!(effective_hours(&config, "fast"), 1, "per-list wins");
     assert_eq!(
-        effective_hours(&config, "default"),
+        effective_hours(list("fast"), config.refresh_interval_hours),
+        1,
+        "per-list wins"
+    );
+    assert_eq!(
+        effective_hours(list("default"), config.refresh_interval_hours),
         12,
         "a list without an override uses the global interval"
     );
-    assert_eq!(effective_hours(&config, "unknown"), 12);
+    assert_eq!(
+        effective_hours(list("off"), config.refresh_interval_hours),
+        5,
+        "the helper ignores enabled; refresh_schedule only iterates enabled lists"
+    );
+
+    // A due name that is no longer configured uses the global interval.
+    let now = Instant::now();
+    let mut next_due = FnvHashMap::default();
+    reschedule_due(&config, &mut next_due, &["removed".to_string()], now);
+    assert_eq!(
+        next_due["removed"],
+        refresh_deadline(now, 12).expect("bounded test duration"),
+        "an unknown due name falls back to the global interval"
+    );
 }
 
 /// WP-2.3: a due list reschedules to a bounded future instant, using its own

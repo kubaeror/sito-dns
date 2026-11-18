@@ -20,7 +20,7 @@ use arc_swap::ArcSwap;
 use fnv::{FnvHashMap, FnvHashSet};
 use hickory_proto::rr::{Name, RecordType};
 use sito_core::client::ClientContext;
-use sito_core::config::{FilteringConfig, MAX_REFRESH_HOURS};
+use sito_core::config::{FilterListConfig, FilteringConfig, MAX_REFRESH_HOURS};
 use sito_core::engine::FilterEngine;
 use sito_core::verdict::{BlockReason, RewriteAction, RuleRef, Verdict};
 use sito_proto::normalize_domain;
@@ -240,28 +240,25 @@ fn refresh_interval(hours: u64) -> Duration {
     Duration::from_secs(hours.clamp(1, MAX_REFRESH_HOURS).saturating_mul(3600))
 }
 
-/// Returns the next refresh deadline, or `None` when the platform `Instant`
-/// cannot represent `now + interval`.
+/// Returns the next refresh deadline, or `None` when the clamped interval
+/// (at most one year) cannot be added to the platform `Instant`.
 ///
 /// The interval is already clamped to `1..=MAX_REFRESH_HOURS` by
-/// [`refresh_interval`], so `None` only happens on platforms where even a
-/// one-year offset overflows; callers skip such lists rather than scheduling
-/// them in the past (which would hot-loop the refresh task).
+/// [`refresh_interval`], so `None` only happens when the platform's `Instant`
+/// cannot represent the resulting deadline; callers skip such lists rather
+/// than scheduling them in the past (which would hot-loop the refresh task).
 fn refresh_deadline(now: Instant, hours: u64) -> Option<Instant> {
     now.checked_add(refresh_interval(hours))
 }
 
-/// Returns the effective refresh interval in hours for `list_name`.
+/// Returns the effective refresh interval in hours for `list`.
 ///
-/// A per-list `refresh_hours` overrides the global `refresh_interval_hours`;
-/// unknown names (e.g. a list removed by a config reload) use the global.
-fn effective_hours(config: &FilteringConfig, list_name: &str) -> u64 {
-    config
-        .lists
-        .iter()
-        .find(|l| l.name == list_name)
-        .and_then(|l| l.refresh_hours)
-        .unwrap_or(config.refresh_interval_hours)
+/// A per-list `refresh_hours` overrides `global_hours`. This helper does not
+/// consider `list.enabled`: callers decide which lists to schedule, and
+/// `refresh_schedule` only iterates enabled lists while `reschedule_due`
+/// looks a due list up by name.
+fn effective_hours(list: &FilterListConfig, global_hours: u64) -> u64 {
+    list.refresh_hours.unwrap_or(global_hours)
 }
 
 /// Reschedules the given due lists from `now` using their per-list interval,
@@ -276,7 +273,13 @@ fn reschedule_due(
     now: Instant,
 ) {
     for name in due {
-        match refresh_deadline(now, effective_hours(config, name)) {
+        let global_hours = config.refresh_interval_hours;
+        let hours = config
+            .lists
+            .iter()
+            .find(|l| &l.name == name)
+            .map_or(global_hours, |l| effective_hours(l, global_hours));
+        match refresh_deadline(now, hours) {
             Some(deadline) => {
                 next_due.insert(name.clone(), deadline);
             }
@@ -307,7 +310,7 @@ fn refresh_schedule(
         let entry = if let Some(entry) = next_due.get(&list.name).copied() {
             entry
         } else {
-            let hours = list.refresh_hours.unwrap_or(config.refresh_interval_hours);
+            let hours = effective_hours(list, config.refresh_interval_hours);
             let Some(deadline) = refresh_deadline(now, hours) else {
                 // An unrepresentable deadline must not be stored as a past
                 // instant: that would make the list due on every pass.

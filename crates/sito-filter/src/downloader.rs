@@ -6,7 +6,7 @@
 //! there is a single downloader implementation.
 
 use crate::error::FilterError;
-use crate::subscription::read_metadata;
+use crate::subscription::{ListMetadata, read_metadata};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -194,6 +194,14 @@ pub async fn save_to_cache(path: &Path, content: &str) -> Result<(), FilterError
     write_atomic(path, content.as_bytes()).await
 }
 
+/// Returns true when cached metadata records exactly `url` as its source.
+///
+/// Legacy metadata without a recorded URL is a miss: an old cache cannot be
+/// attributed to any configured source and must not be served.
+pub(crate) fn metadata_url_matches(meta: &ListMetadata, url: &str) -> bool {
+    meta.url.as_deref() == Some(url)
+}
+
 /// Reads a cached list and rejects it unless its metadata records the same
 /// source URL and matching integrity signals (byte length and line count).
 ///
@@ -218,13 +226,18 @@ pub(crate) async fn read_cache_verified(
     };
     // URL provenance is checked before the body is read or validated: content
     // served for the wrong source would be stale rules, not a corrupt cache.
-    if meta.url.as_deref() != Some(expected_url) {
+    if !metadata_url_matches(&meta, expected_url) {
+        let reason = match meta.url.as_deref() {
+            None => format!(
+                "list '{list_name}' cache has no recorded source URL (legacy) but the configured URL is '{expected_url}'"
+            ),
+            Some(cached_url) => format!(
+                "list '{list_name}' cache was downloaded from a different source URL ('{cached_url}') than the configured URL ('{expected_url}')"
+            ),
+        };
         return Err(FilterError::CacheCorrupted {
             path: cache_path.to_path_buf(),
-            reason: format!(
-                "list '{list_name}' cache was downloaded from '{}' but the configured URL is '{expected_url}'",
-                meta.url.as_deref().unwrap_or("<unknown>")
-            ),
+            reason,
         });
     }
     let content = read_from_cache_capped(cache_path, max_bytes).await?;
@@ -447,6 +460,42 @@ mod tests {
                 assert!(
                     reason.contains("list-b.txt") && reason.contains("list-a.txt"),
                     "the reason must name the cached and expected URLs: {reason}"
+                );
+                assert!(
+                    reason.contains("different source URL"),
+                    "a different recorded URL must be distinguished from legacy metadata: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        // Legacy metadata without any recorded URL is also a provenance miss,
+        // reported distinctly from a different URL.
+        crate::subscription::save_metadata(
+            &meta_file,
+            &crate::subscription::ListMetadata {
+                content_len: Some(content.len() as u64),
+                line_count: Some(content.lines().count()),
+                url: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let err = read_cache_verified(
+            &cache_file,
+            &meta_file,
+            "UrlMismatch",
+            "https://example.com/list-a.txt",
+            DEFAULT_MAX_LIST_BYTES,
+        )
+        .await
+        .expect_err("metadata without a recorded URL must never be served");
+        match err {
+            FilterError::CacheCorrupted { reason, .. } => {
+                assert!(
+                    reason.contains("no recorded source URL (legacy)"),
+                    "legacy metadata must be reported distinctly: {reason}"
                 );
             }
             other => panic!("unexpected error: {other}"),
