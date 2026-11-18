@@ -1136,6 +1136,14 @@ impl<'de> Deserialize<'de> for BlockingMode {
     }
 }
 
+/// Maximum accepted filter refresh interval in hours (one year).
+///
+/// The scheduler converts hours to a [`std::time::Duration`] and adds it to an
+/// [`std::time::Instant`]. Both config validation and the runtime interval
+/// helper clamp to this cap so an enormous value cannot overflow that
+/// arithmetic (or make a refresh deadline unreachable).
+pub const MAX_REFRESH_HOURS: u64 = 8760;
+
 /// A filter list definition to download and compile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1146,7 +1154,8 @@ pub struct FilterListConfig {
     pub enabled: bool,
     /// Per-list refresh interval in hours. When unset, the global
     /// `FilteringConfig.refresh_interval_hours` is used. Must be greater than
-    /// 0 when set; the scheduler would otherwise silently clamp it to 1 hour.
+    /// 0 and at most [`MAX_REFRESH_HOURS`] when set; the scheduler would
+    /// otherwise silently clamp it.
     #[serde(default)]
     pub refresh_hours: Option<u64>,
 }
@@ -1157,6 +1166,9 @@ pub struct FilterListConfig {
 pub struct FilteringConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Interval between automated list re-downloads in hours.
+    ///
+    /// Must be greater than 0 and at most [`MAX_REFRESH_HOURS`] (one year).
     #[serde(default = "default_filtering_refresh_interval_hours")]
     pub refresh_interval_hours: u64,
     #[serde(default)]
@@ -1243,6 +1255,15 @@ impl FilteringConfig {
                 "refresh_interval_hours must be greater than 0",
             ));
         }
+        if self.refresh_interval_hours > MAX_REFRESH_HOURS {
+            return Err(ConfigError::validation(
+                "filtering.refresh_interval_hours",
+                format!(
+                    "refresh_interval_hours must be at most {MAX_REFRESH_HOURS} hours (one year), got {}",
+                    self.refresh_interval_hours
+                ),
+            ));
+        }
         if self.max_rules == 0 {
             return Err(ConfigError::validation(
                 "filtering.max_rules",
@@ -1294,11 +1315,21 @@ impl FilteringConfig {
                     "filter list URL must use http://, https://, or file:// scheme",
                 ));
             }
-            if list.refresh_hours == Some(0) {
-                return Err(ConfigError::validation(
-                    format!("filtering.lists[{i}].refresh_hours"),
-                    "refresh_hours must be greater than 0 when set (omit it to use filtering.refresh_interval_hours)",
-                ));
+            if let Some(hours) = list.refresh_hours {
+                if hours == 0 {
+                    return Err(ConfigError::validation(
+                        format!("filtering.lists[{i}].refresh_hours"),
+                        "refresh_hours must be greater than 0 when set (omit it to use filtering.refresh_interval_hours)",
+                    ));
+                }
+                if hours > MAX_REFRESH_HOURS {
+                    return Err(ConfigError::validation(
+                        format!("filtering.lists[{i}].refresh_hours"),
+                        format!(
+                            "refresh_hours must be at most {MAX_REFRESH_HOURS} hours (one year) when set, got {hours}"
+                        ),
+                    ));
+                }
             }
         }
         match self.anti_doh_bypass.as_str() {

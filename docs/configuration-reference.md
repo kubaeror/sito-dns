@@ -263,7 +263,7 @@ enabled = true
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `true` | Master toggle for blocklist filtering and custom rules. |
-| `refresh_interval_hours` | integer | `24` | Default interval between automated subscription list re-downloads. |
+| `refresh_interval_hours` | integer | `24` | Default interval between automated subscription list re-downloads. Must be greater than 0 and at most 8760 (one year); larger values are rejected. |
 | `blocking_mode` | string | `"zero_ip"` | DNS answer returned for blocked domains: `"zero_ip"` (`0.0.0.0` / `::`), `"nxdomain"`, `"refused"`, `"null_rdata"`, or `"custom_ip:<ip>"`. |
 | `blocking_ttl` | integer | `10` | TTL in seconds returned on blocked responses (low TTL allows rapid unblocking). |
 | `cname_cloaking` | boolean | `true` | Follow CNAME chains upstream and apply filter rules against intermediate canonical names. |
@@ -283,7 +283,7 @@ enabled = true
 | `lists.name` | string | required | Unique list name shown in status, API and UI. |
 | `lists.url` | string | required | Source URL (`http://`, `https://` or `file://`). |
 | `lists.enabled` | boolean | `true` | Download and compile this list. |
-| `lists.refresh_hours` | integer | `None` | Per-list refresh interval in hours. When unset, `filtering.refresh_interval_hours` is used. Must be greater than 0 when set. |
+| `lists.refresh_hours` | integer | `None` | Per-list refresh interval in hours. When unset, `filtering.refresh_interval_hours` is used. Must be greater than 0 and at most 8760 (one year) when set. |
 
 ---
 

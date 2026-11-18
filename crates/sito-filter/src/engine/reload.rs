@@ -782,20 +782,7 @@ impl HostsFilterEngine {
                 }
 
                 let config = self.config.load_full();
-                let global =
-                    Duration::from_secs(config.refresh_interval_hours.max(1).saturating_mul(3600));
-                let now = Instant::now();
-                for name in &due {
-                    let interval = config
-                        .lists
-                        .iter()
-                        .find(|l| &l.name == name)
-                        .and_then(|l| l.refresh_hours)
-                        .map_or(global, |hours| {
-                            Duration::from_secs(hours.max(1).saturating_mul(3600))
-                        });
-                    next_due.insert(name.clone(), now + interval);
-                }
+                reschedule_due(&config, &mut next_due, &due, Instant::now());
             }
         })
     }

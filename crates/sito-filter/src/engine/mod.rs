@@ -20,7 +20,7 @@ use arc_swap::ArcSwap;
 use fnv::{FnvHashMap, FnvHashSet};
 use hickory_proto::rr::{Name, RecordType};
 use sito_core::client::ClientContext;
-use sito_core::config::FilteringConfig;
+use sito_core::config::{FilteringConfig, MAX_REFRESH_HOURS};
 use sito_core::engine::FilterEngine;
 use sito_core::verdict::{BlockReason, RewriteAction, RuleRef, Verdict};
 use sito_proto::normalize_domain;
@@ -230,6 +230,43 @@ fn count_loaded_lists(fetched: &[String], failed: &[String]) -> usize {
     fetched.iter().filter(|name| !failed.contains(name)).count()
 }
 
+/// Converts a configured refresh interval in hours into a safe [`Duration`].
+///
+/// Clamps to `1..=MAX_REFRESH_HOURS`. Config validation already rejects `0`
+/// and values above the cap; the runtime clamp is defense in depth for configs
+/// constructed without validation, and keeps the hour-to-second multiplication
+/// from overflowing.
+fn refresh_interval(hours: u64) -> Duration {
+    Duration::from_secs(hours.clamp(1, MAX_REFRESH_HOURS).saturating_mul(3600))
+}
+
+/// Returns the next refresh deadline, falling back to a one-hour retry when the
+/// platform `Instant` cannot represent `now + interval`.
+fn refresh_deadline(now: Instant, hours: u64) -> Instant {
+    let interval = refresh_interval(hours);
+    now.checked_add(interval)
+        .unwrap_or_else(|| now.checked_add(Duration::from_secs(3600)).unwrap_or(now))
+}
+
+/// Reschedules the given due lists from `now` using their per-list interval,
+/// falling back to the global `refresh_interval_hours`.
+fn reschedule_due(
+    config: &FilteringConfig,
+    next_due: &mut FnvHashMap<String, Instant>,
+    due: &[String],
+    now: Instant,
+) {
+    for name in due {
+        let hours = config
+            .lists
+            .iter()
+            .find(|l| &l.name == name)
+            .and_then(|l| l.refresh_hours)
+            .unwrap_or(config.refresh_interval_hours);
+        next_due.insert(name.clone(), refresh_deadline(now, hours));
+    }
+}
+
 /// Computes the next refresh wake-up and the list names that are due.
 ///
 /// Lists without `refresh_hours` use the global `refresh_interval_hours`.
@@ -238,16 +275,16 @@ fn refresh_schedule(
     next_due: &mut FnvHashMap<String, Instant>,
     now: Instant,
 ) -> (Duration, Vec<String>) {
-    let global = Duration::from_secs(config.refresh_interval_hours.max(1).saturating_mul(3600));
+    let global = refresh_interval(config.refresh_interval_hours);
     next_due.retain(|name, _| config.lists.iter().any(|l| l.enabled && &l.name == name));
 
     let mut due = Vec::new();
     let mut soonest: Option<Instant> = None;
     for list in config.lists.iter().filter(|l| l.enabled) {
-        let interval = list.refresh_hours.map_or(global, |hours| {
-            Duration::from_secs(hours.max(1).saturating_mul(3600))
-        });
-        let entry = next_due.entry(list.name.clone()).or_insert(now + interval);
+        let hours = list.refresh_hours.unwrap_or(config.refresh_interval_hours);
+        let entry = next_due
+            .entry(list.name.clone())
+            .or_insert_with(|| refresh_deadline(now, hours));
         if *entry <= now {
             due.push(list.name.clone());
         }

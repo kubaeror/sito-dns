@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use sito_core::config::FilterListConfig;
+use sito_core::config::{FilterListConfig, MAX_REFRESH_HOURS};
 use std::str::FromStr;
 
 #[tokio::test]
@@ -468,6 +468,103 @@ fn test_per_list_refresh_schedule() {
     // Disabled lists are never scheduled.
     assert!(!next_due.contains_key("off"));
     assert!(next_due.contains_key("slow"));
+}
+
+/// WP-2.3: huge configured intervals must clamp to the one-year cap instead of
+/// building a `Duration` that overflows `Instant::checked_add`.
+#[test]
+fn test_refresh_schedule_clamps_huge_hours() {
+    let huge = FilteringConfig {
+        refresh_interval_hours: u64::MAX,
+        lists: vec![FilterListConfig {
+            name: "huge".to_string(),
+            url: "https://example.com/huge.txt".to_string(),
+            enabled: true,
+            refresh_hours: Some(u64::MAX),
+        }],
+        ..Default::default()
+    };
+
+    let now = Instant::now();
+    let mut next_due = FnvHashMap::default();
+    let (sleep_for, due) = refresh_schedule(&huge, &mut next_due, now);
+    assert!(due.is_empty(), "nothing is due on the first pass: {due:?}");
+    assert!(sleep_for > Duration::ZERO, "the sleep must be positive");
+    assert!(
+        sleep_for <= Duration::from_secs(MAX_REFRESH_HOURS * 3600),
+        "the sleep must stay within the one-year cap, got {sleep_for:?}"
+    );
+    assert!(
+        next_due["huge"] > now,
+        "the scheduled deadline must be in the future"
+    );
+
+    // The global interval alone is capped too.
+    let global_only = FilteringConfig {
+        refresh_interval_hours: u64::MAX,
+        ..Default::default()
+    };
+    let (sleep_for, due) = refresh_schedule(&global_only, &mut next_due, now);
+    assert_eq!(due, Vec::<String>::new());
+    assert!(sleep_for > Duration::ZERO);
+    assert!(sleep_for <= Duration::from_secs(MAX_REFRESH_HOURS * 3600));
+}
+
+/// WP-2.3: the interval helper clamps zero (defense in depth) and over-cap
+/// values for both the global and per-list paths.
+#[test]
+fn test_refresh_interval_is_bounded() {
+    let capped = Duration::from_secs(MAX_REFRESH_HOURS * 3600);
+    assert_eq!(refresh_interval(0), Duration::from_secs(3600));
+    assert_eq!(refresh_interval(1), Duration::from_secs(3600));
+    assert_eq!(refresh_interval(MAX_REFRESH_HOURS), capped);
+    assert_eq!(refresh_interval(u64::MAX), capped);
+}
+
+/// WP-2.3: a due list reschedules to a bounded future instant, using its own
+/// interval when set and the global interval otherwise.
+#[test]
+fn test_due_lists_reschedule_with_bounded_interval() {
+    let config = FilteringConfig {
+        refresh_interval_hours: 2,
+        lists: vec![
+            FilterListConfig {
+                name: "override".to_string(),
+                url: "https://example.com/override.txt".to_string(),
+                enabled: true,
+                refresh_hours: Some(u64::MAX),
+            },
+            FilterListConfig {
+                name: "default".to_string(),
+                url: "https://example.com/default.txt".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let now = Instant::now();
+    let past = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+    let mut next_due = FnvHashMap::default();
+    next_due.insert("override".to_string(), past);
+    next_due.insert("default".to_string(), past);
+
+    let (sleep_for, due) = refresh_schedule(&config, &mut next_due, now);
+    assert_eq!(due.len(), 2, "both past-due lists must be reported");
+    assert_eq!(sleep_for, Duration::ZERO, "due lists must wake immediately");
+
+    reschedule_due(&config, &mut next_due, &due, now);
+    assert_eq!(
+        next_due["default"],
+        now + Duration::from_hours(2),
+        "a list without an override uses the global interval"
+    );
+    assert!(next_due["override"] > now);
+    assert!(
+        next_due["override"] <= now + Duration::from_secs(MAX_REFRESH_HOURS * 3600),
+        "an over-cap per-list interval must clamp to one year"
+    );
 }
 
 #[tokio::test]

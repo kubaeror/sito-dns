@@ -474,6 +474,61 @@ fn test_filtering_list_refresh_hours_zero_rejected() {
     Config::from_toml_str(&positive).expect("a positive refresh_hours must be accepted");
 }
 
+/// WP-2.3: refresh intervals are capped at one year so the scheduler's
+/// `Instant + Duration` arithmetic cannot panic on an enormous value.
+#[test]
+fn test_filtering_refresh_hours_capped_at_one_year() {
+    let over_global = format!(
+        "{TEST_BASE}[filtering]\nrefresh_interval_hours = {}\n",
+        MAX_REFRESH_HOURS + 1
+    );
+    expect_validation_field(&over_global, "filtering.refresh_interval_hours");
+
+    let over_list = format!(
+        "{TEST_BASE}[filtering]\nlists = [{{ name = \"ads\", url = \"https://example.com/a.txt\", refresh_hours = {} }}]\n",
+        MAX_REFRESH_HOURS + 1
+    );
+    expect_validation_field(&over_list, "filtering.lists[0].refresh_hours");
+
+    // TOML integers are i64, so exercise the extreme u64 value on the typed
+    // struct to prove validation does not overflow in either path.
+    let extreme = FilteringConfig {
+        refresh_interval_hours: u64::MAX,
+        ..Default::default()
+    };
+    match extreme.validate() {
+        Err(ConfigError::Validation { field, .. }) => {
+            assert_eq!(field, "filtering.refresh_interval_hours");
+        }
+        other => panic!("expected validation error on the global interval, got {other:?}"),
+    }
+    let extreme_list = FilteringConfig {
+        lists: vec![FilterListConfig {
+            name: "ads".to_string(),
+            url: "https://example.com/a.txt".to_string(),
+            enabled: true,
+            refresh_hours: Some(u64::MAX),
+        }],
+        ..Default::default()
+    };
+    match extreme_list.validate() {
+        Err(ConfigError::Validation { field, .. }) => {
+            assert_eq!(field, "filtering.lists[0].refresh_hours");
+        }
+        other => panic!("expected validation error on the per-list interval, got {other:?}"),
+    }
+
+    let at_cap = format!(
+        "{TEST_BASE}[filtering]\nrefresh_interval_hours = {MAX_REFRESH_HOURS}\nlists = [{{ name = \"ads\", url = \"https://example.com/a.txt\", refresh_hours = {MAX_REFRESH_HOURS} }}]\n"
+    );
+    let accepted = Config::from_toml_str(&at_cap).expect("the one-year cap must be accepted");
+    assert_eq!(accepted.filtering.refresh_interval_hours, MAX_REFRESH_HOURS);
+    assert_eq!(
+        accepted.filtering.lists[0].refresh_hours,
+        Some(MAX_REFRESH_HOURS)
+    );
+}
+
 /// D-07: the per-list download cap is configurable and must stay positive.
 #[test]
 fn test_filtering_max_list_bytes_default_and_validation() {
