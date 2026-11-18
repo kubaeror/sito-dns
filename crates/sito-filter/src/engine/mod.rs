@@ -240,16 +240,35 @@ fn refresh_interval(hours: u64) -> Duration {
     Duration::from_secs(hours.clamp(1, MAX_REFRESH_HOURS).saturating_mul(3600))
 }
 
-/// Returns the next refresh deadline, falling back to a one-hour retry when the
-/// platform `Instant` cannot represent `now + interval`.
-fn refresh_deadline(now: Instant, hours: u64) -> Instant {
-    let interval = refresh_interval(hours);
-    now.checked_add(interval)
-        .unwrap_or_else(|| now.checked_add(Duration::from_secs(3600)).unwrap_or(now))
+/// Returns the next refresh deadline, or `None` when the platform `Instant`
+/// cannot represent `now + interval`.
+///
+/// The interval is already clamped to `1..=MAX_REFRESH_HOURS` by
+/// [`refresh_interval`], so `None` only happens on platforms where even a
+/// one-year offset overflows; callers skip such lists rather than scheduling
+/// them in the past (which would hot-loop the refresh task).
+fn refresh_deadline(now: Instant, hours: u64) -> Option<Instant> {
+    now.checked_add(refresh_interval(hours))
+}
+
+/// Returns the effective refresh interval in hours for `list_name`.
+///
+/// A per-list `refresh_hours` overrides the global `refresh_interval_hours`;
+/// unknown names (e.g. a list removed by a config reload) use the global.
+fn effective_hours(config: &FilteringConfig, list_name: &str) -> u64 {
+    config
+        .lists
+        .iter()
+        .find(|l| l.name == list_name)
+        .and_then(|l| l.refresh_hours)
+        .unwrap_or(config.refresh_interval_hours)
 }
 
 /// Reschedules the given due lists from `now` using their per-list interval,
 /// falling back to the global `refresh_interval_hours`.
+///
+/// A list whose deadline cannot be represented is dropped from `next_due`
+/// instead of being stored as due now, so the scheduler does not spin on it.
 fn reschedule_due(
     config: &FilteringConfig,
     next_due: &mut FnvHashMap<String, Instant>,
@@ -257,19 +276,23 @@ fn reschedule_due(
     now: Instant,
 ) {
     for name in due {
-        let hours = config
-            .lists
-            .iter()
-            .find(|l| &l.name == name)
-            .and_then(|l| l.refresh_hours)
-            .unwrap_or(config.refresh_interval_hours);
-        next_due.insert(name.clone(), refresh_deadline(now, hours));
+        match refresh_deadline(now, effective_hours(config, name)) {
+            Some(deadline) => {
+                next_due.insert(name.clone(), deadline);
+            }
+            None => {
+                next_due.remove(name);
+            }
+        }
     }
 }
 
 /// Computes the next refresh wake-up and the list names that are due.
 ///
 /// Lists without `refresh_hours` use the global `refresh_interval_hours`.
+/// Lists whose deadline cannot be represented are not scheduled at all; when
+/// no list is schedulable the bounded global interval is used, so the refresh
+/// task never falls into a zero-length sleep loop.
 fn refresh_schedule(
     config: &FilteringConfig,
     next_due: &mut FnvHashMap<String, Instant>,
@@ -281,14 +304,22 @@ fn refresh_schedule(
     let mut due = Vec::new();
     let mut soonest: Option<Instant> = None;
     for list in config.lists.iter().filter(|l| l.enabled) {
-        let hours = list.refresh_hours.unwrap_or(config.refresh_interval_hours);
-        let entry = next_due
-            .entry(list.name.clone())
-            .or_insert_with(|| refresh_deadline(now, hours));
-        if *entry <= now {
+        let entry = if let Some(entry) = next_due.get(&list.name).copied() {
+            entry
+        } else {
+            let hours = list.refresh_hours.unwrap_or(config.refresh_interval_hours);
+            let Some(deadline) = refresh_deadline(now, hours) else {
+                // An unrepresentable deadline must not be stored as a past
+                // instant: that would make the list due on every pass.
+                continue;
+            };
+            next_due.insert(list.name.clone(), deadline);
+            deadline
+        };
+        if entry <= now {
             due.push(list.name.clone());
         }
-        soonest = Some(soonest.map_or(*entry, |s| s.min(*entry)));
+        soonest = Some(soonest.map_or(entry, |s| s.min(entry)));
     }
 
     let sleep_for = if due.is_empty() {

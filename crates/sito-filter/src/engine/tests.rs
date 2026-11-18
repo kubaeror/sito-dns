@@ -461,7 +461,9 @@ fn test_per_list_refresh_schedule() {
     );
 
     // One hour later only the fast list is due.
-    let later = now + Duration::from_secs(3601);
+    let later = now
+        .checked_add(Duration::from_secs(3601))
+        .expect("bounded test duration");
     let (_sleep, due) = refresh_schedule(&config, &mut next_due, later);
     assert_eq!(due, vec!["fast".to_string()]);
 
@@ -521,6 +523,62 @@ fn test_refresh_interval_is_bounded() {
     assert_eq!(refresh_interval(u64::MAX), capped);
 }
 
+/// WP-2.3: a huge interval clamps to the one-year cap, so the deadline is
+/// always representable and there is no one-hour fallback literal left.
+#[test]
+fn test_refresh_deadline_is_bounded() {
+    let now = Instant::now();
+    assert_eq!(
+        refresh_deadline(now, 1),
+        Some(
+            now.checked_add(Duration::from_secs(3600))
+                .expect("bounded test duration")
+        )
+    );
+
+    let capped = Duration::from_secs(MAX_REFRESH_HOURS * 3600);
+    let clamped =
+        refresh_deadline(now, u64::MAX).expect("the clamped interval must be representable");
+    assert_eq!(
+        clamped,
+        now.checked_add(capped).expect("bounded test duration"),
+        "u64::MAX hours must clamp to the one-year cap"
+    );
+    assert!(clamped > now, "the deadline must be in the future");
+}
+
+/// A per-list override wins over the global interval; a list without one uses
+/// the global interval (also for unknown names).
+#[test]
+fn test_effective_hours_per_list_and_global() {
+    let config = FilteringConfig {
+        refresh_interval_hours: 12,
+        lists: vec![
+            FilterListConfig {
+                name: "fast".to_string(),
+                url: "https://example.com/fast.txt".to_string(),
+                enabled: true,
+                refresh_hours: Some(1),
+            },
+            FilterListConfig {
+                name: "default".to_string(),
+                url: "https://example.com/default.txt".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            },
+        ],
+        ..Default::default()
+    };
+
+    assert_eq!(effective_hours(&config, "fast"), 1, "per-list wins");
+    assert_eq!(
+        effective_hours(&config, "default"),
+        12,
+        "a list without an override uses the global interval"
+    );
+    assert_eq!(effective_hours(&config, "unknown"), 12);
+}
+
 /// WP-2.3: a due list reschedules to a bounded future instant, using its own
 /// interval when set and the global interval otherwise.
 #[test]
@@ -557,12 +615,16 @@ fn test_due_lists_reschedule_with_bounded_interval() {
     reschedule_due(&config, &mut next_due, &due, now);
     assert_eq!(
         next_due["default"],
-        now + Duration::from_hours(2),
+        now.checked_add(Duration::from_hours(2))
+            .expect("bounded test duration"),
         "a list without an override uses the global interval"
     );
     assert!(next_due["override"] > now);
     assert!(
-        next_due["override"] <= now + Duration::from_secs(MAX_REFRESH_HOURS * 3600),
+        next_due["override"]
+            <= now
+                .checked_add(Duration::from_secs(MAX_REFRESH_HOURS * 3600))
+                .expect("bounded test duration"),
         "an over-cap per-list interval must clamp to one year"
     );
 }

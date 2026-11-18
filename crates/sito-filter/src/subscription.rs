@@ -176,14 +176,14 @@ fn build_client(
     })
 }
 
-/// Removes a cache file and its metadata after an integrity failure so the
-/// corrupt pair is not re-read on every refresh cycle.
+/// Removes a cache file and its metadata after an integrity or provenance
+/// failure so the bad pair is not re-read on every refresh cycle.
 async fn quarantine_cache(cache_path: &Path, meta_path: &Path, list_name: &str, reason: &str) {
     warn!(
         list = %list_name,
         path = %cache_path.display(),
         reason,
-        "Quarantining corrupt blocklist cache"
+        "Quarantining blocklist cache"
     );
     for path in [cache_path, meta_path] {
         if let Err(e) = tokio::fs::remove_file(path).await
@@ -193,10 +193,36 @@ async fn quarantine_cache(cache_path: &Path, meta_path: &Path, list_name: &str, 
                 list = %list_name,
                 path = %path.display(),
                 error = %e,
-                "Failed to remove corrupt blocklist cache file"
+                "Failed to remove blocklist cache file"
             );
         }
     }
+}
+
+/// Quarantines a cache pair whose metadata does not describe `expected_url`.
+///
+/// The quarantine reason distinguishes a URL-provenance miss from a corrupt
+/// cache; both drop the same pair and reset the caller's conditional state.
+async fn quarantine_url_mismatch(
+    cache_path: &Path,
+    meta_path: &Path,
+    list_name: &str,
+    meta: &ListMetadata,
+    expected_url: &str,
+) {
+    quarantine_cache(
+        cache_path,
+        meta_path,
+        list_name,
+        "cached URL does not match the configured list URL",
+    )
+    .await;
+    warn!(
+        list = %list_name,
+        cached_url = meta.url.as_deref().unwrap_or("<unknown>"),
+        expected_url = %expected_url,
+        "Cached blocklist belongs to a different URL; refusing to reuse it"
+    );
 }
 
 /// Reads a verified blocklist from disk cache, returning `error` when
@@ -211,26 +237,15 @@ async fn load_cache_or(
     error: FilterError,
 ) -> Result<String, FilterError> {
     // A cache is only a fallback for the URL it was downloaded from. Legacy
-    // metadata carries no URL, so it is treated like any other mismatch.
+    // metadata carries no URL, so it is treated like any other mismatch. The
+    // caller's fetch error is returned, never the old URL's content.
     if let Some(meta) = read_metadata(meta_path).await
         && !metadata_url_matches(&meta, expected_url)
     {
-        quarantine_cache(
-            cache_path,
-            meta_path,
-            list_name,
-            "cached URL does not match the configured list URL",
-        )
-        .await;
-        warn!(
-            list = %list_name,
-            cached_url = meta.url.as_deref().unwrap_or("<unknown>"),
-            expected_url = %expected_url,
-            "Disk cache belongs to a different URL; refusing fallback"
-        );
+        quarantine_url_mismatch(cache_path, meta_path, list_name, &meta, expected_url).await;
         return Err(error);
     }
-    match read_cache_verified(cache_path, meta_path, list_name, max_bytes).await {
+    match read_cache_verified(cache_path, meta_path, list_name, expected_url, max_bytes).await {
         Ok(cached) => {
             // Older versions could cache an HTML error page or an empty body
             // as a successful list. Never hand that to the engine: HTML lines
@@ -633,19 +648,7 @@ impl SubscriptionFetcher {
         if let Some(meta) = &conditional
             && !metadata_url_matches(meta, url)
         {
-            warn!(
-                list = %list_name,
-                cached_url = meta.url.as_deref().unwrap_or("<unknown>"),
-                url = %url,
-                "Cached blocklist belongs to a different URL; quarantining it"
-            );
-            quarantine_cache(
-                &cache_path,
-                &meta_path,
-                list_name,
-                "cached URL does not match the configured list URL",
-            )
-            .await;
+            quarantine_url_mismatch(&cache_path, &meta_path, list_name, meta, url).await;
             conditional = None;
         }
         let mut last_error = None;
@@ -677,6 +680,7 @@ impl SubscriptionFetcher {
                             &cache_path,
                             &meta_path,
                             list_name,
+                            url,
                             self.max_bytes,
                         )
                         .await
@@ -1023,6 +1027,7 @@ mod tests {
         let meta_file = meta_path_for_list(&temp_dir, "legacy");
         let cache_file = cache_path_for_list(&temp_dir, "legacy");
         let content = "0.0.0.0 legacy.example\n";
+        let url = "https://example.com/legacy.txt";
         save_to_cache(&cache_file, content).await.unwrap();
         save_metadata(
             &meta_file,
@@ -1030,15 +1035,22 @@ mod tests {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
                 updated_at_secs: 1,
+                url: Some(url.to_string()),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
 
-        let err = read_cache_verified(&cache_file, &meta_file, "legacy", DEFAULT_MAX_LIST_BYTES)
-            .await
-            .expect_err("a cache without integrity fields must not be trusted");
+        let err = read_cache_verified(
+            &cache_file,
+            &meta_file,
+            "legacy",
+            url,
+            DEFAULT_MAX_LIST_BYTES,
+        )
+        .await
+        .expect_err("a cache without integrity fields must not be trusted");
         assert!(matches!(err, FilterError::CacheCorrupted { .. }));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -1247,7 +1259,7 @@ mod tests {
         // The metadata written by the fetch must satisfy the integrity check.
         let cache_path = cache_path_for_list(&data_dir, "etag-list");
         let meta_path = meta_path_for_list(&data_dir, "etag-list");
-        let verified = read_cache_verified(&cache_path, &meta_path, "etag-list", 1024 * 1024)
+        let verified = read_cache_verified(&cache_path, &meta_path, "etag-list", &url, 1024 * 1024)
             .await
             .unwrap();
         assert_eq!(verified, first);
@@ -1719,6 +1731,63 @@ mod tests {
         );
 
         server.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// URL provenance is enforced by `load_cache_or` itself, not only by the
+    /// pre-fetch gate: a cache written for URL A must never be served when the
+    /// configured URL changed to B, and the caller's fetch error must survive.
+    #[tokio::test]
+    async fn test_load_cache_or_rejects_url_mismatch_directly() {
+        let data_dir = temp_dir("sito_load_cache_url_mismatch");
+        let list_name = "url-mismatch";
+        let cache_path = cache_path_for_list(&data_dir, list_name);
+        let meta_path = meta_path_for_list(&data_dir, list_name);
+        let content = "0.0.0.0 stale.example\n";
+        save_to_cache(&cache_path, content).await.unwrap();
+        save_metadata(
+            &meta_path,
+            &ListMetadata {
+                content_len: Some(content.len() as u64),
+                line_count: Some(content.lines().count()),
+                url: Some("http://example.invalid/list-a".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = load_cache_or(
+            &cache_path,
+            &meta_path,
+            list_name,
+            "http://example.invalid/list-b",
+            DEFAULT_MAX_LIST_BYTES,
+            false,
+            FilterError::InvalidUrl {
+                url: "http://example.invalid/list-b".to_string(),
+                reason: "sentinel fetch failure".to_string(),
+            },
+        )
+        .await
+        .expect_err("a cache from another URL must not be served");
+
+        match err {
+            FilterError::InvalidUrl { reason, .. } => assert_eq!(
+                reason, "sentinel fetch failure",
+                "the caller-supplied fetch error must be preserved"
+            ),
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(
+            !cache_path.exists(),
+            "the mismatched cache must be quarantined"
+        );
+        assert!(
+            !meta_path.exists(),
+            "the mismatched cache metadata must be quarantined"
+        );
+
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 
