@@ -1609,6 +1609,7 @@ async fn test_pipeline_with_bogus_signed_upstream(
     use hickory_proto::dnssec::TrustAnchors;
     use hickory_proto::dnssec::rdata::{DNSSECRData, RRSIG};
     use hickory_proto::rr::{DNSClass, LowerName, RecordData, RecordSet};
+    use sito_proto::rdata::SOA;
     use sito_upstream::{BootstrapResolver, UpstreamManager};
     use std::sync::atomic::AtomicUsize;
 
@@ -1630,6 +1631,22 @@ async fn test_pipeline_with_bogus_signed_upstream(
     let mut template = Message::new(0, MessageType::Response, OpCode::Query);
     template.metadata.response_code = ResponseCode::NoError;
     template.answers = vec![answer, signature];
+    // A negative-style SOA in the authority section makes the "a Bogus
+    // SERVFAIL must not carry authority data" assertions non-vacuous: the
+    // fail-closed writer has to clear it.
+    template.authorities.push(Record::from_rdata(
+        origin.clone(),
+        300,
+        RData::SOA(SOA::new(
+            origin.clone(),
+            origin.clone(),
+            1,
+            7200,
+            3600,
+            1_209_600,
+            3600,
+        )),
+    ));
     template.additionals.push(Record::from_rdata(
         origin.clone(),
         300,
@@ -1841,9 +1858,91 @@ async fn test_prefetch_strict_bogus_is_cached_as_fail_closed_servfail() {
         "a prefetched Bogus entry must never assert AD"
     );
     assert!(
+        ede_option_present(&cached),
+        "the cached Bogus SERVFAIL must preserve the validator's EDE diagnostic"
+    );
+    assert_eq!(
+        pipeline
+            .cache
+            .cached_entry_lifespan_secs_for_test(&seed_query)
+            .await,
+        Some(sito_cache::DNSSEC_BOGUS_CACHE_TTL),
+        "the cached Bogus entry must use the 5 s DNSSEC failure window"
+    );
+    assert!(
         calls.load(Ordering::SeqCst) >= 1,
         "the prefetch must have re-queried the upstream"
     );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A log-only Bogus refresh must not write a `Bogus` entry: it keeps the
+/// answer and goes through the normal insert as unservable `Indeterminate`.
+#[tokio::test]
+async fn test_prefetch_log_only_bogus_is_cached_as_indeterminate() {
+    use std::sync::atomic::Ordering;
+
+    let mut config = Config::default();
+    config.dns.cache.prefetch = true;
+    config.dns.cache.min_ttl = 10;
+    config.dns.cache.max_ttl = 10;
+    let (pipeline, calls, temp_dir, qname) =
+        test_pipeline_with_bogus_signed_upstream(config, DnssecMode::LogOnly).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let seed_query = do_query(40, &qname);
+    let mut seed = Message::response(40, OpCode::Query);
+    seed.queries = seed_query.queries.clone();
+    seed.answers.push(Record::from_rdata(
+        qname.clone(),
+        10,
+        RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 40))),
+    ));
+    pipeline
+        .cache
+        .insert_with_status(&seed_query, &seed, ValidationStatus::Insecure)
+        .await;
+
+    // Two cache hits cross the prefetch threshold and trigger the background
+    // refresh through the mock upstream.
+    for id in 40..=41 {
+        let resp = pipeline
+            .handle(do_query(id, &qname), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    }
+
+    let mut attempts = 0usize;
+    let (cached, status) = loop {
+        if let Some((message, status)) = pipeline.cache.get_for_query_with_status(&seed_query).await
+            && status == ValidationStatus::Indeterminate
+        {
+            break (message, status);
+        }
+        attempts += 1;
+        assert!(
+            attempts < 250,
+            "the background prefetch never cached the log-only Bogus answer \
+             (upstream calls: {})",
+            calls.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(status, ValidationStatus::Indeterminate);
+    assert_ne!(
+        status,
+        ValidationStatus::Bogus,
+        "a log-only Bogus refresh must never be cached as a fail-closed Bogus entry"
+    );
+    assert_eq!(cached.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        !cached.answers.is_empty(),
+        "log-only keeps the answer in the prefetched entry"
+    );
+    assert!(!cached.metadata.authentic_data);
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
@@ -1904,6 +2003,16 @@ fn test_cache_servability_distinguishes_bogus_from_indeterminate() {
 
 /// Sentinel EDE text attached to a cached Bogus entry in the stale-path test.
 const STALE_BOGUS_SENTINEL: &str = "stale-bogus-sentinel";
+
+/// Whether a response carries any RFC 8914 Extended DNS Error option.
+fn ede_option_present(response: &Message) -> bool {
+    response.edns.as_ref().is_some_and(|edns| {
+        edns.options()
+            .options
+            .iter()
+            .any(|(code, _)| u16::from(*code) == 15)
+    })
+}
 
 /// Whether a response carries an RFC 8914 EDE option whose payload contains
 /// `needle` (the two-byte info-code prefix is included in the payload).

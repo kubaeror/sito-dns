@@ -19,6 +19,11 @@ criterion.workspace = true
 hickory-proto.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 
+[features]
+# Test-only accessors used by cross-crate integration tests. Never enabled by
+# a normal build; `cargo build`/release artifacts do not expose these hooks.
+test-hooks = []
+
 [[bench]]
 name = "cache_bench"
 harness = false

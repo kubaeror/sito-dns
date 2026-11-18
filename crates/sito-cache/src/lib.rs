@@ -1559,6 +1559,36 @@ mod tests {
                 record.ttl
             );
         }
+
+        // The entry's own remaining lifespan is a second upper bound: even a
+        // record TTL under the status window must not outlive the entry.
+        let short_name = Name::from_str("old-short-indeterminate.example.").unwrap();
+        let short_query = query_for(124, &short_name);
+        cache
+            .insert_raw_entry_for_test(
+                &short_query,
+                &answer_response(124, &short_name, [192, 0, 2, 126]),
+                ValidationStatus::Indeterminate,
+                3600,
+                20,
+            )
+            .await;
+        let (short_cached, _) = cache
+            .get_for_query_with_status(&short_query)
+            .await
+            .expect("the short-lived injected entry must still be fresh");
+        for record in short_cached
+            .answers
+            .iter()
+            .chain(short_cached.authorities.iter())
+            .chain(short_cached.additionals.iter())
+        {
+            assert!(
+                record.ttl <= 20,
+                "a record TTL must not outlive the entry's remaining lifespan (got {})",
+                record.ttl
+            );
+        }
     }
 
     #[tokio::test]

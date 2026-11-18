@@ -56,16 +56,19 @@ fn failure_lifespan_cap(status: ValidationStatus) -> Option<u32> {
 
 /// Whether a stale entry may be returned by a status-less getter.
 ///
-/// `Bogus` (a fail-closed SERVFAIL decision) and `Indeterminate` (an
-/// inconclusive validation result) carry no reusable answer data, so the
-/// status-less stale getters hide them. Callers that need to inspect them —
-/// stale-serving tests, background prefetch — use the status-aware getter.
-/// `Unchecked` remains returnable: it is valid whenever local validation is
-/// inactive, and the status-aware pipeline gate makes the final decision.
+/// This is an allow-list: only statuses that are authenticated answers
+/// (`Secure`/`Insecure`) or, when validation is inactive, a genuinely
+/// unvalidated answer (`Unchecked`) are returnable. `Bogus` is a fail-closed
+/// SERVFAIL and `Indeterminate` is unservable/inconclusive (in log-only mode it
+/// can still carry the answer data), so the status-less stale getters hide
+/// both. A caller that needs to inspect them — stale-serving tests and other
+/// inspection code — uses the status-aware stale getter. (The background
+/// prefetch never reads stale entries: it re-resolves and consults the fresh
+/// status-aware getter.)
 fn stale_statusless_servable(status: ValidationStatus) -> bool {
-    !matches!(
+    matches!(
         status,
-        ValidationStatus::Bogus | ValidationStatus::Indeterminate
+        ValidationStatus::Secure | ValidationStatus::Insecure | ValidationStatus::Unchecked
     )
 }
 
@@ -480,16 +483,17 @@ impl DnsCache {
 
         // Defense in depth for the fail-closed/inconclusive windows: an entry
         // copied from an older generation may carry raw record TTLs that were
-        // never clamped at insert time. The status-bound lifespan is an upper
-        // bound for every served record TTL as well.
+        // never clamped at insert time. Record TTLs may outlive neither the
+        // status-bound window nor the entry's own remaining lifespan.
         if let Some(cap) = failure_lifespan_cap(entry.validation_status) {
+            let record_cap = cap.min(lifespan_secs.saturating_sub(elapsed_secs));
             for record in response
                 .answers
                 .iter_mut()
                 .chain(response.authorities.iter_mut())
                 .chain(response.additionals.iter_mut())
             {
-                record.ttl = record.ttl.min(cap);
+                record.ttl = record.ttl.min(record_cap);
             }
         }
 
@@ -509,8 +513,10 @@ impl DnsCache {
     /// authentic.
     ///
     /// Fail-closed (`Bogus`) and inconclusive (`Indeterminate`) entries are
-    /// never returned: they carry no reusable answer data and must not be
-    /// handed to a client from the stale path. Use
+    /// never returned: a `Bogus` entry is a fail-closed SERVFAIL with no
+    /// reusable answer data, and an `Indeterminate` entry is unservable to a
+    /// validating client (in log-only mode it can still carry the answer data,
+    /// which is exactly why the stale path must not hand it out). Use
     /// [`Self::get_stale_for_query_with_status`] to inspect those entries.
     /// `Unchecked` is still returned; it is valid when local validation is
     /// inactive, and the status-aware pipeline gate decides whether it may be
@@ -546,12 +552,16 @@ impl DnsCache {
     ///
     /// This is the unfiltered inspection form: it is the only stale getter
     /// that exposes `Bogus`/`Indeterminate` entries (the status-less getters
-    /// hide them). The pipeline uses the status to apply the same gate as
-    /// fresh cache hits: stale data is not revalidated, so callers must reject
-    /// [`ValidationStatus::Bogus`], [`ValidationStatus::Indeterminate`] and
-    /// [`ValidationStatus::Unchecked`] entries when validation is active —
-    /// only `Secure`/`Insecure` are servable. This method itself does not
-    /// filter on the status.
+    /// hide them).
+    ///
+    /// Callers must **not** apply the fresh-path gate here. The fresh gate may
+    /// serve a cached `Bogus` entry because that entry is a complete,
+    /// fail-closed SERVFAIL response. On the stale path a `Bogus` entry is
+    /// rejected while validation is active: a stale validation failure is not
+    /// replayed, and the resolver instead synthesizes a fresh SERVFAIL from the
+    /// upstream attempt that just failed. `Indeterminate` and `Unchecked` are
+    /// likewise rejected while validation is active — only `Secure`/`Insecure`
+    /// are servable there. This method itself does not filter on the status.
     pub async fn get_stale_for_query_with_status(
         &self,
         query: &Message,
@@ -1201,6 +1211,24 @@ impl DnsCache {
         let mut backdated = (*entry).clone();
         backdated.stored_at = stored_at;
         cache.insert(key, Arc::new(backdated)).await;
+    }
+
+    /// Returns the cached entry's status-bound lifespan for `query`.
+    ///
+    /// Test hook for cross-crate integration tests: it exposes the
+    /// `max_lifespan_secs` the insert path stored so a caller can assert the
+    /// short DNSSEC failure window without clock manipulation. Hidden from
+    /// docs and absent from normal builds (it requires the `test-hooks`
+    /// feature); the crate's own unit tests get it via `cfg(test)`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub async fn cached_entry_lifespan_secs_for_test(&self, query: &Message) -> Option<u32> {
+        let key = CacheKey::for_query(query)?;
+        self.cache
+            .load_full()
+            .get(&key)
+            .await
+            .map(|entry| entry.max_lifespan_secs)
     }
 
     /// Inserts a pre-built entry for `query`, bypassing the insert validation

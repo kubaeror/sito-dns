@@ -681,14 +681,26 @@ impl DnsPipeline {
                     // fail-closed SERVFAIL, not an answer. The normal insert
                     // rejects it (SERVFAIL), which would leave the stale-now
                     // invalid answer in the cache for the rest of its TTL.
-                    super::shaping::cache_bogus_failure(
+                    if !super::shaping::cache_bogus_failure(
                         &bg_cache,
                         &bg_query,
                         &mut resp,
                         bg_policy_epoch,
                         bg_filter_epoch,
                     )
-                    .await;
+                    .await
+                    {
+                        let qname = bg_query
+                            .queries
+                            .first()
+                            .map(|query| query.name().to_string())
+                            .unwrap_or_default();
+                        warn!(
+                            qname = %qname,
+                            "Background prefetch could not cache the strict Bogus SERVFAIL; \
+                             the previous entry stays until it expires"
+                        );
+                    }
                 } else if resp.metadata.response_code == ResponseCode::NoError
                     || resp.metadata.response_code == ResponseCode::NXDomain
                 {

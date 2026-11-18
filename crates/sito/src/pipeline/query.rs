@@ -223,11 +223,12 @@ pub(super) fn cache_entry_servable(status: ValidationStatus, validation_active: 
 ///
 /// Stale answers are not revalidated, so only authenticated cache decisions
 /// (`Secure`/`Insecure`) may be served. A `Bogus` entry is a fail-closed
-/// SERVFAIL and is never reused from the stale path; an `Indeterminate` entry
-/// is inconclusive by definition — in log-only mode even Bogus data is recorded
-/// that way — and `Unchecked` means no local validation ran at all. Neither
-/// may be handed to a CD=0 client that relies on the resolver. Stale answers
-/// are always sanitized to AD=0 before they leave the cache.
+/// SERVFAIL and is never reused from the stale path **while validation is
+/// active**; an `Indeterminate` entry is inconclusive by definition — in
+/// log-only mode even Bogus data is recorded that way — and `Unchecked` means
+/// no local validation ran at all. Neither may be handed to a CD=0 client that
+/// relies on the resolver. Stale answers are always sanitized to AD=0 before
+/// they leave the cache.
 ///
 /// The status-less stale getters enforce the same rule without a gate:
 /// `get_stale`/`get_stale_for_query` hide `Bogus`/`Indeterminate` entries, and
