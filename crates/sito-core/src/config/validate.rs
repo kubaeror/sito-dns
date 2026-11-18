@@ -359,6 +359,17 @@ impl Config {
                         "refresh_hours must be greater than 0",
                     ));
                 }
+                // TOML integers are i64; a value that cannot be represented as
+                // u64 (only possible for a negative, already rejected above)
+                // fails the cap check below.
+                if u64::try_from(refresh).unwrap_or(u64::MAX) > MAX_REFRESH_HOURS {
+                    return Err(ConfigError::validation(
+                        "integrations.lists.refresh_hours",
+                        format!(
+                            "refresh_hours must be at most {MAX_REFRESH_HOURS} hours (one year)"
+                        ),
+                    ));
+                }
             }
             if let Some(categories) = lists.get("categories") {
                 let categories = categories.as_table().ok_or_else(|| {
@@ -403,6 +414,15 @@ impl Config {
                             return Err(ConfigError::cross_section(
                                 format!("integrations.lists.categories.{category}.refresh_hours"),
                                 "refresh_hours must be greater than 0",
+                            ));
+                        }
+                        // TOML integers are i64; see the global check above.
+                        if u64::try_from(refresh).unwrap_or(u64::MAX) > MAX_REFRESH_HOURS {
+                            return Err(ConfigError::validation(
+                                format!("integrations.lists.categories.{category}.refresh_hours"),
+                                format!(
+                                    "refresh_hours must be at most {MAX_REFRESH_HOURS} hours (one year) when set"
+                                ),
                             ));
                         }
                     }

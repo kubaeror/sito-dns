@@ -4,7 +4,7 @@
 //! tests live next to the embedded map in `config_schema.rs`.
 
 use sito_core::ConfigError;
-use sito_core::config::{Config, MigrationOptions};
+use sito_core::config::{Config, MAX_REFRESH_HOURS, MigrationOptions};
 
 const TEST_BASE: &str = "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n";
 
@@ -324,6 +324,61 @@ fn test_bad_integrations_lists_are_rejected() {
         "{TEST_BASE}[integrations.lists]\nrefresh_hours = 24\n[integrations.lists.categories.adult]\nurl = \"https://lists.example.com/adult.txt\"\nlicense = \"CC0-1.0\"\n"
     ))
     .expect("a valid curated list is accepted");
+}
+
+/// `[integrations.lists]` refresh intervals share the filter-list one-year cap
+/// so the runtime scheduler never does unbounded `Instant + Duration` math.
+#[test]
+fn test_integrations_refresh_hours_capped() {
+    // An over-cap default names the exact global field.
+    let over_global = format!(
+        "{TEST_BASE}[integrations.lists]\nrefresh_hours = {}\n",
+        MAX_REFRESH_HOURS + 1
+    );
+    match Config::from_toml_str(&over_global).expect_err("over-cap global refresh must fail") {
+        ConfigError::CrossSection { field, .. } | ConfigError::Validation { field, .. } => {
+            assert_eq!(field, "integrations.lists.refresh_hours");
+        }
+        other => panic!("expected a validation error on the global refresh, got {other:?}"),
+    }
+
+    // An over-cap per-category override names that exact category field.
+    let over_category = format!(
+        "{TEST_BASE}[integrations.lists]\n[integrations.lists.categories.adult]\nurl = \"https://lists.example.com/adult.txt\"\nrefresh_hours = {}\n",
+        MAX_REFRESH_HOURS + 1
+    );
+    match Config::from_toml_str(&over_category).expect_err("over-cap category refresh must fail") {
+        ConfigError::CrossSection { field, .. } | ConfigError::Validation { field, .. } => {
+            assert_eq!(field, "integrations.lists.categories.adult.refresh_hours");
+        }
+        other => panic!("expected a validation error on the category refresh, got {other:?}"),
+    }
+
+    // The existing non-positive checks still run before the cap.
+    for (toml, field) in [
+        (
+            format!("{TEST_BASE}[integrations.lists]\nrefresh_hours = 0\n"),
+            "integrations.lists.refresh_hours",
+        ),
+        (
+            format!(
+                "{TEST_BASE}[integrations.lists]\n[integrations.lists.categories.adult]\nurl = \"https://lists.example.com/adult.txt\"\nrefresh_hours = 0\n"
+            ),
+            "integrations.lists.categories.adult.refresh_hours",
+        ),
+    ] {
+        match Config::from_toml_str(&toml).expect_err("non-positive refresh must fail") {
+            ConfigError::CrossSection { field: actual, .. }
+            | ConfigError::Validation { field: actual, .. } => assert_eq!(actual, field),
+            other => panic!("expected a validation error on '{field}', got {other:?}"),
+        }
+    }
+
+    // Exactly the cap is accepted at both levels.
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}[integrations.lists]\nrefresh_hours = {MAX_REFRESH_HOURS}\n[integrations.lists.categories.adult]\nurl = \"https://lists.example.com/adult.txt\"\nrefresh_hours = {MAX_REFRESH_HOURS}\n"
+    ))
+    .expect("the one-year cap must be accepted");
 }
 
 #[test]

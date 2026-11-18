@@ -729,7 +729,7 @@ url = "https://lists.example.com/services.json"
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be ≥ 1). |
+| `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be ≥ 1 and at most 8760, one year). |
 | `categories` | table (map of category → source) | `{}` | Sources keyed by category id (`adult`, `gambling`, `services`, or any custom parental category). Each entry has a required `url` (`https://`, `http://` or `file://`), an optional `refresh_hours` override and an optional `license` string for operator reference. Refreshed domain lists replace the bundled content of that category; `services` expects service JSON. |
 
 ### `[integrations.lists.categories.<name>]` entries
@@ -737,7 +737,7 @@ url = "https://lists.example.com/services.json"
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `categories.url` | string | required | Source URL for the category (`https://`, `http://` or `file://`). |
-| `categories.refresh_hours` | integer | `None` | Per-category refresh interval in hours. When unset, `integrations.lists.refresh_hours` is used; must be greater than 0 when set. |
+| `categories.refresh_hours` | integer | `None` | Per-category refresh interval in hours. When unset, `integrations.lists.refresh_hours` is used; must be greater than 0 and at most 8760 (one year) when set. |
 | `categories.license` | string | `None` | SPDX license identifier of the upstream data, for operator reference. |
 
 ---
