@@ -340,3 +340,19 @@ The background refresh path publishes the same absolute counter snapshots via
 counter-attribution tests above cover the metric values; publication is the thin
 call in `validate_upstream_response` and the prefetch task, documented but not
 directly unit-tested.
+
+## Phase 2 — filter
+
+WP-2.3 keeps the existing parser/compiler budgets and adds URL-keyed
+subscription cache identity plus bounded, overflow-safe refresh scheduling. The
+public API and behavior notes are in §17 of
+[`docs/2.0-public-api-diff.md`](2.0-public-api-diff.md#17-phase-2--filter-wp-23).
+
+| Finding / acceptance | Named test / check | Focused command |
+|---|---|---|
+| A URL change under the same list name never reuses the old ETag/Last-Modified or cached body, and a `304` after the change still refetches the new URL | `test_url_change_does_not_reuse_cached_etag_or_content` | `cargo test -p sito-filter --lib test_url_change_does_not_reuse_cached_etag_or_content` |
+| A failed fetch after a URL change returns the fetch error and never falls back to the previous URL's content; the old cache and metadata are quarantined | `test_url_change_failed_fetch_does_not_fall_back_to_old_cache` | `cargo test -p sito-filter --lib test_url_change_failed_fetch_does_not_fall_back_to_old_cache` |
+| Legacy metadata without a URL is a cache miss: no conditional headers, a full refetch, and metadata rewritten with the configured URL | `test_legacy_metadata_without_url_forces_full_refetch` | `cargo test -p sito-filter --lib test_legacy_metadata_without_url_forces_full_refetch` |
+| Global and per-list refresh hours are capped at `MAX_REFRESH_HOURS` (8760, one year); over-cap values are rejected with the exact field name, `u64::MAX` is rejected, and exactly the cap is accepted | `test_filtering_refresh_hours_capped_at_one_year` | `cargo test -p sito-core --lib test_filtering_refresh_hours_capped_at_one_year` |
+| Scheduling clamps global/per-list hours and uses `checked_add`, so `u64::MAX` hours cannot panic; due lists reschedule with the same bounded per-list or global interval | `test_refresh_schedule_clamps_huge_hours`, `test_refresh_interval_is_bounded`, `test_due_lists_reschedule_with_bounded_interval` | `cargo test -p sito-filter --lib refresh_`; `cargo test -p sito-filter --lib test_due_lists_reschedule_with_bounded_interval` |
+| Hostile line/pattern/byte/rule and regex/DFA compile budgets plus empty/zero-yield rejection remain in force (no regression from WP-2.3) | P1-7 and P1-8 rows above | `cargo test -p sito-filter test_hostile_line_and_rule_count_hit_parse_budget`; `cargo test -p sito-filter zero_yield` |

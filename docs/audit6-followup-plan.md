@@ -1166,7 +1166,7 @@ The safety gate is the only work done before the 2.0 refactor. It closes all P0 
 - [x] Cache strict-mode `Bogus` SERVFAILs for 5 s (`DNSSEC_BOGUS_CACHE_TTL`)
   and cap log-only `Indeterminate` entries at 30 s
   (`DNSSEC_INDETERMINATE_CACHE_TTL`); never serve stale `Bogus`/`Indeterminate`.
-- [ ] Add metrics for `Secure/Insecure/Bogus/Indeterminate`, key fetch budget, deadline failures.
+- [x] Add metrics for `Secure/Insecure/Bogus/Indeterminate`, key fetch budget, deadline failures.
 - **Acceptance:** policy-change race test passes; stale cache never serves unvalidated data.
 **Estimate:** M.
 
@@ -1175,13 +1175,21 @@ The safety gate is the only work done before the 2.0 refactor. It closes all P0 
 **Addresses:** P1-7, P1-8, P2-24..P2-29, P2-95, P2-96.
 **Files:** `sito-filter/src/{parser,engine,structures/*,subscription,downloader}.rs`.
 **Steps:**
-- [ ] Stream list parsing; enforce per-line/pattern/byte/rule/regex/DFA/compile budgets.
-- [ ] Reject empty/zero-yield lists unless allowed; apply drop guard to all remote reload paths.
-- [ ] Store URL in cache metadata; invalidate on URL change.
-- [ ] Expose status/degraded counts and per-list errors via API/metrics.
-- [ ] Cap `refresh_hours` and use checked time arithmetic.
+- [x] Stream list parsing; enforce per-line/pattern/byte/rule/regex/DFA/compile budgets.
+- [x] Reject empty/zero-yield lists unless allowed; apply drop guard to all remote reload paths.
+- [x] Store URL in cache metadata; invalidate on URL change.
+- [x] Expose status/degraded counts and per-list errors via API/metrics.
+- [x] Cap `refresh_hours` and use checked time arithmetic.
 - **Acceptance:** hostile/empty/URL-change tests pass; status truthful; no OOM.
 **Estimate:** L.
+
+**Status (2026-11-18):** Complete. The downloader streams the response body
+under the hard `max_list_bytes` cap and the parser iterates lines with
+per-line/pattern/rule and regex/DFA compile budgets; empty/zero-yield rejection
+and the drop guard are in place. URL-keyed cache identity, exact per-list
+status/error exposure through the API and metrics, and the one-year refresh cap
+landed in this slice. Evidence: Phase 2 — filter section in
+`docs/audit6-test-matrix.md` and §17 of `docs/2.0-public-api-diff.md`.
 
 ### WP-2.4 — Filter precedence, groups, and rewrites
 
