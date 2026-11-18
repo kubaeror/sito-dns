@@ -1357,6 +1357,210 @@ mod tests {
         );
     }
 
+    /// A validation failure is a fail-closed decision: it must never carry the
+    /// authenticated-data bit. The defensive check rejects an AD=1 response
+    /// even if a future caller forgets to clear it.
+    #[tokio::test]
+    async fn test_bogus_validation_failure_rejects_authentic_data() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("bogus-ad.example.").unwrap();
+        let query = query_for(119, &qname);
+        let mut response = servfail_response(119, &query);
+        response.metadata.authentic_data = true;
+
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a validation failure that asserts AD must never be cached"
+        );
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "the rejected failure must not become visible"
+        );
+    }
+
+    /// The status-less stale getters are used by call paths that cannot apply
+    /// the validation gate themselves, so they must hide fail-closed and
+    /// inconclusive entries. The status-aware getter stays unfiltered for
+    /// inspection (stale-serving tests, debugging) and `Unchecked` remains
+    /// returnable because it is valid when validation is inactive.
+    #[tokio::test]
+    async fn test_stale_statusless_getters_hide_failure_entries() {
+        let mut config = make_test_config(1, 1, 1);
+        config.serve_stale_hours = 1;
+        let cache = DnsCache::new(config);
+
+        let bogus_name = Name::from_str("stale-bogus-getter.example.").unwrap();
+        let bogus_query = query_for(120, &bogus_name);
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &bogus_query,
+                    &servfail_response(120, &bogus_query),
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await
+        );
+        cache
+            .backdate_entry_for_test(
+                &bogus_query,
+                Duration::from_secs(u64::from(DNSSEC_BOGUS_CACHE_TTL)),
+            )
+            .await;
+
+        let indeterminate_name = Name::from_str("stale-indeterminate-getter.example.").unwrap();
+        let indeterminate_query = query_for(121, &indeterminate_name);
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &indeterminate_query,
+                    &servfail_response(121, &indeterminate_query),
+                    ValidationStatus::Indeterminate,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_INDETERMINATE_CACHE_TTL,
+                )
+                .await
+        );
+        cache
+            .backdate_entry_for_test(
+                &indeterminate_query,
+                Duration::from_secs(u64::from(DNSSEC_INDETERMINATE_CACHE_TTL)),
+            )
+            .await;
+
+        // `Unchecked` stays stale-servable: it is a legitimate status when
+        // local validation is inactive, and the status-aware pipeline gate
+        // decides whether it may be used.
+        let unchecked_name = Name::from_str("stale-unchecked-getter.example.").unwrap();
+        let unchecked_query = query_for(122, &unchecked_name);
+        let mut unchecked_response = answer_response(122, &unchecked_name, [192, 0, 2, 122]);
+        unchecked_response.answers[0].ttl = 1;
+        cache.insert(&unchecked_query, &unchecked_response).await;
+        cache
+            .backdate_entry_for_test(&unchecked_query, Duration::from_secs(2))
+            .await;
+
+        // The status-aware getter is the unfiltered inspection form.
+        assert_eq!(
+            cache
+                .get_stale_for_query_with_status(&bogus_query)
+                .await
+                .map(|(_, status)| status),
+            Some(ValidationStatus::Bogus),
+            "the status-aware stale getter must still expose a Bogus entry"
+        );
+        assert_eq!(
+            cache
+                .get_stale_for_query_with_status(&indeterminate_query)
+                .await
+                .map(|(_, status)| status),
+            Some(ValidationStatus::Indeterminate),
+            "the status-aware stale getter must still expose an Indeterminate entry"
+        );
+
+        // Both status-less getters hide fail-closed and inconclusive entries.
+        assert!(
+            cache
+                .get_stale(&bogus_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "get_stale must not return a stale Bogus entry"
+        );
+        assert!(
+            cache.get_stale_for_query(&bogus_query).await.is_none(),
+            "get_stale_for_query must not return a stale Bogus entry"
+        );
+        assert!(
+            cache
+                .get_stale(&indeterminate_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "get_stale must not return a stale Indeterminate entry"
+        );
+        assert!(
+            cache
+                .get_stale_for_query(&indeterminate_query)
+                .await
+                .is_none(),
+            "get_stale_for_query must not return a stale Indeterminate entry"
+        );
+
+        assert!(
+            cache
+                .get_stale(&unchecked_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_some(),
+            "Unchecked must remain returnable from the status-less stale getters"
+        );
+        assert!(
+            cache.get_stale_for_query(&unchecked_query).await.is_some(),
+            "Unchecked must remain returnable from the status-less stale getters"
+        );
+    }
+
+    /// Entries copied from an older cache generation may carry raw record TTL
+    /// vectors that were never clamped to the status-bound window. The fresh
+    /// read path must re-clamp them so the short failure lifespan is a cache
+    /// invariant, not just an insert-time convention.
+    #[tokio::test]
+    async fn test_old_failure_entry_record_ttls_are_capped_on_read() {
+        let cache = DnsCache::new(make_test_config(1, 3600, 1800));
+        let qname = Name::from_str("old-indeterminate.example.").unwrap();
+        let query = query_for(123, &qname);
+        let mut response = answer_response(123, &qname, [192, 0, 2, 123]);
+        response.answers[0].ttl = 3600;
+        response.authorities.push(Record::from_rdata(
+            qname.clone(),
+            3600,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 124))),
+        ));
+        response.additionals.push(Record::from_rdata(
+            qname.clone(),
+            3600,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 125))),
+        ));
+
+        cache
+            .insert_raw_entry_for_test(
+                &query,
+                &response,
+                ValidationStatus::Indeterminate,
+                3600,
+                3600,
+            )
+            .await;
+
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("the injected entry must still be fresh");
+        assert_eq!(status, ValidationStatus::Indeterminate);
+        for record in cached
+            .answers
+            .iter()
+            .chain(cached.authorities.iter())
+            .chain(cached.additionals.iter())
+        {
+            assert!(
+                record.ttl <= DNSSEC_INDETERMINATE_CACHE_TTL,
+                "an uncapped old record TTL must be clamped on read (got {})",
+                record.ttl
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_validation_failure_rejects_mismatched_question() {
         let cache = DnsCache::new(make_test_config(10, 3600, 1800));

@@ -1758,6 +1758,96 @@ async fn test_strict_bogus_servfail_is_cached_and_served_without_upstream() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// A background prefetch that receives a strict-mode Bogus result must cache
+/// the same fail-closed SERVFAIL the foreground path stores. Routing it
+/// through the normal insert would be rejected (SERVFAIL is not RFC 2308
+/// cacheable), leaving the now-invalid answer servable until it expires.
+#[tokio::test]
+async fn test_prefetch_strict_bogus_is_cached_as_fail_closed_servfail() {
+    use std::sync::atomic::Ordering;
+
+    let mut config = Config::default();
+    config.dns.cache.prefetch = true;
+    // A 10 s lifespan makes `should_prefetch` true on the second hit
+    // (`remaining <= 10`) while the seeded entry stays fresh long enough for
+    // the background refresh to replace it.
+    config.dns.cache.min_ttl = 10;
+    config.dns.cache.max_ttl = 10;
+    let (pipeline, calls, temp_dir, qname) =
+        test_pipeline_with_bogus_signed_upstream(config, DnssecMode::Validate).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    // Seed a servable, near-expiry entry so cache hits trigger the background
+    // refresh instead of a foreground upstream resolution.
+    let seed_query = do_query(30, &qname);
+    let mut seed = Message::response(30, OpCode::Query);
+    seed.queries = seed_query.queries.clone();
+    seed.answers.push(Record::from_rdata(
+        qname.clone(),
+        10,
+        RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 30))),
+    ));
+    pipeline
+        .cache
+        .insert_with_status(&seed_query, &seed, ValidationStatus::Insecure)
+        .await;
+
+    // Two cache hits raise the hit counter to the prefetch threshold; the
+    // second hit spawns the background refresh through the mock upstream.
+    for id in 30..=31 {
+        let resp = pipeline
+            .handle(do_query(id, &qname), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NoError,
+            "the foreground keeps serving the seeded entry"
+        );
+    }
+
+    let mut attempts = 0usize;
+    let (cached, status) = loop {
+        if let Some((message, status)) = pipeline.cache.get_for_query_with_status(&seed_query).await
+            && status == ValidationStatus::Bogus
+        {
+            break (message, status);
+        }
+        attempts += 1;
+        assert!(
+            attempts < 250,
+            "the background prefetch never cached a Bogus SERVFAIL (upstream calls: {})",
+            calls.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(status, ValidationStatus::Bogus);
+    assert_eq!(cached.metadata.response_code, ResponseCode::ServFail);
+    assert!(
+        cached.answers.is_empty(),
+        "a prefetched Bogus entry must not carry answer data"
+    );
+    assert!(
+        cached.authorities.is_empty(),
+        "a prefetched Bogus entry must not carry authority data"
+    );
+    assert!(
+        cached.additionals.is_empty(),
+        "a prefetched Bogus entry must not carry additional data"
+    );
+    assert!(
+        !cached.metadata.authentic_data,
+        "a prefetched Bogus entry must never assert AD"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) >= 1,
+        "the prefetch must have re-queried the upstream"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 /// In log-only mode a Bogus result keeps the answer as an unservable
 /// `Indeterminate` entry: it may be cached, but a validating client forces a
 /// re-resolution instead of receiving the unvalidated data.

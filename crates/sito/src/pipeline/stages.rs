@@ -622,6 +622,11 @@ impl DnsPipeline {
                 let Ok(mut resp) = bg_upstream.resolve(&bg_resolve_query).await else {
                     return;
                 };
+                // A strict-mode Bogus decision is a fail-closed SERVFAIL.
+                // Capture it before `validation_status` folds every Bogus
+                // occurrence into `Indeterminate` (log-only) so the failure
+                // insert is used only for the strict path.
+                let mut strict_bogus = false;
                 let bg_status = if let Some(validator) = bg_validator {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -638,6 +643,8 @@ impl DnsPipeline {
                         DNSSEC_VALIDATION_DEADLINE,
                     )
                     .await;
+                    strict_bogus = dnssec_mode == sito_dnssec::DnssecMode::Validate
+                        && matches!(outcome, sito_dnssec::ValidationOutcome::Bogus { .. });
                     // Publish the validator's cumulative counters after the
                     // background pass. These setters replace the gauge values,
                     // so the foreground's own update is refreshed rather than
@@ -669,7 +676,20 @@ impl DnsPipeline {
                     dnssec_mode,
                     edns_udp_size,
                 );
-                if resp.metadata.response_code == ResponseCode::NoError
+                if strict_bogus {
+                    // Parity with the foreground: a strict Bogus refresh is a
+                    // fail-closed SERVFAIL, not an answer. The normal insert
+                    // rejects it (SERVFAIL), which would leave the stale-now
+                    // invalid answer in the cache for the rest of its TTL.
+                    super::shaping::cache_bogus_failure(
+                        &bg_cache,
+                        &bg_query,
+                        &mut resp,
+                        bg_policy_epoch,
+                        bg_filter_epoch,
+                    )
+                    .await;
+                } else if resp.metadata.response_code == ResponseCode::NoError
                     || resp.metadata.response_code == ResponseCode::NXDomain
                 {
                     bg_cache

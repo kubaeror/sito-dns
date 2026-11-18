@@ -228,6 +228,13 @@ pub(super) fn cache_entry_servable(status: ValidationStatus, validation_active: 
 /// that way — and `Unchecked` means no local validation ran at all. Neither
 /// may be handed to a CD=0 client that relies on the resolver. Stale answers
 /// are always sanitized to AD=0 before they leave the cache.
+///
+/// The status-less stale getters enforce the same rule without a gate:
+/// `get_stale`/`get_stale_for_query` hide `Bogus`/`Indeterminate` entries, and
+/// only the status-aware `get_stale_for_query_with_status` exposes them.
+/// When local validation is inactive, this gate allows every status, so a
+/// cached `Bogus` entry may still be served — but only as its fail-closed
+/// SERVFAIL, never as answer data.
 pub(super) fn stale_cache_entry_servable(
     status: ValidationStatus,
     validation_active: bool,
