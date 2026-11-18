@@ -36,6 +36,18 @@ pub struct ListMetadata {
     /// Line count of the cached list content (second integrity signal).
     #[serde(default)]
     pub line_count: Option<usize>,
+    /// Source URL this cache was downloaded from.
+    ///
+    /// `None` for metadata written by older versions. Conditional headers and
+    /// cached content are only reused when this matches the configured URL, so
+    /// changing a list's URL under the same name cannot serve stale rules.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// Returns true when cached metadata describes `url`.
+fn metadata_url_matches(meta: &ListMetadata, url: &str) -> bool {
+    meta.url.as_deref() == Some(url)
 }
 
 /// Generates the file path for storing subscription metadata.
@@ -193,10 +205,31 @@ async fn load_cache_or(
     cache_path: &Path,
     meta_path: &Path,
     list_name: &str,
+    expected_url: &str,
     max_bytes: usize,
     allow_empty: bool,
     error: FilterError,
 ) -> Result<String, FilterError> {
+    // A cache is only a fallback for the URL it was downloaded from. Legacy
+    // metadata carries no URL, so it is treated like any other mismatch.
+    if let Some(meta) = read_metadata(meta_path).await
+        && !metadata_url_matches(&meta, expected_url)
+    {
+        quarantine_cache(
+            cache_path,
+            meta_path,
+            list_name,
+            "cached URL does not match the configured list URL",
+        )
+        .await;
+        warn!(
+            list = %list_name,
+            cached_url = meta.url.as_deref().unwrap_or("<unknown>"),
+            expected_url = %expected_url,
+            "Disk cache belongs to a different URL; refusing fallback"
+        );
+        return Err(error);
+    }
     match read_cache_verified(cache_path, meta_path, list_name, max_bytes).await {
         Ok(cached) => {
             // Older versions could cache an HTML error page or an empty body
@@ -521,6 +554,7 @@ impl SubscriptionFetcher {
                                 &cache_path,
                                 &meta_path,
                                 list_name,
+                                url,
                                 self.max_bytes,
                                 self.allow_empty,
                                 e,
@@ -540,6 +574,7 @@ impl SubscriptionFetcher {
                         &cache_path,
                         &meta_path,
                         list_name,
+                        url,
                         self.max_bytes,
                         self.allow_empty,
                         e,
@@ -574,6 +609,7 @@ impl SubscriptionFetcher {
                     &cache_path,
                     &meta_path,
                     list_name,
+                    url,
                     self.max_bytes,
                     self.allow_empty,
                     e,
@@ -590,6 +626,28 @@ impl SubscriptionFetcher {
         };
 
         let mut conditional = read_metadata(&meta_path).await;
+        // Conditional headers and cached content belong to the URL that
+        // produced them. When the configured URL changed (or the metadata was
+        // written before URLs were recorded), discard the old pair and start
+        // from a full cache miss.
+        if let Some(meta) = &conditional
+            && !metadata_url_matches(meta, url)
+        {
+            warn!(
+                list = %list_name,
+                cached_url = meta.url.as_deref().unwrap_or("<unknown>"),
+                url = %url,
+                "Cached blocklist belongs to a different URL; quarantining it"
+            );
+            quarantine_cache(
+                &cache_path,
+                &meta_path,
+                list_name,
+                "cached URL does not match the configured list URL",
+            )
+            .await;
+            conditional = None;
+        }
         let mut last_error = None;
         let mut backoff = self.initial_backoff;
 
@@ -792,6 +850,7 @@ impl SubscriptionFetcher {
                             &cache_path,
                             &meta_path,
                             list_name,
+                            url,
                             self.max_bytes,
                             self.allow_empty,
                             e,
@@ -822,6 +881,7 @@ impl SubscriptionFetcher {
                             updated_at_secs: updated_secs,
                             content_len: Some(content.len() as u64),
                             line_count: Some(content.lines().count()),
+                            url: Some(url.to_string()),
                         };
                         if let Err(e) = save_metadata(&meta_path, &meta).await {
                             warn!(list = %list_name, error = %e, "Failed to save blocklist metadata");
@@ -859,6 +919,7 @@ impl SubscriptionFetcher {
             &cache_path,
             &meta_path,
             list_name,
+            url,
             self.max_bytes,
             self.allow_empty,
             fallback_error,
@@ -931,6 +992,7 @@ mod tests {
             updated_at_secs: 123_456_789,
             content_len: Some(42),
             line_count: Some(3),
+            url: Some("http://example.com/list.txt".to_string()),
         };
 
         save_metadata(&meta_file, &meta).await.unwrap();
@@ -1213,28 +1275,168 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
     }
 
+    /// WP-2.3: a cache written for URL A must never supply conditional headers
+    /// or content when the configured URL changes to B.
     #[tokio::test]
-    async fn test_304_with_missing_cache_retries_unconditionally() {
-        let data_dir = temp_dir("sito_304_test");
-        let meta_path = meta_path_for_list(&data_dir, "etag-list");
-        let cache_path = cache_path_for_list(&data_dir, "etag-list");
+    async fn test_url_change_does_not_reuse_cached_etag_or_content() {
+        let data_dir = temp_dir("sito_url_change_304");
+        let old_body = "||old.example^";
+        let new_body = "||new.example^";
+        let responses = vec![
+            format!(
+                "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{old_body}",
+                old_body.len()
+            ),
+            "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            format!(
+                "HTTP/1.1 200 OK\r\nETag: \"v2\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{new_body}",
+                new_body.len()
+            ),
+        ];
+        let (addr, captured, server) = spawn_http_server(responses).await;
 
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            1,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+
+        let url_a = format!("http://{addr}/a.txt");
+        let url_b = format!("http://{addr}/b.txt");
+        let first = fetcher
+            .fetch_or_cached("url-change", &url_a, &data_dir)
+            .await
+            .unwrap();
+        assert_eq!(first, old_body);
+
+        let second = fetcher
+            .fetch_or_cached("url-change", &url_b, &data_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            second, new_body,
+            "URL B must not be served URL A's cached content"
+        );
+
+        server.await.unwrap();
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            3,
+            "expected the initial fetch, an unconditional URL B fetch, and a retry"
+        );
+        let lowered = requests[1].to_ascii_lowercase();
+        assert!(
+            !lowered.contains("if-none-match"),
+            "URL B must not inherit URL A's ETag: {}",
+            requests[1]
+        );
+        assert!(
+            !lowered.contains("if-modified-since"),
+            "URL B must not inherit URL A's Last-Modified: {}",
+            requests[1]
+        );
+
+        let meta = read_metadata(&meta_path_for_list(&data_dir, "url-change"))
+            .await
+            .unwrap();
+        assert_eq!(meta.url.as_deref(), Some(url_b.as_str()));
+
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// WP-2.3: a failed fetch for a new URL must return the error, never the
+    /// previous URL's cached rules.
+    #[tokio::test]
+    async fn test_url_change_failed_fetch_does_not_fall_back_to_old_cache() {
+        let data_dir = temp_dir("sito_url_change_fail");
+        let old_body = "||old.example^";
+        let responses = vec![
+            format!(
+                "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{old_body}",
+                old_body.len()
+            ),
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        ];
+        let (addr, captured, server) = spawn_http_server(responses).await;
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            0,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+
+        let url_a = format!("http://{addr}/a.txt");
+        let url_b = format!("http://{addr}/b.txt");
+        let first = fetcher
+            .fetch_or_cached("url-change-fail", &url_a, &data_dir)
+            .await
+            .unwrap();
+        assert_eq!(first, old_body);
+
+        let err = fetcher
+            .fetch_or_cached("url-change-fail", &url_b, &data_dir)
+            .await
+            .expect_err("a failed URL B fetch must not fall back to URL A's cache");
+        assert!(
+            matches!(err, FilterError::DownloadFailed { .. }),
+            "unexpected error: {err}"
+        );
+
+        server.await.unwrap();
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests[1].to_ascii_lowercase().contains("if-none-match"),
+            "URL B must not inherit URL A's ETag: {}",
+            requests[1]
+        );
+        assert!(
+            !cache_path_for_list(&data_dir, "url-change-fail").exists(),
+            "the old URL's cache must be quarantined"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    /// WP-2.3: metadata written before URLs were recorded is a cache miss:
+    /// no conditional headers and no old content.
+    #[tokio::test]
+    async fn test_legacy_metadata_without_url_forces_full_refetch() {
+        let data_dir = temp_dir("sito_legacy_url");
+        let list_name = "legacy-url";
+        let old_body = "||legacy.example^";
+        let new_body = "||fresh.example^";
+        let cache_path = cache_path_for_list(&data_dir, list_name);
+        let meta_path = meta_path_for_list(&data_dir, list_name);
+        save_to_cache(&cache_path, old_body).await.unwrap();
         save_metadata(
             &meta_path,
             &ListMetadata {
-                etag: Some("\"v1\"".to_string()),
-                last_modified: None,
+                etag: Some("\"legacy\"".to_string()),
+                last_modified: Some("Fri, 05 Sep 2026 00:00:00 GMT".to_string()),
                 updated_at_secs: 1,
+                content_len: Some(old_body.len() as u64),
+                line_count: Some(old_body.lines().count()),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
-        assert!(!cache_path.exists());
 
         let responses = vec![
-            "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
-            "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n||fresh.example^".to_string(),
+            "HTTP/1.1 304 Not Modified\r\nETag: \"legacy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            format!(
+                "HTTP/1.1 200 OK\r\nETag: \"new\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{new_body}",
+                new_body.len()
+            ),
         ];
         let (addr, captured, server) = spawn_http_server(responses).await;
 
@@ -1247,6 +1449,71 @@ mod tests {
         fetcher.allow_private_targets = true;
 
         let url = format!("http://{addr}/list.txt");
+        let content = fetcher
+            .fetch_or_cached(list_name, &url, &data_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            content, new_body,
+            "legacy metadata must not reuse the previously cached content"
+        );
+
+        server.await.unwrap();
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "expected a full refetch after the 304");
+        let lowered = requests[0].to_ascii_lowercase();
+        assert!(
+            !lowered.contains("if-none-match"),
+            "legacy metadata must not supply an ETag: {}",
+            requests[0]
+        );
+        assert!(
+            !lowered.contains("if-modified-since"),
+            "legacy metadata must not supply Last-Modified: {}",
+            requests[0]
+        );
+
+        let meta = read_metadata(&meta_path).await.unwrap();
+        assert_eq!(meta.url.as_deref(), Some(url.as_str()));
+
+        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_304_with_missing_cache_retries_unconditionally() {
+        let data_dir = temp_dir("sito_304_test");
+        let meta_path = meta_path_for_list(&data_dir, "etag-list");
+        let cache_path = cache_path_for_list(&data_dir, "etag-list");
+        assert!(!cache_path.exists());
+
+        let responses = vec![
+            "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n||fresh.example^".to_string(),
+        ];
+        let (addr, captured, server) = spawn_http_server(responses).await;
+        let url = format!("http://{addr}/list.txt");
+
+        save_metadata(
+            &meta_path,
+            &ListMetadata {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                updated_at_secs: 1,
+                url: Some(url.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut fetcher = SubscriptionFetcher::new(
+            Duration::from_secs(5),
+            1024 * 1024,
+            1,
+            Duration::from_millis(10),
+        );
+        fetcher.allow_private_targets = true;
+
         let content = fetcher
             .fetch_or_cached("etag-list", &url, &data_dir)
             .await
@@ -1278,6 +1545,14 @@ mod tests {
         let list_name = "etag-list";
         let cache_path = cache_path_for_list(&data_dir, list_name);
         let meta_path = meta_path_for_list(&data_dir, list_name);
+
+        let responses = vec![
+            "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        ];
+        let (addr, _captured, server) = spawn_http_server(responses).await;
+        let url = format!("http://{addr}/list.txt");
+
         let cached_html = "<html><body>CDN error</body></html>\n";
         save_to_cache(&cache_path, cached_html).await.unwrap();
         save_metadata(
@@ -1286,17 +1561,12 @@ mod tests {
                 etag: Some("\"v1\"".to_string()),
                 content_len: Some(cached_html.len() as u64),
                 line_count: Some(cached_html.lines().count()),
+                url: Some(url.clone()),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
-
-        let responses = vec![
-            "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                .to_string(),
-        ];
-        let (addr, _captured, server) = spawn_http_server(responses).await;
 
         let mut fetcher = SubscriptionFetcher::new(
             Duration::from_secs(5),
@@ -1307,7 +1577,7 @@ mod tests {
         fetcher.allow_private_targets = true;
 
         let err = fetcher
-            .fetch_or_cached(list_name, &format!("http://{addr}/list.txt"), &data_dir)
+            .fetch_or_cached(list_name, &url, &data_dir)
             .await
             .expect_err("an HTML cache served under HTTP 304 must be rejected");
         assert!(
@@ -1396,18 +1666,6 @@ mod tests {
         let list_name = "html-cache";
         let cache_path = cache_path_for_list(&data_dir, list_name);
         let meta_path = meta_path_for_list(&data_dir, list_name);
-        let cached_html = "<html><body>CDN error</body></html>\n";
-        save_to_cache(&cache_path, cached_html).await.unwrap();
-        save_metadata(
-            &meta_path,
-            &ListMetadata {
-                content_len: Some(cached_html.len() as u64),
-                line_count: Some(cached_html.lines().count()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
 
         let body = "<!DOCTYPE html><html><body>fresh error</body></html>";
         let response = format!(
@@ -1415,6 +1673,21 @@ mod tests {
             body.len()
         );
         let (addr, _captured, server) = spawn_http_server(vec![response]).await;
+        let url = format!("http://{addr}/list.txt");
+
+        let cached_html = "<html><body>CDN error</body></html>\n";
+        save_to_cache(&cache_path, cached_html).await.unwrap();
+        save_metadata(
+            &meta_path,
+            &ListMetadata {
+                content_len: Some(cached_html.len() as u64),
+                line_count: Some(cached_html.lines().count()),
+                url: Some(url.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         let mut fetcher = SubscriptionFetcher::new(
             Duration::from_secs(5),
@@ -1425,7 +1698,7 @@ mod tests {
         fetcher.allow_private_targets = true;
 
         let err = fetcher
-            .fetch_or_cached(list_name, &format!("http://{addr}/list.txt"), &data_dir)
+            .fetch_or_cached(list_name, &url, &data_dir)
             .await
             .expect_err("the HTML cache fallback must be rejected");
         assert!(
@@ -1463,6 +1736,7 @@ mod tests {
                 // Record a longer body than the file actually contains.
                 content_len: Some(content.len() as u64 + 10),
                 line_count: Some(content.lines().count()),
+                url: Some("http://example.invalid/list".to_string()),
                 ..Default::default()
             },
         )
@@ -1473,6 +1747,7 @@ mod tests {
             &cache_path,
             &meta_path,
             list_name,
+            "http://example.invalid/list",
             DEFAULT_MAX_LIST_BYTES,
             false,
             FilterError::InvalidUrl {

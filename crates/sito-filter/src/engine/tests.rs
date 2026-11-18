@@ -304,6 +304,7 @@ async fn test_disk_cache_offline_fallback() {
         &crate::subscription::ListMetadata {
             content_len: Some(cached_content.len() as u64),
             line_count: Some(cached_content.lines().count()),
+            url: Some("http://127.0.0.1:1".to_string()),
             ..Default::default()
         },
     )
