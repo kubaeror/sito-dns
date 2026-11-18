@@ -336,10 +336,10 @@ fn test_integrations_refresh_hours_capped() {
         MAX_REFRESH_HOURS + 1
     );
     match Config::from_toml_str(&over_global).expect_err("over-cap global refresh must fail") {
-        ConfigError::CrossSection { field, .. } | ConfigError::Validation { field, .. } => {
+        ConfigError::Validation { field, .. } => {
             assert_eq!(field, "integrations.lists.refresh_hours");
         }
-        other => panic!("expected a validation error on the global refresh, got {other:?}"),
+        other => panic!("expected a Validation error on the global refresh, got {other:?}"),
     }
 
     // An over-cap per-category override names that exact category field.
@@ -348,10 +348,10 @@ fn test_integrations_refresh_hours_capped() {
         MAX_REFRESH_HOURS + 1
     );
     match Config::from_toml_str(&over_category).expect_err("over-cap category refresh must fail") {
-        ConfigError::CrossSection { field, .. } | ConfigError::Validation { field, .. } => {
+        ConfigError::Validation { field, .. } => {
             assert_eq!(field, "integrations.lists.categories.adult.refresh_hours");
         }
-        other => panic!("expected a validation error on the category refresh, got {other:?}"),
+        other => panic!("expected a Validation error on the category refresh, got {other:?}"),
     }
 
     // The existing non-positive checks still run before the cap.
@@ -368,9 +368,8 @@ fn test_integrations_refresh_hours_capped() {
         ),
     ] {
         match Config::from_toml_str(&toml).expect_err("non-positive refresh must fail") {
-            ConfigError::CrossSection { field: actual, .. }
-            | ConfigError::Validation { field: actual, .. } => assert_eq!(actual, field),
-            other => panic!("expected a validation error on '{field}', got {other:?}"),
+            ConfigError::CrossSection { field: actual, .. } => assert_eq!(actual, field),
+            other => panic!("expected a CrossSection error on '{field}', got {other:?}"),
         }
     }
 

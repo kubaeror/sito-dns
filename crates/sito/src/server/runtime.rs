@@ -353,5 +353,10 @@ mod tests {
             .expect("a clamped one-year interval must be representable");
         assert!(deadline > now, "the deadline must be in the future");
         assert_eq!(deadline - now, interval);
+        assert_eq!(
+            integration_next_deadline(now, Duration::from_secs(u64::MAX)),
+            None,
+            "checked_add must reject a duration beyond the platform Instant range"
+        );
     }
 }

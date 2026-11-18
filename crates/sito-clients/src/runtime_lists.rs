@@ -53,8 +53,17 @@ impl Default for ListCategoriesConfig {
 }
 
 impl ListCategoriesConfig {
-    /// Validates every configured source URL scheme.
+    /// Validates every configured source URL scheme and refresh interval.
     pub fn validate(&self) -> Result<(), String> {
+        if self.refresh_hours == 0 {
+            return Err("integrations.lists.refresh_hours must be greater than 0".to_string());
+        }
+        if self.refresh_hours > sito_core::config::MAX_REFRESH_HOURS {
+            return Err(format!(
+                "integrations.lists.refresh_hours must be at most {} hours (one year)",
+                sito_core::config::MAX_REFRESH_HOURS
+            ));
+        }
         for (category, source) in &self.categories {
             let allowed = ["https://", "http://", "file://"]
                 .iter()
@@ -64,10 +73,18 @@ impl ListCategoriesConfig {
                     "integrations.lists.categories.{category}.url must use http://, https:// or file://"
                 ));
             }
-            if source.refresh_hours == Some(0) {
-                return Err(format!(
-                    "integrations.lists.categories.{category}.refresh_hours must be greater than 0"
-                ));
+            if let Some(hours) = source.refresh_hours {
+                if hours == 0 {
+                    return Err(format!(
+                        "integrations.lists.categories.{category}.refresh_hours must be greater than 0"
+                    ));
+                }
+                if hours > sito_core::config::MAX_REFRESH_HOURS {
+                    return Err(format!(
+                        "integrations.lists.categories.{category}.refresh_hours must be at most {} hours (one year)",
+                        sito_core::config::MAX_REFRESH_HOURS
+                    ));
+                }
             }
         }
         Ok(())
@@ -448,6 +465,41 @@ mod tests {
         config.categories.get_mut("adult").unwrap().url =
             "https://example.com/adult.txt".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_caps_refresh_hours() {
+        let mut config = ListCategoriesConfig::default();
+        config.refresh_hours = 0;
+        assert!(config.validate().is_err(), "global zero must be rejected");
+        config.refresh_hours = sito_core::config::MAX_REFRESH_HOURS + 1;
+        assert!(
+            config.validate().is_err(),
+            "global over-cap must be rejected"
+        );
+        config.refresh_hours = sito_core::config::MAX_REFRESH_HOURS;
+        assert!(config.validate().is_ok(), "the global cap itself is valid");
+
+        config.categories.insert(
+            "adult".to_string(),
+            ListSourceConfig {
+                url: "https://example.com/adult.txt".to_string(),
+                refresh_hours: Some(sito_core::config::MAX_REFRESH_HOURS + 1),
+                license: None,
+            },
+        );
+        assert!(
+            config.validate().is_err(),
+            "per-category over-cap must be rejected"
+        );
+        config.categories.get_mut("adult").unwrap().refresh_hours = Some(0);
+        assert!(
+            config.validate().is_err(),
+            "per-category zero must be rejected"
+        );
+        config.categories.get_mut("adult").unwrap().refresh_hours =
+            Some(sito_core::config::MAX_REFRESH_HOURS);
+        assert!(config.validate().is_ok(), "the per-category cap is valid");
     }
 
     #[test]

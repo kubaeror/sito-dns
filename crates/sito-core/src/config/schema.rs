@@ -1136,12 +1136,15 @@ impl<'de> Deserialize<'de> for BlockingMode {
     }
 }
 
-/// Maximum accepted filter refresh interval in hours (one year).
+/// Maximum accepted refresh interval in hours (one year).
 ///
-/// The scheduler converts hours to a [`std::time::Duration`] and adds it to an
-/// [`std::time::Instant`]. Both config validation and the runtime interval
-/// helper clamp to this cap so an enormous value cannot overflow that
-/// arithmetic (or make a refresh deadline unreachable).
+/// Applies to `filtering.refresh_interval_hours`,
+/// `filtering.lists[].refresh_hours` and the `[integrations.lists]` default and
+/// per-category refresh values. The schedulers convert hours to a
+/// [`std::time::Duration`] and add it to an [`std::time::Instant`]. Both config
+/// validation and the runtime interval helpers clamp to this cap so an enormous
+/// value cannot overflow that arithmetic (or make a refresh deadline
+/// unreachable).
 pub const MAX_REFRESH_HOURS: u64 = 8760;
 
 /// A filter list definition to download and compile.
