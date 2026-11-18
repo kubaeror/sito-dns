@@ -1178,7 +1178,7 @@ The safety gate is the only work done before the 2.0 refactor. It closes all P0 
 - [x] Stream list parsing; enforce per-line/pattern/byte/rule/regex/DFA/compile budgets.
 - [x] Reject empty/zero-yield lists unless allowed; apply drop guard to all remote reload paths.
 - [x] Store URL in cache metadata; invalidate on URL change.
-- [x] Expose status/degraded counts and per-list errors via API/metrics.
+- [x] Expose status/degraded counts and per-list errors via API/metrics (existing API: failed/degraded list names plus the latest reload error; metrics: aggregate filter-health gauges; per-list error labels and a degraded-lists gauge remain follow-up metrics work).
 - [x] Cap `refresh_hours` and use checked time arithmetic.
 - **Acceptance:** hostile/empty/URL-change tests pass; status truthful; no OOM.
 **Estimate:** L.
@@ -1186,10 +1186,13 @@ The safety gate is the only work done before the 2.0 refactor. It closes all P0 
 **Status (2026-11-18):** Complete. The downloader streams the response body
 under the hard `max_list_bytes` cap and the parser iterates lines with
 per-line/pattern/rule and regex/DFA compile budgets; empty/zero-yield rejection
-and the drop guard are in place. URL-keyed cache identity, exact per-list
-status/error exposure through the API and metrics, and the one-year refresh cap
-landed in this slice. Evidence: Phase 2 — filter section in
-`docs/audit6-test-matrix.md` and §17 of `docs/2.0-public-api-diff.md`.
+and the drop guard are in place. URL-keyed cache identity and the one-year
+refresh cap landed in this slice. The existing API exposes failed/degraded list
+names and the latest reload error, and metrics expose aggregate filter-health
+gauges; the runtime status is truthful for URL changes. Per-list error labels
+and a degraded-lists gauge remain follow-up metrics work. Evidence: Phase 2 —
+filter section in `docs/audit6-test-matrix.md` and §17 of
+`docs/2.0-public-api-diff.md`.
 
 ### WP-2.4 — Filter precedence, groups, and rewrites
 

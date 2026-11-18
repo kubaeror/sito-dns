@@ -1284,7 +1284,7 @@ mod tests {
         let new_body = "||new.example^";
         let responses = vec![
             format!(
-                "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{old_body}",
+                "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nLast-Modified: Fri, 05 Sep 2026 00:00:00 GMT\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{old_body}",
                 old_body.len()
             ),
             "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -1400,6 +1400,10 @@ mod tests {
         assert!(
             !cache_path_for_list(&data_dir, "url-change-fail").exists(),
             "the old URL's cache must be quarantined"
+        );
+        assert!(
+            !meta_path_for_list(&data_dir, "url-change-fail").exists(),
+            "the old URL's metadata must be quarantined"
         );
 
         let _ = tokio::fs::remove_dir_all(&data_dir).await;
