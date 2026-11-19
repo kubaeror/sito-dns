@@ -497,6 +497,11 @@ pub struct HostsFilterEngine {
     group_defs: ArcSwap<Vec<GroupRuleSet>>,
     /// Compiled per-group rule sets, keyed by group name.
     group_snapshots: ArcSwap<FnvHashMap<String, Arc<FilterSnapshot>>>,
+    /// Test-only hook run by `set_group_rules` after it captures the list
+    /// generation and clones `list_rules`, just before the rebuild. Lets tests
+    /// interleave a concurrent reload deterministically.
+    #[cfg(test)]
+    group_rebuild_gate: std::sync::Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Optional sink for compile durations (wired to the metrics registry by
     /// the server binary; the filter crate cannot depend on sito-stats).
     compile_observer: std::sync::RwLock<Option<CompileObserver>>,

@@ -75,8 +75,14 @@ impl HostsFilterEngine {
         self.group_sources_configured
             .store(has_group_sources, Ordering::Release);
         self.group_defs.store(Arc::new(groups));
+        // Capture the generation before cloning the list map. A reload that
+        // completes between the clone and the rebuild must not let this
+        // rebuild publish its (then stale) rules under the newer generation.
+        let generation = self.list_generation.load(Ordering::SeqCst);
         let list_rules = sito_core::sync::lock_or_recover(&self.list_rules).clone();
-        if let Some(degraded) = self.rebuild_group_snapshots(&list_rules) {
+        #[cfg(test)]
+        self.run_group_rebuild_gate();
+        if let Some(degraded) = self.rebuild_group_snapshots_at(&list_rules, generation) {
             self.update_group_status(degraded);
         }
     }
@@ -100,8 +106,9 @@ impl HostsFilterEngine {
     /// Compiles one snapshot per group from the current per-list rules.
     ///
     /// Lists a group references but that are not loaded are skipped (the group
-    /// still gets its custom rules); a group with no usable rules is removed so
-    /// the pipeline does not evaluate an empty set.
+    /// still gets its custom rules) and mark it degraded. A group with
+    /// configured sources but no usable rules keeps its previous snapshot and
+    /// is reported degraded so it never disappears silently.
     pub(super) fn rebuild_group_snapshots(
         &self,
         list_rules: &FnvHashMap<String, Vec<Rule>>,
@@ -126,7 +133,12 @@ impl HostsFilterEngine {
         let mut compiled = FnvHashMap::default();
         let mut degraded_groups = Vec::new();
         for def in defs.iter() {
+            // A group with configured sources must never disappear silently:
+            // if none of them yields usable rules, the group is degraded.
+            // A group with no configured sources is simply inactive.
+            let has_sources = !def.lists.is_empty() || !def.custom_rules.is_empty();
             let mut rules = Vec::new();
+            let mut degraded = false;
             for list_name in &def.lists {
                 if let Some(list_rules) = list_rules.get(list_name) {
                     rules.extend(list_rules.iter().cloned());
@@ -136,6 +148,7 @@ impl HostsFilterEngine {
                         list = %list_name,
                         "Group policy references a filter list that is not loaded; rules from it are inactive"
                     );
+                    degraded = true;
                 }
             }
             let source = format!("group:{}", def.name);
@@ -158,23 +171,25 @@ impl HostsFilterEngine {
                             group = %def.name,
                             "Group custom_rules exceed the parsing budget; truncating group rules"
                         );
-                        degraded_groups.push(def.name.clone());
-                        if rules.is_empty() {
-                            // The group's only rules were the over-budget
-                            // custom rules. Carry over its previous snapshot
-                            // so a degraded group never disappears.
-                            if let Some(previous) = previous.get(&def.name) {
-                                compiled.insert(def.name.clone(), Arc::clone(previous));
-                            }
-                        }
+                        degraded = true;
                         break;
                     }
                 }
             }
             if rules.is_empty() {
+                // No usable rule from any configured source: missing or
+                // unloaded lists, invalid-only custom rules, an empty list,
+                // or a parse budget that consumed everything. Keep the
+                // previous snapshot when one exists so the group never
+                // disappears silently.
+                if has_sources {
+                    degraded_groups.push(def.name.clone());
+                    if let Some(previous) = previous.get(&def.name) {
+                        compiled.insert(def.name.clone(), Arc::clone(previous));
+                    }
+                }
                 continue;
             }
-            let mut degraded = false;
             if rules.len() > max_rules {
                 error!(
                     group = %def.name,
@@ -275,5 +290,14 @@ impl HostsFilterEngine {
         degraded_groups.dedup();
         self.group_snapshots.store(Arc::new(compiled));
         Some(degraded_groups)
+    }
+
+    /// Runs the test-only interleaving hook, if one is installed.
+    #[cfg(test)]
+    fn run_group_rebuild_gate(&self) {
+        let gate = sito_core::sync::lock_or_recover(&self.group_rebuild_gate).take();
+        if let Some(gate) = gate {
+            gate();
+        }
     }
 }

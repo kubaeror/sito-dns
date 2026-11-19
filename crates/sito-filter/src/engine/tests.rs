@@ -1145,6 +1145,272 @@ fn parse_line_for_test(line: &str) -> Rule {
     crate::parser::parse_line(line, "test", 1).expect("valid test rule")
 }
 
+/// P2-24: `set_group_rules` captures the list generation before cloning the
+/// list map. A reload that finishes before the rebuild must make the rebuild
+/// discard its stale compilation instead of publishing it under the newer
+/// generation.
+#[tokio::test]
+async fn test_set_group_rules_discards_reload_interleaved_after_clone() {
+    let temp_dir = std::env::temp_dir().join(format!("sito_group_set_race_{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    let groups = || {
+        vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: vec!["school".to_string()],
+            custom_rules: Vec::new(),
+        }]
+    };
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    // Seed the initial list state and publish the baseline group snapshot.
+    {
+        let mut initial = FnvHashMap::default();
+        initial.insert(
+            "school".to_string(),
+            vec![parse_line_for_test("||old.example^")],
+        );
+        *engine.list_rules.lock().unwrap() = initial;
+    }
+    engine.set_group_rules(groups());
+    assert!(
+        engine
+            .group_snapshot("kids")
+            .expect("baseline group snapshot")
+            .evaluate("old.example", RecordType::A, &client)
+            .is_blocked()
+    );
+
+    // Gate `set_group_rules` after it cloned the list map and before it
+    // rebuilds, so the test can slip a completed reload in between.
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *engine.group_rebuild_gate.lock().unwrap() = Some(Box::new(move || {
+        let _ = reached_tx.send(());
+        let _ = resume_rx.recv();
+    }));
+
+    std::thread::scope(|scope| {
+        let raced = scope.spawn(|| engine.set_group_rules(groups()));
+        reached_rx
+            .recv()
+            .expect("set_group_rules must reach the interleaving gate");
+
+        // Simulate the reload winning the race: store fresh list rules, bump
+        // the generation, and let the reload rebuild the group snapshots.
+        let mut newer = FnvHashMap::default();
+        newer.insert(
+            "school".to_string(),
+            vec![parse_line_for_test("||new.example^")],
+        );
+        *engine.list_rules.lock().unwrap() = newer.clone();
+        engine.list_generation.fetch_add(1, Ordering::SeqCst);
+        engine
+            .rebuild_group_snapshots(&newer)
+            .expect("the reload rebuild must publish");
+
+        resume_tx.send(()).unwrap();
+        raced.join().expect("set_group_rules thread must not panic");
+    });
+
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("reload group snapshot");
+    assert!(
+        snapshot
+            .evaluate("new.example", RecordType::A, &client)
+            .is_blocked(),
+        "the reloaded rules must stay published"
+    );
+    assert!(
+        snapshot
+            .evaluate("old.example", RecordType::A, &client)
+            .is_allowed(),
+        "the list map cloned before the reload must not be published afterwards"
+    );
+}
+
+/// A group whose referenced list is not loaded keeps its previous snapshot and
+/// is reported degraded instead of silently disappearing.
+#[tokio::test]
+async fn test_missing_list_group_retains_previous_snapshot_and_is_degraded() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_group_missing_list_{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    let groups = || {
+        vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: vec!["school".to_string()],
+            custom_rules: Vec::new(),
+        }]
+    };
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    {
+        let mut lists = FnvHashMap::default();
+        lists.insert(
+            "school".to_string(),
+            vec![parse_line_for_test("||keep.example^")],
+        );
+        *engine.list_rules.lock().unwrap() = lists;
+    }
+    engine.set_group_rules(groups());
+    assert!(
+        engine
+            .group_snapshot("kids")
+            .expect("initial group snapshot")
+            .evaluate("keep.example", RecordType::A, &client)
+            .is_blocked()
+    );
+
+    // The referenced list is no longer loaded (removed/disabled).
+    engine.list_rules.lock().unwrap().remove("school");
+    engine.set_group_rules(groups());
+
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("the previous group snapshot must survive a missing list");
+    assert!(
+        snapshot
+            .evaluate("keep.example", RecordType::A, &client)
+            .is_blocked(),
+        "the retained group snapshot must stay active"
+    );
+    assert!(
+        engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "a missing-list group must be reported degraded"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A group whose custom rules are all invalid keeps its previous snapshot and
+/// is reported degraded.
+#[tokio::test]
+async fn test_invalid_only_custom_rules_retain_previous_snapshot() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_group_invalid_only_{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: Vec::new(),
+        custom_rules: vec!["||keep-group.example^".to_string()],
+    }]);
+    assert!(
+        engine
+            .group_snapshot("kids")
+            .expect("initial group snapshot")
+            .evaluate("keep-group.example", RecordType::A, &client)
+            .is_blocked()
+    );
+
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: Vec::new(),
+        custom_rules: vec!["||bad.example^$dnsrewrite=garbage!!".to_string()],
+    }]);
+
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("the previous group snapshot must survive invalid-only rules");
+    assert!(
+        snapshot
+            .evaluate("keep-group.example", RecordType::A, &client)
+            .is_blocked(),
+        "the retained snapshot must stay active"
+    );
+    assert!(
+        engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "a group with invalid-only custom rules must be reported degraded"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A group without configured sources stays absent and is not degraded.
+#[tokio::test]
+async fn test_group_with_no_sources_is_absent_and_not_degraded() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_group_no_sources_{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "empty".to_string(),
+        lists: Vec::new(),
+        custom_rules: Vec::new(),
+    }]);
+
+    assert!(
+        engine.group_snapshot("empty").is_none(),
+        "a source-less group must not be published"
+    );
+    assert!(
+        !engine
+            .status()
+            .degraded_groups
+            .contains(&"empty".to_string()),
+        "a source-less group is inactive, not degraded"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A missing list marks the group degraded even when its custom rules still
+/// compile, so the inactive list reference stays observable.
+#[tokio::test]
+async fn test_missing_list_with_custom_rules_is_degraded_but_published() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_group_missing_list_custom_{}",
+        std::process::id()
+    ));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: vec!["missing".to_string()],
+        custom_rules: vec!["||custom.example^".to_string()],
+    }]);
+
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("the custom rules must still be published");
+    assert!(
+        snapshot
+            .evaluate("custom.example", RecordType::A, &client)
+            .is_blocked()
+    );
+    assert!(
+        engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "the unloaded list reference must mark the group degraded"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 #[tokio::test]
 async fn test_all_list_failure_is_observable_and_not_advertised_ready() {
     let temp_dir = std::env::temp_dir().join(format!("sito_all_fail_test_{}", std::process::id()));
@@ -2030,7 +2296,74 @@ async fn test_group_snapshots_honor_compile_budget() {
 
     assert!(
         engine.group_snapshot("kids").is_none(),
-        "a group whose regex compile exceeds the budget must not be published"
+        "a group whose regex compile exceeds the budget must not be published without a previous snapshot"
+    );
+    assert!(
+        engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "a group dropped by the compile budget must be reported degraded"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Variant of [`test_group_snapshots_honor_compile_budget`]: a group that was
+/// published before must keep its previous snapshot when the new rules cannot
+/// be compiled within the budget.
+#[tokio::test]
+async fn test_group_snapshots_honor_compile_budget_retains_previous() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_group_budget_previous_{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(
+        FilteringConfig {
+            regex_compile_budget_ms: Some(1),
+            ..Default::default()
+        },
+        temp_dir.clone(),
+    );
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: Vec::new(),
+        custom_rules: vec!["||keep-group.example^".to_string()],
+    }]);
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    assert!(
+        engine
+            .group_snapshot("kids")
+            .expect("the cheap group must publish initially")
+            .evaluate("keep-group.example", RecordType::A, &client)
+            .is_blocked()
+    );
+
+    let custom_rules: Vec<String> = (0..2048)
+        .map(|i| format!("/^group-{i}\\..*\\.example$/"))
+        .collect();
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: Vec::new(),
+        custom_rules,
+    }]);
+
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("the previous group snapshot must survive the compile budget failure");
+    assert!(
+        snapshot
+            .evaluate("keep-group.example", RecordType::A, &client)
+            .is_blocked(),
+        "the retained snapshot must stay active"
+    );
+    assert!(
+        engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "the retained group must be reported degraded"
     );
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;

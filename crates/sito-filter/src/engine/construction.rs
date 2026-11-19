@@ -23,6 +23,8 @@ impl HostsFilterEngine {
             status: ArcSwap::new(Arc::new(status)),
             group_defs: ArcSwap::new(Arc::new(Vec::new())),
             group_snapshots: ArcSwap::new(Arc::new(FnvHashMap::default())),
+            #[cfg(test)]
+            group_rebuild_gate: std::sync::Mutex::new(None),
             compile_observer: std::sync::RwLock::new(None),
             status_observer: std::sync::RwLock::new(None),
             snapshot_observer: std::sync::RwLock::new(None),
