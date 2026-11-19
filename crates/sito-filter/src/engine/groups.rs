@@ -147,6 +147,9 @@ impl HostsFilterEngine {
             let mut rules = Vec::new();
             let mut degraded = false;
             for list_name in &def.lists {
+                if list_name.trim().is_empty() {
+                    continue;
+                }
                 if let Some(list_rules) = list_rules.get(list_name) {
                     rules.extend(list_rules.iter().cloned());
                 } else {

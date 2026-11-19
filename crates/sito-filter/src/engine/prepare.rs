@@ -174,8 +174,11 @@ impl HostsFilterEngine {
         self.config.store(Arc::new(config));
         self.group_defs.store(Arc::new(group_defs));
         self.snapshot.store(snapshot);
-        self.group_snapshots.store(group_snapshots);
+        // Bump the generation before publishing group snapshots: a concurrent
+        // public `set_group_rules` caller captures the generation before it
+        // clones the list map, and must observe this publication as newer.
         self.list_generation.fetch_add(1, Ordering::SeqCst);
+        self.group_snapshots.store(group_snapshots);
         let rule_count = status.rule_count;
         self.set_status(status);
         drop(guard);

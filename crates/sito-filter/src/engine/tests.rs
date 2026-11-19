@@ -1422,6 +1422,44 @@ async fn test_missing_list_with_custom_rules_is_degraded_but_published() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// Blank `lists` entries are not sources and must not mark a group with valid
+/// custom rules degraded.
+#[tokio::test]
+async fn test_blank_list_with_custom_rules_is_not_degraded() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_group_blank_list_custom_{}",
+        std::process::id()
+    ));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: vec![String::new()],
+        custom_rules: vec!["||custom.example^".to_string()],
+    }]);
+
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("the custom rules must be published");
+    assert!(
+        snapshot
+            .evaluate("custom.example", RecordType::A, &client)
+            .is_blocked()
+    );
+    assert!(
+        !engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "a blank list name is not a source and must not degrade the group"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 #[tokio::test]
 async fn test_all_list_failure_is_observable_and_not_advertised_ready() {
     let temp_dir = std::env::temp_dir().join(format!("sito_all_fail_test_{}", std::process::id()));

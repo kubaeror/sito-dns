@@ -199,6 +199,7 @@ pub async fn add_rewrite(
     params(("id" = String, Path, description = "Stable rewrite ID")),
     responses(
         (status = 200, description = "DNS rewrite updated", body = RewriteDto),
+        (status = 400, description = "Bad Request"),
         (status = 404, description = "Not Found"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")

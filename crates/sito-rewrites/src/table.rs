@@ -1,7 +1,7 @@
 //! DNS rewrite table implementation supporting exact, wildcard, CNAME chains, and auto-PTR.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, PTR, TXT};
@@ -129,12 +129,19 @@ impl RewriteTable {
                 None => None,
             };
             let is_wildcard = wildcard_suffix.is_some();
+            // MAC-shaped exceptions must match the registry's canonical
+            // lowercase colon form; free-form client/group names stay as-is.
+            let exception_clients: Vec<String> = entry
+                .exception_clients
+                .iter()
+                .map(|value| canonicalize_exception_client(value))
+                .collect();
 
             let rule = StoredRule {
                 wildcard_suffix,
                 record_type,
                 data: rdata.clone(),
-                exception_clients: entry.exception_clients.clone(),
+                exception_clients: exception_clients.clone(),
             };
 
             if is_wildcard {
@@ -158,7 +165,7 @@ impl RewriteTable {
                                         wildcard_suffix: None,
                                         record_type: RecordType::PTR,
                                         data: LocalRecordData::Ptr(target_name),
-                                        exception_clients: entry.exception_clients.clone(),
+                                        exception_clients: exception_clients.clone(),
                                     },
                                 ));
                             }
@@ -174,7 +181,7 @@ impl RewriteTable {
                                     wildcard_suffix: None,
                                     record_type: RecordType::PTR,
                                     data: LocalRecordData::Ptr(target_name),
-                                    exception_clients: entry.exception_clients.clone(),
+                                    exception_clients: exception_clients.clone(),
                                 },
                             ));
                         }
@@ -411,6 +418,47 @@ impl RewriteTable {
 
         Record::from_rdata(qname.clone(), self.ttl, rdata)
     }
+}
+
+/// Canonicalizes a MAC-shaped `exception_clients` value to lowercase
+/// colon-separated form (`aa:bb:cc:dd:ee:ff`).
+///
+/// The client registry stores identity MACs in that canonical form, while
+/// operators may write `:` or `-` separators (or an all-hex dotted form) in
+/// upper or lower case. This mirrors `sito_clients::mac::normalize_mac`; the
+/// logic is duplicated locally so `sito-rewrites` does not depend on
+/// `sito-clients`.
+///
+/// Only values that contain a MAC separator (`:`, `-` or `.`) are considered,
+/// so free-form client/group names are returned unchanged and a bare hex
+/// string is never mistaken for a MAC address.
+fn canonicalize_exception_client(value: &str) -> String {
+    // An address or CIDR is never a MAC, even when its hex digits happen to
+    // count twelve (for example `::aa:bb:cc:dd:ee:ff`).
+    if value.contains('/') || value.parse::<IpAddr>().is_ok() {
+        return value.to_string();
+    }
+    if !(value.contains(':') || value.contains('-') || value.contains('.')) {
+        return value.to_string();
+    }
+
+    let hex: String = value
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    if hex.len() != 12 {
+        return value.to_string();
+    }
+
+    let mut mac = String::with_capacity(17);
+    for (index, digit) in hex.chars().enumerate() {
+        if index > 0 && index % 2 == 0 {
+            mac.push(':');
+        }
+        mac.push(digit);
+    }
+    mac
 }
 
 fn is_client_excepted(client: &ClientContext, exceptions: &[String]) -> bool {
@@ -996,6 +1044,65 @@ entries = [
                 &client
             )),
             "a spaced authenticated client name must match the exception exactly"
+        );
+    }
+
+    /// MAC-shaped exceptions are canonicalized to the registry's lowercase
+    /// colon form, so dash, dotted and uppercase spellings all bypass.
+    #[test]
+    fn test_mac_exception_forms_match_canonical_identity_mac() {
+        use sito_core::IdentitySource;
+
+        for exception in ["aa-bb-cc-dd-ee-ff", "AA:BB:CC:DD:EE:FF", "aabb.ccdd.eeff"] {
+            let config: RewritesConfig = toml::from_str(&format!(
+                r#"
+auto_ptr = false
+entries = [
+    {{ domain = "nas.home.arpa", type = "A", answer = "192.168.1.10", exception_clients = ["{exception}"] }},
+]
+"#
+            ))
+            .unwrap();
+            let table = RewriteTable::new(config);
+            let qname = Name::from_str("nas.home.arpa.").unwrap();
+
+            let mut client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+            client.mac = Some("aa:bb:cc:dd:ee:ff".to_string());
+            client.identity_source = Some(IdentitySource::Ip);
+            assert!(
+                is_not_found(&table.lookup(&qname, RecordType::A, &client)),
+                "{exception} must match the canonical identity MAC and bypass the rewrite"
+            );
+
+            let mut other = ClientContext::new(IpAddr::from_str("192.168.1.21").unwrap());
+            other.mac = Some("11:22:33:44:55:66".to_string());
+            other.identity_source = Some(IdentitySource::Ip);
+            assert!(
+                is_answered(&table.lookup(&qname, RecordType::A, &other)),
+                "{exception} must not bypass a different identity MAC"
+            );
+        }
+    }
+
+    /// Free-form names are not reinterpreted as MAC addresses.
+    #[test]
+    fn test_canonicalize_exception_client_keeps_names_unchanged() {
+        for name in [
+            "Admin Laptop",
+            "admin-laptop",
+            "Jane's Phone",
+            "deadbeefcafe",
+        ] {
+            assert_eq!(canonicalize_exception_client(name), name);
+        }
+        assert_eq!(
+            canonicalize_exception_client("AA-BB-CC-DD-EE-FF"),
+            "aa:bb:cc:dd:ee:ff"
+        );
+        assert_eq!(
+            canonicalize_exception_client("::aa:bb:cc:dd:ee:ff"),
+            "::aa:bb:cc:dd:ee:ff",
+            "a valid IPv6 address is never reinterpreted as a MAC"
         );
     }
 

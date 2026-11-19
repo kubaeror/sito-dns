@@ -1028,7 +1028,7 @@ The safety gate is the only work done before the 2.0 refactor. It closes all P0 
 
 ### WP-1.2 — Normalized domain and client identity model
 
-**Addresses:** P1-9, P2-31..P2-35, P2-97..P2-99, IDN gaps.
+**Addresses:** P1-9, P2-97..P2-99, IDN gaps.
 **Files:** `sito-core/src/{domain,client}.rs`, `sito-clients/src/{registry,mac,schedule}.rs`, `sito-filter/src/parser.rs`, `sito-rewrites/src/table.rs`.
 **Interfaces:** `NormalizedDomain`, `ClientIdentity`, `IdentitySource`.
 **Steps:**
@@ -1210,9 +1210,11 @@ filter section in `docs/audit6-test-matrix.md` and §17 of
 `Allow > Rewrite > Block` within a tier, group-overlay tie-breaking and the
 `$important` tier; the code and ADR-0007 record the P2-25 direct-path
 resolution (a group standard `$dnsrewrite` overrides a global standard block,
-while an important block still wins). Groups retain the previous snapshot and
-report `degraded_groups` on missing/unloaded lists, invalid-only rules and
-compile-budget failures; publication is generation-guarded and serialized.
+while an important block still wins). Groups retain the previous snapshot when
+one exists and report `degraded_groups` on missing/unloaded lists, invalid-only
+rules and compile-budget failures; a first failure reports the group degraded
+without publishing an empty snapshot, and publication is generation-guarded and
+serialized.
 Local A/AAAA/PTR/TXT owners return NODATA for unconfigured qtypes with an
 exception-client fall-through, TXT values are chunked, rewrite config/API
 validation rejects inert entries, and safe search is limited to A/AAAA/HTTPS.
