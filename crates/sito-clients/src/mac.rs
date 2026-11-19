@@ -455,6 +455,19 @@ mod tests {
 
         // Re-installing the same snapshot keeps the positive cache warm.
         resolver.set_mock_arp(mock);
+        {
+            let cache = resolver.cache.read().unwrap();
+            assert!(
+                cache.contains_key(&ip),
+                "an identical refresh must not clear the positive cache"
+            );
+            let entry = cache.get(&ip).expect("positive cache entry");
+            assert_eq!(
+                entry.epoch,
+                resolver.epoch.load(Ordering::SeqCst),
+                "the cached entry belongs to the current snapshot epoch"
+            );
+        }
         assert_eq!(
             resolver.resolve_mac(ip),
             Some("aa:bb:cc:dd:ee:ff".to_string())
@@ -558,25 +571,49 @@ mod tests {
     }
 
     #[test]
-    fn test_negative_cache_expiry_allows_fresh_snapshot_entry() {
-        let resolver = MacResolver::with_ttls(Duration::from_secs(60), Duration::ZERO);
+    fn test_negative_cache_suppresses_until_ttl_expiry() {
+        let resolver = MacResolver::with_ttls(Duration::from_secs(60), Duration::from_millis(60));
         let ip = IpAddr::from_str("192.168.1.51").unwrap();
 
+        // An unchanged empty snapshot: the first miss is negatively cached.
         resolver.set_mock_arp(HashMap::new());
         assert_eq!(resolver.resolve_mac(ip), None);
+        let first_expiry = {
+            let negative = resolver.negative.read().unwrap();
+            let entry = negative.get(&ip).expect("negative entry cached");
+            assert_eq!(entry.epoch, resolver.epoch.load(Ordering::SeqCst));
+            entry.expires_at
+        };
 
-        // Simulate the address appearing in the snapshot without an
-        // install-time invalidation (for example a concurrent refresh). An
-        // expired negative entry must not suppress the fresh value.
-        resolver
-            .snapshot
-            .write()
-            .unwrap()
-            .insert(ip, "aa:bb:cc:dd:ee:01".to_string());
+        // While the entry is fresh the retry is suppressed without a snapshot
+        // lookup, so the cached expiry is not refreshed.
+        assert_eq!(resolver.resolve_mac(ip), None);
+        let suppressed_expiry = {
+            let negative = resolver.negative.read().unwrap();
+            negative
+                .get(&ip)
+                .expect("negative entry retained")
+                .expires_at
+        };
         assert_eq!(
-            resolver.resolve_mac(ip).as_deref(),
-            Some("aa:bb:cc:dd:ee:01"),
-            "an expired negative entry must not suppress a fresh snapshot entry"
+            suppressed_expiry, first_expiry,
+            "a fresh negative entry must suppress the retry"
+        );
+
+        // After the TTL the next lookup retries the snapshot and refreshes the
+        // negative entry instead of serving the stale miss.
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(resolver.resolve_mac(ip), None);
+        let retried_expiry = {
+            let negative = resolver.negative.read().unwrap();
+            negative
+                .get(&ip)
+                .expect("negative entry refreshed")
+                .expires_at
+        };
+        assert!(
+            retried_expiry > suppressed_expiry,
+            "an expired negative entry must allow a retry"
         );
     }
 
