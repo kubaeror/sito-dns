@@ -81,7 +81,7 @@ per-group rule sets are evaluated independently, then combined with this rank:
 |---|---|
 | 3 | `Allow` (`@@...`) |
 | 2 | `Rewrite` (`$dnsrewrite`) |
-| 1 | `Block` (`||...^`) |
+| 1 | `Block` (`\|\|...^`) |
 | 0 | no match (`Allow(None)`) |
 
 1. Within a tier the order is `Allow > Rewrite > Block`.

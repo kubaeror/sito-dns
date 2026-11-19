@@ -30,7 +30,7 @@ Incoming Request
 ```
 
 ### Invariants:
-1. **Explicit Identity Beats IP:** A client ID provided in the DoH path (`/dns-query/kids-phone`) or DoT SNI (`kids-phone.dns.lan`) always overrides the client's source IP address.
+1. **Explicit Identity Beats IP:** A client ID supplied via the DoH path (`/dns-query/kids-phone`) or DoT SNI (`kids-phone.dns.lan`) overrides the client's source IP address only when it is registry-authenticated by a configured shared secret. A raw path/SNI label without a matching secret is display-only and never grants policy identity or satisfies `$client`.
 2. **Graceful Fallback:** Unidentified clients are routed to the `default` group. Unidentified clients discovered via RouterOS or ARP are recorded in `unidentified_clients` for administrative discovery without interrupting resolution.
 3. **RouterOS Lease Sync:** Queries the RouterOS REST API periodically (default 300s). Router outages or network partitions trigger warnings and gracefully degrade, retaining existing leases.
 

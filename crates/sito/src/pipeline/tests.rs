@@ -907,7 +907,7 @@ async fn spawn_mock_upstream(
                     resp.answers.push(Record::from_rdata(
                         question.name().clone(),
                         300,
-                        RData::A(A(std::net::Ipv4Addr::new(203, 0, 113, 9))),
+                        RData::A(A(MOCK_UPSTREAM_A)),
                     ));
                 }
                 let encoded = sito_proto::encode_message(&resp).unwrap();
@@ -1469,7 +1469,7 @@ async fn test_policy_global_important_block_beats_group_rewrite_end_to_end() {
         ..Default::default()
     };
     let (pipeline, calls, temp_dir) =
-        policy_pipeline(&["||pinned.example^$important"], clients).await;
+        policy_pipeline(&["||pinned.example^$important"], clients.clone()).await;
 
     for ip in ["127.0.0.1", "127.0.0.2"] {
         let response = pipeline
@@ -1491,6 +1491,29 @@ async fn test_policy_global_important_block_beats_group_rewrite_end_to_end() {
         "an important block must stop before upstream"
     );
 
+    // Positive control: without the important block, the same group rule
+    // rewrites locally, so the block above is attributable to the tier, not a
+    // broken rewrite.
+    let (control, control_calls, control_temp_dir) = policy_pipeline(&[], clients).await;
+    let rewritten = control
+        .handle(
+            rewrite_query("pinned.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&rewritten),
+        vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+        "without the important block the group rewrite must apply"
+    );
+    assert_eq!(
+        control_calls.load(Ordering::SeqCst),
+        0,
+        "the positive-control rewrite must not reach upstream"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&control_temp_dir).await;
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
@@ -1568,7 +1591,7 @@ async fn test_policy_global_important_allow_beats_group_important_block_end_to_e
         ..Default::default()
     };
     let (pipeline, calls, temp_dir) =
-        policy_pipeline(&["@@||clearance.example^$important"], clients).await;
+        policy_pipeline(&["@@||clearance.example^$important"], clients.clone()).await;
 
     // Use distinct names so the second lookup cannot be served from the cache.
     for (ip, name) in [
@@ -1594,6 +1617,28 @@ async fn test_policy_global_important_allow_beats_group_important_block_end_to_e
         "both clients must resolve upstream"
     );
 
+    // Positive control: without the global important allow, the same group
+    // important block does block its member, so the allow above is real.
+    let (control, control_calls, control_temp_dir) = policy_pipeline(&[], clients).await;
+    let blocked = control
+        .handle(
+            rewrite_query("clearance.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&blocked),
+        vec![std::net::Ipv4Addr::UNSPECIFIED],
+        "without the global important allow the group important block must apply"
+    );
+    assert_eq!(
+        control_calls.load(Ordering::SeqCst),
+        0,
+        "the positive-control block must stop before upstream"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&control_temp_dir).await;
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
@@ -3689,6 +3734,11 @@ fn test_group_global_precedence_table() {
             "||blocked.example^".to_string(),
         )))
     };
+    let group_block = || {
+        Verdict::Block(BlockReason::Rule(RuleRef::new(
+            "||group-blocked.example^".to_string(),
+        )))
+    };
     let allow = || Verdict::Allow(Some(RuleRef::new("@@||allowed.example^".to_string())));
     let no_match = || Verdict::Allow(None);
     let rewrite = || {
@@ -3714,11 +3764,15 @@ fn test_group_global_precedence_table() {
         combine_standard_verdicts(allow(), Some(rewrite())),
         Verdict::Allow(_)
     ));
-    // Ties go to the group overlay.
-    assert!(matches!(
-        combine_standard_verdicts(block(), Some(block())),
-        Verdict::Block(_)
-    ));
+    // Ties go to the group overlay, so the combined verdict carries the
+    // group rule text (not just "some block").
+    match combine_standard_verdicts(block(), Some(group_block())) {
+        Verdict::Block(BlockReason::Rule(rule)) => assert_eq!(
+            rule.rule_text, "||group-blocked.example^",
+            "an equally ranked tie must keep the group overlay's rule"
+        ),
+        other => panic!("expected the group block to win the tie, got {other:?}"),
+    }
 
     // Important tier: a group `@@...$important` overrides a global
     // `$important` block (the old code returned the global block first).
