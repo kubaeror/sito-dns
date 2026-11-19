@@ -525,6 +525,14 @@ async fn test_local_rewrite_owner_returns_nodata_for_unconfigured_types() {
             "{qtype:?} must be NODATA instead of querying upstream: {:?}",
             resp.answers
         );
+        assert_eq!(resp.metadata.id, 42, "{qtype:?} must echo the query ID");
+        assert_eq!(resp.queries.len(), 1, "{qtype:?} must echo the question");
+        assert_eq!(
+            resp.queries[0].name(),
+            &Name::from_str("printer.lan.").unwrap(),
+            "{qtype:?} must echo the query name"
+        );
+        assert_eq!(resp.queries[0].query_type(), qtype);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -612,6 +620,17 @@ async fn test_local_rewrite_txt_values_are_chunked() {
             "{domain} chunks must fit one character-string"
         );
         assert_eq!(strings.concat(), expected, "{domain} must round-trip");
+
+        let encoded = sito_proto::encode_message(&resp)
+            .unwrap_or_else(|error| panic!("{domain} TXT response must encode: {error}"));
+        let decoded = sito_proto::decode_message(&encoded)
+            .unwrap_or_else(|error| panic!("{domain} TXT response must decode: {error}"));
+        assert_eq!(decoded.metadata.id, resp.metadata.id);
+        assert_eq!(
+            decoded.answers.len(),
+            1,
+            "{domain} must survive encode/decode"
+        );
     }
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;

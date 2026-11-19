@@ -185,6 +185,11 @@ impl RewriteTable {
     }
 
     /// Look up local rewrite records for a query.
+    ///
+    /// A local owner is authoritative for its name: an unconfigured `qtype`
+    /// returns [`RewriteLookup::NoData`], which terminates the later
+    /// `$dnsrewrite` and safe-search stages. `ANY` at a local owner is
+    /// therefore NODATA by design.
     pub fn lookup(&self, qname: &Name, qtype: RecordType, client: &ClientContext) -> RewriteLookup {
         let mut visited = Vec::new();
         self.lookup_inner(qname, qtype, client, &mut visited, 0)
@@ -1137,6 +1142,54 @@ entries = [
             table.lookup(&qname, RecordType::AAAA, &allowed),
             RewriteLookup::NoData
         ));
+    }
+
+    #[test]
+    fn test_partially_excepted_owner_still_answers_with_remaining_records() {
+        let config: RewritesConfig = toml::from_str(
+            r#"
+auto_ptr = false
+entries = [
+    { domain = "printer.lan", type = "A", answer = "192.168.1.50", exception_clients = ["10.0.0.0/8"] },
+    { domain = "printer.lan", type = "A", answer = "192.168.1.51" },
+]
+"#,
+        )
+        .unwrap();
+        let table = RewriteTable::new(config);
+        let qname = Name::from_str("printer.lan.").unwrap();
+
+        // The excepted client only skips the one matching exception; the other
+        // rule still answers, so the result is Answered rather than NODATA or
+        // an upstream fallthrough.
+        let excepted = ClientContext::new(IpAddr::from_str("10.10.4.7").unwrap());
+        let records = answered(table.lookup(&qname, RecordType::A, &excepted));
+        let ips: Vec<Ipv4Addr> = records
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ips, vec![Ipv4Addr::new(192, 168, 1, 51)]);
+
+        // A non-excepted client gets every rule applicable to it.
+        let allowed = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+        let records = answered(table.lookup(&qname, RecordType::A, &allowed));
+        let ips: Vec<Ipv4Addr> = records
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ips,
+            vec![
+                Ipv4Addr::new(192, 168, 1, 50),
+                Ipv4Addr::new(192, 168, 1, 51),
+            ]
+        );
     }
 
     #[test]

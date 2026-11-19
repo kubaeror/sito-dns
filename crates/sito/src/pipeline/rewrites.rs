@@ -152,6 +152,10 @@ pub(super) fn effective_rewrites(
 
 impl PipelineContext<'_> {
     /// ADR-0007 stage 2: local rewrite table and auto-PTR records.
+    ///
+    /// A local owner is authoritative: an unconfigured qtype returns NODATA
+    /// here, before the standard `$dnsrewrite` and safe-search stages. `ANY`
+    /// at a local owner is NODATA by design.
     pub(super) fn apply_local_rewrite(&self) -> Option<QueryOutcome> {
         let lookup = self
             .runtime_snapshot
