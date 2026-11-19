@@ -200,7 +200,7 @@ The catalog lists every material finding from the eight audits. Some P2/P3 items
 | **P2-25** | Filter | Group standard `$dnsrewrite` can override a global block; group `$important @@` cannot override a global `$important` block. |
 | **P2-26** | Filter | Group snapshot rebuild can race with list reload and publish a snapshot compiled from stale list rules. |
 | **P2-27** | Filter | Huge `refresh_hours` can panic on `Instant + Duration` overflow; config validation only rejects zero. |
-| **P2-28** | Filter | `apply_content_forced` is never used by production refresh, so a legitimate >50% shrink is rejected forever. |
+| **P2-28** | Filter | `apply_content_forced` was never used by production refresh, so a legitimate >50% shrink was rejected forever. **Resolved by WP-2.5:** the operator-initiated curated-list refresh endpoint (`POST /api/v1/filtering/lists/{category}/refresh`) uses the forced path; the periodic task keeps the guarded path. |
 | **P2-29** | Filter | Disk cache identity is keyed only by list name, not URL; changing URL while keeping the name serves stale/foreign rules. |
 | **P2-30** | Filter | RouterOS client uses env proxies, silently falls through when `token_env` is missing, and reads unbounded error bodies. |
 | **P2-31** | Rewrites | Local `TXT` rewrites do not split into 255-byte character-strings; long TXT values fail encoding. |
@@ -282,7 +282,7 @@ The catalog lists every material finding from the eight audits. Some P2/P3 items
 | P3-2 | Code | 114 functions >100 lines; `DnsPipeline::handle` 669, `validate_response_inner` 585, `render_prometheus` 501, `run_server_full` 437, `start_doh3_listener` 395. |
 | P3-3 | Code | Workspace production: 63 `unwrap`, 26 `expect`, 2 panic sites, 147 `let _ =`, 96 `.ok()`, 41 `unwrap_or_default`, 24 `#[allow]`. |
 | P3-4 | Code | `sito-ha` has 20 `Mutex::lock().unwrap()` calls; poison would abort release. `pktinfo.rs` has 17 unsafe sites, blanket `clippy::all`/`pedantic` allow, no SAFETY comments. |
-| P3-5 | Code | Dead/test-only APIs: `run_server`, `run_healthcheck` re-export, `Config::network_exposure_warnings`, `DnsPipeline::with_anti_bypass`, `extract_query_info`, `RewriteAction::SynthesizeAnswer`, `RuntimeLists::apply_content_forced`, `FilterStatus` external use, `MAX_REGEX_BATCHES`, `config_writer::save_config_atomic`, `Session::to_cookie_header`, `AuthManager::admin_count`. |
+| P3-5 | Code | Dead/test-only APIs: `run_server`, `run_healthcheck` re-export, `Config::network_exposure_warnings`, `DnsPipeline::with_anti_bypass`, `extract_query_info`, `RewriteAction::SynthesizeAnswer`, `FilterStatus` external use, `MAX_REGEX_BATCHES`, `config_writer::save_config_atomic`, `Session::to_cookie_header`, `AuthManager::admin_count`. |
 | P3-6 | Code | Duplicated logic: three DNSSEC chain walkers, TCP/DoT writer loops, DoH/DoH3 request parsing, DoQ/DoH3 cert polling, four TLS acceptor sets, three CIDR parsers, two suffix matchers, six `mock_context` helpers, 22 hardcoded `"1.2.1"` test fixtures. |
 | P3-7 | Code | Unused dependencies: `sito-stats` declares `sito-core`; `sito-rewrites` declares `serde_json`/`thiserror`. `tokio full` used workspace-wide. `rust-version = "1.99.1"` is an exact pin, not a minimum. |
 | P3-8 | Code | Hardcoded values: 20+ transport timeouts/caps, 16 DNSSEC policy constants, `0.0.0.0` ACME bind, `127.0.0.1:8080`/`:53` health probe, `admin@example.com`, `example.com`, `localhost.`, 3600000 repeated in SQL, `HOUR_MS` absent. |
@@ -399,7 +399,7 @@ This is the explicit cleanup list for the refactor. Each item is either removed,
 | `DnsPipeline::with_anti_bypass` | `sito/src/pipeline.rs:679` | Test-only; delete; WP-1.1. |
 | `extract_query_info` | `sito-proto/src/wire.rs:22` | Delete; WP-1.1. |
 | `RewriteAction::SynthesizeAnswer` | `sito-core/src/verdict.rs:62` | Never constructed; delete; WP-1.1. |
-| `RuntimeLists::apply_content_forced` | `sito-clients/src/runtime_lists.rs:239-242` | Wire force refresh or delete; WP-2.5. |
+| `RuntimeLists::apply_content_forced` | `sito-clients/src/runtime_lists.rs` | Wired: operator-initiated curated-list refresh uses the forced path; the periodic task keeps the guarded path. WP-2.5. |
 | `FilterStatus` external use | `sito-filter` | Expose via API/metrics; WP-2.3. |
 | `MAX_REGEX_BATCHES` | `sito-filter/src/structures/compiled.rs` | Dead limit; delete or derive; WP-2.3. |
 | `config_writer::save_config_atomic` | `sito-api/src/config_writer.rs` | No production caller; delete; WP-1.1. |

@@ -169,6 +169,10 @@ pub struct RuntimeListStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     /// Number of entries in the currently active content.
+    ///
+    /// For `services` this stays the number of service ids for display, while
+    /// the emptiness/truncation guards measure the registry's usable rule
+    /// count instead.
     pub entries: u64,
     /// Whether the active content is the bundled fallback.
     pub bundled: bool,
@@ -368,7 +372,10 @@ impl RuntimeLists {
     ///
     /// Applies a >50% truncation guard: after a category has been refreshed
     /// from an external source, content with fewer than half of the previous
-    /// entries is rejected to protect against partial/corrupted downloads.
+    /// effective entries is rejected to protect against partial/corrupted
+    /// downloads. For `services` the effective count is the number of usable
+    /// domain rules, not the number of service ids; for domain categories it is
+    /// the number of parsed domains.
     /// Use [`RuntimeLists::apply_content_forced`] to accept an intentional
     /// shrink.
     pub fn apply_content(&self, category: &str, content: &str) -> Result<u64, String> {
@@ -394,22 +401,30 @@ impl RuntimeLists {
         // Canonical key: `"Adult"` and `"adult"` must update (and clear the
         // bundled flag on) one shared status row.
         let category_key = category.to_ascii_lowercase();
-        let (entries, new_parental, new_services) = if category_key == "services" {
+        // `status_entries` feeds the public status row; `effective` is what the
+        // emptiness and truncation guards measure. They differ for `services`:
+        // the status keeps reporting service ids, while the guards count the
+        // usable domain rules that actually block queries.
+        let (status_entries, effective, new_parental, new_services) = if category_key == "services"
+        {
             let registry = ServiceRegistry::from_json(content).map_err(|e| e.to_string())?;
-            let entries = registry.service_count() as u64;
-            (entries, None, Some(Arc::new(registry)))
+            let status_entries = registry.service_count() as u64;
+            let effective = registry.rule_count() as u64;
+            (status_entries, effective, None, Some(Arc::new(registry)))
         } else {
             let mut parental = (*self.parental.load_full()).clone();
-            // Count parsed entries, not raw lines: malformed/comment lines must
-            // not inflate the reported entry count or the truncation guard.
+            // Count parsed entries, not raw lines: malformed/comment lines
+            // must not inflate the reported entry count or the truncation
+            // guard.
             let entries = parental.set_category_list(&category_key, content);
-            (entries, Some(Arc::new(parental)), None)
+            (entries, entries, Some(Arc::new(parental)), None)
         };
 
-        // An empty/zero-entry result is always rejected, even for an explicit
+        // An empty/zero-rule result is always rejected, even for an explicit
         // force refresh: a broken or empty download must never silently
-        // disable protection.
-        if entries == 0 {
+        // disable protection. For `services` this measures usable rules, so a
+        // list of service ids with empty rule arrays is rejected too.
+        if effective == 0 {
             return Err(format!(
                 "refusing to replace category '{category}' with empty content"
             ));
@@ -417,18 +432,24 @@ impl RuntimeLists {
 
         // Guard refreshes that replace previously downloaded content; the
         // bundled fallback may legitimately be replaced by a smaller list.
-        // Only a non-empty intentional shrink may be forced.
+        // Only a non-empty intentional shrink may be forced. The baseline is
+        // the live effective count: rules for `services`, parsed domains
+        // otherwise.
         let previous_status = {
             let statuses = sito_core::sync::read_or_recover(&self.statuses);
             statuses.get(&category_key).cloned()
         };
-        let previous = previous_status.as_ref().map_or(0, |status| status.entries);
+        let previous = if new_services.is_some() {
+            self.services.load().rule_count() as u64
+        } else {
+            previous_status.as_ref().map_or(0, |status| status.entries)
+        };
         let was_bundled = previous_status.as_ref().is_none_or(|status| status.bundled);
-        let truncating = entries.saturating_mul(2) < previous;
+        let truncating = effective.saturating_mul(2) < previous;
         if !force && previous > 0 && truncating && !was_bundled {
             return Err(format!(
                 "refusing to replace category '{category}' with \
-                 {entries} entries after {previous} (>50% shrink); \
+                 {effective} entries after {previous} (>50% shrink); \
                  use a forced refresh to accept the truncation"
             ));
         }
@@ -452,9 +473,9 @@ impl RuntimeLists {
                 entries: 0,
                 bundled: false,
             });
-        entry.entries = entries;
+        entry.entries = status_entries;
         entry.bundled = false;
-        Ok(entries)
+        Ok(status_entries)
     }
 }
 
@@ -700,6 +721,99 @@ mod tests {
         let store = store();
         assert!(store.apply_content("services", "not json").is_err());
         assert!(store.services().is_service_domain("tiktok", "tiktok.com"));
+    }
+
+    fn services_status(store: &RuntimeLists) -> RuntimeListStatus {
+        store
+            .statuses()
+            .into_iter()
+            .find(|status| status.category == "services")
+            .expect("services row")
+    }
+
+    #[test]
+    fn test_services_with_empty_rule_arrays_rejected_even_with_force() {
+        let store = store();
+        let mut services: HashMap<String, Vec<String>> =
+            serde_json::from_str(crate::bundled::SERVICES_JSON)
+                .expect("bundled services JSON must parse");
+        assert_eq!(services.len(), 35, "all bundled service ids are present");
+        for rules in services.values_mut() {
+            rules.clear();
+        }
+        let content = serde_json::to_string(&services).expect("serialize empty service rules");
+
+        // 35 service ids but zero usable rules: the old service-count guard
+        // would have accepted this and silently disabled service blocking.
+        let err = store.apply_content("services", &content).unwrap_err();
+        assert!(err.contains("empty content"), "unexpected error: {err}");
+        let err = store
+            .apply_content_forced("services", &content)
+            .unwrap_err();
+        assert!(err.contains("empty content"), "unexpected error: {err}");
+
+        let live = store.services();
+        assert!(live.is_service_domain("tiktok", "tiktok.com"));
+        assert_eq!(live.service_count(), 35);
+        let status = services_status(&store);
+        assert!(status.bundled, "rejected content must keep the bundled row");
+        assert_eq!(status.entries, 35);
+    }
+
+    #[test]
+    fn test_services_cleaned_to_zero_rules_are_rejected() {
+        let store = store();
+        let content = r#"[
+            { "id": "regex_only", "rules": ["/re.*/", "*.wild.com", "bad domain", "?x"] }
+        ]"#;
+
+        let err = store.apply_content("services", content).unwrap_err();
+        assert!(err.contains("empty content"), "unexpected error: {err}");
+        let err = store.apply_content_forced("services", content).unwrap_err();
+        assert!(err.contains("empty content"), "unexpected error: {err}");
+
+        assert!(
+            store.services().is_service_domain("tiktok", "tiktok.com"),
+            "previous registry must survive unsupported-only rules"
+        );
+        assert!(services_status(&store).bundled);
+    }
+
+    #[test]
+    fn test_services_shrink_guard_uses_rule_count_not_service_count() {
+        use std::fmt::Write as _;
+
+        let store = store();
+        let mut rules = String::new();
+        for i in 0..10 {
+            if i > 0 {
+                rules.push(',');
+            }
+            write!(rules, "\"d{i}.example\"").expect("writing to a String cannot fail");
+        }
+        let first = format!(r#"[{{"id": "old", "rules": [{rules}]}}]"#);
+        store.apply_content("services", &first).unwrap();
+        assert_eq!(store.services().rule_count(), 10);
+
+        // Four service ids (up from one) but only four rules: effective
+        // coverage drops by more than half, which the service-count baseline
+        // (1 -> 4) would have missed.
+        let shrunk = r#"[
+            {"id": "a", "rules": ["a.example"]},
+            {"id": "b", "rules": ["b.example"]},
+            {"id": "c", "rules": ["c.example"]},
+            {"id": "d", "rules": ["d.example"]}
+        ]"#;
+        let err = store.apply_content("services", shrunk).unwrap_err();
+        assert!(err.contains(">50% shrink"), "unexpected error: {err}");
+        assert_eq!(store.services().rule_count(), 10);
+        assert!(store.services().is_service_domain("old", "d0.example"));
+
+        // The operator path may accept the intentional shrink.
+        store.apply_content_forced("services", shrunk).unwrap();
+        assert_eq!(store.services().rule_count(), 4);
+        assert_eq!(store.services().service_count(), 4);
+        assert_eq!(services_status(&store).entries, 4);
     }
 
     #[test]

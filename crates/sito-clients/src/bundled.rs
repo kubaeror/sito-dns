@@ -133,6 +133,30 @@ pub fn verified_content(list: &BundledList) -> Result<&'static str, BundledListE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parental::ParentalRegistry;
+    use crate::services::ServiceRegistry;
+
+    /// Explicit id→file convention for the bundled lists.
+    fn expected_file_for_id(id: &str) -> Option<&'static str> {
+        match id {
+            "adult" => Some("adult.txt"),
+            "gambling" => Some("gambling.txt"),
+            "services" => Some("services.json"),
+            _ => None,
+        }
+    }
+
+    /// Each manifest id must map to a file named after it (generic rule), and
+    /// the three known ids must map to their documented files explicitly.
+    fn id_file_mapping_ok(list: &BundledList) -> bool {
+        if expected_file_for_id(&list.id).is_some_and(|expected| list.file != expected) {
+            return false;
+        }
+        std::path::Path::new(&list.file)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            == Some(list.id.as_str())
+    }
 
     #[test]
     fn test_manifest_is_valid_and_unique() {
@@ -185,7 +209,20 @@ mod tests {
                 )
             });
             verify(list, content).unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                !list.source.is_empty() && !list.license.is_empty(),
+                "list {} must document source and license",
+                list.id
+            );
+            assert!(
+                id_file_mapping_ok(list),
+                "manifest list '{}' must map to a file named after its id, got '{}'",
+                list.id,
+                list.file
+            );
 
+            // Compare the manifest count against the real parser used at load
+            // time, not a simplistic line/JSON count.
             let parsed = match list.kind.as_str() {
                 "domains" => {
                     assert!(
@@ -196,11 +233,9 @@ mod tests {
                         list.id,
                         list.file
                     );
-                    content
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                        .count() as u64
+                    // A fresh registry exercises the same parser production
+                    // uses; no need to re-verify bundled checksums here.
+                    ParentalRegistry::empty().set_category_list(&list.id, content)
                 }
                 "services" => {
                     assert!(
@@ -211,12 +246,16 @@ mod tests {
                         list.id,
                         list.file
                     );
-                    let value: serde_json::Value = serde_json::from_str(content)
-                        .unwrap_or_else(|e| panic!("list '{}' is invalid JSON: {e}", list.id));
-                    value
-                        .as_object()
-                        .unwrap_or_else(|| panic!("list '{}' must be a JSON object", list.id))
-                        .len() as u64
+                    let registry = ServiceRegistry::from_json(content).unwrap_or_else(|e| {
+                        panic!("list '{}' is invalid services JSON: {e}", list.id)
+                    });
+                    assert!(
+                        registry.rule_count() > 0,
+                        "list '{}' has {} services but no usable rules",
+                        list.id,
+                        registry.service_count()
+                    );
+                    registry.service_count() as u64
                 }
                 other => panic!("list '{}' has unknown kind '{other}'", list.id),
             };
@@ -228,6 +267,32 @@ mod tests {
                 list.id, list.entries
             );
         }
+    }
+
+    #[test]
+    fn test_manifest_id_file_mapping_rejects_wrong_file() {
+        let manifest = BundledManifest::try_bundled().expect("bundled manifest must parse");
+        let adult = manifest.list("adult").expect("adult list").clone();
+        assert!(id_file_mapping_ok(&adult));
+
+        // In-memory entry with `adult` pointing at the gambling file must fail
+        // the same mapping check the manifest test uses.
+        let mismatched = BundledList {
+            file: "gambling.txt".to_string(),
+            ..adult
+        };
+        assert!(
+            !id_file_mapping_ok(&mismatched),
+            "adult must not be allowed to point at gambling.txt"
+        );
+        let in_memory = BundledManifest {
+            lists: vec![mismatched],
+            ..manifest
+        };
+        assert!(
+            in_memory.lists.iter().any(|list| !id_file_mapping_ok(list)),
+            "the mapping check must reject an in-memory manifest entry"
+        );
     }
 
     #[test]
