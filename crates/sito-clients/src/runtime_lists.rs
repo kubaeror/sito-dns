@@ -287,11 +287,12 @@ impl RuntimeLists {
             .collect()
     }
 
-    /// Records the start of a fetch/apply attempt for `category`.
+    /// Records a fetch/apply attempt for `category`.
     ///
-    /// `error` is `None` while the attempt is in flight and `Some` when it
-    /// failed. A success must call [`Self::mark_refreshed`], which clears the
-    /// error.
+    /// A start-of-attempt call passes `None` and only updates
+    /// `last_attempt_unix`; a previous `last_error` stays visible until the
+    /// outcome is known. A failure passes `Some(error)`, which records it. Only
+    /// [`Self::mark_refreshed`] clears the error.
     pub fn record_attempt(&self, category: &str, error: Option<String>) {
         let now = unix_now();
         let category = category.to_ascii_lowercase();
@@ -308,7 +309,9 @@ impl RuntimeLists {
                 bundled: false,
             });
         entry.last_attempt_unix = Some(now);
-        entry.last_error = error;
+        if let Some(error) = error {
+            entry.last_error = Some(error);
+        }
     }
 
     /// Marks a category as refreshed from `source_url` at the current time.
@@ -403,25 +406,29 @@ impl RuntimeLists {
             (entries, Some(Arc::new(parental)), None)
         };
 
+        // An empty/zero-entry result is always rejected, even for an explicit
+        // force refresh: a broken or empty download must never silently
+        // disable protection.
+        if entries == 0 {
+            return Err(format!(
+                "refusing to replace category '{category}' with empty content"
+            ));
+        }
+
         // Guard refreshes that replace previously downloaded content; the
         // bundled fallback may legitimately be replaced by a smaller list.
-        // An empty response is always rejected while any content is active so
-        // a broken first fetch cannot silently disable protection.
+        // Only a non-empty intentional shrink may be forced.
         let previous_status = {
             let statuses = sito_core::sync::read_or_recover(&self.statuses);
             statuses.get(&category_key).cloned()
         };
         let previous = previous_status.as_ref().map_or(0, |status| status.entries);
         let was_bundled = previous_status.as_ref().is_none_or(|status| status.bundled);
-        let truncating = entries == 0 || entries.saturating_mul(2) < previous;
-        if !force && previous > 0 && truncating && (!was_bundled || entries == 0) {
-            let detail = if entries == 0 {
-                "empty content".to_string()
-            } else {
-                format!("{entries} entries after {previous} (>50% shrink)")
-            };
+        let truncating = entries.saturating_mul(2) < previous;
+        if !force && previous > 0 && truncating && !was_bundled {
             return Err(format!(
-                "refusing to replace category '{category}' with {detail}; \
+                "refusing to replace category '{category}' with \
+                 {entries} entries after {previous} (>50% shrink); \
                  use a forced refresh to accept the truncation"
             ));
         }
@@ -626,6 +633,21 @@ mod tests {
             status.bundled,
             "a failed refresh keeps the bundled fallback"
         );
+
+        // Starting another attempt must not hide the previous error before the
+        // outcome is known; only a success clears it.
+        store.record_attempt("adult", None);
+        let status = store
+            .statuses()
+            .into_iter()
+            .find(|status| status.category == "adult")
+            .expect("adult row");
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("fetch failed"),
+            "an in-flight attempt keeps the prior error visible"
+        );
+        assert!(status.last_attempt_unix.is_some());
 
         // A success clears the error and records the refresh.
         store
@@ -887,6 +909,26 @@ mod tests {
             store.parental().matches_category("adult", "pornhub.com"),
             "bundled fallback must survive an empty first refresh"
         );
+
+        // Even the explicit force path must not accept an empty result.
+        let err = store
+            .apply_content_forced("adult", "\n# nothing\n")
+            .unwrap_err();
+        assert!(err.contains("empty content"), "unexpected error: {err}");
+        assert!(
+            store.parental().matches_category("adult", "pornhub.com"),
+            "forced refresh must not wipe protection with empty content"
+        );
+        let status = store
+            .statuses()
+            .into_iter()
+            .find(|status| status.category == "adult")
+            .expect("adult row");
+        assert!(
+            status.bundled,
+            "a rejected empty force keeps the bundled row"
+        );
+        assert_eq!(status.entries, 40);
     }
 
     #[test]

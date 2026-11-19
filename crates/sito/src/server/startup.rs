@@ -110,20 +110,20 @@ pub async fn run_server_with_lease(
         service_registry.clone(),
     ));
     let integrations = integrations_from_config(&config)?;
+    // `validate_typed_sections` above already validated `[integrations.lists]`
+    // (generic rules and known bundled categories), so this block only starts
+    // the refresh task and does not duplicate validation.
     if let Some(ref integrations) = integrations
         && let Some(ref lists_cfg) = integrations.lists
+        && !lists_cfg.categories.is_empty()
     {
         let lists_cfg = lists_cfg.clone();
-        if let Err(e) = lists_cfg.validate_known_categories() {
-            warn!("Ignoring invalid [integrations.lists] configuration: {e}");
-        } else if !lists_cfg.categories.is_empty() {
-            let lists_store = runtime_lists.clone();
-            let lists_data_dir = config.server.data_dir.clone();
-            let lists_shutdown = shutdown_rx.clone();
-            tokio::spawn(async move {
-                run_list_refresh(lists_cfg, lists_store, lists_data_dir, lists_shutdown).await;
-            });
-        }
+        let lists_store = runtime_lists.clone();
+        let lists_data_dir = config.server.data_dir.clone();
+        let lists_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_list_refresh(lists_cfg, lists_store, lists_data_dir, lists_shutdown).await;
+        });
     }
 
     // Initialize local rewrites table

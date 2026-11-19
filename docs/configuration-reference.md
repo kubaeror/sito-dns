@@ -355,7 +355,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `groups.safe_search` | boolean | `false` | Force safe-search resolution for group members. |
 | `groups.safe_search_youtube` | string | `None` | YouTube safe-search mode when `safe_search` is enabled (`"off"`, `"moderate"` or `"strict"`). |
 | `groups.parental` | boolean | `false` | Enable parental-category blocking for group members. |
-| `groups.parental_categories` | array of strings | `[]` | Parental categories to block (for example `"adult"`, `"gambling"`). |
+| `groups.parental_categories` | array of strings | `[]` | Parental categories to block (for example `"adult"`, `"gambling"`). Unknown ids are rejected against the bundled parental registries during configuration validation. |
 | `groups.schedule_enabled` | boolean | `false` | Enable the group's time-of-day schedule. |
 | `groups.schedule` | string | `None` | Cron-style schedule used when `schedule_enabled = true`, evaluated in `clients.timezone`. |
 | `groups.blocked_services` | array of tables | `[]` | Service-specific block rules for members of this group. |
@@ -364,8 +364,14 @@ schedule = "0 0 15-21 * * MON-FRI"
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `groups.blocked_services.service` | string | required | Service identifier (`tiktok`, `youtube`, …) to block. |
+| `groups.blocked_services.service` | string | required | Service identifier (`tiktok`, `youtube`, …) to block. Unknown ids are rejected against the bundled service registry during configuration validation. |
 | `groups.blocked_services.schedule` | string | `None` | Optional cron-style schedule that limits when the service is blocked. |
+
+> [!NOTE]
+> `parental_categories` and `blocked_services.service` are validated against the
+> **bundled** parental/service registries at configuration-validation time (the
+> same data startup uses). Service ids that only exist in a runtime-refreshed
+> `[integrations.lists]` source are not accepted as client references yet.
 
 ---
 

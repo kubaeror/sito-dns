@@ -354,6 +354,66 @@ mod tests {
         assert_eq!(integration_refresh_interval(u64::MAX), cap);
     }
 
+    #[tokio::test]
+    async fn test_list_refresh_failure_records_last_error() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_list_refresh_failure_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut config = sito_clients::ListCategoriesConfig::default();
+        config.categories.insert(
+            "adult".to_string(),
+            sito_clients::ListSourceConfig {
+                url: format!("file://{}", temp_dir.join("missing.txt").display()),
+                refresh_hours: None,
+                license: None,
+            },
+        );
+        let store = std::sync::Arc::new(
+            sito_clients::RuntimeLists::try_new().expect("bundled lists must load"),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_list_refresh(
+            config,
+            store.clone(),
+            temp_dir.clone(),
+            shutdown_rx,
+        ));
+
+        let mut recorded = None;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Some(status) = store
+                .statuses()
+                .into_iter()
+                .find(|status| status.category == "adult")
+                && status.last_error.is_some()
+            {
+                recorded = Some(status);
+                break;
+            }
+        }
+        let status = recorded.expect("a failed fetch must record last_error");
+        assert!(
+            !status.last_error.unwrap().is_empty(),
+            "last_error must carry the fetch failure"
+        );
+        assert!(status.last_attempt_unix.is_some());
+        assert!(
+            status.bundled,
+            "a failed refresh keeps the bundled fallback active"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[test]
     fn test_integration_next_deadline_is_bounded() {
         let now = tokio::time::Instant::now();
