@@ -387,7 +387,7 @@ exception_clients = ["admin-laptop"]
 |---|---|---|---|
 | `auto_ptr` | boolean | `false` | Automatically synthesize reverse PTR records (`in-addr.arpa` / `ip6.arpa`) for local A/AAAA rewrites in RFC 1918 / ULA ranges. Opt-in. |
 | `ttl` | integer | `60` | TTL for synthesized rewrite records. |
-| `entries` | array of tables | `[]` | Local record rewrites (`domain`, `type` (`A`/`AAAA`/`CNAME`/`PTR`/`TXT`), `answer`, and optional `exception_clients`). A local `A`/`AAAA`/`PTR`/`TXT` owner is authoritative: a query for an unconfigured qtype returns NOERROR/NODATA without an upstream lookup. Stage 2 (local rewrites) runs before standard, parental and service blocking, so those block stages do not apply to locally owned qtypes. |
+| `entries` | array of tables | `[]` | Local record rewrites (`domain`, `type` (`A`/`AAAA`/`CNAME`/`PTR`/`TXT`), `answer`, and optional `exception_clients`). A local `A`/`AAAA`/`PTR`/`TXT` owner is authoritative: a query for an unconfigured qtype returns NOERROR/NODATA without an upstream lookup, unless the client matches `exception_clients`, in which case the rewrite is bypassed and the query falls through to upstream instead. Stage 2 (local rewrites) runs before standard, parental and service blocking, so those block stages do not apply to locally owned qtypes. |
 
 ### `[[rewrites.entries]]` entries
 

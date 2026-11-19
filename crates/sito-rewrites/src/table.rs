@@ -424,33 +424,48 @@ impl RewriteTable {
 /// colon-separated form (`aa:bb:cc:dd:ee:ff`).
 ///
 /// The client registry stores identity MACs in that canonical form, while
-/// operators may write `:` or `-` separators (or an all-hex dotted form) in
-/// upper or lower case. This mirrors `sito_clients::mac::normalize_mac`; the
+/// operators may write `:` or `-` separators (or a dotted `aabb.ccdd.eeff`
+/// form) in upper or lower case.
+///
+/// Only strict MAC shapes are accepted: six two-hex groups with one consistent
+/// `:` or `-` separator, or three four-hex groups separated by `.`. Mixed
+/// separators, other group counts or lengths, and every free-form client/group
+/// name are returned unchanged, so names such as `abc-def-123456` still match
+/// `identity.name` and a bare hex string is never mistaken for a MAC address.
+/// This mirrors `sito_clients::mac::normalize_mac` for the accepted shapes; the
 /// logic is duplicated locally so `sito-rewrites` does not depend on
 /// `sito-clients`.
-///
-/// Only values that contain a MAC separator (`:`, `-` or `.`) are considered,
-/// so free-form client/group names are returned unchanged and a bare hex
-/// string is never mistaken for a MAC address.
 fn canonicalize_exception_client(value: &str) -> String {
     // An address or CIDR is never a MAC, even when its hex digits happen to
     // count twelve (for example `::aa:bb:cc:dd:ee:ff`).
     if value.contains('/') || value.parse::<IpAddr>().is_ok() {
         return value.to_string();
     }
-    if !(value.contains(':') || value.contains('-') || value.contains('.')) {
+
+    let groups: Vec<&str> = if value.contains(':') && !value.contains('-') && !value.contains('.') {
+        value.split(':').collect()
+    } else if value.contains('-') && !value.contains(':') && !value.contains('.') {
+        value.split('-').collect()
+    } else if value.contains('.') && !value.contains(':') && !value.contains('-') {
+        value.split('.').collect()
+    } else {
+        return value.to_string();
+    };
+
+    let valid_shape = match groups.len() {
+        6 => groups
+            .iter()
+            .all(|group| group.len() == 2 && group.chars().all(|c| c.is_ascii_hexdigit())),
+        3 => groups
+            .iter()
+            .all(|group| group.len() == 4 && group.chars().all(|c| c.is_ascii_hexdigit())),
+        _ => false,
+    };
+    if !valid_shape {
         return value.to_string();
     }
 
-    let hex: String = value
-        .chars()
-        .filter(char::is_ascii_hexdigit)
-        .map(|character| character.to_ascii_lowercase())
-        .collect();
-    if hex.len() != 12 {
-        return value.to_string();
-    }
-
+    let hex = groups.concat().to_ascii_lowercase();
     let mut mac = String::with_capacity(17);
     for (index, digit) in hex.chars().enumerate() {
         if index > 0 && index % 2 == 0 {
@@ -1100,10 +1115,42 @@ entries = [
             "aa:bb:cc:dd:ee:ff"
         );
         assert_eq!(
+            canonicalize_exception_client("aabb.ccdd.eeff"),
+            "aa:bb:cc:dd:ee:ff"
+        );
+        assert_eq!(
             canonicalize_exception_client("::aa:bb:cc:dd:ee:ff"),
             "::aa:bb:cc:dd:ee:ff",
             "a valid IPv6 address is never reinterpreted as a MAC"
         );
+    }
+
+    /// Name-shaped values with twelve hex digits and separators must not be
+    /// mangled into MACs; only the strict six-by-two or three-by-four shapes
+    /// are canonicalized.
+    #[test]
+    fn test_canonicalize_exception_client_rejects_name_shapes() {
+        for name in ["abc-def-123456", "123.456.789.abc"] {
+            assert_eq!(
+                canonicalize_exception_client(name),
+                name,
+                "{name} must stay a free-form name"
+            );
+        }
+        for name in [
+            "aa:bb-cc:dd:ee:ff",
+            "aa-bb-cc-dd-ee",
+            "aa-bb-cc-dd-ee-ff-00",
+            "aabb.ccdd.ee",
+            "aabbc.cdddeeff",
+            "aa:bb:cc:dd:ee:fff",
+        ] {
+            assert_eq!(
+                canonicalize_exception_client(name),
+                name,
+                "{name} is not a strict MAC shape"
+            );
+        }
     }
 
     /// P1-9: an identified client at a configured IP must not satisfy a
