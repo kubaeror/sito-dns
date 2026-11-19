@@ -277,6 +277,25 @@ fn validate_dow_field(
         if let Some((start_str, end_str)) = range_part.split_once('-') {
             validate_dow_value(full_expr, start_str, field_num)?;
             validate_dow_value(full_expr, end_str, field_num)?;
+
+            // Numeric day-of-week ranges get the same reversal diagnostic as
+            // the other numeric fields. Named ranges (`FRI-MON`, ...) are left
+            // to croner, which owns their interpretation.
+            if let (Ok(start), Ok(end)) = (
+                start_str.trim().parse::<u32>(),
+                end_str.trim().parse::<u32>(),
+            ) && start > end
+            {
+                return Err(ScheduleError::field_error(
+                    full_expr,
+                    field_num,
+                    "day of week",
+                    format!(
+                        "range {start}-{end} is reversed (start > end); cron ranges do not wrap, \
+                         split the week into explicit ranges such as {start}-7,0-{end}"
+                    ),
+                ));
+            }
         } else {
             validate_dow_value(full_expr, range_part, field_num)?;
         }
@@ -758,6 +777,41 @@ mod tests {
         assert!(Schedule::parse("0 0 15-21 * * MON-FRI").is_ok());
         assert!(Schedule::parse("0 0 * * 7").is_ok());
         assert!(Schedule::parse("0 0 * * SUN").is_ok());
+    }
+
+    #[test]
+    fn test_numeric_day_of_week_reversed_range_rejected() {
+        // 5-field: day of week is field 5.
+        let err = Schedule::parse("0 0 * * 5-1").unwrap_err();
+        match err {
+            ScheduleError::InvalidSyntax {
+                field_number,
+                field_name,
+                message,
+                ..
+            } => {
+                assert_eq!(field_number, Some(5));
+                assert_eq!(field_name.as_deref(), Some("day of week"));
+                assert!(message.contains("range 5-1 is reversed (start > end)"));
+                assert!(message.contains("5-7,0-1"));
+            }
+        }
+
+        // 6-field: day of week is field 6.
+        let err6 = Schedule::parse("0 0 0 * * 6-2").unwrap_err();
+        match err6 {
+            ScheduleError::InvalidSyntax {
+                field_number,
+                message,
+                ..
+            } => {
+                assert_eq!(field_number, Some(6));
+                assert!(message.contains("range 6-2 is reversed"));
+            }
+        }
+
+        // Named ranges stay with croner rather than the numeric reversal path.
+        assert!(validate_dow_field("0 0 * * FRI-MON", "FRI-MON", 5).is_ok());
     }
 
     #[test]

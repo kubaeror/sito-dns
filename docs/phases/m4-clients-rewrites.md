@@ -30,7 +30,7 @@ Goal: the full "who sees what" model like AdGuard Home, plus local DNS records. 
 
 ### 4. Safe search, parental, services
 
-- Safe search: system rewrites from table 9.3 (Google/TLDs, Bing, YouTube strict/moderate, DDG), priority above regular rules
+- Safe search: system rewrites from table 9.3 (Google/TLDs, Bing, YouTube strict/moderate, DDG), evaluated at stage 4 after `$important`, local rewrites, and standard/parental/service blocking (see `docs/policy-matrix.md`)
 - Parental: category lists as regular subscriptions + a bundled starter list; category flags on the group
 - Services: `services.json` (AdGuard hostlist-compiler-compatible format) bundled via `include_str!`; evaluated after filters, with schedule
 

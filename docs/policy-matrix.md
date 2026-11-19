@@ -62,8 +62,10 @@ When a client is resolved, its effective group policy is compiled lazily at quer
 - Supports interval ranges (e.g. `0 0 15-21 * * MON-FRI` for 15:00:00 through 21:59:59).
 - Ranges do not wrap around. An overnight window must be split into explicit
   comma-separated ranges, e.g. `0 22-23,0-6 * * *` for 22:00 through 06:59.
-  Reversed ranges such as `0 22-6 * * *` are rejected at load time with a
-  field-attributed error, not silently interpreted as always/never active.
+  Reversed **numeric** ranges such as `0 22-6 * * *` or `0 0 * * 5-1` are
+  rejected at load time with a field-attributed error, not silently interpreted
+  as always/never active. Named day-of-week ranges (e.g. `FRI-MON`) are left to
+  `croner`, which owns their interpretation.
 - `schedule_enabled = true` with no `schedule` leaves the group always active;
   it does not disable filtering. A configured `schedule` is ignored unless
   `schedule_enabled = true`.

@@ -353,11 +353,11 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `groups.lists` | array of strings | `[]` | Filter list names applied to this group in addition to global lists. |
 | `groups.custom_rules` | array of strings | `[]` | Inline ABP/AdGuard rules applied only to this group. |
 | `groups.safe_search` | boolean | `false` | Force safe-search resolution for group members. |
-| `groups.safe_search_youtube` | string | `None` | YouTube safe-search mode when `safe_search` is enabled (`"off"`, `"moderate"` or `"strict"`). |
+| `groups.safe_search_youtube` | string | `None` | YouTube safe-search mode when `safe_search` is enabled (`"strict"` or `"moderate"`; defaults to `"strict"` when unset). |
 | `groups.parental` | boolean | `false` | Enable parental-category blocking for group members. |
 | `groups.parental_categories` | array of strings | `[]` | Parental categories to block (for example `"adult"`, `"gambling"`). Unknown ids are rejected against the bundled parental registries during configuration validation. |
 | `groups.schedule_enabled` | boolean | `false` | Enable the group's time-of-day schedule. When `true` without `schedule`, the group stays active at all times (it does not disable filtering). |
-| `groups.schedule` | string | `None` | Cron-style schedule used only when `schedule_enabled = true`, evaluated in `clients.timezone`. Ranges do not wrap: split overnight windows into comma-separated ranges such as `0 22-23,0-6 * * *`. Reversed ranges are rejected at configuration load. |
+| `groups.schedule` | string | `None` | Cron-style schedule used only when `schedule_enabled = true`, evaluated in `clients.timezone`. Ranges do not wrap: split overnight windows into comma-separated ranges such as `0 22-23,0-6 * * *`. Reversed numeric ranges are rejected at configuration load; named day-of-week ranges (e.g. `FRI-MON`) are interpreted by `croner`. |
 | `groups.blocked_services` | array of tables | `[]` | Service-specific block rules for members of this group. |
 
 ### `[[clients.groups.<name>.blocked_services]]`
@@ -373,8 +373,9 @@ schedule = "0 0 15-21 * * MON-FRI"
 > always active (the same result as `schedule_enabled = false`); a `schedule`
 > configured while `schedule_enabled = false` is ignored. Cron ranges do not
 > wrap around, so an overnight window must be written as split ranges, for
-> example `0 22-23,0-6 * * *`; a reversed range such as `0 22-6 * * *` is
-> rejected at configuration load with an error naming the field.
+> example `0 22-23,0-6 * * *`; a reversed numeric range such as `0 22-6 * * *`
+> is rejected at configuration load with an error naming the field. Named
+> day-of-week ranges are left to `croner`.
 
 > [!NOTE]
 > `parental_categories` and `blocked_services.service` are validated against the

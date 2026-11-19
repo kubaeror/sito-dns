@@ -1243,6 +1243,10 @@ schedule_enabled = true
             let at = Utc.with_ymd_and_hms(2026, 9, 7, hour, minute, 0).unwrap();
             let mut ctx = ClientContext::new(IpAddr::from_str("192.168.1.31").unwrap());
             let policy = reg.resolve(&mut ctx, reg.timezone().at_utc(at));
+            assert_eq!(
+                policy.group_name, "kids",
+                "the test must resolve the configured group, not the default group"
+            );
             assert!(
                 policy.is_filtering_enabled,
                 "schedule_enabled without schedule must stay active at {hour:02}:{minute:02}"

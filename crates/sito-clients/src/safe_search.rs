@@ -235,7 +235,9 @@ mod tests {
             assert_eq!(match_safe_search("safe.duckduckgo.com.", mode), None);
             assert_eq!(match_safe_search("SAFE.DuckDuckGo.com", mode), None);
 
-            // Other provider targets are not matched as queries either.
+            // Only `safe.duckduckgo.com` exercises the self-CNAME guard; the
+            // Google/Bing/YouTube target hosts are simply absent from their
+            // respective matchers (these assertions pin that they stay absent).
             assert_eq!(match_safe_search("forcesafesearch.google.com", mode), None);
             assert_eq!(match_safe_search("strict.bing.com", mode), None);
             assert_eq!(match_safe_search("restrict.youtube.com", mode), None);
