@@ -619,10 +619,17 @@ fn build_client_index(config: &ClientsConfig) -> ClientIndex {
 
     for (entry_idx, entry) in config.entries.iter().enumerate() {
         for id in &entry.ids {
-            if let Ok(ip) = id.trim().parse::<IpAddr>() {
+            let id = id.trim();
+            // An id that parses as an address or CIDR is never MAC-parsed,
+            // even when its hex digits would otherwise look like a MAC (for
+            // example `::aa:bb:cc:dd:ee:ff`).
+            if let Ok(ip) = id.parse::<IpAddr>() {
                 index.exact_ips.entry(ip).or_insert(entry_idx);
-            } else if let Ok(network) = IpNetwork::parse(id) {
+                continue;
+            }
+            if let Ok(network) = IpNetwork::parse(id) {
                 index.subnets.push((network, entry_idx));
+                continue;
             }
             if let Some(mac) = normalize_mac_id(id) {
                 index.macs.entry(mac).or_insert(entry_idx);
@@ -934,6 +941,54 @@ group = "hex"
         reg.mac_resolver().set_mock_arp(arp);
         let mut ctx = ClientContext::new(ip);
         assert_eq!(reg.resolve(&mut ctx, reg.now()).group_name, "hex");
+    }
+
+    #[test]
+    fn test_ip_or_cidr_id_is_never_a_mac_identity() {
+        let cfg: ClientsConfig = toml::from_str(
+            r#"
+[[entries]]
+name = "IPv6 Address"
+ids = ["::aa:bb:cc:dd:ee:ff"]
+group = "ipv6"
+
+[[entries]]
+name = "IPv6 Subnet"
+ids = ["::aa:bb:cc:dd:ee:ff/128"]
+group = "subnet"
+
+[groups.ipv6]
+[groups.subnet]
+"#,
+        )
+        .unwrap();
+
+        let index = build_client_index(&cfg);
+        assert!(
+            index.macs.is_empty(),
+            "an id that parses as an IP/CIDR must never become a MAC identity"
+        );
+        assert!(
+            index
+                .exact_ips
+                .contains_key(&"::aa:bb:cc:dd:ee:ff".parse().unwrap())
+        );
+        assert_eq!(index.subnets.len(), 1);
+
+        // A client whose ARP MAC matches those hex digits is still not
+        // identified by the MAC-shaped address/subnet ids.
+        let reg = ClientRegistry::new(cfg);
+        let ip = IpAddr::from_str("192.168.1.200").unwrap();
+        let mut arp = HashMap::new();
+        arp.insert(ip, "aa:bb:cc:dd:ee:ff".to_string());
+        reg.mac_resolver().set_mock_arp(arp);
+        let mut ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(policy.group_name, "default");
+        assert_eq!(
+            ctx.mac, None,
+            "no entry declares MAC identity, so ARP is not consulted"
+        );
     }
 
     #[test]

@@ -8,8 +8,11 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+
+pub use sito_core::net::{normalize_mac, normalize_mac_id};
 
 /// ARP table path (Linux only).
 const ARP_TABLE_PATH: &str = "/proc/net/arp";
@@ -33,61 +36,19 @@ const MAX_ARP_ENTRIES: usize = 4096;
 #[cfg(test)]
 static ARP_FILE_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Normalizes a MAC address string into standard lowercase `aa:bb:cc:dd:ee:ff`.
-///
-/// This accepts bare 12-character hex strings too (e.g. RouterOS/ARP values);
-/// use [`normalize_mac_id`] when parsing operator-supplied client identifiers,
-/// where a bare hex string must not be mistaken for a MAC address.
-pub fn normalize_mac(s: &str) -> Option<String> {
-    let clean: String = s
-        .chars()
-        .filter(char::is_ascii_hexdigit)
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-
-    if clean.len() != 12 {
-        return None;
-    }
-
-    let mut formatted = String::with_capacity(17);
-    for (i, ch) in clean.chars().enumerate() {
-        if i > 0 && i % 2 == 0 {
-            formatted.push(':');
-        }
-        formatted.push(ch);
-    }
-
-    Some(formatted)
-}
-
-/// Parses a MAC address written in an explicit MAC form from a client `id`.
-///
-/// Unlike [`normalize_mac`], a bare 12-character hex string (for example a
-/// hostname or client name that happens to be all hex digits) is rejected:
-/// the value must use `:`, `-` or `.` separators, or carry the explicit
-/// `mac:` prefix. This prevents a misclassification where `ids = ["aabbccddeeff"]`
-/// silently becomes a MAC-based identity rule.
-pub fn normalize_mac_id(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    let (candidate, explicit) = match trimmed.get(..4) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("mac:") => (&trimmed[4..], true),
-        _ => (trimmed, false),
-    };
-
-    let has_separators =
-        candidate.contains(':') || candidate.contains('-') || candidate.contains('.');
-    if !explicit && !has_separators {
-        return None;
-    }
-
-    normalize_mac(candidate)
-}
-
 /// Cache entry for a resolved MAC address.
 #[derive(Clone, Debug)]
 struct CachedMac {
     mac: String,
     expires_at: Instant,
+    epoch: u64,
+}
+
+/// Cache entry for a failed lookup.
+#[derive(Clone, Copy, Debug)]
+struct CachedNegative {
+    expires_at: Instant,
+    epoch: u64,
 }
 
 /// Resolver for MAC addresses backed by a background-refreshed ARP snapshot.
@@ -98,8 +59,12 @@ struct CachedMac {
 #[derive(Clone)]
 pub struct MacResolver {
     cache: Arc<RwLock<HashMap<IpAddr, CachedMac>>>,
-    negative: Arc<RwLock<HashMap<IpAddr, Instant>>>,
+    negative: Arc<RwLock<HashMap<IpAddr, CachedNegative>>>,
     snapshot: Arc<RwLock<HashMap<IpAddr, String>>>,
+    /// Incremented whenever a different ARP snapshot is installed. Cache
+    /// entries from an older generation are ignored even if a concurrent
+    /// resolve races with the invalidation.
+    epoch: Arc<AtomicU64>,
     mock_arp: Arc<RwLock<Option<HashMap<IpAddr, String>>>>,
     refresh_started: Arc<OnceLock<()>>,
     cache_ttl: Duration,
@@ -123,6 +88,7 @@ impl MacResolver {
             cache: Arc::new(RwLock::new(HashMap::new())),
             negative: Arc::new(RwLock::new(HashMap::new())),
             snapshot: Arc::new(RwLock::new(HashMap::new())),
+            epoch: Arc::new(AtomicU64::new(0)),
             mock_arp: Arc::new(RwLock::new(None)),
             refresh_started: Arc::new(OnceLock::new()),
             cache_ttl,
@@ -149,14 +115,20 @@ impl MacResolver {
         }
 
         let snapshot = Arc::downgrade(&self.snapshot);
+        let cache = Arc::downgrade(&self.cache);
         let negative = Arc::downgrade(&self.negative);
+        let epoch = Arc::downgrade(&self.epoch);
         let mock_arp = Arc::downgrade(&self.mock_arp);
         handle.spawn(async move {
             loop {
                 tokio::time::sleep(ARP_REFRESH_INTERVAL).await;
-                let (Some(snapshot), Some(negative), Some(mock_arp)) =
-                    (snapshot.upgrade(), negative.upgrade(), mock_arp.upgrade())
-                else {
+                let (Some(snapshot), Some(cache), Some(negative), Some(epoch), Some(mock_arp)) = (
+                    snapshot.upgrade(),
+                    cache.upgrade(),
+                    negative.upgrade(),
+                    epoch.upgrade(),
+                    mock_arp.upgrade(),
+                ) else {
                     break;
                 };
                 let mocked = mock_arp.read().is_ok_and(|mock| mock.is_some());
@@ -166,14 +138,7 @@ impl MacResolver {
                 let table = tokio::task::spawn_blocking(read_system_arp)
                     .await
                     .unwrap_or_default();
-                if let Ok(mut snapshot) = snapshot.write() {
-                    *snapshot = table;
-                }
-                // A refreshed snapshot may contain addresses that were missing
-                // before, so drop the negative cache.
-                if let Ok(mut negative) = negative.write() {
-                    negative.clear();
-                }
+                install_arp_snapshot(&snapshot, &cache, &negative, &epoch, table);
             }
         });
         true
@@ -182,9 +147,8 @@ impl MacResolver {
     /// Sets mock ARP entries for testing purposes.
     ///
     /// While a mock table is installed the background refresher leaves the
-    /// snapshot untouched. Positive cache entries are preserved (a previously
-    /// resolved MAC stays valid for its TTL); the negative cache is cleared
-    /// because the snapshot changed.
+    /// snapshot untouched. Installing a different table invalidates both the
+    /// positive and negative caches, exactly like a background refresh.
     pub fn set_mock_arp(&self, table: HashMap<IpAddr, String>) {
         let mut normalized_table = HashMap::with_capacity(table.len());
         for (ip, mac) in table {
@@ -196,7 +160,6 @@ impl MacResolver {
             *mock = Some(normalized_table.clone());
         }
         self.install_snapshot(normalized_table);
-        self.clear_negative_cache();
     }
 
     /// Resolves the MAC address for a given IP address.
@@ -209,12 +172,13 @@ impl MacResolver {
         let _ = self.start_background_refresh();
 
         let now = Instant::now();
+        let epoch = self.epoch.load(Ordering::SeqCst);
 
         let cached = {
             let cache = sito_core::sync::read_or_recover(&self.cache);
             cache
                 .get(&ip)
-                .filter(|entry| entry.expires_at > now)
+                .filter(|entry| entry.expires_at > now && entry.epoch == epoch)
                 .map(|entry| entry.mac.clone())
         };
         if let Some(mac) = cached {
@@ -225,7 +189,7 @@ impl MacResolver {
             let negative = sito_core::sync::read_or_recover(&self.negative);
             negative
                 .get(&ip)
-                .is_some_and(|expires_at| *expires_at > now)
+                .is_some_and(|entry| entry.expires_at > now && entry.epoch == epoch)
         };
         if negatively_cached {
             return None;
@@ -239,15 +203,15 @@ impl MacResolver {
 
         if let Some(mac) = resolved {
             sito_core::sync::write_or_recover(&self.negative).remove(&ip);
-            self.store_positive(ip, mac.clone(), now);
+            self.store_positive(ip, mac.clone(), now, epoch);
             Some(mac)
         } else {
-            self.store_negative(ip, now);
+            self.store_negative(ip, now, epoch);
             None
         }
     }
 
-    fn store_positive(&self, ip: IpAddr, mac: String, now: Instant) {
+    fn store_positive(&self, ip: IpAddr, mac: String, now: Instant, epoch: u64) {
         let mut cache = sito_core::sync::write_or_recover(&self.cache);
         if cache.len() >= MAX_CACHE_ENTRIES {
             cache.retain(|_, entry| entry.expires_at > now);
@@ -265,36 +229,41 @@ impl MacResolver {
             CachedMac {
                 mac,
                 expires_at: now + self.cache_ttl,
+                epoch,
             },
         );
     }
 
-    fn store_negative(&self, ip: IpAddr, now: Instant) {
+    fn store_negative(&self, ip: IpAddr, now: Instant, epoch: u64) {
         let mut negative = sito_core::sync::write_or_recover(&self.negative);
         if negative.len() >= MAX_CACHE_ENTRIES {
-            negative.retain(|_, expires_at| *expires_at > now);
+            negative.retain(|_, entry| entry.expires_at > now);
             if negative.len() >= MAX_CACHE_ENTRIES
                 && let Some(oldest) = negative
                     .iter()
-                    .min_by_key(|(_, expires_at)| **expires_at)
+                    .min_by_key(|(_, entry)| entry.expires_at)
                     .map(|(ip, _)| *ip)
             {
                 negative.remove(&oldest);
             }
         }
-        negative.insert(ip, now + self.negative_ttl);
+        negative.insert(
+            ip,
+            CachedNegative {
+                expires_at: now + self.negative_ttl,
+                epoch,
+            },
+        );
     }
 
     fn install_snapshot(&self, table: HashMap<IpAddr, String>) {
-        if let Ok(mut snapshot) = self.snapshot.write() {
-            *snapshot = table;
-        }
-    }
-
-    fn clear_negative_cache(&self) {
-        if let Ok(mut negative) = self.negative.write() {
-            negative.clear();
-        }
+        install_arp_snapshot(
+            &self.snapshot,
+            &self.cache,
+            &self.negative,
+            &self.epoch,
+            table,
+        );
     }
 
     /// Reads the ARP table and installs it as the new snapshot.
@@ -306,8 +275,38 @@ impl MacResolver {
         let table = read_system_arp();
         let entries = table.len();
         self.install_snapshot(table);
-        self.clear_negative_cache();
         entries
+    }
+}
+
+/// Installs an ARP snapshot and invalidates both caches when it changed.
+///
+/// The snapshot is compared before replacement so a periodic refresh that
+/// returns identical data keeps the positive cache warm. A changed snapshot
+/// increments the generation and drops every positive and negative entry.
+fn install_arp_snapshot(
+    snapshot: &RwLock<HashMap<IpAddr, String>>,
+    cache: &RwLock<HashMap<IpAddr, CachedMac>>,
+    negative: &RwLock<HashMap<IpAddr, CachedNegative>>,
+    epoch: &AtomicU64,
+    table: HashMap<IpAddr, String>,
+) {
+    let changed = {
+        let mut snapshot = sito_core::sync::write_or_recover(snapshot);
+        if *snapshot == table {
+            false
+        } else {
+            *snapshot = table;
+            epoch.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    };
+
+    if changed {
+        // A new snapshot can turn a previous positive answer stale or make a
+        // previously missing address resolvable.
+        sito_core::sync::write_or_recover(cache).clear();
+        sito_core::sync::write_or_recover(negative).clear();
     }
 }
 
@@ -356,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mac_normalization() {
+    fn test_mac_normalization_accepts_strict_and_bare_forms() {
         assert_eq!(
             normalize_mac("AA:BB:CC:DD:EE:FF"),
             Some("aa:bb:cc:dd:ee:ff".to_string())
@@ -369,6 +368,7 @@ mod tests {
             normalize_mac("aabb.ccdd.eeff"),
             Some("aa:bb:cc:dd:ee:ff".to_string())
         );
+        // Trusted ARP/RouterOS values may be bare hex.
         assert_eq!(
             normalize_mac("aabbccddeeff"),
             Some("aa:bb:cc:dd:ee:ff".to_string())
@@ -377,7 +377,27 @@ mod tests {
     }
 
     #[test]
-    fn test_mac_id_requires_explicit_mac_format() {
+    fn test_mac_normalization_rejects_non_mac_shapes() {
+        for value in [
+            "aa:bb:cc:dd:ee",
+            "aa:bb:cc:dd:ee:ff:00",
+            "aa:bb-cc:dd:ee:ff",
+            "aa.bb.cc.dd.ee.ff",
+            "aabb.cdddeeff",
+            "::aa:bb:cc:dd:ee:ff",
+            "2001:db8::1",
+            "192.168.1.1",
+            "10.0.0.0/8",
+            "aa:bb:cc:dd:ee:ff/24",
+            "janes-phone",
+            "abc-def-123456",
+        ] {
+            assert_eq!(normalize_mac(value), None, "{value} must not be a MAC");
+        }
+    }
+
+    #[test]
+    fn test_mac_id_requires_strict_or_explicit_mac_format() {
         // Separators or the `mac:` prefix make the intent explicit.
         assert_eq!(
             normalize_mac_id("AA:BB:CC:DD:EE:FF"),
@@ -388,13 +408,35 @@ mod tests {
             Some("aa:bb:cc:dd:ee:ff".to_string())
         );
         assert_eq!(
+            normalize_mac_id("aabb.ccdd.eeff"),
+            Some("aa:bb:cc:dd:ee:ff".to_string())
+        );
+        // The historical explicit marker allows a bare hex MAC.
+        assert_eq!(
             normalize_mac_id("mac:aabbccddeeff"),
             Some("aa:bb:cc:dd:ee:ff".to_string())
         );
+        assert_eq!(
+            normalize_mac_id("MAC:AA-BB-CC-DD-EE-FF"),
+            Some("aa:bb:cc:dd:ee:ff".to_string())
+        );
         // A bare 12-hex string is a hostname/client name, not a MAC.
-        assert_eq!(normalize_mac_id("aabbccddeeff"), None);
-        assert_eq!(normalize_mac_id("deadbeefcafe"), None);
-        assert_eq!(normalize_mac_id("janes-phone"), None);
+        for value in [
+            "aabbccddeeff",
+            "deadbeefcafe",
+            "janes-phone",
+            "abc-def-123456",
+            "::aa:bb:cc:dd:ee:ff",
+            "10.0.0.0/8",
+            "192.168.1.1",
+            "aa:bb-cc:dd:ee:ff",
+        ] {
+            assert_eq!(
+                normalize_mac_id(value),
+                None,
+                "{value} must not be a MAC identity"
+            );
+        }
     }
 
     #[test]
@@ -406,16 +448,61 @@ mod tests {
 
         let mut mock = HashMap::new();
         mock.insert(ip, "AA:BB:CC:DD:EE:FF".to_string());
-        resolver.set_mock_arp(mock);
+        resolver.set_mock_arp(mock.clone());
 
         let mac = resolver.resolve_mac(ip).unwrap();
         assert_eq!(mac, "aa:bb:cc:dd:ee:ff");
 
-        // Should return from cache even if mock table is cleared
-        resolver.set_mock_arp(HashMap::new());
+        // Re-installing the same snapshot keeps the positive cache warm.
+        resolver.set_mock_arp(mock);
         assert_eq!(
             resolver.resolve_mac(ip),
             Some("aa:bb:cc:dd:ee:ff".to_string())
+        );
+
+        // Changing the snapshot invalidates it; a stale MAC must not survive.
+        resolver.set_mock_arp(HashMap::new());
+        assert_eq!(resolver.resolve_mac(ip), None);
+    }
+
+    #[test]
+    fn test_arp_snapshot_change_invalidates_positive_cache() {
+        let resolver = MacResolver::new();
+        let ip = IpAddr::from_str("192.168.1.52").unwrap();
+
+        let mut first = HashMap::new();
+        first.insert(ip, "AA:BB:CC:DD:EE:01".to_string());
+        resolver.set_mock_arp(first);
+        assert_eq!(
+            resolver.resolve_mac(ip).as_deref(),
+            Some("aa:bb:cc:dd:ee:01")
+        );
+
+        // A refresh installs a different MAC for the same address.
+        let mut second = HashMap::new();
+        second.insert(ip, "aa:bb:cc:dd:ee:02".to_string());
+        resolver.install_snapshot(second);
+        assert_eq!(
+            resolver.resolve_mac(ip).as_deref(),
+            Some("aa:bb:cc:dd:ee:02"),
+            "the cached positive answer must be invalidated by the new snapshot"
+        );
+    }
+
+    #[test]
+    fn test_arp_snapshot_change_invalidates_negative_cache() {
+        let resolver = MacResolver::new();
+        let ip = IpAddr::from_str("192.168.1.53").unwrap();
+        resolver.set_mock_arp(HashMap::new());
+        assert_eq!(resolver.resolve_mac(ip), None);
+
+        let mut table = HashMap::new();
+        table.insert(ip, "aa:bb:cc:dd:ee:03".to_string());
+        resolver.install_snapshot(table);
+        assert_eq!(
+            resolver.resolve_mac(ip).as_deref(),
+            Some("aa:bb:cc:dd:ee:03"),
+            "a new snapshot entry must not be suppressed by a stale negative entry"
         );
     }
 
@@ -471,25 +558,21 @@ mod tests {
     }
 
     #[test]
-    fn test_negative_cache_expires_after_ttl() {
-        let resolver = MacResolver::with_ttls(Duration::from_secs(60), Duration::from_millis(30));
+    fn test_negative_cache_expiry_allows_fresh_snapshot_entry() {
+        let resolver = MacResolver::with_ttls(Duration::from_secs(60), Duration::ZERO);
         let ip = IpAddr::from_str("192.168.1.51").unwrap();
 
         resolver.set_mock_arp(HashMap::new());
         assert_eq!(resolver.resolve_mac(ip), None);
 
-        // The address appears in the snapshot while the negative entry is
-        // still fresh: the miss must be served from the negative cache.
-        let mut table = HashMap::new();
-        table.insert(ip, "aa:bb:cc:dd:ee:01".to_string());
-        resolver.install_snapshot(table);
-        assert_eq!(
-            resolver.resolve_mac(ip),
-            None,
-            "a negative entry must be honored for its TTL"
-        );
-
-        std::thread::sleep(Duration::from_millis(60));
+        // Simulate the address appearing in the snapshot without an
+        // install-time invalidation (for example a concurrent refresh). An
+        // expired negative entry must not suppress the fresh value.
+        resolver
+            .snapshot
+            .write()
+            .unwrap()
+            .insert(ip, "aa:bb:cc:dd:ee:01".to_string());
         assert_eq!(
             resolver.resolve_mac(ip).as_deref(),
             Some("aa:bb:cc:dd:ee:01"),

@@ -266,8 +266,9 @@ schema also fails the fixture test.
 ## 10. Deferred fields
 
 - `clients.trust_arp` is **not** added in config v2. D10 defines the trust
-  table, but the optional ARP-trust knob is deferred to WP-2.5 and will be an
-  optional v2 field with default `false`.
+  table, but the optional ARP-trust knob is deferred past WP-2.5 (matching
+  `docs/2.0-public-api-diff.md`); if it lands it will be an optional v2 field
+  with default `false`.
 - `/api/v2` and the API v1 compatibility facade are Phase 2 work (WP-2.11);
   the Phase 1 preview deliberately uses `/api/v1/config/restart-required`.
 - Installer/Docker auto-migration is WP-2.13. The full narrative migration

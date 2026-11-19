@@ -8,7 +8,7 @@ use hickory_proto::rr::rdata::{A, AAAA, CNAME, PTR, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use sito_core::client::ClientContext;
 use sito_core::domain::NormalizedDomain;
-use sito_core::net::IpNetwork;
+use sito_core::net::{IpNetwork, is_strict_mac};
 use tracing::warn;
 
 use crate::config::RewritesConfig;
@@ -427,14 +427,11 @@ impl RewriteTable {
 /// operators may write `:` or `-` separators (or a dotted `aabb.ccdd.eeff`
 /// form) in upper or lower case.
 ///
-/// Only strict MAC shapes are accepted: six two-hex groups with one consistent
-/// `:` or `-` separator, or three four-hex groups separated by `.`. Mixed
-/// separators, other group counts or lengths, and every free-form client/group
-/// name are returned unchanged, so names such as `abc-def-123456` still match
-/// `identity.name` and a bare hex string is never mistaken for a MAC address.
-/// This mirrors `sito_clients::mac::normalize_mac` for the accepted shapes; the
-/// logic is duplicated locally so `sito-rewrites` does not depend on
-/// `sito-clients`.
+/// Only strict MAC shapes are accepted (see [`sito_core::net::is_strict_mac`]);
+/// IP/CIDR values, mixed separators, other group counts or lengths, and every
+/// free-form client/group name are returned unchanged. Names such as
+/// `abc-def-123456` still match `identity.name`, and a bare hex string is never
+/// mistaken for a MAC address.
 fn canonicalize_exception_client(value: &str) -> String {
     // An address or CIDR is never a MAC, even when its hex digits happen to
     // count twelve (for example `::aa:bb:cc:dd:ee:ff`).
@@ -442,38 +439,7 @@ fn canonicalize_exception_client(value: &str) -> String {
         return value.to_string();
     }
 
-    let groups: Vec<&str> = if value.contains(':') && !value.contains('-') && !value.contains('.') {
-        value.split(':').collect()
-    } else if value.contains('-') && !value.contains(':') && !value.contains('.') {
-        value.split('-').collect()
-    } else if value.contains('.') && !value.contains(':') && !value.contains('-') {
-        value.split('.').collect()
-    } else {
-        return value.to_string();
-    };
-
-    let valid_shape = match groups.len() {
-        6 => groups
-            .iter()
-            .all(|group| group.len() == 2 && group.chars().all(|c| c.is_ascii_hexdigit())),
-        3 => groups
-            .iter()
-            .all(|group| group.len() == 4 && group.chars().all(|c| c.is_ascii_hexdigit())),
-        _ => false,
-    };
-    if !valid_shape {
-        return value.to_string();
-    }
-
-    let hex = groups.concat().to_ascii_lowercase();
-    let mut mac = String::with_capacity(17);
-    for (index, digit) in hex.chars().enumerate() {
-        if index > 0 && index % 2 == 0 {
-            mac.push(':');
-        }
-        mac.push(digit);
-    }
-    mac
+    is_strict_mac(value).unwrap_or_else(|| value.to_string())
 }
 
 fn is_client_excepted(client: &ClientContext, exceptions: &[String]) -> bool {
