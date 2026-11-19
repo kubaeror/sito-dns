@@ -71,6 +71,12 @@ pub(crate) async fn save_rewrite_store_locked(
     ctx: &ServerContext,
     store: &RewriteStore,
 ) -> Result<(), ProblemDetails> {
+    // Single persistence gate for both the JSON API and the UI: reject an
+    // invalid entry before it can be written to disk or applied live.
+    store.cfg.validate().map_err(|error| {
+        ProblemDetails::bad_request(format!("Invalid rewrites configuration: {error}"))
+    })?;
+
     let mut new_cfg = (**ctx.config.load()).clone();
     let mut value = toml::Value::try_from(&store.cfg).map_err(|e| {
         ProblemDetails::internal_error(format!("Failed to serialize rewrites: {e}"))
@@ -175,9 +181,6 @@ pub async fn add_rewrite(
 
     store.cfg.entries.push(entry);
     store.ids.push(id.clone());
-    store.cfg.validate().map_err(|error| {
-        ProblemDetails::bad_request(format!("Invalid rewrites configuration: {error}"))
-    })?;
     save_rewrite_store_locked(&ctx, &store).await?;
 
     Ok(Json(RewriteDto {
@@ -220,9 +223,6 @@ pub async fn update_rewrite(
         exception_clients: payload.exception_clients.clone(),
     };
     validate_rewrite_entry(&store.cfg.entries[idx])?;
-    store.cfg.validate().map_err(|error| {
-        ProblemDetails::bad_request(format!("Invalid rewrites configuration: {error}"))
-    })?;
 
     save_rewrite_store_locked(&ctx, &store).await?;
 

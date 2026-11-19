@@ -266,6 +266,71 @@ async fn test_ui_rbac_checks() {
 }
 
 #[tokio::test]
+async fn test_ui_rewrite_add_rejects_invalid_entry_without_persisting() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_rewrite_validation_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    ctx.auth_mgr
+        .create_user("oper_user", "pass", Role::Operator)
+        .await;
+    let LoginResult::Success(session) = ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1").await
+    else {
+        panic!("login failed");
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
+
+    let resp = rewrites_add_handler(
+        State(ctx.clone()),
+        headers.clone(),
+        Form(AddRewriteForm {
+            domain: "bad..name".to_string(),
+            record_type: "A".to_string(),
+            answer: "10.0.0.1".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        crate::handlers::rewrites::load_rewrite_store(&ctx)
+            .cfg
+            .entries,
+        Vec::new(),
+        "an invalid UI rewrite add must not persist an entry"
+    );
+    assert!(
+        ctx.config.load().rewrites.is_none(),
+        "an invalid UI rewrite add must not write configuration"
+    );
+
+    // A valid entry still goes through the same gate.
+    let resp = rewrites_add_handler(
+        State(ctx.clone()),
+        headers,
+        Form(AddRewriteForm {
+            domain: "printer.lan".to_string(),
+            record_type: "A".to_string(),
+            answer: "10.0.0.1".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        crate::handlers::rewrites::load_rewrite_store(&ctx)
+            .cfg
+            .entries
+            .len(),
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
 async fn test_wizard_validation_and_user_creation() {
     let temp_dir = std::env::temp_dir().join(format!("sito_ui_wiz_test_{}", rand::random::<u64>()));
     let _ = std::fs::create_dir_all(&temp_dir);

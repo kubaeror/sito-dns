@@ -582,12 +582,6 @@ async fn test_local_rewrite_txt_values_are_chunked() {
                 answer: unicode.clone(),
                 exception_clients: Vec::new(),
             },
-            RewriteEntryConfig {
-                domain: "empty.lan".to_string(),
-                r#type: "TXT".to_string(),
-                answer: String::new(),
-                exception_clients: Vec::new(),
-            },
         ],
     });
     let mut config = Config::default();
@@ -596,11 +590,7 @@ async fn test_local_rewrite_txt_values_are_chunked() {
     let (pipeline, _calls, temp_dir) = test_pipeline_with_rewrites(config, rewrites).await;
     let client = ClientContext::new("127.0.0.1".parse().unwrap());
 
-    for (domain, expected) in [
-        ("long.lan.", ascii),
-        ("utf8.lan.", unicode),
-        ("empty.lan.", String::new()),
-    ] {
+    for (domain, expected) in [("long.lan.", ascii), ("utf8.lan.", unicode)] {
         let resp = pipeline
             .handle(rewrite_query(domain, RecordType::TXT), client.clone())
             .await

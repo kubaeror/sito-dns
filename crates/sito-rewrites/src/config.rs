@@ -108,9 +108,11 @@ impl RewriteEntryConfig {
             return Err("invalid domain '.': the DNS root cannot be a rewrite owner".to_string());
         }
         if let Some(suffix) = normalized.as_str().strip_prefix("*.") {
-            if NormalizedDomain::parse(suffix).is_err() {
+            let valid_suffix =
+                NormalizedDomain::parse(suffix).is_ok_and(|suffix| !suffix.has_wildcard_labels());
+            if !valid_suffix {
                 return Err(format!(
-                    "invalid wildcard domain '{}': the suffix after '*.' is not a valid DNS name",
+                    "invalid wildcard domain '{}': only a single leading '*.' wildcard is allowed",
                     self.domain.trim()
                 ));
             }
@@ -142,9 +144,7 @@ impl RewriteEntryConfig {
                     self.answer.len()
                 ));
             }
-        }
-
-        if self.answer.trim().is_empty() {
+        } else if self.answer.trim().is_empty() {
             return Err(format!(
                 "invalid answer for type {record_type}: must not be empty"
             ));
@@ -164,35 +164,43 @@ impl RewriteEntryConfig {
 /// Accepted forms are an IP address, an IP network in CIDR notation, a MAC
 /// address with `:` or `-` separators, or a non-empty client/group name. Names
 /// are not required to exist in the client registry: they may be resolved
-/// later by an identity integration.
+/// later by an identity integration, and may contain internal spaces and
+/// apostrophes. A name containing `/` is not supported: any value with a slash
+/// must be a valid CIDR network. Values with leading or trailing whitespace
+/// are rejected because matching uses the raw value and a padded value would
+/// never match.
 fn validate_exception_client(value: &str) -> Result<(), String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
+    if value.trim().is_empty() {
         return Err("invalid exception_clients value: must not be empty".to_string());
     }
-    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if value != value.trim() {
         return Err(format!(
-            "invalid exception_clients value '{trimmed}': must not contain whitespace or control characters"
+            "invalid exception_clients value '{value}': must not have leading or trailing whitespace"
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!(
+            "invalid exception_clients value '{value}': must not contain control characters"
         ));
     }
 
-    if trimmed.contains('/') {
-        return IpNetwork::parse(trimmed)
+    if value.contains('/') {
+        return IpNetwork::parse(value)
             .map(|_| ())
-            .map_err(|error| format!("invalid exception_clients CIDR '{trimmed}': {error}"));
+            .map_err(|error| format!("invalid exception_clients CIDR '{value}': {error}"));
     }
-    if trimmed.parse::<IpAddr>().is_ok() {
+    if value.parse::<IpAddr>().is_ok() {
         return Ok(());
     }
-    if let Some(groups) = mac_groups(trimmed) {
+    if let Some(groups) = mac_groups(value) {
         if groups.iter().any(|group| group.len() != 2) {
             return Err(format!(
-                "invalid exception_clients MAC address '{trimmed}': expected six two-digit hex groups"
+                "invalid exception_clients MAC address '{value}': expected six two-digit hex groups"
             ));
         }
         return Ok(());
     }
-    // Anything else is a client or group name.
+    // Anything else is a client or group name (internal spaces are allowed).
     Ok(())
 }
 
@@ -282,10 +290,39 @@ mod tests {
             "aa-bb-cc-dd-ee-ff".to_string(),
             "admin-laptop".to_string(),
             "admins".to_string(),
+            "Admin Laptop".to_string(),
+            "Jane's Phone".to_string(),
         ];
         wildcard
             .validate()
             .expect("wildcard with IP/CIDR/MAC/name exceptions must validate");
+    }
+
+    #[test]
+    fn test_valid_domains_include_idn_and_trailing_dot() {
+        for domain in [
+            "printer.lan.",
+            "MÜNCHEN.de.",
+            "*.BÜCHER.example.",
+            "xn--mnchen-3ya.de",
+        ] {
+            entry(domain, "A", "192.168.1.1")
+                .validate()
+                .unwrap_or_else(|error| panic!("{domain:?} must validate: {error}"));
+        }
+    }
+
+    #[test]
+    fn test_rejects_nested_wildcards() {
+        for domain in ["*.*.example.com", "*.foo.*.bar", "*.*"] {
+            let err = entry(domain, "A", "192.168.1.1")
+                .validate()
+                .expect_err("nested wildcard must be rejected");
+            assert!(
+                err.contains("wildcard") || err.contains("domain"),
+                "error for {domain:?} must name the wildcard/domain: {err}"
+            );
+        }
     }
 
     #[test]
@@ -337,10 +374,14 @@ mod tests {
             .expect_err("over-65535-byte TXT must be rejected");
         assert!(err.contains("65535"), "got: {err}");
 
-        // The exact limit is accepted.
+        // The exact limit is accepted, as is a whitespace-only value (a valid
+        // non-empty TXT character-string).
         entry("txt.lan", "TXT", &"a".repeat(65_535))
             .validate()
             .expect("65535-byte TXT must validate");
+        entry("txt.lan", "TXT", "   ")
+            .validate()
+            .expect("whitespace-only TXT must validate");
     }
 
     #[test]
@@ -348,7 +389,8 @@ mod tests {
         for exception in [
             "",
             "   ",
-            "admin laptop",
+            " admin-laptop",
+            "admin-laptop ",
             "admin\tlaptop",
             "10.0.0.0/99",
             "not/a/cidr",

@@ -87,6 +87,16 @@ impl RewriteTable {
         let ttl = config.ttl.max(1);
 
         for entry in config.entries {
+            if let Err(error) = entry.validate() {
+                warn!(
+                    domain = %entry.domain,
+                    record_type = %entry.r#type,
+                    %error,
+                    "invalid rewrite entry; entry skipped"
+                );
+                continue;
+            }
+
             let Some((record_type, rdata)) = parse_entry_record(&entry.r#type, &entry.answer)
             else {
                 warn!(
@@ -1307,11 +1317,7 @@ entries = [
         let table = RewriteTable::new(config);
         let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
 
-        for (domain, expected) in [
-            ("long.lan.", ascii),
-            ("utf8.lan.", unicode),
-            ("empty.lan.", String::new()),
-        ] {
+        for (domain, expected) in [("long.lan.", ascii), ("utf8.lan.", unicode)] {
             let records =
                 match table.lookup(&Name::from_str(domain).unwrap(), RecordType::TXT, &client) {
                     RewriteLookup::Answered(records) => records,
@@ -1332,6 +1338,17 @@ entries = [
             );
             assert_eq!(strings.concat(), expected, "{domain} round-trip");
         }
+
+        // An empty TXT bypassed validation and is skipped by the table, so the
+        // name is not owned locally.
+        assert!(
+            is_not_found(&table.lookup(
+                &Name::from_str("empty.lan.").unwrap(),
+                RecordType::TXT,
+                &client
+            )),
+            "an empty TXT entry must be skipped"
+        );
     }
 
     /// Regression (audit 6, WP-3.6): punycode config entries must match, and

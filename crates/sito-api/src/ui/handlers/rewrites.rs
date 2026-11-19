@@ -70,7 +70,7 @@ pub async fn rewrites_add_handler(
     if let Err(e) = crate::handlers::rewrites::save_rewrite_store_locked(&ctx, &store).await {
         tracing::error!("Failed to persist rewrites: {e:?}");
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             &format!("Failed to persist rewrites: {}", e.detail),
         );
     }
