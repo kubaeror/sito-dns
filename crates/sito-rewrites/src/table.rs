@@ -89,6 +89,11 @@ impl RewriteTable {
         for entry in config.entries {
             let Some((record_type, rdata)) = parse_entry_record(&entry.r#type, &entry.answer)
             else {
+                warn!(
+                    domain = %entry.domain,
+                    record_type = %entry.r#type,
+                    "invalid rewrite type or answer; entry skipped"
+                );
                 continue;
             };
 
@@ -451,7 +456,7 @@ fn is_client_excepted(client: &ClientContext, exceptions: &[String]) -> bool {
 /// as Unicode must become punycode and a config entry written as punycode must
 /// stay as-is. Invalid entries are rejected by the caller instead of being
 /// silently compared in their raw form.
-fn normalize_domain_key(domain: &str) -> Option<NormalizedDomain> {
+pub(crate) fn normalize_domain_key(domain: &str) -> Option<NormalizedDomain> {
     let trimmed = domain.trim();
     if trimmed.is_empty() {
         return None;
@@ -490,7 +495,10 @@ pub fn txt_chunks(value: &str) -> Vec<String> {
     chunks
 }
 
-fn parse_entry_record(rtype: &str, answer: &str) -> Option<(RecordType, LocalRecordData)> {
+pub(crate) fn parse_entry_record(
+    rtype: &str,
+    answer: &str,
+) -> Option<(RecordType, LocalRecordData)> {
     match rtype.to_ascii_uppercase().as_str() {
         "A" => {
             let ip = answer.parse::<Ipv4Addr>().ok()?;

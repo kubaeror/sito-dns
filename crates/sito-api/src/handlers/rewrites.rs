@@ -113,6 +113,13 @@ fn to_dto(id: String, entry: RewriteEntryConfig) -> RewriteDto {
     }
 }
 
+/// Rejects an invalid rewrite entry before it can be persisted.
+fn validate_rewrite_entry(entry: &RewriteEntryConfig) -> Result<(), ProblemDetails> {
+    entry
+        .validate()
+        .map_err(|error| ProblemDetails::bad_request(format!("Invalid rewrite entry: {error}")))
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/rewrites",
@@ -164,9 +171,13 @@ pub async fn add_rewrite(
         answer: payload.answer.clone(),
         exception_clients: payload.exception_clients.clone(),
     };
+    validate_rewrite_entry(&entry)?;
 
     store.cfg.entries.push(entry);
     store.ids.push(id.clone());
+    store.cfg.validate().map_err(|error| {
+        ProblemDetails::bad_request(format!("Invalid rewrites configuration: {error}"))
+    })?;
     save_rewrite_store_locked(&ctx, &store).await?;
 
     Ok(Json(RewriteDto {
@@ -208,6 +219,10 @@ pub async fn update_rewrite(
         answer: payload.answer.clone(),
         exception_clients: payload.exception_clients.clone(),
     };
+    validate_rewrite_entry(&store.cfg.entries[idx])?;
+    store.cfg.validate().map_err(|error| {
+        ProblemDetails::bad_request(format!("Invalid rewrites configuration: {error}"))
+    })?;
 
     save_rewrite_store_locked(&ctx, &store).await?;
 
@@ -340,6 +355,80 @@ mod tests {
             role: Role::Operator,
             token_id: None,
         })
+    }
+
+    #[tokio::test]
+    async fn test_add_and_update_reject_invalid_entries_without_persisting() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_rewrite_validation_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        // An invalid add returns 400 and persists nothing.
+        let err = add_rewrite(
+            operator(),
+            State(ctx.clone()),
+            Json(AddRewriteRequest {
+                domain: "bad..name".to_string(),
+                record_type: "A".to_string(),
+                answer: "10.0.0.1".to_string(),
+                exception_clients: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("an invalid rewrite must be rejected");
+        assert_eq!(err.status, 400);
+        assert!(
+            err.detail.contains("rewrite") && err.detail.contains("domain"),
+            "the error must be explicit: {}",
+            err.detail
+        );
+        assert_eq!(load_rewrite_store(&ctx).cfg.entries, Vec::new());
+        assert!(
+            ctx.config.load().rewrites.is_none(),
+            "nothing may be persisted for an invalid add"
+        );
+
+        let created = add_rewrite(
+            operator(),
+            State(ctx.clone()),
+            Json(AddRewriteRequest {
+                domain: "printer.lan".to_string(),
+                record_type: "A".to_string(),
+                answer: "10.0.0.1".to_string(),
+                exception_clients: Vec::new(),
+            }),
+        )
+        .await
+        .expect("valid add")
+        .0;
+
+        // An invalid update returns 400 and leaves the stored entry unchanged.
+        let err = update_rewrite(
+            operator(),
+            State(ctx.clone()),
+            Path(created.id.clone()),
+            Json(AddRewriteRequest {
+                domain: "printer.lan".to_string(),
+                record_type: "A".to_string(),
+                answer: "not-an-ip".to_string(),
+                exception_clients: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("an invalid rewrite update must be rejected");
+        assert_eq!(err.status, 400);
+        assert!(
+            err.detail.contains("answer"),
+            "the error must be explicit: {}",
+            err.detail
+        );
+
+        let store = load_rewrite_store(&ctx);
+        assert_eq!(store.cfg.entries.len(), 1);
+        assert_eq!(store.cfg.entries[0].answer, "10.0.0.1");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]

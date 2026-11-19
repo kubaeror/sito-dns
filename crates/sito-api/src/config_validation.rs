@@ -37,9 +37,12 @@ pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("invalid [clients] configuration: {e}"))?;
     }
     if let Some(value) = config.rewrites.as_ref() {
-        let _: sito_rewrites::RewritesConfig = value
+        let rewrites: sito_rewrites::RewritesConfig = value
             .clone()
             .try_into()
+            .map_err(|e| anyhow::anyhow!("invalid [rewrites] configuration: {e}"))?;
+        rewrites
+            .validate()
             .map_err(|e| anyhow::anyhow!("invalid [rewrites] configuration: {e}"))?;
     }
     if let Some(value) = config.integrations.as_ref() {
@@ -151,6 +154,27 @@ mod tests {
         )
         .expect_err("must reject bad [clients]");
         assert!(err.to_string().contains("[clients]"), "got: {err}");
+    }
+
+    #[test]
+    fn test_rejects_invalid_rewrite_entry() {
+        let config = Config::from_toml_str(
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[rewrites]\nentries = [{ domain = \"bad..name\", type = \"A\", answer = \"192.168.1.1\" }]\n",
+        )
+        .expect("parses");
+        let err = validate_typed_sections(&config)
+            .expect_err("an invalid rewrite entry must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("[rewrites]") && message.contains("entry 0"),
+            "the error must name the section and entry: {message}"
+        );
+
+        let valid = Config::from_toml_str(
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[rewrites]\nentries = [{ domain = \"*.home.arpa\", type = \"A\", answer = \"192.168.1.1\", exception_clients = [\"10.0.0.0/8\"] }]\n",
+        )
+        .expect("parses");
+        validate_typed_sections(&valid).expect("a valid rewrite entry must be accepted");
     }
 
     #[test]
