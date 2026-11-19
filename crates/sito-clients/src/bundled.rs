@@ -165,6 +165,72 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_entries_match_content() {
+        let manifest = BundledManifest::try_bundled().expect("bundled manifest must parse");
+
+        // Every embedded file must be described by the manifest, so content
+        // cannot silently become an unreferenced orphan.
+        for file in ["adult.txt", "gambling.txt", "services.json"] {
+            assert!(
+                manifest.lists.iter().any(|list| list.file == file),
+                "embedded file {file} is not described by the manifest"
+            );
+        }
+
+        for list in &manifest.lists {
+            let content = content_for(list).unwrap_or_else(|| {
+                panic!(
+                    "manifest list '{}' references '{}' with no embedded content",
+                    list.id, list.file
+                )
+            });
+            verify(list, content).unwrap_or_else(|e| panic!("{e}"));
+
+            let parsed = match list.kind.as_str() {
+                "domains" => {
+                    assert!(
+                        std::path::Path::new(&list.file)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("txt")),
+                        "list '{}' has kind 'domains' but file '{}' is not a .txt file",
+                        list.id,
+                        list.file
+                    );
+                    content
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                        .count() as u64
+                }
+                "services" => {
+                    assert!(
+                        std::path::Path::new(&list.file)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("json")),
+                        "list '{}' has kind 'services' but file '{}' is not a .json file",
+                        list.id,
+                        list.file
+                    );
+                    let value: serde_json::Value = serde_json::from_str(content)
+                        .unwrap_or_else(|e| panic!("list '{}' is invalid JSON: {e}", list.id));
+                    value
+                        .as_object()
+                        .unwrap_or_else(|| panic!("list '{}' must be a JSON object", list.id))
+                        .len() as u64
+                }
+                other => panic!("list '{}' has unknown kind '{other}'", list.id),
+            };
+
+            assert_eq!(
+                list.entries, parsed,
+                "manifest list '{}' declares {} entries but its content has {parsed}; \
+                 update the data file and its manifest entry together",
+                list.id, list.entries
+            );
+        }
+    }
+
+    #[test]
     fn test_tampered_content_is_rejected() {
         let manifest = BundledManifest::try_bundled().expect("bundled manifest must parse");
         let adult = manifest.list("adult").unwrap();

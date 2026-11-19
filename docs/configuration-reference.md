@@ -382,6 +382,12 @@ schedule = "0 0 15-21 * * MON-FRI"
 > **bundled** parental/service registries at configuration-validation time (the
 > same data startup uses). Service ids that only exist in a runtime-refreshed
 > `[integrations.lists]` source are not accepted as client references yet.
+>
+> The bundled parental (`adult`, `gambling`) and service data is a **minimal
+> built-in fallback**, not a maintained external dataset: it covers common
+> providers only and is not continuously curated or security-reviewed. External
+> curated data (licensed source, update pipeline, checksum/version manifest) is
+> deferred past WP-2.5; configure `[integrations.lists]` for broader coverage.
 
 ---
 
@@ -724,11 +730,19 @@ interval_s = 300
 
 ## 15. `[integrations.lists]` — Curated List Updates
 
-Point the bundled parental/service categories at maintained sources; a
+Point the bundled parental/service categories at operator-managed sources; a
 background task downloads them through the shared subscription downloader
 (ETag/If-Modified-Since, disk cache under `data_dir`, size caps) and swaps the
 runtime registries without a restart. The bundled data remains the fallback
 until the first successful refresh.
+
+> [!IMPORTANT]
+> The bundled parental/service lists are a **minimal built-in fallback**, not a
+> maintained external dataset. They cover common providers, are not
+> continuously curated, and are not a substitute for a licensed blocklist.
+> Shipping a maintained external dataset is deferred past WP-2.5; the bundled
+> entries and their manifest exist to make the fallback honest and
+> reproducible, not to claim upstream curation.
 
 ```toml
 [integrations.lists]

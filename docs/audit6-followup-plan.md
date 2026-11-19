@@ -1228,7 +1228,7 @@ Evidence: Phase 2 — rewrites and policy section in
 **Steps:**
 - [ ] Strict MAC parsing and ARP-snapshot invalidation.
 - [ ] Add IANA timezone support or document fixed-offset only; validate cron window semantics.
-- [ ] Replace tiny bundled parental/service data with a maintained manifest or mark experimental in UI/docs.
+- [ ] Replace tiny bundled parental/service data with a maintained manifest or mark experimental in UI/docs. **D15 descope:** bundled parental/service data is labeled a minimal built-in fallback in UI/docs; a maintained external dataset is deferred past WP-2.5 (manifest/count checks shipped instead).
 - [ ] Add force-refresh/status for runtime lists; validate category keys.
 - [ ] Expand safe search coverage; remove self-CNAME.
 - **Acceptance:** parental/service tests and data manifest checks pass; UI no longer overclaims.

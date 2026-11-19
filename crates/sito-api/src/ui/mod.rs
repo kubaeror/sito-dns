@@ -249,6 +249,11 @@ mod tests {
         };
         let filtering_html = filter_tmpl.render().expect("render filtering page");
         assert!(filtering_html.contains("built-in (minimal)"));
+        assert!(
+            filtering_html.contains("Minimal built-in fallback")
+                && filtering_html.contains("not a maintained external dataset"),
+            "bundled lists must be labeled a minimal fallback, not a maintained dataset"
+        );
         assert!(filtering_html.contains("adult"));
         assert!(filtering_html.contains("CC0-1.0"));
         assert!(filtering_html.contains("Last attempt: 2023-11-14 22:13 UTC"));
