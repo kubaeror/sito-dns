@@ -28,6 +28,27 @@ pub enum LocalRecordData {
     Txt(Vec<String>),
 }
 
+/// Result of a local rewrite table lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewriteLookup {
+    /// The table owns the name and produced at least one answer record.
+    Answered(Vec<Record>),
+    /// The name is owned locally but has no record for the queried type.
+    NoData,
+    /// The name is not owned locally (or every matching rule is bypassed by a
+    /// client exception), so the query must fall through to upstream.
+    NotFound,
+}
+
+/// Record types that can be stored in the exact rewrite map.
+const EXACT_TYPES: [RecordType; 5] = [
+    RecordType::A,
+    RecordType::AAAA,
+    RecordType::CNAME,
+    RecordType::PTR,
+    RecordType::TXT,
+];
+
 #[derive(Debug, Clone)]
 struct StoredRule {
     wildcard_suffix: Option<NormalizedDomain>,
@@ -164,12 +185,7 @@ impl RewriteTable {
     }
 
     /// Look up local rewrite records for a query.
-    pub fn lookup(
-        &self,
-        qname: &Name,
-        qtype: RecordType,
-        client: &ClientContext,
-    ) -> Option<Vec<Record>> {
+    pub fn lookup(&self, qname: &Name, qtype: RecordType, client: &ClientContext) -> RewriteLookup {
         let mut visited = Vec::new();
         self.lookup_inner(qname, qtype, client, &mut visited, 0)
     }
@@ -181,30 +197,52 @@ impl RewriteTable {
         client: &ClientContext,
         visited: &mut Vec<String>,
         depth: usize,
-    ) -> Option<Vec<Record>> {
+    ) -> RewriteLookup {
         if depth > MAX_CNAME_DEPTH {
-            return None;
+            return RewriteLookup::NotFound;
         }
 
-        let qname_key = normalize_domain_key(&qname.to_ascii())?;
+        let Some(qname_key) = normalize_domain_key(&qname.to_ascii()) else {
+            return RewriteLookup::NotFound;
+        };
         let qname_str = qname_key.as_str();
         if visited.iter().any(|seen| seen == qname_str) {
             // CNAME loop detected; stop resolving to avoid unbounded recursion.
-            return None;
+            return RewriteLookup::NotFound;
         }
         visited.push(qname_str.to_string());
 
+        // Track two independent facts while walking the table:
+        // - `owner_non_excepted`: a non-bypassed rule of any type owns the
+        //   name, so an unconfigured qtype is authoritative NODATA.
+        // - `applicable_excepted`: a rule that would have answered this query
+        //   was bypassed by a client exception, so the query must fall through
+        //   instead of being answered NODATA.
+        let mut owner_non_excepted = false;
+        let mut applicable_excepted = false;
+
         // 1. Exact match: return every non-excepted rule for (qname, qtype)
         //    in configuration order.
-        if let Some(rules) = self.exact.get(&(qname_str.to_string(), qtype)) {
-            let answers: Vec<Record> = rules
-                .iter()
-                .filter(|rule| !is_client_excepted(client, &rule.exception_clients))
-                .map(|rule| self.build_record(qname, &rule.data))
-                .collect();
-            if !answers.is_empty() {
-                return Some(answers);
+        let mut exact_answers = Vec::new();
+        for rtype in EXACT_TYPES {
+            let Some(rules) = self.exact.get(&(qname_str.to_string(), rtype)) else {
+                continue;
+            };
+            for rule in rules {
+                if is_client_excepted(client, &rule.exception_clients) {
+                    if rule_applies_to_qtype(rtype, qtype) {
+                        applicable_excepted = true;
+                    }
+                    continue;
+                }
+                owner_non_excepted = true;
+                if rtype == qtype {
+                    exact_answers.push(self.build_record(qname, &rule.data));
+                }
             }
+        }
+        if !exact_answers.is_empty() {
+            return RewriteLookup::Answered(exact_answers);
         }
 
         // 2. Check exact CNAME (when qtype == CNAME, step 1 already returned it)
@@ -215,17 +253,26 @@ impl RewriteTable {
                 if !is_client_excepted(client, &rule.exception_clients)
                     && let LocalRecordData::Cname(ref target) = rule.data
                 {
-                    return self.resolve_cname(qname, target, qtype, client, visited, depth);
+                    return match self.resolve_cname(qname, target, qtype, client, visited, depth) {
+                        Some(records) => RewriteLookup::Answered(records),
+                        None => RewriteLookup::NotFound,
+                    };
                 }
             }
         }
 
         // 3. Check auto-PTR table (for PTR queries)
-        if qtype == RecordType::PTR
-            && let Some(rule) = self.auto_ptr.get(qname_str)
-            && !is_client_excepted(client, &rule.exception_clients)
-        {
-            return Some(vec![self.build_record(qname, &rule.data)]);
+        if let Some(rule) = self.auto_ptr.get(qname_str) {
+            if is_client_excepted(client, &rule.exception_clients) {
+                if qtype == RecordType::PTR {
+                    applicable_excepted = true;
+                }
+            } else {
+                owner_non_excepted = true;
+                if qtype == RecordType::PTR {
+                    return RewriteLookup::Answered(vec![self.build_record(qname, &rule.data)]);
+                }
+            }
         }
 
         // 4. Check wildcard rules. The most specific (longest) matching suffix
@@ -235,18 +282,22 @@ impl RewriteTable {
         let mut best_suffix_len: Option<usize> = None;
         let mut matched: Vec<&StoredRule> = Vec::new();
         for rule in &self.wildcards {
-            if is_client_excepted(client, &rule.exception_clients) {
-                continue;
-            }
-
-            if rule.record_type != qtype && rule.record_type != RecordType::CNAME {
-                continue;
-            }
-
             let Some(ref suffix) = rule.wildcard_suffix else {
                 continue;
             };
             if !matches_wildcard(&qname_key, suffix) {
+                continue;
+            }
+
+            if is_client_excepted(client, &rule.exception_clients) {
+                if rule_applies_to_qtype(rule.record_type, qtype) {
+                    applicable_excepted = true;
+                }
+                continue;
+            }
+
+            owner_non_excepted = true;
+            if rule.record_type != qtype && rule.record_type != RecordType::CNAME {
                 continue;
             }
 
@@ -267,7 +318,7 @@ impl RewriteTable {
             .filter(|rule| rule.record_type == qtype)
             .collect();
         if !preferred.is_empty() {
-            return Some(
+            return RewriteLookup::Answered(
                 preferred
                     .iter()
                     .map(|rule| self.build_record(qname, &rule.data))
@@ -280,10 +331,20 @@ impl RewriteTable {
             .find(|rule| rule.record_type == RecordType::CNAME)
             && let LocalRecordData::Cname(ref target) = rule.data
         {
-            return self.resolve_cname(qname, target, qtype, client, visited, depth);
+            return match self.resolve_cname(qname, target, qtype, client, visited, depth) {
+                Some(records) => RewriteLookup::Answered(records),
+                None => RewriteLookup::NotFound,
+            };
         }
 
-        None
+        if applicable_excepted {
+            // A bypassed rule must fall through to upstream, never NODATA.
+            RewriteLookup::NotFound
+        } else if owner_non_excepted {
+            RewriteLookup::NoData
+        } else {
+            RewriteLookup::NotFound
+        }
     }
 
     /// Builds the CNAME answer for `qname -> target` and follows the chain.
@@ -311,7 +372,9 @@ impl RewriteTable {
         }
 
         let mut answers = vec![self.build_record(qname, &LocalRecordData::Cname(target.clone()))];
-        if let Some(target_answers) = self.lookup_inner(target, qtype, client, visited, depth + 1) {
+        if let RewriteLookup::Answered(target_answers) =
+            self.lookup_inner(target, qtype, client, visited, depth + 1)
+        {
             answers.extend(target_answers);
         }
         Some(answers)
@@ -396,6 +459,32 @@ fn matches_wildcard(candidate: &NormalizedDomain, suffix: &NormalizedDomain) -> 
     candidate.is_strict_subdomain_of(suffix)
 }
 
+/// Whether a stored record type can answer the given query type. A CNAME
+/// answers every type; everything else matches exactly.
+fn rule_applies_to_qtype(rtype: RecordType, qtype: RecordType) -> bool {
+    rtype == RecordType::CNAME || rtype == qtype
+}
+
+/// Splits TXT data into the 255-byte character-strings a DNS TXT record allows.
+///
+/// The split is UTF-8 safe and an empty value yields one empty character-string.
+pub fn txt_chunks(value: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < value.len() {
+        let mut end = (start + 255).min(value.len());
+        while end > start && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(value[start..end].to_string());
+        start = end;
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
 fn parse_entry_record(rtype: &str, answer: &str) -> Option<(RecordType, LocalRecordData)> {
     match rtype.to_ascii_uppercase().as_str() {
         "A" => {
@@ -414,10 +503,7 @@ fn parse_entry_record(rtype: &str, answer: &str) -> Option<(RecordType, LocalRec
             let name = Name::from_str(&format!("{}.", answer.trim_end_matches('.'))).ok()?;
             Some((RecordType::PTR, LocalRecordData::Ptr(name)))
         }
-        "TXT" => Some((
-            RecordType::TXT,
-            LocalRecordData::Txt(vec![answer.to_string()]),
-        )),
+        "TXT" => Some((RecordType::TXT, LocalRecordData::Txt(txt_chunks(answer)))),
         _ => None,
     }
 }
@@ -494,6 +580,21 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
 
+    fn answered(lookup: RewriteLookup) -> Vec<Record> {
+        match lookup {
+            RewriteLookup::Answered(records) => records,
+            other => panic!("expected Answered, got {other:?}"),
+        }
+    }
+
+    fn is_answered(lookup: &RewriteLookup) -> bool {
+        matches!(lookup, RewriteLookup::Answered(_))
+    }
+
+    fn is_not_found(lookup: &RewriteLookup) -> bool {
+        matches!(lookup, RewriteLookup::NotFound)
+    }
+
     fn sample_table() -> RewriteTable {
         let toml_str = r#"
 auto_ptr = true
@@ -517,14 +618,12 @@ entries = [
         let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
 
         let qname_printer = Name::from_str("printer.lan.").unwrap();
-        let answers = table
-            .lookup(&qname_printer, RecordType::A, &client)
-            .unwrap();
+        let answers = answered(table.lookup(&qname_printer, RecordType::A, &client));
         assert_eq!(answers.len(), 1);
         assert_eq!(answers[0].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 50))));
 
         let qname_v6 = Name::from_str("printer-v6.lan.").unwrap();
-        let answers_v6 = table.lookup(&qname_v6, RecordType::AAAA, &client).unwrap();
+        let answers_v6 = answered(table.lookup(&qname_v6, RecordType::AAAA, &client));
         assert_eq!(answers_v6.len(), 1);
         assert_eq!(
             answers_v6[0].data,
@@ -538,13 +637,13 @@ entries = [
         let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
 
         let qname_nas = Name::from_str("nas.home.arpa.").unwrap();
-        let answers = table.lookup(&qname_nas, RecordType::A, &client).unwrap();
+        let answers = answered(table.lookup(&qname_nas, RecordType::A, &client));
         assert_eq!(answers.len(), 1);
         assert_eq!(answers[0].name, qname_nas);
         assert_eq!(answers[0].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 10))));
 
         let qname_deep = Name::from_str("foo.bar.home.arpa.").unwrap();
-        let answers_deep = table.lookup(&qname_deep, RecordType::A, &client).unwrap();
+        let answers_deep = answered(table.lookup(&qname_deep, RecordType::A, &client));
         assert_eq!(answers_deep.len(), 1);
         assert_eq!(answers_deep[0].name, qname_deep);
     }
@@ -555,7 +654,7 @@ entries = [
         let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
 
         let qname = Name::from_str("special.home.arpa.").unwrap();
-        let answers = table.lookup(&qname, RecordType::A, &client).unwrap();
+        let answers = answered(table.lookup(&qname, RecordType::A, &client));
         assert_eq!(answers.len(), 1);
         // Should get .99 from exact match, not .10 from wildcard
         assert_eq!(answers[0].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 99))));
@@ -576,9 +675,8 @@ entries = [
 
         // From `a.lan` only the first (valid) CNAME may be returned; the
         // closing `b.lan -> a.lan` record must be suppressed.
-        let answers = table
-            .lookup(&Name::from_str("a.lan.").unwrap(), RecordType::A, &client)
-            .expect("valid prefix must be returned");
+        let answers =
+            answered(table.lookup(&Name::from_str("a.lan.").unwrap(), RecordType::A, &client));
         assert_eq!(answers.len(), 1, "closing cycle record must be suppressed");
         assert_eq!(answers[0].record_type(), RecordType::CNAME);
         assert_eq!(
@@ -587,9 +685,8 @@ entries = [
         );
 
         // The same holds when the cycle is entered from `b.lan`.
-        let answers_b = table
-            .lookup(&Name::from_str("b.lan.").unwrap(), RecordType::A, &client)
-            .expect("valid prefix must be returned");
+        let answers_b =
+            answered(table.lookup(&Name::from_str("b.lan.").unwrap(), RecordType::A, &client));
         assert_eq!(answers_b.len(), 1);
         assert_eq!(
             answers_b[0].data,
@@ -611,15 +708,11 @@ entries = [
 
         // A self-referencing CNAME resolves to no answer (the pipeline falls
         // through to upstream/blocking stages instead of emitting a loop).
-        assert!(
-            table
-                .lookup(
-                    &Name::from_str("loop.lan.").unwrap(),
-                    RecordType::A,
-                    &client
-                )
-                .is_none()
-        );
+        assert!(is_not_found(&table.lookup(
+            &Name::from_str("loop.lan.").unwrap(),
+            RecordType::A,
+            &client
+        )));
     }
 
     #[test]
@@ -636,13 +729,11 @@ entries = [
         let table = RewriteTable::new(cfg);
         let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
 
-        let answers = table
-            .lookup(
-                &Name::from_str("multi.lan.").unwrap(),
-                RecordType::A,
-                &client,
-            )
-            .unwrap();
+        let answers = answered(table.lookup(
+            &Name::from_str("multi.lan.").unwrap(),
+            RecordType::A,
+            &client,
+        ));
         assert_eq!(answers.len(), 3, "every rule for (domain, type) must match");
         let ips: Vec<Ipv4Addr> = answers
             .iter()
@@ -680,25 +771,21 @@ entries = [
 
         // `x.sub.home.arpa` is covered by both suffixes; only the most
         // specific one may answer.
-        let deep = table
-            .lookup(
-                &Name::from_str("x.sub.home.arpa.").unwrap(),
-                RecordType::A,
-                &client,
-            )
-            .unwrap();
+        let deep = answered(table.lookup(
+            &Name::from_str("x.sub.home.arpa.").unwrap(),
+            RecordType::A,
+            &client,
+        ));
         assert_eq!(deep.len(), 1);
         assert_eq!(deep[0].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 20))));
 
         // `x.home.arpa` only matches `*.home.arpa`; both same-suffix rules
         // answer, in configuration order.
-        let shallow = table
-            .lookup(
-                &Name::from_str("x.home.arpa.").unwrap(),
-                RecordType::A,
-                &client,
-            )
-            .unwrap();
+        let shallow = answered(table.lookup(
+            &Name::from_str("x.home.arpa.").unwrap(),
+            RecordType::A,
+            &client,
+        ));
         assert_eq!(shallow.len(), 2);
         assert_eq!(shallow[0].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 10))));
         assert_eq!(shallow[1].data, RData::A(A(Ipv4Addr::new(192, 168, 1, 11))));
@@ -718,17 +805,29 @@ entries = [
 
         // In-range IPv4 client is excepted.
         let excepted = ClientContext::new(IpAddr::from_str("10.10.4.7").unwrap());
-        assert!(table.lookup(&qname, RecordType::A, &excepted).is_none());
+        assert!(is_not_found(&table.lookup(
+            &qname,
+            RecordType::A,
+            &excepted
+        )));
 
         // In-range IPv6 client is excepted.
         let excepted_v6 = ClientContext::new(IpAddr::from_str("fd00::7").unwrap());
-        assert!(table.lookup(&qname, RecordType::A, &excepted_v6).is_none());
+        assert!(is_not_found(&table.lookup(
+            &qname,
+            RecordType::A,
+            &excepted_v6
+        )));
 
         // Out-of-range client still receives the rewrite.
         let allowed = ClientContext::new(IpAddr::from_str("10.11.0.1").unwrap());
-        assert!(table.lookup(&qname, RecordType::A, &allowed).is_some());
+        assert!(is_answered(&table.lookup(&qname, RecordType::A, &allowed)));
         let allowed_v6 = ClientContext::new(IpAddr::from_str("fe80::1").unwrap());
-        assert!(table.lookup(&qname, RecordType::A, &allowed_v6).is_some());
+        assert!(is_answered(&table.lookup(
+            &qname,
+            RecordType::A,
+            &allowed_v6
+        )));
     }
 
     #[test]
@@ -744,13 +843,11 @@ entries = [
         assert_eq!(cfg.ttl, 120);
         let table = RewriteTable::new(cfg);
         let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
-        let answers = table
-            .lookup(
-                &Name::from_str("printer.lan.").unwrap(),
-                RecordType::A,
-                &client,
-            )
-            .unwrap();
+        let answers = answered(table.lookup(
+            &Name::from_str("printer.lan.").unwrap(),
+            RecordType::A,
+            &client,
+        ));
         assert_eq!(answers[0].ttl, 120);
 
         // Absent `ttl` keeps the historical 60s default.
@@ -780,7 +877,7 @@ entries = [
         let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
         // `*.home.arpa` must not match the bare `home.arpa` apex.
         let qname = Name::from_str("home.arpa.").unwrap();
-        assert!(table.lookup(&qname, RecordType::A, &client).is_none());
+        assert!(is_not_found(&table.lookup(&qname, RecordType::A, &client)));
     }
 
     #[test]
@@ -789,7 +886,7 @@ entries = [
         let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
 
         let qname_router = Name::from_str("router.lan.").unwrap();
-        let answers = table.lookup(&qname_router, RecordType::A, &client).unwrap();
+        let answers = answered(table.lookup(&qname_router, RecordType::A, &client));
         assert_eq!(answers.len(), 2);
         assert_eq!(answers[0].record_type(), RecordType::CNAME);
         assert_eq!(answers[1].record_type(), RecordType::A);
@@ -797,13 +894,11 @@ entries = [
 
         // External CNAME returns only CNAME (including for non-A/AAAA types like HTTPS/TXT)
         let qname_ext = Name::from_str("external.lan.").unwrap();
-        let answers_ext = table.lookup(&qname_ext, RecordType::A, &client).unwrap();
+        let answers_ext = answered(table.lookup(&qname_ext, RecordType::A, &client));
         assert_eq!(answers_ext.len(), 1);
         assert_eq!(answers_ext[0].record_type(), RecordType::CNAME);
 
-        let answers_https = table
-            .lookup(&qname_ext, RecordType::HTTPS, &client)
-            .unwrap();
+        let answers_https = answered(table.lookup(&qname_ext, RecordType::HTTPS, &client));
         assert_eq!(answers_https.len(), 1);
         assert_eq!(answers_https[0].record_type(), RecordType::CNAME);
     }
@@ -815,7 +910,7 @@ entries = [
 
         // 192.168.1.50 -> printer.lan
         let ptr_query = Name::from_str("50.1.168.192.in-addr.arpa.").unwrap();
-        let answers = table.lookup(&ptr_query, RecordType::PTR, &client).unwrap();
+        let answers = answered(table.lookup(&ptr_query, RecordType::PTR, &client));
         assert_eq!(answers.len(), 1);
         let expected_target = Name::from_str("printer.lan.").unwrap();
         assert_eq!(answers[0].data, RData::PTR(PTR(expected_target)));
@@ -823,9 +918,7 @@ entries = [
         // fd00::50 -> printer-v6.lan
         let v6_arpa = ipv6_to_ip6_arpa(&Ipv6Addr::from_str("fd00::50").unwrap());
         let ptr_v6_query = Name::from_str(&format!("{v6_arpa}.")).unwrap();
-        let answers_v6 = table
-            .lookup(&ptr_v6_query, RecordType::PTR, &client)
-            .unwrap();
+        let answers_v6 = answered(table.lookup(&ptr_v6_query, RecordType::PTR, &client));
         assert_eq!(answers_v6.len(), 1);
         let expected_v6_target = Name::from_str("printer-v6.lan.").unwrap();
         assert_eq!(answers_v6[0].data, RData::PTR(PTR(expected_v6_target)));
@@ -841,7 +934,7 @@ entries = [
 
         let qname_nas = Name::from_str("nas.home.arpa.").unwrap();
         assert!(
-            table.lookup(&qname_nas, RecordType::A, &attacker).is_some(),
+            is_answered(&table.lookup(&qname_nas, RecordType::A, &attacker)),
             "unidentified clients must not match rewrite exceptions by raw id"
         );
 
@@ -849,11 +942,11 @@ entries = [
         let mut identified = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
         identified.client_name = Some("admin-laptop".to_string());
         identified.id = Some(sito_core::ClientId::new("admin-laptop"));
-        assert!(
-            table
-                .lookup(&qname_nas, RecordType::A, &identified)
-                .is_none()
-        );
+        assert!(is_not_found(&table.lookup(
+            &qname_nas,
+            RecordType::A,
+            &identified
+        )));
     }
 
     /// P1-9: an identified client at a configured IP must not satisfy a
@@ -871,7 +964,7 @@ entries = [
 
         let qname_nas = Name::from_str("nas.home.arpa.").unwrap();
         assert!(
-            table.lookup(&qname_nas, RecordType::A, &client).is_some(),
+            is_answered(&table.lookup(&qname_nas, RecordType::A, &client)),
             "an unauthenticated path id must not bypass a rewrite exception"
         );
 
@@ -880,14 +973,14 @@ entries = [
         client.id_authenticated = true;
         client.identity_source = Some(IdentitySource::Secret);
         assert!(
-            table.lookup(&qname_nas, RecordType::A, &client).is_some(),
+            is_answered(&table.lookup(&qname_nas, RecordType::A, &client)),
             "policy must never match the raw registered id"
         );
 
         // The registry-resolved identity name may satisfy the exception.
         client.client_name = Some("admin-laptop".to_string());
         assert!(
-            table.lookup(&qname_nas, RecordType::A, &client).is_none(),
+            is_not_found(&table.lookup(&qname_nas, RecordType::A, &client)),
             "an authenticated identity name may satisfy the exception"
         );
     }
@@ -905,15 +998,15 @@ entries = [
         // A display-only SNI/DoH identity cannot satisfy an exception.
         client.identity_source = Some(IdentitySource::TlsSni);
         assert!(
-            table.lookup(&qname, RecordType::A, &client).is_some(),
+            is_answered(&table.lookup(&qname, RecordType::A, &client)),
             "untrusted identity must not bypass a rewrite exception"
         );
         client.identity_source = Some(IdentitySource::DohPath);
-        assert!(table.lookup(&qname, RecordType::A, &client).is_some());
+        assert!(is_answered(&table.lookup(&qname, RecordType::A, &client)));
 
         // The same name from an authenticated identity may.
         client.identity_source = Some(IdentitySource::Ip);
-        assert!(table.lookup(&qname, RecordType::A, &client).is_none());
+        assert!(is_not_found(&table.lookup(&qname, RecordType::A, &client)));
     }
 
     #[test]
@@ -932,13 +1025,13 @@ entries = [
 
         let exact = Name::from_str("xn--mnchen-3ya.de.").unwrap();
         assert!(
-            table.lookup(&exact, RecordType::A, &client).is_some(),
+            is_answered(&table.lookup(&exact, RecordType::A, &client)),
             "raw Unicode rewrite domains must match punycode queries"
         );
 
         let wildcard = Name::from_str("shop.xn--bcher-kva.example.").unwrap();
         assert!(
-            table.lookup(&wildcard, RecordType::A, &client).is_some(),
+            is_answered(&table.lookup(&wildcard, RecordType::A, &client)),
             "wildcard IDN rewrite domains must match punycode queries"
         );
     }
@@ -951,15 +1044,233 @@ entries = [
 
         let qname_nas = Name::from_str("nas.home.arpa.").unwrap();
         // admin-laptop is in exception_clients for *.home.arpa -> should bypass and return None
-        assert!(table.lookup(&qname_nas, RecordType::A, &client).is_none());
+        assert!(is_not_found(&table.lookup(
+            &qname_nas,
+            RecordType::A,
+            &client
+        )));
 
         // But non-excepted client gets the rewrite
         let other_client = ClientContext::new(IpAddr::from_str("192.168.1.30").unwrap());
-        assert!(
-            table
-                .lookup(&qname_nas, RecordType::A, &other_client)
-                .is_some()
-        );
+        assert!(is_answered(&table.lookup(
+            &qname_nas,
+            RecordType::A,
+            &other_client
+        )));
+    }
+
+    fn exact_a_only_table() -> RewriteTable {
+        let config: RewritesConfig = toml::from_str(
+            r#"
+auto_ptr = false
+entries = [
+    { domain = "printer.lan", type = "A", answer = "192.168.1.50" },
+]
+"#,
+        )
+        .unwrap();
+        RewriteTable::new(config)
+    }
+
+    /// An exact owner configured only for `A` is authoritative for the name:
+    /// other types are NODATA rather than an upstream lookup.
+    #[test]
+    fn test_exact_owner_returns_nodata_for_unconfigured_types() {
+        let table = exact_a_only_table();
+        let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+        let qname = Name::from_str("printer.lan.").unwrap();
+
+        assert!(matches!(
+            table.lookup(&qname, RecordType::A, &client),
+            RewriteLookup::Answered(records) if records.len() == 1
+        ));
+        for qtype in [
+            RecordType::AAAA,
+            RecordType::TXT,
+            RecordType::PTR,
+            RecordType::HTTPS,
+        ] {
+            assert!(
+                matches!(table.lookup(&qname, qtype, &client), RewriteLookup::NoData),
+                "{qtype:?} must be NODATA for an A-only owner"
+            );
+        }
+
+        let unknown = Name::from_str("unknown.lan.").unwrap();
+        assert!(matches!(
+            table.lookup(&unknown, RecordType::A, &client),
+            RewriteLookup::NotFound
+        ));
+    }
+
+    #[test]
+    fn test_excepted_client_gets_not_found_not_nodata() {
+        let config: RewritesConfig = toml::from_str(
+            r#"
+auto_ptr = false
+entries = [
+    { domain = "printer.lan", type = "A", answer = "192.168.1.50", exception_clients = ["10.0.0.0/8"] },
+]
+"#,
+        )
+        .unwrap();
+        let table = RewriteTable::new(config);
+        let qname = Name::from_str("printer.lan.").unwrap();
+
+        let excepted = ClientContext::new(IpAddr::from_str("10.10.4.7").unwrap());
+        for qtype in [RecordType::A, RecordType::AAAA, RecordType::TXT] {
+            assert!(
+                matches!(
+                    table.lookup(&qname, qtype, &excepted),
+                    RewriteLookup::NotFound
+                ),
+                "an exception bypass must fall through for {qtype:?}"
+            );
+        }
+
+        let allowed = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+        assert!(matches!(
+            table.lookup(&qname, RecordType::A, &allowed),
+            RewriteLookup::Answered(_)
+        ));
+        assert!(matches!(
+            table.lookup(&qname, RecordType::AAAA, &allowed),
+            RewriteLookup::NoData
+        ));
+    }
+
+    #[test]
+    fn test_wildcard_owner_returns_nodata_for_unconfigured_types() {
+        let config: RewritesConfig = toml::from_str(
+            r#"
+auto_ptr = false
+entries = [
+    { domain = "*.home.arpa", type = "A", answer = "192.168.1.10" },
+]
+"#,
+        )
+        .unwrap();
+        let table = RewriteTable::new(config);
+        let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+        let qname = Name::from_str("nas.home.arpa.").unwrap();
+
+        assert!(matches!(
+            table.lookup(&qname, RecordType::A, &client),
+            RewriteLookup::Answered(_)
+        ));
+        for qtype in [RecordType::AAAA, RecordType::TXT, RecordType::HTTPS] {
+            assert!(
+                matches!(table.lookup(&qname, qtype, &client), RewriteLookup::NoData),
+                "{qtype:?} must be NODATA for a wildcard A-only owner"
+            );
+        }
+    }
+
+    #[test]
+    fn test_auto_ptr_owner_outcomes() {
+        let config: RewritesConfig = toml::from_str(
+            r#"
+auto_ptr = true
+entries = [
+    { domain = "printer.lan", type = "A", answer = "192.168.1.50" },
+]
+"#,
+        )
+        .unwrap();
+        let table = RewriteTable::new(config);
+        let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+        let ptr_name = Name::from_str("50.1.168.192.in-addr.arpa.").unwrap();
+
+        assert!(matches!(
+            table.lookup(&ptr_name, RecordType::PTR, &client),
+            RewriteLookup::Answered(records) if records.len() == 1
+        ));
+        assert!(matches!(
+            table.lookup(&ptr_name, RecordType::A, &client),
+            RewriteLookup::NoData
+        ));
+    }
+
+    #[test]
+    fn test_txt_chunks_splits_long_values_and_preserves_utf8() {
+        let ascii = "a".repeat(300);
+        let chunks = txt_chunks(&ascii);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 255);
+        assert_eq!(chunks[1].len(), 45);
+        assert_eq!(chunks.concat(), ascii);
+
+        // 254 ASCII bytes followed by a 2-byte character: the 255-byte
+        // boundary falls inside the character and must move back to a
+        // UTF-8 boundary.
+        let mut unicode = "a".repeat(254);
+        unicode.push('é');
+        let chunks = txt_chunks(&unicode);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 255));
+        assert_eq!(chunks.concat(), unicode);
+        assert_eq!(chunks[0], "a".repeat(254));
+        assert_eq!(chunks[1], "é");
+
+        assert_eq!(txt_chunks(""), vec![String::new()]);
+    }
+
+    #[test]
+    fn test_local_txt_entries_are_chunked_on_lookup() {
+        let ascii = "a".repeat(300);
+        let mut unicode = "b".repeat(254);
+        unicode.push('é');
+        let config = RewritesConfig {
+            auto_ptr: false,
+            ttl: 60,
+            entries: vec![
+                crate::config::RewriteEntryConfig {
+                    domain: "long.lan".to_string(),
+                    r#type: "TXT".to_string(),
+                    answer: ascii.clone(),
+                    exception_clients: Vec::new(),
+                },
+                crate::config::RewriteEntryConfig {
+                    domain: "utf8.lan".to_string(),
+                    r#type: "TXT".to_string(),
+                    answer: unicode.clone(),
+                    exception_clients: Vec::new(),
+                },
+                crate::config::RewriteEntryConfig {
+                    domain: "empty.lan".to_string(),
+                    r#type: "TXT".to_string(),
+                    answer: String::new(),
+                    exception_clients: Vec::new(),
+                },
+            ],
+        };
+        let table = RewriteTable::new(config);
+        let client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+
+        for (domain, expected) in [
+            ("long.lan.", ascii),
+            ("utf8.lan.", unicode),
+            ("empty.lan.", String::new()),
+        ] {
+            let records =
+                match table.lookup(&Name::from_str(domain).unwrap(), RecordType::TXT, &client) {
+                    RewriteLookup::Answered(records) => records,
+                    other => panic!("{domain} must be Answered: {other:?}"),
+                };
+            assert_eq!(records.len(), 1);
+            let RData::TXT(txt) = &records[0].data else {
+                panic!("{domain} must be a TXT record");
+            };
+            let strings = txt
+                .txt_data
+                .iter()
+                .map(|chunk| String::from_utf8(chunk.to_vec()).expect("valid UTF-8"))
+                .collect::<Vec<_>>();
+            assert!(
+                strings.iter().all(|chunk| chunk.len() <= 255),
+                "{domain} chunks must fit in one character-string"
+            );
+            assert_eq!(strings.concat(), expected, "{domain} round-trip");
+        }
     }
 
     /// Regression (audit 6, WP-3.6): punycode config entries must match, and
@@ -989,23 +1300,17 @@ entries = [
         let client = ClientContext::new("192.168.1.50".parse().unwrap());
 
         let puny_apex = Name::from_ascii("xn--mnchen-3ya.de.").unwrap();
-        let records = table
-            .lookup(&puny_apex, RecordType::A, &client)
-            .expect("punycode entry must match a punycode query");
+        let records = answered(table.lookup(&puny_apex, RecordType::A, &client));
         assert_eq!(records[0].data, RData::A(A(Ipv4Addr::new(192, 0, 2, 10))));
 
         // The Unicode config entry is normalized to punycode too.
         let unicode_entry = Name::from_ascii("xn--bcher-kva.example.").unwrap();
-        let records = table
-            .lookup(&unicode_entry, RecordType::A, &client)
-            .expect("uninitialized Unicode entry must be normalized");
+        let records = answered(table.lookup(&unicode_entry, RecordType::A, &client));
         assert_eq!(records[0].data, RData::A(A(Ipv4Addr::new(192, 0, 2, 11))));
 
         // Wildcards with IDN suffixes resolve as well.
         let wildcard = Name::from_ascii("shop.xn--mnchen-3ya.de.").unwrap();
-        let records = table
-            .lookup(&wildcard, RecordType::A, &client)
-            .expect("IDN wildcard must match");
+        let records = answered(table.lookup(&wildcard, RecordType::A, &client));
         assert_eq!(records[0].data, RData::A(A(Ipv4Addr::new(192, 0, 2, 12))));
     }
 }

@@ -126,18 +126,5 @@ pub(super) fn make_blocked_response(
 
 /// Splits TXT data into the 255-byte character-strings a DNS TXT record allows.
 pub(super) fn txt_chunks(value: &str) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < value.len() {
-        let mut end = (start + 255).min(value.len());
-        while end > start && !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        chunks.push(value[start..end].to_string());
-        start = end;
-    }
-    if chunks.is_empty() {
-        chunks.push(String::new());
-    }
-    chunks
+    sito_rewrites::txt_chunks(value)
 }

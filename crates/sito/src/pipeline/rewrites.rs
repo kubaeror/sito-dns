@@ -153,10 +153,28 @@ pub(super) fn effective_rewrites(
 impl PipelineContext<'_> {
     /// ADR-0007 stage 2: local rewrite table and auto-PTR records.
     pub(super) fn apply_local_rewrite(&self) -> Option<QueryOutcome> {
-        let records =
-            self.runtime_snapshot
-                .rewrites
-                .lookup(&self.qname, self.qtype, &self.client)?;
+        let lookup = self
+            .runtime_snapshot
+            .rewrites
+            .lookup(&self.qname, self.qtype, &self.client);
+        let records = match lookup {
+            RewriteLookup::Answered(records) => records,
+            RewriteLookup::NoData => {
+                trace!(
+                    qname = %self.qname,
+                    qtype = ?self.qtype,
+                    "Local rewrite owner has no record for the query type; returning NODATA"
+                );
+                let mut rewrite_resp = synthesize_records_response(&self.query, Vec::new());
+                rewrite_resp.metadata.id = self.query_id;
+                return Some(QueryOutcome::rewritten(
+                    rewrite_resp,
+                    self.domain_str.clone(),
+                    self.qtype,
+                ));
+            }
+            RewriteLookup::NotFound => return None,
+        };
         trace!(
             qname = %self.qname,
             qtype = ?self.qtype,
@@ -174,6 +192,15 @@ impl PipelineContext<'_> {
 
     /// ADR-0007 stage 4: safe-search CNAME rewrite.
     pub(super) fn apply_safe_search_rewrite(&self) -> Option<QueryOutcome> {
+        // Safe search only affects address and HTTPS lookups. Other types
+        // (TXT, MX, CNAME, ...) must resolve normally instead of being
+        // replaced by a CNAME.
+        if !matches!(
+            self.qtype,
+            RecordType::A | RecordType::AAAA | RecordType::HTTPS
+        ) {
+            return None;
+        }
         if !self.is_filtering_active || !self.policy.safe_search || self.important_allowed {
             return None;
         }

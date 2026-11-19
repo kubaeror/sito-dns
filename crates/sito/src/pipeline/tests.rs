@@ -475,6 +475,252 @@ async fn test_pipeline_rewrite_matches_query_type_without_upstream() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// A local rewrite owner configured for a single type is authoritative for
+/// the name: other query types are answered with NOERROR/NODATA and never
+/// reach upstream. An exception client still falls through.
+#[tokio::test]
+async fn test_local_rewrite_owner_returns_nodata_for_unconfigured_types() {
+    use sito_rewrites::{RewriteEntryConfig, RewriteTable, RewritesConfig};
+    use std::sync::atomic::Ordering;
+
+    let rewrites = RewriteTable::new(RewritesConfig {
+        auto_ptr: false,
+        ttl: 60,
+        entries: vec![RewriteEntryConfig {
+            domain: "printer.lan".to_string(),
+            r#type: "A".to_string(),
+            answer: "192.168.1.50".to_string(),
+            exception_clients: vec!["127.0.0.9".to_string()],
+        }],
+    });
+    let mut config = Config::default();
+    config.dns.dnssec.validate = false;
+    config.filtering.fail_closed = false;
+    let (pipeline, calls, temp_dir) = test_pipeline_with_rewrites(config, rewrites).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let resp = pipeline
+        .handle(rewrite_query("printer.lan.", RecordType::A), client.clone())
+        .await
+        .unwrap();
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(resp.answers.len(), 1);
+    assert!(
+        matches!(resp.answers[0].data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::new(192, 168, 1, 50))
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    for qtype in [RecordType::AAAA, RecordType::TXT, RecordType::HTTPS] {
+        let resp = pipeline
+            .handle(rewrite_query("printer.lan.", qtype), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NoError,
+            "{qtype:?} must be NOERROR/NODATA"
+        );
+        assert!(
+            resp.answers.is_empty(),
+            "{qtype:?} must be NODATA instead of querying upstream: {:?}",
+            resp.answers
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "{qtype:?} must not query upstream"
+        );
+    }
+
+    // An exception client bypasses the local rewrite and resolves upstream.
+    let excepted = ClientContext::new("127.0.0.9".parse().unwrap());
+    let resp = pipeline
+        .handle(rewrite_query("printer.lan.", RecordType::A), excepted)
+        .await
+        .unwrap();
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        matches!(resp.answers[0].data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::new(203, 0, 113, 9)),
+        "an excepted client must reach upstream: {:?}",
+        resp.answers
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Local TXT rewrites split long and multi-byte values into valid
+/// character-strings, including the empty-value case.
+#[tokio::test]
+async fn test_local_rewrite_txt_values_are_chunked() {
+    use sito_rewrites::{RewriteEntryConfig, RewriteTable, RewritesConfig};
+
+    let ascii = "a".repeat(300);
+    let mut unicode = "b".repeat(254);
+    unicode.push('é');
+    let rewrites = RewriteTable::new(RewritesConfig {
+        auto_ptr: false,
+        ttl: 60,
+        entries: vec![
+            RewriteEntryConfig {
+                domain: "long.lan".to_string(),
+                r#type: "TXT".to_string(),
+                answer: ascii.clone(),
+                exception_clients: Vec::new(),
+            },
+            RewriteEntryConfig {
+                domain: "utf8.lan".to_string(),
+                r#type: "TXT".to_string(),
+                answer: unicode.clone(),
+                exception_clients: Vec::new(),
+            },
+            RewriteEntryConfig {
+                domain: "empty.lan".to_string(),
+                r#type: "TXT".to_string(),
+                answer: String::new(),
+                exception_clients: Vec::new(),
+            },
+        ],
+    });
+    let mut config = Config::default();
+    config.dns.dnssec.validate = false;
+    config.filtering.fail_closed = false;
+    let (pipeline, _calls, temp_dir) = test_pipeline_with_rewrites(config, rewrites).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    for (domain, expected) in [
+        ("long.lan.", ascii),
+        ("utf8.lan.", unicode),
+        ("empty.lan.", String::new()),
+    ] {
+        let resp = pipeline
+            .handle(rewrite_query(domain, RecordType::TXT), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+        let RData::TXT(txt) = &resp.answers[0].data else {
+            panic!("{domain} must answer TXT");
+        };
+        let strings = txt
+            .txt_data
+            .iter()
+            .map(|chunk| String::from_utf8(chunk.to_vec()).expect("valid UTF-8"))
+            .collect::<Vec<_>>();
+        assert!(
+            strings.iter().all(|chunk| chunk.len() <= 255),
+            "{domain} chunks must fit one character-string"
+        );
+        assert_eq!(strings.concat(), expected, "{domain} must round-trip");
+    }
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Safe-search rewriting only applies to address/HTTPS lookups; other query
+/// types must resolve normally.
+#[tokio::test]
+async fn test_safe_search_rewrite_is_limited_to_address_and_https_qtypes() {
+    use sito_clients::{ClientEntryConfig, ClientGroupConfig, ClientsConfig};
+    use sito_rewrites::{RewriteTable, RewritesConfig};
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let (mock_addr, calls) = spawn_mock_upstream(None).await;
+    let mut config = Config::default();
+    config.dns.dnssec.validate = false;
+    config.filtering.enabled = true;
+    config.filtering.fail_closed = false;
+    config.filtering.lists.clear();
+    config.filtering.custom_rules.clear();
+    config.upstream.servers = vec![mock_addr.to_string()];
+
+    let clients = ClientsConfig {
+        entries: vec![ClientEntryConfig {
+            name: "kid".to_string(),
+            ids: vec!["127.0.0.1".to_string()],
+            group: "kids".to_string(),
+            ignore_query_log: false,
+            ignore_stats: false,
+            use_global_upstreams: true,
+            upstreams: None,
+            trusted: false,
+        }],
+        groups: HashMap::from([(
+            "kids".to_string(),
+            ClientGroupConfig {
+                safe_search: true,
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+    let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+    let (pipeline, temp_dir) = build_test_pipeline_with_rewrites(
+        config,
+        upstream,
+        validator,
+        clients,
+        RewriteTable::new(RewritesConfig::default()),
+    )
+    .await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    for qtype in [RecordType::A, RecordType::AAAA, RecordType::HTTPS] {
+        let resp = pipeline
+            .handle(rewrite_query("google.com.", qtype), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            resp.answers.iter().any(|record| {
+                matches!(&record.data, RData::CNAME(cname)
+                    if cname.0.to_ascii().trim_end_matches('.') == "forcesafesearch.google.com")
+            }),
+            "{qtype:?} must be safe-search rewritten: {:?}",
+            resp.answers
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "{qtype:?} must not query upstream"
+        );
+    }
+
+    let mut expected_calls = 0;
+    for qtype in [RecordType::TXT, RecordType::MX, RecordType::CNAME] {
+        let resp = pipeline
+            .handle(rewrite_query("google.com.", qtype), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            !resp.answers.iter().any(|record| {
+                matches!(&record.data, RData::CNAME(cname)
+                    if cname.0.to_ascii().trim_end_matches('.') == "forcesafesearch.google.com")
+            }),
+            "{qtype:?} must not be safe-search rewritten: {:?}",
+            resp.answers
+        );
+        expected_calls += 1;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            expected_calls,
+            "{qtype:?} must resolve upstream"
+        );
+    }
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 /// Collects candidates exactly like [`DnsPipeline::handle`] does and
 /// compares the resulting verdicts with the engine's own `evaluate*`
 /// wrappers. This guards the WP-18 single-collection refactor against
@@ -1097,14 +1343,33 @@ async fn build_test_pipeline_with_validator(
 /// Builds a pipeline with an explicit client registry, compiling group
 /// rule sets from it (used by the group-only end-to-end test).
 async fn build_test_pipeline_with_clients(
-    mut config: Config,
+    config: Config,
     upstream: std::sync::Arc<UpstreamManager>,
     dnssec: sito_dnssec::DnssecValidator,
     clients: sito_clients::ClientsConfig,
 ) -> (DnsPipeline, std::path::PathBuf) {
+    use sito_rewrites::{RewriteTable, RewritesConfig};
+
+    build_test_pipeline_with_rewrites(
+        config,
+        upstream,
+        dnssec,
+        clients,
+        RewriteTable::new(RewritesConfig::default()),
+    )
+    .await
+}
+
+/// Builds a pipeline with explicit client and rewrite configuration.
+async fn build_test_pipeline_with_rewrites(
+    mut config: Config,
+    upstream: std::sync::Arc<UpstreamManager>,
+    dnssec: sito_dnssec::DnssecValidator,
+    clients: sito_clients::ClientsConfig,
+    rewrites: sito_rewrites::RewriteTable,
+) -> (DnsPipeline, std::path::PathBuf) {
     use sito_clients::{ClientRegistry, ParentalRegistry, ServiceRegistry};
     use sito_filter::HostsFilterEngine;
-    use sito_rewrites::{RewriteTable, RewritesConfig};
     use std::sync::atomic::AtomicUsize;
 
     let temp_dir = std::env::temp_dir().join(format!(
@@ -1141,9 +1406,7 @@ async fn build_test_pipeline_with_clients(
             ParentalRegistry::try_bundled().expect("bundled parental lists must load"),
         ),
         std::sync::Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load")),
-        std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(RewriteTable::new(
-            RewritesConfig::default(),
-        )))),
+        std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(rewrites))),
         std::sync::Arc::new(AtomicUsize::new(0)),
     );
     (pipeline, temp_dir)
@@ -1168,6 +1431,38 @@ async fn test_pipeline(
             .unwrap(),
     );
     let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+    (pipeline, calls, temp_dir)
+}
+
+/// Builds a pipeline backed by the default successful UDP mock upstream and a
+/// caller-supplied local rewrite table.
+async fn test_pipeline_with_rewrites(
+    mut config: Config,
+    rewrites: sito_rewrites::RewriteTable,
+) -> (
+    DnsPipeline,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::path::PathBuf,
+) {
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+    let (mock_addr, calls) = spawn_mock_upstream(None).await;
+    config.upstream.servers = vec![mock_addr.to_string()];
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+    let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+    let (pipeline, temp_dir) = build_test_pipeline_with_rewrites(
+        config,
+        upstream,
+        validator,
+        sito_clients::ClientsConfig::default(),
+        rewrites,
+    )
+    .await;
     (pipeline, calls, temp_dir)
 }
 
