@@ -10,12 +10,12 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
 
 use sito_core::client::ClientContext;
 use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
+use crate::admission::{AdmissionController, DEFAULT_MAX_CONNECTIONS_PER_IP};
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
 use crate::tls::TlsAcceptorManager;
@@ -330,23 +330,22 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
     let local_addr = endpoint.local_addr()?;
     info!("DoH3 listener started on {}", local_addr);
 
-    let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
-        Arc::new(RateLimiter::new(
-            config.rate_limit_per_ip,
-            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
-        ))
-    });
-    rate_limiter.spawn_pruner(shutdown_rx.clone());
-    let semaphore = Arc::new(Semaphore::new(config.max_connections));
-    let per_ip_limiter = crate::admission::PerIpConnectionLimiter::new(
-        crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP,
-    );
-    let request_semaphore = Arc::new(Semaphore::new(
+    let admission = AdmissionController::new(
+        config.max_connections,
+        DEFAULT_MAX_CONNECTIONS_PER_IP,
+        config.rate_limiter.clone().unwrap_or_else(|| {
+            Arc::new(RateLimiter::new(
+                config.rate_limit_per_ip,
+                RateLimiter::burst_for_rate(config.rate_limit_per_ip),
+            ))
+        }),
         config
             .max_connections
             .saturating_mul(DOH3_REQUESTS_PER_CONNECTION)
             .max(1),
-    ));
+    );
+    admission.spawn_pruner(shutdown_rx.clone());
+    let max_connections = config.max_connections;
     let acceptor_mgr = config.acceptor_mgr.clone();
     let dedicated_hostname = config.dedicated_hostname.clone();
 
@@ -365,31 +364,24 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                     }
                 }
                 Some(incoming) = endpoint_accept.accept() => {
-                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-                        warn!(
-                            "DoH3 max connections ({}) reached; rejecting incoming QUIC connection",
-                            config.max_connections
-                        );
-                        incoming.refuse();
-                        continue;
-                    };
-                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(incoming.remote_address().ip()) else {
-                        warn!(
-                            "DoH3 per-IP connection limit ({}) reached; rejecting connection",
-                            crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP
-                        );
-                        incoming.refuse();
-                        continue;
+                    let permit = match admission.try_acquire_connection(incoming.remote_address().ip()) {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            warn!(
+                                "DoH3 incoming connection rejected: {} (max connections {})",
+                                e, max_connections
+                            );
+                            incoming.refuse();
+                            continue;
+                        }
                     };
 
                     let handler = Arc::clone(&handler);
-                    let rate_limiter = Arc::clone(&rate_limiter);
-                    let request_semaphore = Arc::clone(&request_semaphore);
+                    let admission = Arc::clone(&admission);
                     let dedicated_hostname = dedicated_hostname.clone();
 
                     connection_tasks.spawn(async move {
                         let _permit = permit;
-                        let _per_ip_permit = per_ip_permit;
                         let conn = match tokio::time::timeout(limits.handshake_timeout, incoming).await {
                             Ok(Ok(c)) => c,
                             Ok(Err(e)) => {
@@ -408,8 +400,8 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                         let peer_addr = conn.remote_address();
                         let client_ip = peer_addr.ip();
 
-                        if !rate_limiter.check(client_ip) {
-                            debug!("DoH3 rate limit exceeded for client {}", client_ip);
+                        if let Err(e) = admission.check_rate(client_ip) {
+                            debug!("DoH3 rate limit exceeded for client {}: {}", client_ip, e);
                             conn.close(1u32.into(), b"Rate limit exceeded");
                             return;
                         }
@@ -442,18 +434,20 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                                         break;
                                     };
                             let handler = Arc::clone(&handler);
-                            let rate_limiter = Arc::clone(&rate_limiter);
-                            let request_semaphore = Arc::clone(&request_semaphore);
+                            let admission = Arc::clone(&admission);
                             let sni = sni.clone();
                             let dedicated_hostname = dedicated_hostname.clone();
 
                             request_tasks.spawn(async move {
-                                if !rate_limiter.check(client_ip) {
-                                    debug!("DoH3 rate limit exceeded for client {}", client_ip);
+                                if let Err(e) = admission.check_rate(client_ip) {
+                                    debug!(
+                                        "DoH3 rate limit exceeded for client {}: {}",
+                                        client_ip, e
+                                    );
                                     return;
                                 }
 
-                                let Ok(_request_permit) = request_semaphore.clone().try_acquire_owned() else {
+                                let Ok(_request_permit) = admission.try_acquire_request() else {
                                     debug!(
                                         "DoH3 global request limit reached for client {}",
                                         client_ip

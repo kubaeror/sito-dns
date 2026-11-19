@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
 
@@ -55,6 +54,7 @@ use hyper_util::service::TowerToHyperService;
 use sito_core::client::ClientContext;
 use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
+use crate::admission::{AdmissionController, AdmissionError, DEFAULT_MAX_CONNECTIONS_PER_IP};
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
 use crate::tls::TlsAcceptorManager;
@@ -104,10 +104,10 @@ impl DohConfig {
 
 struct DohState<H: QueryHandler> {
     handler: Arc<H>,
-    rate_limiter: Arc<RateLimiter>,
-    /// Global in-flight request budget. Acquired before any request body is
-    /// read so a client cannot force buffering simply by opening streams.
-    request_semaphore: Arc<Semaphore>,
+    /// Global connection/per-source/rate/request admission. The request slot
+    /// is acquired before any request body is read so a client cannot force
+    /// buffering simply by opening streams.
+    admission: Arc<AdmissionController>,
     alt_svc_header: Option<HeaderValue>,
     dedicated_hostname: Option<String>,
 }
@@ -270,22 +270,24 @@ async fn handle_doh_request<H: QueryHandler>(
     }
 
     let client_ip = peer_addr.ip();
-    if !state.rate_limiter.check(client_ip) {
-        debug!("DoH rate limit exceeded for client {}", client_ip);
-        return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
-    }
-
-    let Ok(_request_permit) = state.request_semaphore.clone().try_acquire_owned() else {
-        debug!("DoH global request limit reached for client {}", client_ip);
-        let mut response = (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Server is handling too many DNS requests",
-        )
-            .into_response();
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-        return response;
+    let _request_permit = match state.admission.try_admit_request(client_ip) {
+        Ok(permit) => permit,
+        Err(AdmissionError::RateLimited) => {
+            debug!("DoH rate limit exceeded for client {}", client_ip);
+            return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
+        }
+        Err(e) => {
+            debug!("DoH admission rejected for client {}: {}", client_ip, e);
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server is handling too many DNS requests",
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
     };
 
     if let Ok(response) = tokio::time::timeout(
@@ -511,9 +513,10 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
         HeaderValue::from_str(&val).expect("valid alt-svc header value")
     });
 
-    let state = Arc::new(DohState {
-        handler,
-        rate_limiter: config.rate_limiter.clone().unwrap_or_else(|| {
+    let admission = AdmissionController::new(
+        config.max_connections,
+        DEFAULT_MAX_CONNECTIONS_PER_IP,
+        config.rate_limiter.clone().unwrap_or_else(|| {
             Arc::new(RateLimiter::new(
                 config.rate_limit_per_ip,
                 RateLimiter::burst_for_rate(config.rate_limit_per_ip),
@@ -521,13 +524,16 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
         }),
         // Two in-flight requests per connection slot: enough for ordinary
         // HTTP/2 concurrency while still bounding pre-body buffering.
-        request_semaphore: Arc::new(Semaphore::new(
-            config.max_connections.saturating_mul(2).max(2),
-        )),
+        config.max_connections.saturating_mul(2).max(2),
+    );
+    admission.spawn_pruner(shutdown_rx.clone());
+
+    let state = Arc::new(DohState {
+        handler,
+        admission: Arc::clone(&admission),
         alt_svc_header,
         dedicated_hostname: config.dedicated_hostname,
     });
-    state.rate_limiter.spawn_pruner(shutdown_rx.clone());
 
     let app = Router::new()
         .route("/dns-query", any(doh_route::<H>))
@@ -541,11 +547,8 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
     // `Arc`-cheap, so no per-connection stack construction is needed.
     let router_service = TowerToHyperService::new(app);
 
-    let semaphore = Arc::new(Semaphore::new(config.max_connections));
-    let per_ip_limiter = crate::admission::PerIpConnectionLimiter::new(
-        crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP,
-    );
     let acceptor_mgr = config.acceptor_mgr;
+    let max_connections = config.max_connections;
 
     let handle = tokio::spawn(async move {
         let mut accept_backoff = crate::admission::AcceptBackoff::default();
@@ -574,19 +577,15 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
                         }
                     };
 
-                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-                        warn!(
-                            "DoH max connections ({}) reached; rejecting connection from {}",
-                            config.max_connections, peer_addr
-                        );
-                        continue;
-                    };
-                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(peer_addr.ip()) else {
-                        warn!(
-                            "DoH per-IP connection limit ({}) reached; rejecting connection from {}",
-                            crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP, peer_addr
-                        );
-                        continue;
+                    let permit = match admission.try_acquire_connection(peer_addr.ip()) {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            warn!(
+                                "DoH connection from {} rejected: {} (max connections {})",
+                                peer_addr, e, max_connections
+                            );
+                            continue;
+                        }
                     };
 
                     let hyper_service = InsertPeerAddr {
@@ -597,7 +596,6 @@ pub async fn start_doh_listener<H: QueryHandler + 'static>(
 
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let _per_ip_permit = per_ip_permit;
 
                         if let Some(mgr) = maybe_mgr {
                             let acceptor = mgr.acceptor();

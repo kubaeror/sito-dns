@@ -17,10 +17,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
-use crate::admission::{AcceptBackoff, PerIpConnectionLimiter};
+use crate::admission::{AcceptBackoff, AdmissionController};
 use crate::limiter::RateLimiter;
 
 /// Resource limits for the ACME HTTP-01 listener. The challenge endpoint is
@@ -193,13 +192,16 @@ pub(crate) fn start_acme_http01_listener_on_with_limits(
         .with_state(ChallengeState { challenges });
     let service = TowerToHyperService::new(app);
 
-    let semaphore = Arc::new(Semaphore::new(limits.max_connections.max(1)));
-    let per_ip_limiter = PerIpConnectionLimiter::new(limits.max_connections_per_ip);
-    let rate_limiter = Arc::new(RateLimiter::new(
-        limits.rate_per_sec,
-        RateLimiter::burst_for_rate(limits.rate_per_sec),
-    ));
-    rate_limiter.spawn_pruner(shutdown_rx.clone());
+    let admission = AdmissionController::new(
+        limits.max_connections.max(1),
+        limits.max_connections_per_ip,
+        Arc::new(RateLimiter::new(
+            limits.rate_per_sec,
+            RateLimiter::burst_for_rate(limits.rate_per_sec),
+        )),
+        limits.max_connections.max(1),
+    );
+    admission.spawn_pruner(shutdown_rx.clone());
 
     let handle = tokio::spawn(async move {
         let mut accept_backoff = AcceptBackoff::default();
@@ -230,33 +232,29 @@ pub(crate) fn start_acme_http01_listener_on_with_limits(
                         }
                     };
 
-                    if !rate_limiter.check(peer_addr.ip()) {
+                    if let Err(e) = admission.check_rate(peer_addr.ip()) {
                         debug!(
-                            "ACME HTTP-01 connection rate limit exceeded for {}",
-                            peer_addr.ip()
+                            "ACME HTTP-01 connection rate limit exceeded for {}: {}",
+                            peer_addr.ip(),
+                            e
                         );
                         continue;
                     }
 
-                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-                        debug!(
-                            "ACME HTTP-01 max connections ({}) reached; dropping connection from {}",
-                            limits.max_connections, peer_addr
-                        );
-                        continue;
-                    };
-                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(peer_addr.ip()) else {
-                        debug!(
-                            "ACME HTTP-01 per-IP connection limit ({}) reached; dropping connection from {}",
-                            limits.max_connections_per_ip, peer_addr
-                        );
-                        continue;
+                    let permit = match admission.try_acquire_connection(peer_addr.ip()) {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            debug!(
+                                "ACME HTTP-01 connection from {} rejected: {}",
+                                peer_addr, e
+                            );
+                            continue;
+                        }
                     };
 
                     let service = service.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
-                        let _per_ip_permit = per_ip_permit;
                         let mut builder = ConnBuilder::new(TokioExecutor::new());
                         builder
                             .http1()

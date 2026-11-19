@@ -6,9 +6,11 @@
 //! by rotating through addresses inside its own allocation.
 
 use dashmap::DashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
+
+use crate::admission::RateKey;
 
 #[derive(Debug)]
 struct Bucket {
@@ -31,19 +33,7 @@ const EVICTION_SAMPLE: usize = 32;
 /// collapse an entire IPv4 LAN into one bucket and throttle every client when
 /// the listener accepts dual-stack socket traffic (`IPV6_V6ONLY=false`).
 pub(crate) fn rate_key(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(v4) => {
-            let bits = u32::from(v4) & 0xFFFF_FF00;
-            IpAddr::V4(Ipv4Addr::from(bits))
-        }
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return IpAddr::V4(Ipv4Addr::from(u32::from(v4) & 0xFFFF_FF00));
-            }
-            let bits = u128::from(v6) & 0xFFFF_FFFF_FFFF_FFFF_0000_0000_0000_0000;
-            IpAddr::V6(Ipv6Addr::from(bits))
-        }
-    }
+    RateKey::from_ip(ip).as_ip()
 }
 
 /// Token-bucket based rate limiter keyed by client network prefix.
@@ -208,7 +198,7 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn test_rate_limiter_allows_under_limit() {

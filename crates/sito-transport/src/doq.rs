@@ -7,12 +7,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
 
 use sito_core::client::ClientContext;
 use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
+use crate::admission::{AdmissionController, DEFAULT_MAX_CONNECTIONS_PER_IP};
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
 use crate::tcp::frame_prefix;
@@ -142,25 +142,24 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
     let local_addr = endpoint.local_addr()?;
     info!("DoQ listener started on {}", local_addr);
 
-    let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
-        Arc::new(RateLimiter::new(
-            config.rate_limit_per_ip,
-            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
-        ))
-    });
-    rate_limiter.spawn_pruner(shutdown_rx.clone());
-    let semaphore = Arc::new(Semaphore::new(config.max_connections));
-    // Global stream budget: bounds buffered query bodies/tasks even when a
-    // client keeps every allowed connection open.
-    let stream_semaphore = Arc::new(Semaphore::new(
+    let admission = AdmissionController::new(
+        config.max_connections,
+        DEFAULT_MAX_CONNECTIONS_PER_IP,
+        config.rate_limiter.clone().unwrap_or_else(|| {
+            Arc::new(RateLimiter::new(
+                config.rate_limit_per_ip,
+                RateLimiter::burst_for_rate(config.rate_limit_per_ip),
+            ))
+        }),
+        // Global stream budget: bounds buffered query bodies/tasks even when a
+        // client keeps every allowed connection open.
         config
             .max_connections
             .saturating_mul(DOQ_STREAMS_PER_CONNECTION)
             .max(1),
-    ));
-    let per_ip_limiter = crate::admission::PerIpConnectionLimiter::new(
-        crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP,
     );
+    admission.spawn_pruner(shutdown_rx.clone());
+    let max_connections = config.max_connections;
     let acceptor_mgr = config.acceptor_mgr.clone();
 
     let endpoint_accept = endpoint.clone();
@@ -178,30 +177,23 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                     }
                 }
                 Some(incoming) = endpoint_accept.accept() => {
-                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-                        warn!(
-                            "DoQ max connections ({}) reached; rejecting incoming QUIC connection",
-                            config.max_connections
-                        );
-                        incoming.refuse();
-                        continue;
-                    };
-                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(incoming.remote_address().ip()) else {
-                        warn!(
-                            "DoQ per-IP connection limit ({}) reached; rejecting connection",
-                            crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP
-                        );
-                        incoming.refuse();
-                        continue;
+                    let permit = match admission.try_acquire_connection(incoming.remote_address().ip()) {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            warn!(
+                                "DoQ incoming connection rejected: {} (max connections {})",
+                                e, max_connections
+                            );
+                            incoming.refuse();
+                            continue;
+                        }
                     };
 
                     let handler = Arc::clone(&handler);
-                    let rate_limiter = Arc::clone(&rate_limiter);
-                    let stream_semaphore = Arc::clone(&stream_semaphore);
+                    let admission = Arc::clone(&admission);
 
                     connection_tasks.spawn(async move {
                         let _permit = permit;
-                        let _per_ip_permit = per_ip_permit;
                         let conn = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
                             Ok(Ok(c)) => c,
                             Ok(Err(e)) => {
@@ -238,7 +230,7 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                     let Ok((send, recv)) = accept_res else {
                                         break;
                                     };
-                            let Ok(stream_permit) = stream_semaphore.clone().try_acquire_owned() else {
+                            let Ok(stream_permit) = admission.try_acquire_request() else {
                                 warn!(
                                     "DoQ global stream limit reached; abandoning stream from {}",
                                     client_ip
@@ -251,10 +243,10 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                             // Admit the query before reading any body data: a
                             // client must not force buffering by opening
                             // streams while over its rate budget.
-                            if !rate_limiter.check(client_ip) {
+                            if let Err(e) = admission.check_rate(client_ip) {
                                 debug!(
-                                    "DoQ per-query rate limit exceeded for client {}",
-                                    client_ip
+                                    "DoQ per-query admission denied for client {}: {}",
+                                    client_ip, e
                                 );
                                 let mut send = send;
                                 let _ = send.reset(DOQ_EXCESSIVE_LOAD.into());
