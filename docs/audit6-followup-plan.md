@@ -1199,12 +1199,25 @@ filter section in `docs/audit6-test-matrix.md` and §17 of
 **Addresses:** P1-9, P2-24..P2-26, P2-31..P2-33, P2-35.
 **Files:** `sito-filter/src/engine.rs`, `sito-rewrites/src/table.rs`, `sito/src/pipeline.rs`.
 **Steps:**
-- [ ] Define global/group precedence table; test `$important @@`, `$dnsrewrite`, `$denyallow`, `$client`.
-- [ ] Never drop a whole group on compile failure; publish non-regex subset + degraded status.
-- [ ] Add authenticated identity gate for rewrite exceptions.
-- [ ] Chunk TXT records; local owner NODATA for unconfigured qtypes; safe search only A/AAAA/HTTPS.
+- [x] Define global/group precedence table; test `$important @@`, `$dnsrewrite`, `$denyallow`, `$client`.
+- [x] Never drop a whole group on compile failure; publish non-regex subset + degraded status.
+- [x] Add authenticated identity gate for rewrite exceptions.
+- [x] Chunk TXT records; local owner NODATA for unconfigured qtypes; safe search only A/AAAA/HTTPS.
 - **Acceptance:** precedence matrix tests pass; no group fail-open; rewrite exception spoof test passes.
 **Estimate:** M–L.
+
+**Status (2026-11-19):** Complete. Parsed-rule end-to-end tests pin
+`Allow > Rewrite > Block` within a tier, group-overlay tie-breaking and the
+`$important` tier; the code and ADR-0007 record the P2-25 direct-path
+resolution (a group standard `$dnsrewrite` overrides a global standard block,
+while an important block still wins). Groups retain the previous snapshot and
+report `degraded_groups` on missing/unloaded lists, invalid-only rules and
+compile-budget failures; publication is generation-guarded and serialized.
+Local A/AAAA/PTR/TXT owners return NODATA for unconfigured qtypes with an
+exception-client fall-through, TXT values are chunked, rewrite config/API
+validation rejects inert entries, and safe search is limited to A/AAAA/HTTPS.
+Evidence: Phase 2 — rewrites and policy section in
+`docs/audit6-test-matrix.md` and §18 of `docs/2.0-public-api-diff.md`.
 
 ### WP-2.5 — Client policy, schedules, parental/service lists
 
