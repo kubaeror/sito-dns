@@ -972,6 +972,33 @@ entries = [
         )));
     }
 
+    /// A spaced client name is a valid exception and matches the authenticated
+    /// identity's resolved name exactly.
+    #[test]
+    fn test_spaced_exception_name_matches_authenticated_identity() {
+        let config: RewritesConfig = toml::from_str(
+            r#"
+auto_ptr = false
+entries = [
+    { domain = "nas.home.arpa", type = "A", answer = "192.168.1.10", exception_clients = ["Admin Laptop"] },
+]
+"#,
+        )
+        .unwrap();
+        let table = RewriteTable::new(config);
+        let mut client = ClientContext::new(IpAddr::from_str("192.168.1.20").unwrap());
+        client.client_name = Some("Admin Laptop".to_string());
+
+        assert!(
+            is_not_found(&table.lookup(
+                &Name::from_str("nas.home.arpa.").unwrap(),
+                RecordType::A,
+                &client
+            )),
+            "a spaced authenticated client name must match the exception exactly"
+        );
+    }
+
     /// P1-9: an identified client at a configured IP must not satisfy a
     /// rewrite exception using a DoH-path id that was not registry-resolved.
     #[test]

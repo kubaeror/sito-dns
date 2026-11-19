@@ -396,7 +396,7 @@ exception_clients = ["admin-laptop"]
 | `entries.domain` | string | required | Domain or wildcard pattern to answer locally (`*.home.arpa`). Normalized as a domain. |
 | `entries.type` | string | required | Record type: `"A"`, `"AAAA"`, `"CNAME"`, `"PTR"` or `"TXT"`. |
 | `entries.answer` | string | required | Answer value for the record. |
-| `entries.exception_clients` | array of strings | `[]` | Client names/groups/MACs that bypass the rewrite. Matching requires an authenticated identity; IP/CIDR matching still uses the query source. |
+| `entries.exception_clients` | array of strings | `[]` | Client names/groups/MACs that bypass the rewrite. Matching requires an authenticated identity; IP/CIDR matching still uses the query source. Names may contain spaces and apostrophes; leading/trailing whitespace is rejected, and names containing `/` are not supported (the value is treated as a CIDR attempt). |
 | `entries.id` | string | `None` | Stable rewrite identifier preserved by the admin rewrite API and returned by `/api/v1/rewrites`. The DNS rewrite loader does not use it. If it is absent, the API synthesizes `legacy-<index>`; removing an existing id changes the identifier clients see. |
 
 ---

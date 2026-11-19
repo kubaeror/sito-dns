@@ -558,7 +558,9 @@ async fn test_local_rewrite_owner_returns_nodata_for_unconfigured_types() {
 }
 
 /// Local TXT rewrites split long and multi-byte values into valid
-/// character-strings, including the empty-value case.
+/// character-strings and survive encode/decode. Empty TXT entries are rejected
+/// by config validation and skipped by table construction (covered in
+/// `sito-rewrites`).
 #[tokio::test]
 async fn test_local_rewrite_txt_values_are_chunked() {
     use sito_rewrites::{RewriteEntryConfig, RewriteTable, RewritesConfig};
