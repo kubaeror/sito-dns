@@ -116,6 +116,43 @@ The pipeline guarantees strict deterministic resolution order ratifying [ADR-000
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Global and Group Rule Overlay (WP-2.4)
+
+Global rules (`filtering.lists` / `filtering.custom_rules`) and a client's
+group rules (`clients.groups.<name>.*`) are evaluated per tier and combined
+with one deterministic rank. `$important` rules form a separate tier evaluated
+before local rewrites and standard rules, so an important verdict always
+outranks a standard one.
+
+| Rank (within one tier) | Verdict | Notes |
+|---|---|---|
+| 3 | `Allow` | Standard `@@`, or `@@...$important` in the important tier |
+| 2 | `Rewrite` | `$dnsrewrite` |
+| 1 | `Block` | `\|\|...^` or `\|\|...^$important` |
+| 0 | no match (`Allow(None)`) | A group no-match never erases a global verdict |
+
+Tie rule: equally ranked verdicts resolve in favour of the **group overlay**;
+a group no-match (`Allow(None)`) is ignored. An important allow short-circuits
+stages 2-5 above and resolves from cache/upstream.
+
+Key examples (pinned by parsed-rule end-to-end tests in
+`crates/sito/src/pipeline/tests.rs`):
+
+| Global rule | Group rule | Effect |
+|---|---|---|
+| `\|\|host.example^` (standard block) | `\|\|host.example^$dnsrewrite=192.0.2.10` | Group clients get the rewritten A with zero upstream queries; default clients are blocked. |
+| `\|\|host.example^$important` | `\|\|host.example^$dnsrewrite=192.0.2.10` | Blocked for everyone: `$important` outranks the standard rewrite. |
+| `\|\|host.example^$important` | `@@\|\|host.example^$important` | Group clients resolve from upstream; default clients stay blocked. |
+| `@@\|\|host.example^$important` | `\|\|host.example^$important` | Allowed for everyone: global important allow outranks the group important block. |
+
+Scope modifiers compose with the same table:
+
+- `$denyallow=allowed.host.example` on a global block still blocks the owner,
+  while the allow-listed subdomain falls through to normal resolution.
+- `$client=name` matches only a registry-authenticated identity. An
+  unauthenticated DoH path or SNI label carrying the same text never satisfies
+  it.
+
 ---
 
 ## 4. Test Matrix Verification

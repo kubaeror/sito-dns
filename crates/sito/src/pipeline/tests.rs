@@ -1327,6 +1327,366 @@ async fn test_group_rule_does_not_mask_failed_global_source_end_to_end() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// Builds a client entry with every unrelated field at its test default.
+fn policy_entry(name: &str, ip: &str, group: &str) -> sito_clients::ClientEntryConfig {
+    sito_clients::ClientEntryConfig {
+        name: name.to_string(),
+        ids: vec![ip.to_string()],
+        group: group.to_string(),
+        ignore_query_log: false,
+        ignore_stats: false,
+        use_global_upstreams: true,
+        upstreams: None,
+        trusted: false,
+    }
+}
+
+/// Builds a pipeline from global custom rules and a client registry, backed by
+/// the counting mock upstream used by the precedence matrix tests.
+async fn policy_pipeline(
+    global_rules: &[&str],
+    clients: sito_clients::ClientsConfig,
+) -> (
+    DnsPipeline,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::path::PathBuf,
+) {
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+    let (mock_addr, calls) = spawn_mock_upstream(None).await;
+    let mut config = Config::default();
+    config.dns.dnssec.validate = false;
+    config.filtering.enabled = true;
+    config.filtering.fail_closed = false;
+    config.filtering.lists.clear();
+    config.filtering.custom_rules = global_rules
+        .iter()
+        .map(|rule| (*rule).to_string())
+        .collect();
+    config.upstream.servers = vec![mock_addr.to_string()];
+
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+    let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+    let (pipeline, temp_dir) =
+        build_test_pipeline_with_clients(config, upstream, validator, clients).await;
+    (pipeline, calls, temp_dir)
+}
+
+/// A-record addresses in a response, in answer order.
+fn policy_a_values(response: &Message) -> Vec<std::net::Ipv4Addr> {
+    response
+        .answers
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::A(a) => Some(a.0),
+            _ => None,
+        })
+        .collect()
+}
+
+const MOCK_UPSTREAM_A: std::net::Ipv4Addr = std::net::Ipv4Addr::new(203, 0, 113, 9);
+
+/// P2-25: within the standard tier the rank is `Allow > Rewrite > Block` and
+/// the per-group overlay wins ties. A group standard `$dnsrewrite` therefore
+/// overrides a global standard block for group members only.
+#[tokio::test]
+async fn test_policy_group_rewrite_overrides_global_block_end_to_end() {
+    use sito_clients::{ClientGroupConfig, ClientsConfig};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let clients = ClientsConfig {
+        entries: vec![policy_entry("kid", "127.0.0.1", "kids")],
+        groups: HashMap::from([(
+            "kids".to_string(),
+            ClientGroupConfig {
+                custom_rules: vec!["||overlay.example^$dnsrewrite=192.0.2.10".to_string()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let (pipeline, calls, temp_dir) = policy_pipeline(&["||overlay.example^"], clients).await;
+
+    let group = pipeline
+        .handle(
+            rewrite_query("overlay.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(group.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        policy_a_values(&group),
+        vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+        "a group standard rewrite must override the global standard block"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a rewritten query must not reach upstream"
+    );
+
+    let default = pipeline
+        .handle(
+            rewrite_query("overlay.example.", RecordType::A),
+            ClientContext::new("127.0.0.2".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&default),
+        vec![std::net::Ipv4Addr::UNSPECIFIED],
+        "a default client must still get the global standard block"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// `$important` outranks the whole standard tier, so a global important block
+/// beats a group standard `$dnsrewrite` for every client.
+#[tokio::test]
+async fn test_policy_global_important_block_beats_group_rewrite_end_to_end() {
+    use sito_clients::{ClientGroupConfig, ClientsConfig};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let clients = ClientsConfig {
+        entries: vec![policy_entry("kid", "127.0.0.1", "kids")],
+        groups: HashMap::from([(
+            "kids".to_string(),
+            ClientGroupConfig {
+                custom_rules: vec!["||pinned.example^$dnsrewrite=192.0.2.10".to_string()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let (pipeline, calls, temp_dir) =
+        policy_pipeline(&["||pinned.example^$important"], clients).await;
+
+    for ip in ["127.0.0.1", "127.0.0.2"] {
+        let response = pipeline
+            .handle(
+                rewrite_query("pinned.example.", RecordType::A),
+                ClientContext::new(ip.parse().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            policy_a_values(&response),
+            vec![std::net::Ipv4Addr::UNSPECIFIED],
+            "a global important block must beat a group standard rewrite for {ip}"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "an important block must stop before upstream"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Within the important tier `Allow > Block` and the group overlay wins ties:
+/// a group important exception clears a global important block for its members
+/// while the default client stays blocked.
+#[tokio::test]
+async fn test_policy_group_important_allow_beats_global_important_block_end_to_end() {
+    use sito_clients::{ClientGroupConfig, ClientsConfig};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let clients = ClientsConfig {
+        entries: vec![policy_entry("kid", "127.0.0.1", "kids")],
+        groups: HashMap::from([(
+            "kids".to_string(),
+            ClientGroupConfig {
+                custom_rules: vec!["@@||allowance.example^$important".to_string()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let (pipeline, calls, temp_dir) =
+        policy_pipeline(&["||allowance.example^$important"], clients).await;
+
+    let group = pipeline
+        .handle(
+            rewrite_query("allowance.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&group),
+        vec![MOCK_UPSTREAM_A],
+        "a group important allow must clear the global important block"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let default = pipeline
+        .handle(
+            rewrite_query("allowance.example.", RecordType::A),
+            ClientContext::new("127.0.0.2".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&default),
+        vec![std::net::Ipv4Addr::UNSPECIFIED],
+        "the global important block must still apply to a default client"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A global important exception outranks a group important block: both the
+/// group member and the default client resolve upstream.
+#[tokio::test]
+async fn test_policy_global_important_allow_beats_group_important_block_end_to_end() {
+    use sito_clients::{ClientGroupConfig, ClientsConfig};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let clients = ClientsConfig {
+        entries: vec![policy_entry("kid", "127.0.0.1", "kids")],
+        groups: HashMap::from([(
+            "kids".to_string(),
+            ClientGroupConfig {
+                custom_rules: vec!["||clearance.example^$important".to_string()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let (pipeline, calls, temp_dir) =
+        policy_pipeline(&["@@||clearance.example^$important"], clients).await;
+
+    // Use distinct names so the second lookup cannot be served from the cache.
+    for (ip, name) in [
+        ("127.0.0.1", "clearance.example."),
+        ("127.0.0.2", "sub.clearance.example."),
+    ] {
+        let response = pipeline
+            .handle(
+                rewrite_query(name, RecordType::A),
+                ClientContext::new(ip.parse().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            policy_a_values(&response),
+            vec![MOCK_UPSTREAM_A],
+            "a global important allow must beat a group important block for {ip}"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "both clients must resolve upstream"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// `$denyallow` on a global rule scopes the block: the owner is blocked and
+/// the allow-listed subdomain passes to upstream.
+#[tokio::test]
+async fn test_policy_global_denyallow_scope_end_to_end() {
+    use sito_clients::ClientsConfig;
+    use std::sync::atomic::Ordering;
+
+    let (pipeline, calls, temp_dir) = policy_pipeline(
+        &["||denyallow.example^$denyallow=allowed.denyallow.example"],
+        ClientsConfig::default(),
+    )
+    .await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let denied = pipeline
+        .handle(
+            rewrite_query("denyallow.example.", RecordType::A),
+            client.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&denied),
+        vec![std::net::Ipv4Addr::UNSPECIFIED],
+        "the rule owner must be blocked"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let allowed = pipeline
+        .handle(
+            rewrite_query("allowed.denyallow.example.", RecordType::A),
+            client,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&allowed),
+        vec![MOCK_UPSTREAM_A],
+        "a $denyallow-listed subdomain must pass to upstream"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// `$client=name` only matches a registry-authenticated identity: a raw DoH
+/// path id carrying the same name must not satisfy the rule.
+#[tokio::test]
+async fn test_policy_client_scope_requires_authenticated_identity_end_to_end() {
+    use sito_clients::ClientsConfig;
+    use std::sync::atomic::Ordering;
+
+    let clients = ClientsConfig {
+        entries: vec![policy_entry("laptop", "127.0.0.1", "default")],
+        ..Default::default()
+    };
+    let (pipeline, calls, temp_dir) =
+        policy_pipeline(&["||scoped-client.example^$client=laptop"], clients).await;
+
+    let authenticated = pipeline
+        .handle(
+            rewrite_query("scoped-client.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&authenticated),
+        vec![std::net::Ipv4Addr::UNSPECIFIED],
+        "a registry-authenticated name must satisfy $client"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let raw_id = pipeline
+        .handle(
+            rewrite_query("scoped-client.example.", RecordType::A),
+            ClientContext::with_id("127.0.0.2".parse().unwrap(), "laptop"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&raw_id),
+        vec![MOCK_UPSTREAM_A],
+        "a wire-claimed raw id must not satisfy $client"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 async fn build_test_pipeline(
     config: Config,
     upstream: std::sync::Arc<UpstreamManager>,

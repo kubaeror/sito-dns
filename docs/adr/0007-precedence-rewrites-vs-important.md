@@ -67,3 +67,38 @@ This order is verified in conformance integration tests (`tests/precedence.rs` a
 - **Cons:** Breaks compatibility with major filter lists (e.g., AdGuard Base, OISD, Hagezi lists) that rely on `$important` to resolve complex anti-adblock unblocking rules.
 - **Why not chosen:** High compatibility with established AdGuard/ABP filter lists is a core design goal.
 
+## Amendment: Phase 2 global/group overlay (WP-2.4)
+
+* **Date:** 2026-11-19
+* **Status:** Accepted (amends, does not replace, the decision above)
+* **Resolves:** audit finding P2-25 (precedence ambiguity between global and
+  group rules)
+
+The Phase 2 implementation makes the per-tier combination explicit. Global and
+per-group rule sets are evaluated independently, then combined with this rank:
+
+| Rank (within one tier) | Verdict |
+|---|---|
+| 3 | `Allow` (`@@...`) |
+| 2 | `Rewrite` (`$dnsrewrite`) |
+| 1 | `Block` (`||...^`) |
+| 0 | no match (`Allow(None)`) |
+
+1. Within a tier the order is `Allow > Rewrite > Block`.
+2. The per-group overlay wins ties against the global set. A group no-match
+   (`Allow(None)`) is ignored and never erases a global verdict.
+3. `$important` rules form a tier evaluated before local rewrites and standard
+   rules, so an important verdict always outranks a standard verdict regardless
+   of source (global or group).
+
+Consequently, on the direct-resolution path a group standard `$dnsrewrite`
+intentionally overrides a global standard block (the rewrite is the higher rank
+within that tier), while a global or group `$important` block still outranks it.
+This is the intended P2-25 resolution, not an accident of ordering. The CNAME
+target path is unchanged: a `$dnsrewrite` cannot be applied there and is
+dropped, so it cannot hide a block.
+
+The decision is pinned by parsed-rule end-to-end tests in
+`crates/sito/src/pipeline/tests.rs` and documented in
+[`docs/policy-matrix.md`](../policy-matrix.md#global-and-group-rule-overlay-wp-24).
+
