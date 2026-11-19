@@ -50,11 +50,23 @@ When a client is resolved, its effective group policy is compiled lazily at quer
 
 ### Schedule Evaluation (`croner`):
 - Evaluated lazily at query timestamp in the client's configured timezone.
-  `clients.timezone` defaults to `"local"` (the host's system timezone,
-  DST-aware), not UTC; `"UTC"` and fixed offsets such as `"+02:00"` are also
-  accepted. IANA zone names are not supported (no tzdb dependency).
+  `clients.timezone` defaults to `"local"` (the host's system timezone), not
+  UTC; `"UTC"` and fixed offsets such as `"+02:00"` are also accepted.
+- DST handling is runtime-dependent: `"local"`/`"system"` follows the host
+  platform's local-time conversion, so wall-clock times around a DST transition
+  (skipped or repeated hours) follow the host's rules. Fixed offsets never
+  shift for DST. IANA zone names (e.g. `Europe/Warsaw`) are not supported (no
+  tzdb dependency); deployments that need a specific IANA zone must set an
+  explicit UTC or fixed offset and accept the DST behaviour of that offset.
 - Supports both standard 5-field cron (`min hour dom month dow`) and 6-field cron with seconds (`sec min hour dom month dow`).
 - Supports interval ranges (e.g. `0 0 15-21 * * MON-FRI` for 15:00:00 through 21:59:59).
+- Ranges do not wrap around. An overnight window must be split into explicit
+  comma-separated ranges, e.g. `0 22-23,0-6 * * *` for 22:00 through 06:59.
+  Reversed ranges such as `0 22-6 * * *` are rejected at load time with a
+  field-attributed error, not silently interpreted as always/never active.
+- `schedule_enabled = true` with no `schedule` leaves the group always active;
+  it does not disable filtering. A configured `schedule` is ignored unless
+  `schedule_enabled = true`.
 - Syntax errors in configuration are rejected at load time via `sito check-config` with the exact 1-indexed field number that failed validation.
 
 ---
@@ -104,6 +116,8 @@ The pipeline guarantees strict deterministic resolution order ratifying [ADR-000
 │ Stage 4: Safe Search System Rewrites                                    │
 │ - Google, Bing, DuckDuckGo CNAME rewrite                                │
 │ - YouTube strict/moderate CNAME rewrite                                 │
+│ - A/AAAA/HTTPS queries only; provider targets pass through (no         │
+│   self-CNAME)                                                           │
 └───────────────────────────────┬─────────────────────────────────────────┘
                                 │ (no safe search rewrite)
                                 ▼

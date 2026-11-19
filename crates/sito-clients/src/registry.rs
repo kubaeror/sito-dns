@@ -1221,6 +1221,36 @@ schedule = "0 0 15-21 * * MON-FRI"
     }
 
     #[test]
+    fn test_schedule_enabled_without_schedule_is_always_active() {
+        // Pins the documented behaviour: `schedule_enabled = true` without a
+        // `schedule` does not disable filtering, it leaves the group active at
+        // all times (the same as `schedule_enabled = false`).
+        let cfg: ClientsConfig = toml::from_str(
+            r#"
+[[entries]]
+name = "Kid"
+ids = ["192.168.1.31"]
+group = "kids"
+
+[groups.kids]
+schedule_enabled = true
+"#,
+        )
+        .unwrap();
+        let reg = ClientRegistry::new(cfg);
+
+        for (hour, minute) in [(3, 0), (12, 0), (23, 59)] {
+            let at = Utc.with_ymd_and_hms(2026, 9, 7, hour, minute, 0).unwrap();
+            let mut ctx = ClientContext::new(IpAddr::from_str("192.168.1.31").unwrap());
+            let policy = reg.resolve(&mut ctx, reg.timezone().at_utc(at));
+            assert!(
+                policy.is_filtering_enabled,
+                "schedule_enabled without schedule must stay active at {hour:02}:{minute:02}"
+            );
+        }
+    }
+
+    #[test]
     fn test_schedule_timezone_default_is_local() {
         let cfg: ClientsConfig = toml::from_str("").unwrap();
         assert!(cfg.timezone.is_local());

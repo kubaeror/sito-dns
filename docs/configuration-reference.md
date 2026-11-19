@@ -325,7 +325,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `groups` | table (map of name → group) | `{}` | Policy groups keyed by group name, e.g. `[clients.groups.kids]`, with optional `[[clients.groups.<name>.blocked_services]]` entries. Group fields: description (optional operator note), filtering, lists, custom_rules, safe_search, safe_search_youtube, parental, parental_categories, schedule_enabled, schedule, blocked_services. |
 | `client_id_secrets` | table (map of entry name → secret) | `{}` | Shared secrets accepted as the first DoT SNI label (`<secret>.dns.example.com`) or the DoH path segment (`/dns-query/<secret>`). Empty disables path/SNI identification. |
 | `trust_routeros_lease_names` | boolean | `false` | Trust RouterOS DHCP lease host names/comments for client identification. Off by default because lease data is client-controlled. |
-| `timezone` | string | `"local"` | Timezone used to evaluate client schedules and time-of-day rules. `"local"`/`"system"` uses the host zone (DST-aware); `"UTC"` and fixed offsets (`"+02:00"`, `"-05:30"`, `"+0530"`, `"UTC+2"`) are also accepted. IANA names are not supported (no tzdb dependency); schedules in UTC-only deployments should set this explicitly. |
+| `timezone` | string | `"local"` | Timezone used to evaluate client schedules and time-of-day rules. `"local"`/`"system"` resolves the host zone at runtime, so DST transitions and skipped/repeated wall-clock times follow the host platform. `"UTC"` and fixed offsets (`"+02:00"`, `"-05:30"`, `"+0530"`, `"UTC+2"`) are accepted and never shift for DST. IANA names (e.g. `"Europe/Warsaw"`) are not supported (no tzdb dependency); deployments that need a stable clock should set `"UTC"` or a fixed offset explicitly. |
 
 > Every `[[clients.entries]]` `group` must name an existing
 > `[clients.groups.<name>]` table (or be omitted / `"default"`). An unknown
@@ -356,8 +356,8 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `groups.safe_search_youtube` | string | `None` | YouTube safe-search mode when `safe_search` is enabled (`"off"`, `"moderate"` or `"strict"`). |
 | `groups.parental` | boolean | `false` | Enable parental-category blocking for group members. |
 | `groups.parental_categories` | array of strings | `[]` | Parental categories to block (for example `"adult"`, `"gambling"`). Unknown ids are rejected against the bundled parental registries during configuration validation. |
-| `groups.schedule_enabled` | boolean | `false` | Enable the group's time-of-day schedule. |
-| `groups.schedule` | string | `None` | Cron-style schedule used when `schedule_enabled = true`, evaluated in `clients.timezone`. |
+| `groups.schedule_enabled` | boolean | `false` | Enable the group's time-of-day schedule. When `true` without `schedule`, the group stays active at all times (it does not disable filtering). |
+| `groups.schedule` | string | `None` | Cron-style schedule used only when `schedule_enabled = true`, evaluated in `clients.timezone`. Ranges do not wrap: split overnight windows into comma-separated ranges such as `0 22-23,0-6 * * *`. Reversed ranges are rejected at configuration load. |
 | `groups.blocked_services` | array of tables | `[]` | Service-specific block rules for members of this group. |
 
 ### `[[clients.groups.<name>.blocked_services]]`
@@ -366,6 +366,15 @@ schedule = "0 0 15-21 * * MON-FRI"
 |---|---|---|---|
 | `groups.blocked_services.service` | string | required | Service identifier (`tiktok`, `youtube`, …) to block. Unknown ids are rejected against the bundled service registry during configuration validation. |
 | `groups.blocked_services.schedule` | string | `None` | Optional cron-style schedule that limits when the service is blocked. |
+
+> [!NOTE]
+> Group and blocked-service schedules are evaluated lazily against the query
+> timestamp. `schedule_enabled = true` without a `schedule` leaves the group
+> always active (the same result as `schedule_enabled = false`); a `schedule`
+> configured while `schedule_enabled = false` is ignored. Cron ranges do not
+> wrap around, so an overnight window must be written as split ranges, for
+> example `0 22-23,0-6 * * *`; a reversed range such as `0 22-6 * * *` is
+> rejected at configuration load with an error naming the field.
 
 > [!NOTE]
 > `parental_categories` and `blocked_services.service` are validated against the

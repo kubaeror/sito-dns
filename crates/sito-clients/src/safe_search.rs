@@ -28,6 +28,12 @@ impl YouTubeSafeSearchMode {
 
 /// Evaluates if a given query domain matches a search engine requiring
 /// safe search enforcement, returning the target CNAME domain if so.
+///
+/// Provider targets themselves are never rewritten: querying
+/// `safe.duckduckgo.com` returns `None` so the resolver does not synthesize a
+/// self-referential CNAME. The verified provider set is deliberately limited to
+/// the targets above; unverified provider domains must not be added without
+/// confirming their safe-search CNAME.
 pub fn match_safe_search(
     domain: &str,
     youtube_mode: YouTubeSafeSearchMode,
@@ -36,25 +42,34 @@ pub fn match_safe_search(
 
     // 1. YouTube
     if is_youtube_domain(&d) {
-        return Some(youtube_mode.target_cname());
+        return self_cname_guard(&d, youtube_mode.target_cname());
     }
 
     // 2. Google
     if is_google_search_domain(&d) {
-        return Some("forcesafesearch.google.com");
+        return self_cname_guard(&d, "forcesafesearch.google.com");
     }
 
     // 3. Bing
     if is_bing_domain(&d) {
-        return Some("strict.bing.com");
+        return self_cname_guard(&d, "strict.bing.com");
     }
 
     // 4. DuckDuckGo
     if is_duckduckgo_domain(&d) {
-        return Some("safe.duckduckgo.com");
+        return self_cname_guard(&d, "safe.duckduckgo.com");
     }
 
     None
+}
+
+/// Returns the target unless the query already *is* the target.
+fn self_cname_guard(domain: &str, target: &'static str) -> Option<&'static str> {
+    if domain.eq_ignore_ascii_case(target.trim_end_matches('.')) {
+        None
+    } else {
+        Some(target)
+    }
 }
 
 fn is_youtube_domain(d: &str) -> bool {
@@ -201,7 +216,34 @@ mod tests {
             match_safe_search("www.duckduckgo.com", mode),
             Some("safe.duckduckgo.com")
         );
+        assert_eq!(
+            match_safe_search("www.duckduckgo.com.", mode),
+            Some("safe.duckduckgo.com")
+        );
         assert_eq!(match_safe_search("duck.com", mode), None);
+    }
+
+    #[test]
+    fn test_safe_search_targets_pass_through_without_self_cname() {
+        for mode in [
+            YouTubeSafeSearchMode::Strict,
+            YouTubeSafeSearchMode::Moderate,
+        ] {
+            // The DuckDuckGo safe-search host must resolve normally rather
+            // than produce a CNAME pointing at itself.
+            assert_eq!(match_safe_search("safe.duckduckgo.com", mode), None);
+            assert_eq!(match_safe_search("safe.duckduckgo.com.", mode), None);
+            assert_eq!(match_safe_search("SAFE.DuckDuckGo.com", mode), None);
+
+            // Other provider targets are not matched as queries either.
+            assert_eq!(match_safe_search("forcesafesearch.google.com", mode), None);
+            assert_eq!(match_safe_search("strict.bing.com", mode), None);
+            assert_eq!(match_safe_search("restrict.youtube.com", mode), None);
+            assert_eq!(
+                match_safe_search("restrictmoderate.youtube.com", mode),
+                None
+            );
+        }
     }
 
     #[test]
