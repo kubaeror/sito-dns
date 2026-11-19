@@ -58,6 +58,8 @@ pub(crate) fn bundled_list_views(
                     "built-in (minimal)".to_string()
                 },
                 last_refresh: format_refresh(status.and_then(|status| status.last_refresh_unix)),
+                last_attempt: format_refresh(status.and_then(|status| status.last_attempt_unix)),
+                last_error: status.and_then(|status| status.last_error.clone()),
             }
         })
         .collect();
@@ -78,6 +80,8 @@ pub(crate) fn bundled_list_views(
                 "runtime refresh".to_string()
             },
             last_refresh: format_refresh(status.last_refresh_unix),
+            last_attempt: format_refresh(status.last_attempt_unix),
+            last_error: status.last_error.clone(),
         });
     }
     bundled_lists.sort_by(|a, b| a.id.cmp(&b.id));

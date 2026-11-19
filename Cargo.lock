@@ -3208,6 +3208,7 @@ dependencies = [
  "tokio",
  "toml",
  "totp-rs",
+ "tower",
  "tracing",
  "utoipa",
  "utoipa-swagger-ui",

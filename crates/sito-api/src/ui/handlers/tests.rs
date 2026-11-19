@@ -139,6 +139,8 @@ fn test_bundled_list_views_corrupt_manifest_returns_runtime_rows_without_panic()
         category: "adult".to_string(),
         source_url: Some("https://lists.example/adult.txt".to_string()),
         last_refresh_unix: Some(1_700_000_000),
+        last_attempt_unix: Some(1_700_000_100),
+        last_error: Some("previous fetch failed".to_string()),
         entries: 42,
         bundled: false,
     }];
@@ -154,6 +156,12 @@ fn test_bundled_list_views_corrupt_manifest_returns_runtime_rows_without_panic()
     assert_eq!(views[0].entries, 42);
     assert_eq!(views[0].state, "runtime refresh");
     assert!(views[0].last_refresh.contains("2023-11-14"));
+    assert!(views[0].last_attempt.contains("2023-11-14"));
+    assert_eq!(
+        views[0].last_error.as_deref(),
+        Some("previous fetch failed"),
+        "the UI must surface the recorded refresh error"
+    );
 
     // The healthy path still merges bundled metadata with runtime status.
     let manifest =

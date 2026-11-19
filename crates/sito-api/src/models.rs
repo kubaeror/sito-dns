@@ -115,6 +115,39 @@ pub struct UpdateFilterListRequest {
     pub refresh_hours: Option<u32>,
 }
 
+/// Runtime refresh state of one curated parental/service category.
+///
+/// Mirrors `sito_clients::RuntimeListStatus`; keep the field names stable for
+/// API clients. Optional fields are omitted when unset.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct IntegrationListStatusDto {
+    pub category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub entries: u64,
+    pub bundled: bool,
+}
+
+impl From<sito_clients::RuntimeListStatus> for IntegrationListStatusDto {
+    fn from(status: sito_clients::RuntimeListStatus) -> Self {
+        Self {
+            category: status.category,
+            source_url: status.source_url,
+            last_refresh_unix: status.last_refresh_unix,
+            last_attempt_unix: status.last_attempt_unix,
+            last_error: status.last_error,
+            entries: status.entries,
+            bundled: status.bundled,
+        }
+    }
+}
+
 /// Custom rules collection.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CustomRulesDto {

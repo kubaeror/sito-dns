@@ -2431,6 +2431,81 @@
         ]
       }
     },
+    "/api/v1/integrations/lists": {
+      "get": {
+        "tags": [
+          "Integrations"
+        ],
+        "operationId": "get_integration_lists",
+        "responses": {
+          "200": {
+            "description": "Runtime state of every curated parental/service category",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/IntegrationListStatusDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/lists/{category}/refresh": {
+      "post": {
+        "tags": [
+          "Integrations"
+        ],
+        "operationId": "refresh_integration_list",
+        "parameters": [
+          {
+            "name": "category",
+            "in": "path",
+            "description": "Curated category id (case-insensitive)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Category force-refreshed; the >50% shrink guard is bypassed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntegrationListStatusDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Downloaded content could not be applied"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Category is not configured in [integrations.lists]"
+          },
+          "502": {
+            "description": "Source could not be fetched"
+          }
+        }
+      }
+    },
     "/api/v1/querylog": {
       "get": {
         "tags": [
@@ -4308,6 +4383,56 @@
           }
         }
       },
+      "IntegrationListStatusDto": {
+        "type": "object",
+        "description": "Runtime refresh state of one curated parental/service category.\n\nMirrors `sito_clients::RuntimeListStatus`; keep the field names stable for\nAPI clients. Optional fields are omitted when unset.",
+        "required": [
+          "category",
+          "entries",
+          "bundled"
+        ],
+        "properties": {
+          "bundled": {
+            "type": "boolean"
+          },
+          "category": {
+            "type": "string"
+          },
+          "entries": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_attempt_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_refresh_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "InvalidateCacheQuery": {
         "type": "object",
         "description": "Query parameters for cache invalidation.",
@@ -5409,6 +5534,10 @@
     {
       "name": "Filtering",
       "description": "Blocklists, allowlists, and custom rules"
+    },
+    {
+      "name": "Integrations",
+      "description": "Curated runtime list status and refresh"
     },
     {
       "name": "Clients",

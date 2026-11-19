@@ -48,6 +48,9 @@ rust-embed = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 askama = { workspace = true, optional = true }
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [features]
 default = []
 # High-availability replication: compiles in `sito-ha` and the full HA API

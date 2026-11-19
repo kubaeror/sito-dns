@@ -319,6 +319,15 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
             get(filtering::get_filtering_rules).put(filtering::set_filtering_rules),
         )
         .route("/filtering/check", post(filtering::check_filtering))
+        // Curated runtime lists
+        .route(
+            "/integrations/lists",
+            get(filtering::get_integration_lists),
+        )
+        .route(
+            "/integrations/lists/{category}/refresh",
+            post(filtering::refresh_integration_list),
+        )
         // Clients
         .route(
             "/clients",

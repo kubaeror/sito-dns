@@ -31,10 +31,11 @@ pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
     config.validate_full().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if let Some(value) = config.clients.as_ref() {
-        let _: sito_clients::ClientsConfig = value
+        let clients: sito_clients::ClientsConfig = value
             .clone()
             .try_into()
             .map_err(|e| anyhow::anyhow!("invalid [clients] configuration: {e}"))?;
+        validate_client_curated_references(&clients)?;
     }
     if let Some(value) = config.rewrites.as_ref() {
         let rewrites: sito_rewrites::RewritesConfig = value
@@ -97,6 +98,39 @@ pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Rejects group policy references the bundled registries cannot resolve.
+///
+/// `parental_categories` and `blocked_services.service` are plain strings in
+/// the TOML schema; without this check a typo is accepted but silently matches
+/// nothing at query time. The registries are built once per validation pass.
+fn validate_client_curated_references(clients: &sito_clients::ClientsConfig) -> anyhow::Result<()> {
+    if clients.groups.is_empty() {
+        return Ok(());
+    }
+    let lists = sito_clients::RuntimeLists::try_new()
+        .map_err(|e| anyhow::anyhow!("failed to load bundled parental/service registries: {e}"))?;
+    for (group_name, group) in &clients.groups {
+        for category in &group.parental_categories {
+            if !lists.has_parental_category(category) {
+                return Err(anyhow::anyhow!(
+                    "invalid [clients] configuration: clients.groups.{group_name}.parental_categories \
+                     references unknown parental category '{category}'"
+                ));
+            }
+        }
+        for blocked in &group.blocked_services {
+            if !lists.has_service(&blocked.service) {
+                return Err(anyhow::anyhow!(
+                    "invalid [clients] configuration: clients.groups.{group_name}.blocked_services \
+                     references unknown service '{}'",
+                    blocked.service
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Rejects an enabled RouterOS integration when this build cannot honour it.
 ///
 /// The `routeros` feature is a property of the `sito` binary, propagated to
@@ -107,6 +141,11 @@ fn validate_integrations(
     integrations: &sito_clients::IntegrationsConfig,
     routeros_supported: bool,
 ) -> anyhow::Result<()> {
+    if let Some(lists) = integrations.lists.as_ref() {
+        lists
+            .validate_known_categories()
+            .map_err(|e| anyhow::anyhow!("invalid [integrations.lists] configuration: {e}"))?;
+    }
     if !routeros_supported
         && integrations
             .mikrotik
@@ -184,6 +223,64 @@ mod tests {
         )
         .expect("parses");
         validate_typed_sections(&config).expect("valid sections");
+    }
+
+    #[test]
+    fn test_rejects_unknown_curated_categories() {
+        let valid = Config::from_toml_str(
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n\
+             [integrations.lists.categories.adult]\nurl = \"https://example.com/adult.txt\"\n",
+        )
+        .expect("parses");
+        validate_typed_sections(&valid).expect("a bundled category is accepted");
+
+        let invalid = Config::from_toml_str(
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n\
+             [integrations.lists.categories.advertising]\nurl = \"https://example.com/ads.txt\"\n",
+        )
+        .expect("parses");
+        let err =
+            validate_typed_sections(&invalid).expect_err("an unknown category must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("[integrations.lists]") && message.contains("advertising"),
+            "the error must name the section and category: {message}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_unknown_client_curated_references() {
+        let valid = Config::from_toml_str(
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n\
+             [clients.groups.kids]\nparental_categories = [\"adult\"]\n\
+             [[clients.groups.kids.blocked_services]]\nservice = \"tiktok\"\n",
+        )
+        .expect("parses");
+        validate_typed_sections(&valid).expect("bundled categories and services are accepted");
+
+        let invalid_category = Config::from_toml_str(
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n\
+             [clients.groups.kids]\nparental_categories = [\"social\"]\n",
+        )
+        .expect("parses");
+        let err = validate_typed_sections(&invalid_category)
+            .expect_err("an unknown parental category must be rejected");
+        assert!(
+            err.to_string().contains("parental_categories") && err.to_string().contains("social"),
+            "unexpected error: {err}"
+        );
+
+        let invalid_service = Config::from_toml_str(
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n\
+             [[clients.groups.kids.blocked_services]]\nservice = \"myspace\"\n",
+        )
+        .expect("parses");
+        let err = validate_typed_sections(&invalid_service)
+            .expect_err("an unknown blocked service must be rejected");
+        assert!(
+            err.to_string().contains("blocked_services") && err.to_string().contains("myspace"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(feature = "ha")]

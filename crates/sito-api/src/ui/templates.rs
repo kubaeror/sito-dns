@@ -201,6 +201,10 @@ pub struct BundledListView {
     /// `built-in (minimal)` until the category is refreshed from a configured source.
     pub state: String,
     pub last_refresh: String,
+    /// Last fetch/apply attempt, successful or not (`—` before any attempt).
+    pub last_attempt: String,
+    /// Most recent fetch/apply error, when the last attempt failed.
+    pub last_error: Option<String>,
 }
 
 #[derive(Template)]

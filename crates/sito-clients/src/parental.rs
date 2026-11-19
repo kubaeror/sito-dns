@@ -170,6 +170,12 @@ impl ParentalRegistry {
         &self.lists
     }
 
+    /// Whether a parental category is present in this registry.
+    #[must_use]
+    pub fn contains_category(&self, category: &str) -> bool {
+        self.categories.contains_key(&category.to_ascii_lowercase())
+    }
+
     /// Replaces the content of a category with a newline-delimited text list.
     ///
     /// Returns the number of distinct domains stored. Malformed lines,

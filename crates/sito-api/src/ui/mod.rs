@@ -243,12 +243,16 @@ mod tests {
                 entries: 40,
                 state: "built-in (minimal)".to_string(),
                 last_refresh: "—".to_string(),
+                last_attempt: "2023-11-14 22:13 UTC".to_string(),
+                last_error: Some("fetch failed".to_string()),
             }],
         };
         let filtering_html = filter_tmpl.render().expect("render filtering page");
         assert!(filtering_html.contains("built-in (minimal)"));
         assert!(filtering_html.contains("adult"));
         assert!(filtering_html.contains("CC0-1.0"));
+        assert!(filtering_html.contains("Last attempt: 2023-11-14 22:13 UTC"));
+        assert!(filtering_html.contains("Last error: fetch failed"));
 
         let rewrites_tmpl = RewritesTemplate {
             csrf_token: "",

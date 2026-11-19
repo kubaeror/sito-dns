@@ -114,7 +114,7 @@ pub async fn run_server_with_lease(
         && let Some(ref lists_cfg) = integrations.lists
     {
         let lists_cfg = lists_cfg.clone();
-        if let Err(e) = lists_cfg.validate() {
+        if let Err(e) = lists_cfg.validate_known_categories() {
             warn!("Ignoring invalid [integrations.lists] configuration: {e}");
         } else if !lists_cfg.categories.is_empty() {
             let lists_store = runtime_lists.clone();

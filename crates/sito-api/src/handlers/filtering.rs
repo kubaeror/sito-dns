@@ -5,11 +5,12 @@ use crate::config_apply::{FilterApply, apply_and_persist_config_locked};
 use crate::error::ProblemDetails;
 use crate::models::{
     AddFilterListRequest, CustomRulesDto, FilterCheckRequest, FilterCheckResponse, FilterListDto,
-    FilterStatusDto, GenericMessageResponse, UpdateFilterListRequest,
+    FilterStatusDto, GenericMessageResponse, IntegrationListStatusDto, UpdateFilterListRequest,
 };
 use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use sito_core::client::ClientContext;
 use sito_core::config::FilterListConfig;
 use sito_core::engine::FilterEngine;
@@ -122,6 +123,137 @@ pub async fn get_filter_lists(
         dtos.push(filter_list_dto(&ctx, list).await);
     }
     Json(dtos)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/integrations/lists",
+    responses(
+        (status = 200, description = "Runtime state of every curated parental/service category", body = Vec<IntegrationListStatusDto>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden")
+    ),
+    tag = "Integrations"
+)]
+#[allow(clippy::unused_async)]
+pub async fn get_integration_lists(
+    _operator: RequireOperator,
+    State(ctx): State<ServerContext>,
+) -> Json<Vec<IntegrationListStatusDto>> {
+    Json(
+        ctx.runtime_lists
+            .statuses()
+            .into_iter()
+            .map(IntegrationListStatusDto::from)
+            .collect(),
+    )
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/integrations/lists/{category}/refresh",
+    params(("category" = String, Path, description = "Curated category id (case-insensitive)")),
+    responses(
+        (status = 200, description = "Category force-refreshed; the >50% shrink guard is bypassed", body = IntegrationListStatusDto),
+        (status = 400, description = "Downloaded content could not be applied"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Category is not configured in [integrations.lists]"),
+        (status = 502, description = "Source could not be fetched")
+    ),
+    tag = "Integrations"
+)]
+pub async fn refresh_integration_list(
+    _operator: RequireOperator,
+    State(ctx): State<ServerContext>,
+    Path(category): Path<String>,
+) -> Result<Json<IntegrationListStatusDto>, ProblemDetails> {
+    // Resolve against the current typed config so a renamed/uppercase request
+    // targets the configured source. Only configured categories can refresh;
+    // bundled-only rows still have no upstream URL.
+    let (category_name, url, data_dir) = {
+        let cfg = ctx.config.load();
+        let integrations: sito_clients::IntegrationsConfig = cfg
+            .integrations
+            .as_ref()
+            .ok_or_else(|| {
+                ProblemDetails::not_found(format!(
+                    "Curated list category '{category}' is not configured"
+                ))
+            })?
+            .clone()
+            .try_into()
+            .map_err(|e| {
+                ProblemDetails::internal_error(format!("invalid [integrations] configuration: {e}"))
+            })?;
+        let lists = integrations.lists.ok_or_else(|| {
+            ProblemDetails::not_found(format!(
+                "Curated list category '{category}' is not configured"
+            ))
+        })?;
+        let (name, source) = lists
+            .categories
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&category))
+            .ok_or_else(|| {
+                ProblemDetails::not_found(format!(
+                    "Curated list category '{category}' is not configured in [integrations.lists]"
+                ))
+            })?;
+        (
+            name.clone(),
+            source.url.clone(),
+            cfg.server.data_dir.clone(),
+        )
+    };
+
+    // Same downloader policy as the startup refresh task: default timeout and
+    // size cap, with `file://` reads restricted to the data directory.
+    let fetcher =
+        sito_filter::subscription::SubscriptionFetcher::default().with_file_root(data_dir.clone());
+    let cache_name = format!("integration-{category_name}");
+    ctx.runtime_lists.record_attempt(&category_name, None);
+
+    let content = match fetcher.fetch_or_cached(&cache_name, &url, &data_dir).await {
+        Ok(content) => content,
+        Err(e) => {
+            let detail = format!("Failed to fetch curated list '{category_name}': {e}");
+            ctx.runtime_lists
+                .record_attempt(&category_name, Some(detail.clone()));
+            return Err(ProblemDetails::new(
+                StatusCode::BAD_GATEWAY,
+                "Bad Gateway",
+                detail,
+            ));
+        }
+    };
+
+    // Operator-initiated refresh: an intentional shrink must be allowed to
+    // replace the active content. The periodic task keeps using the guarded
+    // `apply_content`.
+    if let Err(e) = ctx
+        .runtime_lists
+        .apply_content_forced(&category_name, &content)
+    {
+        let detail = format!("Failed to apply curated list '{category_name}': {e}");
+        ctx.runtime_lists
+            .record_attempt(&category_name, Some(detail.clone()));
+        return Err(ProblemDetails::bad_request(detail));
+    }
+    ctx.runtime_lists.mark_refreshed(&category_name, &url);
+
+    let key = category_name.to_ascii_lowercase();
+    let status = ctx
+        .runtime_lists
+        .statuses()
+        .into_iter()
+        .find(|status| status.category == key)
+        .ok_or_else(|| {
+            ProblemDetails::internal_error(format!(
+                "Curated list category '{category_name}' disappeared after refresh"
+            ))
+        })?;
+    Ok(Json(status.into()))
 }
 
 #[utoipa::path(
@@ -515,6 +647,196 @@ mod tests {
         let missing = dtos.iter().find(|d| d.name == "Missing").unwrap();
         assert_eq!(local.rule_count, 3);
         assert_eq!(missing.rule_count, 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// The curated-list API exposes status, resolves categories
+    /// case-insensitively, reports unknown/unfetchable categories, and is
+    /// Operator-only.
+    #[tokio::test]
+    async fn test_integration_lists_api_status_refresh_and_auth() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, header};
+        use tower::ServiceExt;
+
+        let temp_dir = crate::test_support::temp_dir("sito_integration_lists_api");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        // Rotate the bootstrap password so the setup gate lets API requests
+        // reach the normal auth layer (which is what this test exercises).
+        ctx.auth_mgr
+            .update_user_password("admin", "TestPassword123!")
+            .await;
+        let source_path = temp_dir.join("adult.txt");
+        std::fs::write(&source_path, "a.example\nb.example\n").unwrap();
+        let missing_path = temp_dir.join("missing.txt");
+        let invalid_services_path = temp_dir.join("services.json");
+        std::fs::write(&invalid_services_path, "not service json").unwrap();
+
+        let mut config = (**ctx.config.load()).clone();
+        config.server.data_dir = temp_dir.clone();
+        config.integrations = Some(
+            toml::from_str(&format!(
+                r#"
+                [lists]
+                refresh_hours = 24
+                [lists.categories.adult]
+                url = "file://{}"
+                [lists.categories.gambling]
+                url = "file://{}"
+                [lists.categories.services]
+                url = "file://{}"
+                "#,
+                source_path.display(),
+                missing_path.display(),
+                invalid_services_path.display()
+            ))
+            .expect("valid integrations fixture"),
+        );
+        ctx.set_config(config);
+
+        let token = ctx
+            .auth_mgr
+            .create_token("lists-test", Role::Operator, None)
+            .await
+            .expect("create operator token")
+            .1
+            .token;
+        let app = crate::create_router(ctx.clone());
+
+        // Unauthenticated reads are rejected.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/integrations/lists")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let get_rows = |app: axum::Router, token: String| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/integrations/lists")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap()
+        };
+
+        let rows = get_rows(app.clone(), token.clone()).await;
+        let adult = rows
+            .iter()
+            .find(|row| row["category"] == "adult")
+            .expect("adult status row");
+        assert_eq!(adult["bundled"], true);
+        assert!(adult.get("last_error").is_none());
+
+        // Uppercase request resolves the configured lowercase key.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/integrations/lists/Adult/refresh")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let refreshed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(refreshed["category"], "adult");
+        assert_eq!(refreshed["bundled"], false);
+        assert_eq!(refreshed["entries"], 2);
+        assert!(refreshed.get("last_error").is_none());
+        assert!(refreshed["last_refresh_unix"].is_number());
+        assert!(refreshed["last_attempt_unix"].is_number());
+
+        // Unknown categories are 404, not a silent bundled-only refresh.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/integrations/lists/unknown/refresh")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // A fetch failure is a 502 and records the error for status consumers.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/integrations/lists/gambling/refresh")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let problem: crate::error::ProblemDetails = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            problem.detail.contains("Failed to fetch"),
+            "unexpected problem: {problem:?}"
+        );
+
+        // Invalid downloaded content is a 400 and also records the error.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/integrations/lists/services/refresh")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let rows = get_rows(app, token).await;
+        let gambling = rows
+            .iter()
+            .find(|row| row["category"] == "gambling")
+            .expect("gambling status row");
+        assert!(
+            gambling["last_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("Failed to fetch")),
+            "the 502 must leave last_error visible: {gambling}"
+        );
+        assert!(gambling["last_attempt_unix"].is_number());
+        let services = rows
+            .iter()
+            .find(|row| row["category"] == "services")
+            .expect("services status row");
+        assert!(
+            services["last_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("Failed to apply")),
+            "the 400 must leave last_error visible: {services}"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -89,6 +89,12 @@ impl ServiceRegistry {
         self.services.len()
     }
 
+    /// Whether a service id is present in this registry.
+    #[must_use]
+    pub fn contains_service(&self, service: &str) -> bool {
+        self.services.contains_key(&service.to_ascii_lowercase())
+    }
+
     /// Parse service definitions from a JSON string.
     ///
     /// Supports both map format `{"service": ["domain1", "domain2"]}` and

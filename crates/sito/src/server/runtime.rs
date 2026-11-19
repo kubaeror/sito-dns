@@ -293,6 +293,9 @@ pub(crate) async fn run_list_refresh(
                 let name = entries[next_idx].0.clone();
                 let url = entries[next_idx].1.clone();
                 let cache_name = format!("integration-{name}");
+                // Record the attempt before the network/file read so status
+                // consumers see in-flight work even if the fetch stalls.
+                store.record_attempt(&name, None);
                 match fetcher.fetch_or_cached(&cache_name, &url, &data_dir).await {
                     Ok(content) => match store.apply_content(&name, &content) {
                         Ok(entries) => {
@@ -304,16 +307,22 @@ pub(crate) async fn run_list_refresh(
                                 "Refreshed curated list category"
                             );
                         }
-                        Err(e) => warn!(
-                            category = %name,
-                            "Ignoring invalid refreshed curated list: {e}"
-                        ),
+                        Err(e) => {
+                            store.record_attempt(&name, Some(e.clone()));
+                            warn!(
+                                category = %name,
+                                "Ignoring invalid refreshed curated list: {e}"
+                            );
+                        }
                     },
-                    Err(e) => warn!(
-                        category = %name,
-                        url = %url,
-                        "Failed to refresh curated list: {e}"
-                    ),
+                    Err(e) => {
+                        store.record_attempt(&name, Some(e.to_string()));
+                        warn!(
+                            category = %name,
+                            url = %url,
+                            "Failed to refresh curated list: {e}"
+                        );
+                    }
                 }
                 let next = integration_next_deadline(
                     tokio::time::Instant::now(),
