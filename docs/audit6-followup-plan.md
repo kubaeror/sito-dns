@@ -200,7 +200,7 @@ The catalog lists every material finding from the eight audits. Some P2/P3 items
 | **P2-25** | Filter | Group standard `$dnsrewrite` can override a global block; group `$important @@` cannot override a global `$important` block. |
 | **P2-26** | Filter | Group snapshot rebuild can race with list reload and publish a snapshot compiled from stale list rules. |
 | **P2-27** | Filter | Huge `refresh_hours` can panic on `Instant + Duration` overflow; config validation only rejects zero. |
-| **P2-28** | Filter | `apply_content_forced` was never used by production refresh, so a legitimate >50% shrink was rejected forever. **Resolved by WP-2.5:** the operator-initiated curated-list refresh endpoint (`POST /api/v1/filtering/lists/{category}/refresh`) uses the forced path; the periodic task keeps the guarded path. |
+| **P2-28** | Filter | `apply_content_forced` was never used by production refresh, so a legitimate >50% shrink was rejected forever. **Resolved by WP-2.5:** the operator-initiated curated-list refresh endpoint (`POST /api/v1/integrations/lists/{category}/refresh`) uses the forced path; the periodic task keeps the guarded path. |
 | **P2-29** | Filter | Disk cache identity is keyed only by list name, not URL; changing URL while keeping the name serves stale/foreign rules. |
 | **P2-30** | Filter | RouterOS client uses env proxies, silently falls through when `token_env` is missing, and reads unbounded error bodies. |
 | **P2-31** | Rewrites | Local `TXT` rewrites do not split into 255-byte character-strings; long TXT values fail encoding. |
@@ -1226,13 +1226,29 @@ Evidence: Phase 2 — rewrites and policy section in
 **Addresses:** P2-34..P2-37, P2-97..P2-99.
 **Files:** `sito-clients/src/*`, `sito-filter/data/*`, docs.
 **Steps:**
-- [ ] Strict MAC parsing and ARP-snapshot invalidation.
-- [ ] Add IANA timezone support or document fixed-offset only; validate cron window semantics.
-- [ ] Replace tiny bundled parental/service data with a maintained manifest or mark experimental in UI/docs. **D15 descope:** bundled parental/service data is labeled a minimal built-in fallback in UI/docs; a maintained external dataset is deferred past WP-2.5 (manifest/count checks shipped instead).
-- [ ] Add force-refresh/status for runtime lists; validate category keys.
-- [ ] Expand safe search coverage; remove self-CNAME.
+- [x] Strict MAC parsing and ARP-snapshot invalidation.
+- [x] Add IANA timezone support or document fixed-offset only; validate cron window semantics.
+- [x] Replace tiny bundled parental/service data with a maintained manifest or mark experimental in UI/docs. **D15 descope:** bundled parental/service data is labeled a minimal built-in fallback in UI/docs; a maintained external dataset is deferred past WP-2.5 (manifest/count checks shipped instead).
+- [x] Add force-refresh/status for runtime lists; validate category keys.
+- [x] Expand safe search coverage; remove self-CNAME.
 - **Acceptance:** parental/service tests and data manifest checks pass; UI no longer overclaims.
 **Estimate:** L.
+
+**Status (2026-11-20):** Complete. Operator MAC IDs use one strict shape parser
+(6×2 `:`/`-` or 3×4 `.`, explicit `mac:` marker only) and a changed ARP
+snapshot invalidates positive and negative caches. Runtime-list status keys are
+case-insensitive, record `last_attempt`/`last_error` (cleared only on success),
+reject empty/unknown/duplicate categories, guard services by effective rule
+count, and expose `GET`/`POST /api/v1/integrations/lists` status/force-refresh
+for Operators. Safe search has a self-CNAME guard (`safe.duckduckgo.com` passes
+through) and remains A/AAAA/HTTPS-only. Numeric reversed cron ranges are
+rejected with field attribution, split overnight windows are documented, and
+`schedule_enabled` without a schedule is pinned as always active. Bundled
+parental/service data is labeled minimal with manifest consistency checks, and
+the anti-bypass dataset has a companion metadata file with exact counts
+(29 exact + 1 wildcard + 70 IPs). Evidence: Phase 2 — clients, schedules and
+curated data section in `docs/audit6-test-matrix.md` and §19 of
+`docs/2.0-public-api-diff.md`.
 
 ### WP-2.6 — Transport admission and TLS hardening
 
