@@ -58,8 +58,11 @@ pub struct FilterStatusDto {
     pub failed_lists: Vec<String>,
     /// Lists whose newest content was rejected while an older snapshot stayed.
     pub degraded_lists: Vec<String>,
-    /// Groups published without their regex/wildcard (or substring/prefix)
-    /// class after a budget/limit failure.
+    /// Groups that could not be published with their full rule set: a
+    /// budget/limit failure (only a non-regex subset was published), a
+    /// missing/unloaded referenced list, an invalid-only rule set, or a
+    /// group that could not be published at all. The previous snapshot is
+    /// retained when one is available.
     pub degraded_groups: Vec<String>,
     /// Regex/wildcard patterns dropped from the active snapshot.
     pub dropped_regex_patterns: usize,

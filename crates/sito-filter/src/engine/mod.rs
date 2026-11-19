@@ -84,8 +84,11 @@ pub struct FilterStatus {
     /// Regex/wildcard patterns dropped from the active snapshot because they
     /// could not be compiled.
     pub dropped_regex_patterns: usize,
-    /// Groups whose snapshot was published without part of its rule class
-    /// (regex/wildcard or substring/prefix) after a budget/limit failure.
+    /// Groups that could not be published with their full rule set: a
+    /// budget/limit failure (only a non-regex subset was published), a
+    /// missing/unloaded referenced list, an invalid-only rule set, or a
+    /// group that could not be published at all. The previous snapshot is
+    /// retained when one is available.
     pub degraded_groups: Vec<String>,
     /// Lists whose newest content was rejected (parse/limit/empty) while a
     /// previous snapshot was retained.
@@ -497,6 +500,10 @@ pub struct HostsFilterEngine {
     group_defs: ArcSwap<Vec<GroupRuleSet>>,
     /// Compiled per-group rule sets, keyed by group name.
     group_snapshots: ArcSwap<FnvHashMap<String, Arc<FilterSnapshot>>>,
+    /// Serializes the generation re-check and publication of group snapshots.
+    /// A stale rebuild must not overwrite a newer snapshot published by a
+    /// reload that bumped the generation after the rebuild's check.
+    group_publish_lock: std::sync::Mutex<()>,
     /// Test-only hook run by `set_group_rules` after it captures the list
     /// generation and clones `list_rules`, just before the rebuild. Lets tests
     /// interleave a concurrent reload deterministically.

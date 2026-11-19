@@ -3932,7 +3932,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Groups published without their regex/wildcard (or substring/prefix)\nclass after a budget/limit failure."
+            "description": "Groups that could not be published with their full rule set: a\nbudget/limit failure (only a non-regex subset was published), a\nmissing/unloaded referenced list, an invalid-only rule set, or a\ngroup that could not be published at all. The previous snapshot is\nretained when one is available."
           },
           "degraded_lists": {
             "type": "array",

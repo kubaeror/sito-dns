@@ -83,7 +83,12 @@ impl HostsFilterEngine {
         #[cfg(test)]
         self.run_group_rebuild_gate();
         if let Some(degraded) = self.rebuild_group_snapshots_at(&list_rules, generation) {
-            self.update_group_status(degraded);
+            // A reload may have bumped the generation after this rebuild
+            // published. In that case the reload owns the group status; do
+            // not overwrite it with this (now stale) degraded set.
+            if self.list_generation.load(Ordering::SeqCst) == generation {
+                self.update_group_status(degraded);
+            }
         }
     }
 
@@ -135,8 +140,10 @@ impl HostsFilterEngine {
         for def in defs.iter() {
             // A group with configured sources must never disappear silently:
             // if none of them yields usable rules, the group is degraded.
-            // A group with no configured sources is simply inactive.
-            let has_sources = !def.lists.is_empty() || !def.custom_rules.is_empty();
+            // A group with no configured sources is simply inactive. Blank
+            // entries are not sources, consistent with `has_group_custom_rules`.
+            let has_sources = def.lists.iter().any(|list| !list.trim().is_empty())
+                || def.custom_rules.iter().any(|rule| !rule.trim().is_empty());
             let mut rules = Vec::new();
             let mut degraded = false;
             for list_name in &def.lists {
@@ -279,6 +286,11 @@ impl HostsFilterEngine {
             }
         }
 
+        // Re-check and publish under the publish lock so a reload that bumped
+        // the generation after the loop cannot have its fresh snapshot
+        // overwritten by this stale compilation. Compilation and the test
+        // gate are deliberately outside the lock.
+        let _publish_guard = sito_core::sync::lock_or_recover(&self.group_publish_lock);
         if self.list_generation.load(Ordering::SeqCst) != generation {
             warn!(
                 generation,

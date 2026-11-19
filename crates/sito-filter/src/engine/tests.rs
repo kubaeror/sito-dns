@@ -1189,13 +1189,13 @@ async fn test_set_group_rules_discards_reload_interleaved_after_clone() {
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     *engine.group_rebuild_gate.lock().unwrap() = Some(Box::new(move || {
         let _ = reached_tx.send(());
-        let _ = resume_rx.recv();
+        let _ = resume_rx.recv_timeout(Duration::from_secs(5));
     }));
 
     std::thread::scope(|scope| {
         let raced = scope.spawn(|| engine.set_group_rules(groups()));
         reached_rx
-            .recv()
+            .recv_timeout(Duration::from_secs(5))
             .expect("set_group_rules must reach the interleaving gate");
 
         // Simulate the reload winning the race: store fresh list rules, bump
@@ -1210,6 +1210,10 @@ async fn test_set_group_rules_discards_reload_interleaved_after_clone() {
         engine
             .rebuild_group_snapshots(&newer)
             .expect("the reload rebuild must publish");
+        // The reload owns the group status from here on.
+        let mut reload_status = engine.status();
+        reload_status.degraded_groups = vec!["reload-degraded".to_string()];
+        engine.set_status(reload_status);
 
         resume_tx.send(()).unwrap();
         raced.join().expect("set_group_rules thread must not panic");
@@ -1230,6 +1234,13 @@ async fn test_set_group_rules_discards_reload_interleaved_after_clone() {
             .is_allowed(),
         "the list map cloned before the reload must not be published afterwards"
     );
+    assert_eq!(
+        engine.status().degraded_groups,
+        vec!["reload-degraded".to_string()],
+        "a discarded rebuild must not overwrite the reload's degraded groups"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
 /// A group whose referenced list is not loaded keeps its previous snapshot and

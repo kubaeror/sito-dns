@@ -1119,7 +1119,7 @@ impl MetricsRegistry {
             self.filter_lists_failed.load(Ordering::Relaxed)
         );
         out.push_str(
-            "# HELP sito_filter_degraded_groups Groups published with a partial rule class\n",
+            "# HELP sito_filter_degraded_groups Groups with degraded or unpublishable rules (budget/limit, missing list, invalid-only)\n",
         );
         out.push_str("# TYPE sito_filter_degraded_groups gauge\n");
         let _ = writeln!(
@@ -1795,7 +1795,7 @@ sito_filter_lists_loaded 3
 # HELP sito_filter_lists_failed Configured filter lists that failed in the last reload
 # TYPE sito_filter_lists_failed gauge
 sito_filter_lists_failed 1
-# HELP sito_filter_degraded_groups Groups published with a partial rule class
+# HELP sito_filter_degraded_groups Groups with degraded or unpublishable rules (budget/limit, missing list, invalid-only)
 # TYPE sito_filter_degraded_groups gauge
 sito_filter_degraded_groups 1
 # HELP sito_filter_dropped_regex_patterns Regex/wildcard patterns dropped from the active snapshot

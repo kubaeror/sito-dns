@@ -201,6 +201,7 @@ impl HostsFilterEngine {
             status: ArcSwap::new(Arc::new(self.status())),
             group_defs: ArcSwap::new(Arc::new(group_defs)),
             group_snapshots: ArcSwap::new(self.group_snapshots()),
+            group_publish_lock: std::sync::Mutex::new(()),
             #[cfg(test)]
             group_rebuild_gate: std::sync::Mutex::new(None),
             compile_observer: std::sync::RwLock::new(
