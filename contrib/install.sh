@@ -20,11 +20,15 @@ esac
 # the installer E2E can run unprivileged without touching the real system.
 INSTALL_BIN="${SITO_INSTALL_BIN:-/usr/local/bin/sito}"
 COSIGN_INSTALL_BIN="${SITO_INSTALL_COSIGN_BIN:-/usr/local/bin/cosign}"
+# Marker proving this installer placed cosign. Only a marked binary is removed
+# on --uninstall; a pre-existing user-managed cosign is left untouched.
+COSIGN_MARKER="${COSIGN_INSTALL_BIN}.installed-by-sito"
 CONFIG_DIR="${SITO_CONFIG_DIR:-/etc/sito}"
 DATA_DIR="${SITO_DATA_DIR:-/var/lib/sito}"
 SERVICE_PATH="${SITO_SERVICE_PATH:-/etc/systemd/system/sito.service}"
 SYSTEMCTL="${SITO_SYSTEMCTL:-systemctl}"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
+ENV_FILE="${CONFIG_DIR}/sito.env"
 BACKUP_BIN="${INSTALL_BIN}.bak"
 CONFIG_BACKUP="${CONFIG_FILE}.bak"
 SERVICE_STOPPED=0
@@ -38,7 +42,7 @@ for arg in "$@"; do
             ;;
         -h|--help)
             echo "Usage: install.sh [--uninstall]"
-            echo "  --uninstall  Remove the sito binary and systemd unit (keeps config/data)"
+            echo "  --uninstall  Remove the sito binary and systemd unit (keeps config, env and data)"
             echo "  SITO_VERSION=<version>  Pin a specific release version (default: latest)"
             echo "  SITO_INSTALL_COSIGN=0   Skip automatic cosign installation"
             echo "  COSIGN_VERSION=<tag>    Pin the cosign release (default: v2.6.5)"
@@ -80,11 +84,21 @@ if [ "${UNINSTALL}" -eq 1 ]; then
     if have_systemctl; then
         run_systemctl stop sito || true
         run_systemctl disable sito || true
-        rm -f "${SERVICE_PATH}"
+    fi
+    # Remove the unit unconditionally: a unit may predate this installer or the
+    # host may have lost systemd since it was written.
+    rm -f "${SERVICE_PATH}"
+    if have_systemctl; then
         run_systemctl daemon-reload || true
         run_systemctl reset-failed sito 2>/dev/null || true
     fi
     rm -f "${INSTALL_BIN}" "${BACKUP_BIN}" "${CONFIG_BACKUP}"
+    if [ -f "${COSIGN_MARKER}" ]; then
+        rm -f "${COSIGN_INSTALL_BIN}" "${COSIGN_MARKER}"
+        echo "Removed installer-managed cosign (${COSIGN_INSTALL_BIN})."
+    elif [ -e "${COSIGN_INSTALL_BIN}" ]; then
+        echo "Keeping pre-existing cosign (${COSIGN_INSTALL_BIN}); it was not installed by sito."
+    fi
     echo "Removed ${INSTALL_BIN} and ${SERVICE_PATH}."
 
     # Remove the dedicated system user/group when possible. Config and data are
@@ -107,7 +121,7 @@ if [ "${UNINSTALL}" -eq 1 ]; then
         fi
     fi
 
-    echo "Configuration (${CONFIG_DIR}) and data (${DATA_DIR}) were kept."
+    echo "Configuration (${CONFIG_DIR}, including sito.env) and data (${DATA_DIR}) were kept."
     exit 0
 fi
 
@@ -150,8 +164,29 @@ resolve_latest_version() {
 apply_capabilities() {
     chmod 755 "${INSTALL_BIN}"
     # Grant ambient capabilities to bind privileged ports (53, 443, 853)
-    if command -v setcap >/dev/null 2>&1; then
-        setcap 'cap_net_bind_service=+ep' "${INSTALL_BIN}" || true
+    if ! command -v setcap >/dev/null 2>&1; then
+        echo "Warning: 'setcap' was not found; ${INSTALL_BIN} cannot bind ports 53/443/853" >&2
+        echo "Warning: without privileges. Install libcap (or start the service with the" >&2
+        echo "Warning: CAP_NET_BIND_SERVICE ambient capability) before starting sito." >&2
+        return 0
+    fi
+    if ! setcap 'cap_net_bind_service=+ep' "${INSTALL_BIN}"; then
+        echo "Warning: failed to set cap_net_bind_service on ${INSTALL_BIN}." >&2
+        echo "Warning: the service may fail to bind privileged DNS ports; re-run as root" >&2
+        echo "Warning: and verify with: getcap ${INSTALL_BIN}" >&2
+        return 0
+    fi
+    if command -v getcap >/dev/null 2>&1; then
+        local caps
+        caps="$(getcap "${INSTALL_BIN}" 2>/dev/null || true)"
+        case "${caps}" in
+            *cap_net_bind_service*)
+                ;;
+            *)
+                echo "Warning: getcap did not report cap_net_bind_service for ${INSTALL_BIN}." >&2
+                echo "Warning: verify manually with: getcap ${INSTALL_BIN}" >&2
+                ;;
+        esac
     fi
 }
 
@@ -206,6 +241,31 @@ backup_config_if_present() {
             echo "Error: failed to back up ${CONFIG_FILE} to ${CONFIG_BACKUP}." >&2
             return 1
         fi
+    else
+        # Never let a stale backup from an earlier run be used for rollback.
+        rm -f "${CONFIG_BACKUP}"
+    fi
+}
+
+# Restores the configuration backup with a temp file + rename so a crash or a
+# failed write can never leave a truncated config.toml behind.
+restore_config_atomically() {
+    local dir tmp
+    dir="$(dirname -- "${CONFIG_FILE}")"
+    tmp="$(mktemp "${dir}/.sito-config-restore.XXXXXX")" || return 1
+    if ! cp -pf "${CONFIG_BACKUP}" "${tmp}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    if command -v sync >/dev/null 2>&1; then
+        sync -- "${tmp}" 2>/dev/null || sync || true
+    fi
+    if ! mv -f -- "${tmp}" "${CONFIG_FILE}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    if command -v sync >/dev/null 2>&1; then
+        sync -- "${dir}" 2>/dev/null || sync || true
     fi
 }
 
@@ -223,7 +283,7 @@ rollback_install() {
     fi
     if [ -f "${CONFIG_BACKUP}" ]; then
         echo "Restoring previous configuration from ${CONFIG_BACKUP}..." >&2
-        if ! cp -pf "${CONFIG_BACKUP}" "${CONFIG_FILE}"; then
+        if ! restore_config_atomically; then
             echo "Error: failed to restore ${CONFIG_FILE} from ${CONFIG_BACKUP}." >&2
             return 1
         fi
@@ -312,6 +372,17 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 chmod 750 "${CONFIG_DIR}" "${DATA_DIR}"
 
+# Optional systemd environment file. Create it empty with mode 0600 only when
+# it is missing: upgrades must preserve operator-provided values, and the unit
+# reads it with `EnvironmentFile=-`, so an absent file is equally valid.
+if [ ! -e "${ENV_FILE}" ] && [ ! -L "${ENV_FILE}" ]; then
+    (umask 077 && : >"${ENV_FILE}")
+    if [ "$(id -u)" -eq 0 ]; then
+        chown sito:sito "${ENV_FILE}"
+    fi
+    chmod 0600 "${ENV_FILE}"
+fi
+
 # 5. Detect upgrade vs fresh install and backup existing binary
 IS_UPGRADE=0
 if [ -x "${INSTALL_BIN}" ]; then
@@ -321,13 +392,11 @@ if [ -x "${INSTALL_BIN}" ]; then
         echo "Detected existing installation: ${PREV_VERSION}"
         echo "Backing up existing binary to ${BACKUP_BIN}..."
         cp -pf "${INSTALL_BIN}" "${BACKUP_BIN}"
-        backup_config_if_present
         echo "Upgrading sito ${PREV_VERSION} → v${SITO_VERSION}..."
     fi
 fi
 if [ "${IS_UPGRADE}" -eq 0 ]; then
     echo "Fresh install of sito v${SITO_VERSION}..."
-    backup_config_if_present
 fi
 
 # 6. Obtain and verify binary
@@ -440,6 +509,10 @@ install_cosign_if_missing() {
     )
 
     install -m 0755 "${TMP_DIR}/${asset}" "${COSIGN_INSTALL_BIN}"
+    if ! printf 'installed by sito installer %s\n' "${SITO_VERSION:-unknown}" >"${COSIGN_MARKER}"; then
+        echo "Warning: installed cosign but could not write ${COSIGN_MARKER}." >&2
+        echo "Warning: --uninstall will keep ${COSIGN_INSTALL_BIN} because ownership is unproven." >&2
+    fi
     echo "Installed cosign to ${COSIGN_INSTALL_BIN}."
 }
 
@@ -463,6 +536,9 @@ try_download_file() {
 if [ "${USE_LOCAL_BINARY}" -eq 1 ]; then
     echo "Using existing local release binary target/release/sito (verification skipped)..."
     stop_service_for_install
+    # Back up only after the service stopped: a running service can still write
+    # config.toml, so an earlier copy would capture a half-applied state.
+    backup_config_if_present
     install_binary_atomic "target/release/sito"
 else
     install_cosign_if_missing
@@ -540,6 +616,9 @@ else
         exit 1
     fi
     stop_service_for_install
+    # Back up only after the service stopped: a running service can still write
+    # config.toml, so an earlier copy would capture a half-applied state.
+    backup_config_if_present
     install_binary_atomic "${TMP_DIR}/sito"
 fi
 
@@ -579,6 +658,9 @@ Type=simple
 User=sito
 Group=sito
 ExecStart=/usr/local/bin/sito --config /etc/sito/config.toml
+# Optional environment overrides (for example RUST_LOG). The leading '-' keeps
+# the unit valid when the file is absent; the installer creates it mode 0600.
+EnvironmentFile=-/etc/sito/sito.env
 # The service runs unprivileged with ProtectSystem=strict, so in-app updates
 # cannot replace the binary in /usr/local/bin. Updates must be applied as root
 # while the service is stopped: sudo systemctl stop sito && sudo sito update
@@ -593,12 +675,20 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
+SystemCallArchitectures=native
+UMask=0077
+PrivateTmp=true
 ReadWritePaths=/var/lib/sito /etc/sito
 LimitNOFILE=1048576
 Restart=on-failure
 RestartSec=2s
+TimeoutStopSec=180
 
 [Install]
 WantedBy=multi-user.target
@@ -725,6 +815,11 @@ EOF
     else
         echo "sito service is active and responding."
     fi
+else
+    echo "Warning: systemd is not available (systemctl not found); no service unit was" >&2
+    echo "Warning: installed and sito was not started. The binary is at ${INSTALL_BIN}." >&2
+    echo "Warning: supervise it with your init system, or install systemd and re-run this" >&2
+    echo "Warning: installer. Use SITO_SYSTEMCTL=<path> to point at a non-standard systemctl." >&2
 fi
 
 INSTALL_COMMITTED=1
@@ -739,13 +834,14 @@ echo "=================================================="
 echo " sito v${SITO_VERSION} installed successfully!"
 echo ""
 echo " Complete First-Time Setup:"
-echo "   Open http://${HOST_IP}:8080 from the server or your LAN"
-echo "   to configure administrator credentials, upstreams,"
-echo "   blocklists, and DNS listeners."
+echo "   Open http://${HOST_IP}:8080 from the server or your LAN (1.9.x default)."
+echo "   A 2.0 config-v2 install binds the admin UI to 127.0.0.1; use the SSH"
+echo "   tunnel below instead of the LAN address."
 echo "   The admin UI is plain HTTP. Do not expose port 8080 to the internet."
 echo ""
 echo " Firewall guidance (LAN-only by default):"
-echo "   sito binds DNS on all interfaces and the admin UI on 0.0.0.0:8080."
+echo "   sito binds DNS on all interfaces. The 1.9.x admin default is"
+echo "   0.0.0.0:8080; 2.0 config-v2 defaults to 127.0.0.1."
 echo "   Allow only your LAN; replace 192.168.0.0/24 with your subnet."
 echo "   UFW (allow SSH first so a remote session survives enabling the firewall):"
 echo "     ufw allow OpenSSH"

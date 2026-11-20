@@ -51,6 +51,29 @@ pub async fn resolve_probe_addr(host: &str, port: u16) -> Result<SocketAddr, Str
     Ok(addrs[0])
 }
 
+/// Splits `scheme://rest` into a lowercased scheme (when present) and `rest`.
+fn split_probe_scheme(addr_str: &str) -> (Option<String>, &str) {
+    match addr_str.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme.to_ascii_lowercase()), rest),
+        None => (None, addr_str),
+    }
+}
+
+/// Builds the query used by REST/UI probes. RD=1 is required: a recursive
+/// resolver may legitimately drop RD=0 queries, which must not look unhealthy.
+fn build_probe_query(id: u16, qname: sito_proto::Name) -> Message {
+    let mut query = Message::new(
+        id,
+        sito_proto::MessageType::Query,
+        sito_proto::OpCode::Query,
+    );
+    query.metadata.recursion_desired = true;
+    query
+        .queries
+        .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
+    query
+}
+
 fn split_probe_host_port(addr_str: &str, scheme: &str, default_port: u16) -> (String, u16) {
     let rest = addr_str
         .strip_prefix(&format!("{scheme}://"))
@@ -96,71 +119,67 @@ pub async fn probe_upstream_target(addr_str: &str, probe_domain: &str) -> Result
     let start = std::time::Instant::now();
     let qname = sito_proto::Name::from_str(probe_domain)
         .unwrap_or_else(|_| sito_proto::Name::from_str("example.com").unwrap());
+    let (scheme, rest) = split_probe_scheme(addr_str);
 
-    if addr_str.starts_with("tls://") {
-        let (host, port) = split_probe_host_port(addr_str, "tls", 853);
-        let addr = resolve_probe_addr(&host, port).await?;
+    match scheme.as_deref() {
+        Some("tls") => {
+            let (host, port) = split_probe_host_port(rest, "tls", 853);
+            let addr = resolve_probe_addr(&host, port).await?;
 
-        let stream = tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(addr))
-            .await
-            .map_err(|_| "Connection timed out".to_string())?
-            .map_err(|e| format!("TCP connection failed: {e}"))?;
-        drop(stream);
-        return Ok(start.elapsed().as_secs_f64() * 1000.0);
+            let stream = tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(addr))
+                .await
+                .map_err(|_| "Connection timed out".to_string())?
+                .map_err(|e| format!("TCP connection failed: {e}"))?;
+            drop(stream);
+            Ok(start.elapsed().as_secs_f64() * 1000.0)
+        }
+        Some("https") => {
+            let (host, port) = split_probe_host_port(rest, "https", 443);
+            let addr = resolve_probe_addr(&host, port).await?;
+            let url = format!("https://{rest}");
+            let doh = sito_upstream::HttpsUpstream::new(&url, &[addr.ip()], PROBE_TIMEOUT)
+                .map_err(|e| format!("Invalid DoH upstream: {e}"))?;
+            let query = build_probe_query(0, qname);
+            let response = doh
+                .resolve(&query)
+                .await
+                .map_err(|e| format!("DoH query failed: {e}"))?;
+            validate_probe_reply(&query, &response)?;
+            Ok(start.elapsed().as_secs_f64() * 1000.0)
+        }
+        Some("quic") => {
+            let (host, port) = split_probe_host_port(rest, "quic", 853);
+            let addr = resolve_probe_addr(&host, port).await?;
+            let doq = sito_upstream::QuicUpstream::new(&host, addr, PROBE_TIMEOUT)
+                .map_err(|e| format!("Invalid DoQ upstream: {e}"))?;
+            let query = build_probe_query(0, qname);
+            let response = doq
+                .resolve(&query)
+                .await
+                .map_err(|e| format!("DoQ query failed: {e}"))?;
+            validate_probe_reply(&query, &response)?;
+            Ok(start.elapsed().as_secs_f64() * 1000.0)
+        }
+        Some("udp") | None => {
+            let target_addr: SocketAddr = if let Ok(sa) = rest.parse() {
+                sa
+            } else {
+                let (host, port) = split_probe_host_port(rest, "udp", 53);
+                resolve_probe_addr(&host, port).await?
+            };
+            if is_forbidden_probe_ip(&target_addr.ip()) {
+                return Err(format!(
+                    "Target resolves to a restricted address ({})",
+                    target_addr.ip()
+                ));
+            }
+
+            probe_udp_target(target_addr, qname).await
+        }
+        Some(other) => Err(format!(
+            "Unsupported probe scheme '{other}://'; use udp://, tls://, https:// or quic://"
+        )),
     }
-
-    if addr_str.starts_with("https://") {
-        let (host, port) = split_probe_host_port(addr_str, "https", 443);
-        let addr = resolve_probe_addr(&host, port).await?;
-        let doh = sito_upstream::HttpsUpstream::new(addr_str, &[addr.ip()], PROBE_TIMEOUT)
-            .map_err(|e| format!("Invalid DoH upstream: {e}"))?;
-        let mut query =
-            sito_proto::Message::new(0, sito_proto::MessageType::Query, sito_proto::OpCode::Query);
-        query
-            .queries
-            .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
-        let response = doh
-            .resolve(&query)
-            .await
-            .map_err(|e| format!("DoH query failed: {e}"))?;
-        validate_probe_reply(&query, &response)?;
-        return Ok(start.elapsed().as_secs_f64() * 1000.0);
-    }
-
-    if addr_str.starts_with("quic://") {
-        let (host, port) = split_probe_host_port(addr_str, "quic", 853);
-        let addr = resolve_probe_addr(&host, port).await?;
-        let doq = sito_upstream::QuicUpstream::new(&host, addr, PROBE_TIMEOUT)
-            .map_err(|e| format!("Invalid DoQ upstream: {e}"))?;
-        let mut query =
-            sito_proto::Message::new(0, sito_proto::MessageType::Query, sito_proto::OpCode::Query);
-        query
-            .queries
-            .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
-        let response = doq
-            .resolve(&query)
-            .await
-            .map_err(|e| format!("DoQ query failed: {e}"))?;
-        validate_probe_reply(&query, &response)?;
-        return Ok(start.elapsed().as_secs_f64() * 1000.0);
-    }
-
-    // Standard UDP probe
-    let target = addr_str.strip_prefix("udp://").unwrap_or(addr_str);
-    let target_addr: SocketAddr = if let Ok(sa) = target.parse() {
-        sa
-    } else {
-        let (host, port) = split_probe_host_port(target, "udp", 53);
-        resolve_probe_addr(&host, port).await?
-    };
-    if is_forbidden_probe_ip(&target_addr.ip()) {
-        return Err(format!(
-            "Target resolves to a restricted address ({})",
-            target_addr.ip()
-        ));
-    }
-
-    probe_udp_target(target_addr, qname).await
 }
 
 /// Sends one UDP probe to `target_addr` and validates the reply.
@@ -183,15 +202,7 @@ async fn probe_udp_target(target_addr: SocketAddr, qname: sito_proto::Name) -> R
         .await
         .map_err(|e| format!("UDP connect failed: {e}"))?;
 
-    let mut query_msg = sito_proto::Message::new(
-        rand::random(),
-        sito_proto::MessageType::Query,
-        sito_proto::OpCode::Query,
-    );
-    query_msg.metadata.recursion_desired = true;
-    query_msg
-        .queries
-        .push(sito_proto::Query::query(qname, sito_proto::RecordType::A));
+    let query_msg = build_probe_query(rand::random(), qname);
     let wire = sito_proto::encode_message(&query_msg)
         .map_err(|e| format!("Failed to encode DNS probe message: {e}"))?;
 
@@ -200,16 +211,32 @@ async fn probe_udp_target(target_addr: SocketAddr, qname: sito_proto::Name) -> R
         .await
         .map_err(|e| format!("UDP send failed: {e}"))?;
 
+    // A connected UDP socket still delivers datagrams from the target address
+    // that are junk, truncated, or for a different query. Ignore those until
+    // the probe deadline instead of failing the server on the first packet.
+    let deadline = start + PROBE_TIMEOUT;
     let mut buf = [0u8; 512];
-    let bytes_read = tokio::time::timeout(PROBE_TIMEOUT, socket.recv(&mut buf))
-        .await
-        .map_err(|_| "Probe query timed out".to_string())?
-        .map_err(|e| format!("UDP recv failed: {e}"))?;
-    let response = sito_proto::decode_message(&buf[..bytes_read])
-        .map_err(|e| format!("UDP probe reply is not a DNS message: {e}"))?;
-    validate_probe_reply(&query_msg, &response)?;
-
-    Ok(start.elapsed().as_secs_f64() * 1000.0)
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("Probe query timed out".to_string());
+        }
+        let bytes_read = match tokio::time::timeout(remaining, socket.recv(&mut buf)).await {
+            Err(_) => return Err("Probe query timed out".to_string()),
+            Ok(Err(e)) => return Err(format!("UDP recv failed: {e}")),
+            Ok(Ok(n)) => n,
+        };
+        let Ok(response) = sito_proto::decode_message(&buf[..bytes_read]) else {
+            continue;
+        };
+        if validate_response(&query_msg, &response).is_err() {
+            continue;
+        }
+        // The reply belongs to this query: a matching EDNS failure means the
+        // server cannot answer probes and must be reported down.
+        validate_probe_reply(&query_msg, &response)?;
+        return Ok(start.elapsed().as_secs_f64() * 1000.0);
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +252,30 @@ mod tests {
             RecordType::A,
         ));
         query
+    }
+
+    #[test]
+    fn test_probe_scheme_is_case_insensitive() {
+        assert_eq!(
+            split_probe_scheme("TLS://dns.example"),
+            (Some("tls".to_string()), "dns.example")
+        );
+        assert_eq!(
+            split_probe_scheme("QuIc://dns.example"),
+            (Some("quic".to_string()), "dns.example")
+        );
+        assert_eq!(split_probe_scheme("1.1.1.1:53"), (None, "1.1.1.1:53"));
+    }
+
+    #[test]
+    fn test_probe_query_sets_recursion_desired() {
+        let qname = sito_proto::Name::from_str("example.com.").unwrap();
+        let query = build_probe_query(0x1234, qname);
+        assert!(
+            query.metadata.recursion_desired,
+            "REST/UI probes must ask the upstream for recursion (RD=1)"
+        );
+        assert_eq!(query.queries.len(), 1);
     }
 
     /// Deferred D4b: a matching-ID FORMERR/BADVERS without a question is
@@ -301,6 +352,40 @@ mod tests {
         let rtt = probe_udp_target(addr, qname)
             .await
             .expect("a matching NOERROR reply must succeed");
+        assert!(rtt.is_finite(), "unexpected probe RTT: {rtt}");
+        server_task.await.unwrap();
+    }
+
+    /// WP-2.7: junk and mismatched datagrams from the probe target must be
+    /// ignored until a reply that belongs to this query arrives (or the probe
+    /// deadline expires), not treated as the server's answer.
+    #[tokio::test]
+    async fn test_udp_probe_ignores_mismatched_datagrams() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let query = sito_proto::decode_message(&buf[..n]).unwrap();
+
+            server.send_to(b"not a dns message", peer).await.unwrap();
+            let mut wrong_id =
+                Message::response(query.metadata.id.wrapping_add(1), query.metadata.op_code);
+            wrong_id.queries = query.queries.clone();
+            let bytes = sito_proto::encode_message(&wrong_id).unwrap();
+            server.send_to(&bytes, peer).await.unwrap();
+
+            let mut response = Message::response(query.metadata.id, query.metadata.op_code);
+            response.queries = query.queries.clone();
+            response.metadata.response_code = ResponseCode::NoError;
+            let bytes = sito_proto::encode_message(&response).unwrap();
+            server.send_to(&bytes, peer).await.unwrap();
+        });
+
+        let qname = sito_proto::Name::from_str("example.com.").unwrap();
+        let rtt = probe_udp_target(addr, qname)
+            .await
+            .expect("junk and mismatched replies must be ignored");
         assert!(rtt.is_finite(), "unexpected probe RTT: {rtt}");
         server_task.await.unwrap();
     }

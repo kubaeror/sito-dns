@@ -22,7 +22,8 @@ use crate::state::ServerContext;
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Upstream",
 )]
 pub async fn get_upstream_config(
     _operator: RequireOperator,
@@ -64,7 +65,8 @@ pub async fn get_upstream_config(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Upstream",
 )]
 pub async fn update_upstream_config(
     _operator: RequireOperator,
@@ -124,7 +126,8 @@ pub async fn update_upstream_config(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Upstream",
 )]
 pub async fn test_upstream_servers(
     _operator: RequireOperator,

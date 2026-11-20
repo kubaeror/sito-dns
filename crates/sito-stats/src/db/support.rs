@@ -25,6 +25,11 @@ impl StatsDb {
         Ok(())
     }
 
+    /// Whether rollups may store client names under the current live policy.
+    pub(super) fn rollup_client_names_enabled(&self) -> bool {
+        self.rollup_client_names.load(Ordering::Relaxed)
+    }
+
     /// Whether `value` is a stored keyed digest (current or legacy prefix).
     ///
     /// Requiring exactly 64 hex characters avoids treating a real IPv6 address
@@ -42,14 +47,24 @@ impl StatsDb {
     /// Hashes a client identifier for storage in `stats_hourly`.
     ///
     /// Already-hashed values are returned unchanged so re-merging a rollup does
-    /// not hash twice. The keyed BLAKE3 digest is not reversible without the
+    /// not hash twice. IPv4-mapped IPv6 addresses are canonicalized to their
+    /// native IPv4 spelling so one host does not appear under two identifiers
+    /// in the rollups. The keyed BLAKE3 digest is not reversible without the
     /// per-install salt.
     pub(super) fn hash_client_ip(&self, client_ip: &str) -> String {
         if Self::is_hashed_client_id(client_ip) {
             return client_ip.to_string();
         }
+        let mapped = client_ip
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .and_then(|ip| match ip {
+                std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                std::net::IpAddr::V4(_) => None,
+            })
+            .map(|v4| v4.to_string());
         let mut hasher = blake3::Hasher::new_keyed(self.salt.as_ref());
-        hasher.update(client_ip.as_bytes());
+        hasher.update(mapped.as_deref().unwrap_or(client_ip).as_bytes());
         format!("{ROLLUP_HASH_PREFIX}{}", hasher.finalize().to_hex())
     }
 

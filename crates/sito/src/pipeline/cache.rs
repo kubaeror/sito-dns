@@ -63,6 +63,7 @@ impl PipelineContext<'_> {
                         query_id,
                         self.domain_str.clone(),
                         bypass_check_needed,
+                        policy.ignore_stats,
                         &runtime_snapshot.config,
                         &runtime_snapshot,
                         &effective_upstream,
@@ -71,7 +72,9 @@ impl PipelineContext<'_> {
             );
         }
         debug!(qname = %qname, qtype = ?qtype, "Cache miss");
-        if let Some(ref m) = pipeline.metrics {
+        if !policy.ignore_stats
+            && let Some(ref m) = pipeline.metrics
+        {
             m.inc_cache_misses();
         }
 
@@ -117,6 +120,7 @@ impl PipelineContext<'_> {
                         query_id,
                         self.domain_str.clone(),
                         bypass_check_needed,
+                        policy.ignore_stats,
                         &runtime_snapshot.config,
                         &runtime_snapshot,
                         &effective_upstream,

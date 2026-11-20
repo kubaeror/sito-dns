@@ -25,7 +25,7 @@ use sito_filter::HostsFilterEngine;
 use sito_ha::{
     ConfigBundle, Ed25519SigningKey, FilterListMetadata, HaConfig, HaMessage, MasterCoordinator,
     PublishOutcome, SlaveAppHandles, SlaveConfigApplier, SlaveState, SlaveStatusTracker,
-    build_and_sign_push, config_digest, push_payload_hash, spawn_slave_worker,
+    build_and_sign_push, push_payload_hash, shared_config_digest, spawn_slave_worker,
 };
 use sito_rewrites::RewriteTable;
 use sito_stats::{MetricsRegistry, QueryLogWriter, StatsDb};
@@ -105,6 +105,9 @@ fn signed_push(
 ) -> HaMessage {
     build_and_sign_push(
         &ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
+            protocol_version: sito_ha::PROTOCOL_VERSION,
             version,
             term,
             timestamp: 1,
@@ -224,7 +227,7 @@ servers = ["9.9.9.9"]
             5,
             0,
             &payload_hash,
-            Some(&config_digest(applied_doc)),
+            Some(&shared_config_digest(applied_doc)),
         )
         .unwrap();
 
@@ -303,7 +306,7 @@ servers = ["9.9.9.9"]
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_legacy_watermark_without_digest_forces_full_apply() {
+async fn test_watermark_without_digest_forces_full_apply() {
     let dir = temp_dir("legacy-digest");
     let config_path = dir.join("config.toml");
     let watermark_path = dir.join("ha_watermark.toml");
@@ -320,11 +323,12 @@ servers = ["9.9.9.9"]
     std::fs::write(&config_path, applied_doc).unwrap();
     let push = signed_push(5, 0, applied_doc, vec![], &key);
     let payload_hash = push_payload_hash(&push).unwrap();
-    // A 1.9.3 watermark: no `applied_config_digest`.
+    // A pre-digest v2 watermark: wrapped with protocol_version but no
+    // `applied_config_digest`.
     std::fs::write(
         &watermark_path,
         format!(
-            r#"{{"version":5,"term":0,"payload_hash":"{payload_hash}","timestamp":1,"forked":false,"forked_at_version":0}}"#
+            r#"{{"protocol_version":2,"watermark":{{"version":5,"term":0,"payload_hash":"{payload_hash}","timestamp":1,"forked":false,"forked_at_version":0}}}}"#
         ),
     )
     .unwrap();
@@ -503,6 +507,9 @@ async fn test_delayed_same_version_fork_ack_after_newer_publish_is_divergence() 
 
 fn bundle(version: u64) -> ConfigBundle {
     ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version,
         term: 0,
         timestamp: 1,
@@ -575,6 +582,9 @@ async fn test_publish_bundle_propagates_sanitize_failure_and_rejects_oversize() 
     .with_state_path(state_path.clone());
 
     let oversized = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version: 1,
         term: 0,
         timestamp: 1,
@@ -618,12 +628,13 @@ async fn test_file_watcher_rejects_oversized_bundle_and_rolls_back() {
     let ctx = publish_context(&dir, &config_path).await;
     let original_ttl = ctx.config.load().dns.cache.min_ttl;
 
-    // A real small shared change plus a large *valid* custom rule. Unknown
-    // tables are rejected by config v2 (D5), so the oversized payload must be
-    // a real setting that survives HA sanitization and exceeds the 1 MiB
-    // WebSocket limit.
+    // A real small shared change plus a large *valid* value. Unknown tables
+    // are rejected by config v2 (D5), and a huge filtering payload would now
+    // require a synchronous filter apply; use a client-group note instead,
+    // which survives HA sanitization and exceeds the 1 MiB WebSocket limit
+    // while `[filtering]` stays unchanged.
     let oversized_document = format!(
-        "config_version = 2\n[server]\nrole = \"master\"\n[ha]\nreplication_port = 8953\nallow_insecure_ws = true\nslave_token = \"test-token\"\n[dns.cache]\nmin_ttl = {}\n[filtering]\ncustom_rules = [\"{}\"]\n",
+        "config_version = 2\n[server]\nrole = \"master\"\n[ha]\nreplication_port = 8953\nallow_insecure_ws = true\nslave_token = \"test-token\"\n[dns.cache]\nmin_ttl = {}\n[clients.groups.big]\ndescription = \"{}\"\n",
         original_ttl.saturating_add(7),
         "x".repeat(1_100_000)
     );

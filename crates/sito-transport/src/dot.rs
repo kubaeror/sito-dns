@@ -15,6 +15,7 @@ use sito_proto::{
     DOT_PADDING_BLOCK_SIZE, apply_dot_padding, decode_message, encode_message, truncate_for_framing,
 };
 
+use crate::admission::{AdmissionController, DEFAULT_MAX_CONNECTIONS_PER_IP};
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
 use crate::tcp::{MAX_PIPELINED_QUERIES, frame_prefix};
@@ -70,24 +71,20 @@ pub async fn start_dot_listener<H: QueryHandler>(
     let local_addr = listener.local_addr()?;
     info!("DoT listener started on {}", local_addr);
 
-    let semaphore = Arc::new(Semaphore::new(config.max_connections));
-    let per_ip_limiter = crate::admission::PerIpConnectionLimiter::new(
-        crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP,
+    let admission = AdmissionController::new(
+        config.max_connections,
+        DEFAULT_MAX_CONNECTIONS_PER_IP,
+        config.rate_limiter.clone().unwrap_or_else(|| {
+            Arc::new(RateLimiter::new(
+                config.rate_limit_per_ip,
+                RateLimiter::burst_for_rate(config.rate_limit_per_ip),
+            ))
+        }),
+        config.max_connections.max(1),
     );
-    let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
-        Arc::new(RateLimiter::new(
-            config.rate_limit_per_ip,
-            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
-        ))
-    });
-    rate_limiter.spawn_pruner(shutdown_rx.clone());
+    admission.spawn_pruner(shutdown_rx.clone());
 
-    // The per-query check inside the connection handler reads
-    // `config.rate_limiter`; make sure a default-constructed DotConfig still
-    // enforces the configured limit instead of silently serving unlimited
-    // queries.
-    let mut config = config;
-    config.rate_limiter = Some(Arc::clone(&rate_limiter));
+    let max_connections = config.max_connections;
 
     let handle = tokio::spawn(async move {
         let mut accept_backoff = crate::admission::AcceptBackoff::default();
@@ -113,19 +110,15 @@ pub async fn start_dot_listener<H: QueryHandler>(
                         }
                     };
 
-                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-                        warn!(
-                            "DoT max connections ({}) reached; rejecting connection from {}",
-                            config.max_connections, peer_addr
-                        );
-                        continue;
-                    };
-                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(peer_addr.ip()) else {
-                        warn!(
-                            "DoT per-IP connection limit ({}) reached; rejecting connection from {}",
-                            crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP, peer_addr
-                        );
-                        continue;
+                    let permit = match admission.try_acquire_connection(peer_addr.ip()) {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            warn!(
+                                "DoT connection from {} rejected: {} (max connections {})",
+                                peer_addr, e, max_connections
+                            );
+                            continue;
+                        }
                     };
 
                     // Rate limiting is per query inside handle_dot_connection;
@@ -133,11 +126,11 @@ pub async fn start_dot_listener<H: QueryHandler>(
                     let acceptor = config.acceptor_mgr.acceptor();
                     let handler = Arc::clone(&handler);
                     let cfg = config.clone();
+                    let admission = Arc::clone(&admission);
 
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let _per_ip_permit = per_ip_permit;
-                        if let Err(e) = handle_dot_connection(stream, peer_addr, acceptor, handler, cfg).await {
+                        if let Err(e) = handle_dot_connection(stream, peer_addr, acceptor, handler, cfg, admission).await {
                             trace!("DoT connection from {} ended: {}", peer_addr, e);
                         }
                     });
@@ -155,6 +148,7 @@ async fn handle_dot_connection<H: QueryHandler>(
     acceptor: tokio_rustls::TlsAcceptor,
     handler: Arc<H>,
     config: DotConfig,
+    admission: Arc<AdmissionController>,
 ) -> std::io::Result<()> {
     let tls_stream = match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
         Ok(Ok(s)) => s,
@@ -299,6 +293,18 @@ async fn handle_dot_connection<H: QueryHandler>(
             break;
         }
 
+        // Per-query budget: charge the source prefix before allocating or
+        // reading the body. A denied peer never forces a body buffer; the
+        // connection is closed instead of draining an unbounded frame.
+        if let Err(e) = admission.check_rate(peer_addr.ip()) {
+            debug!(
+                "DoT query from client {} rejected before body read: {}",
+                peer_addr.ip(),
+                e
+            );
+            break;
+        }
+
         let mut msg_buf = vec![0u8; read_len];
         match timeout(config.idle_timeout, reader.read_exact(&mut msg_buf)).await {
             Ok(Ok(_)) => {}
@@ -313,18 +319,6 @@ async fn handle_dot_connection<H: QueryHandler>(
         }
 
         query_count += 1;
-
-        // Per-query budget: the accept-time check alone lets one connection
-        // issue unlimited queries.
-        if let Some(ref limiter) = config.rate_limiter
-            && !limiter.check(peer_addr.ip())
-        {
-            debug!(
-                "DoT per-query rate limit exceeded for client {}; dropping query",
-                peer_addr.ip()
-            );
-            continue;
-        }
 
         let query = match decode_message(&msg_buf) {
             Ok(q) => q,

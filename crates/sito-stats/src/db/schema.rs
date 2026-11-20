@@ -28,7 +28,7 @@ impl StatsDb {
             pool,
             db_path: None,
             salt: Arc::new(random_salt()),
-            rollup_client_names,
+            rollup_client_names: Arc::new(AtomicBool::new(rollup_client_names)),
             cache: Arc::new(StatsCache::default()),
         };
         db.run_migrations().await?;
@@ -77,7 +77,7 @@ impl StatsDb {
             pool,
             db_path: Some(path),
             salt: Arc::new(salt),
-            rollup_client_names,
+            rollup_client_names: Arc::new(AtomicBool::new(rollup_client_names)),
             cache: Arc::new(StatsCache::default()),
         };
         db.run_migrations().await?;
@@ -182,7 +182,7 @@ impl StatsDb {
                         .map(|(client_ip, client_name, total, blocked, last_seen)| {
                             (
                                 self.hash_client_ip(&client_ip),
-                                if self.rollup_client_names {
+                                if self.rollup_client_names_enabled() {
                                     client_name
                                 } else {
                                     None
@@ -226,7 +226,7 @@ impl StatsDb {
             "INSERT INTO stats_meta (key, value) VALUES ('rollup_client_names_policy', ?) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
-        .bind(if self.rollup_client_names {
+        .bind(if self.rollup_client_names_enabled() {
             "true"
         } else {
             "false"
@@ -237,26 +237,48 @@ impl StatsDb {
         Ok(())
     }
 
+    /// Re-applies a new `rollup_client_names` policy to the live database.
+    ///
+    /// Config apply calls this when the setting changes so the new policy takes
+    /// effect without a restart. Turning names off scrubs every existing
+    /// rollup (irreversible); turning them on only affects future rollups.
+    pub async fn set_rollup_client_names(&self, enabled: bool) -> Result<(), StatsError> {
+        self.rollup_client_names.store(enabled, Ordering::Relaxed);
+        self.sync_rollup_name_policy().await
+    }
+
     /// Enforces the current `rollup_client_names` policy on existing rollups.
     ///
     /// When the operator switches the setting from `true` to `false`, rewrite
     /// every stored `top_clients` list with names removed. A marker stores the
     /// last policy so this full scrub runs only on the transition (or once when
     /// upgrading from a build that had no policy marker).
+    ///
+    /// The whole check/scrub/marker sequence runs in one `BEGIN IMMEDIATE`
+    /// transaction on a pooled write connection. That serializes it with
+    /// in-flight retention chunks and keep-aggregates clears: the scrub waits
+    /// for a writer already holding the lock, and a writer that starts after
+    /// the scrub commits observes the live `false` policy and strips names.
+    /// The marker is committed with the scrubbed rows, so a later startup
+    /// cannot skip the scrub while a name-bearing row is still visible.
     pub(super) async fn sync_rollup_name_policy(&self) -> Result<(), StatsError> {
+        // Take the write lock before the first read. An in-flight writer is
+        // either included in this scan (it committed before we acquired the
+        // lock) or blocked until the marker is committed.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let stored: Option<String> = sqlx::query_scalar(
             "SELECT value FROM stats_meta WHERE key = 'rollup_client_names_policy'",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        let current = if self.rollup_client_names {
+        let current = if self.rollup_client_names_enabled() {
             "true"
         } else {
             "false"
         };
 
-        if !self.rollup_client_names && stored.as_deref() != Some("false") {
-            self.scrub_rollup_client_names().await?;
+        if !self.rollup_client_names_enabled() && stored.as_deref() != Some("false") {
+            self.scrub_rollup_client_names(&mut tx).await?;
         }
 
         sqlx::query(
@@ -264,14 +286,19 @@ impl StatsDb {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
         .bind(current)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     /// Rewrites every rollup client list with names removed (and raw IPs
-    /// hashed) in bounded batches.
-    pub(super) async fn scrub_rollup_client_names(&self) -> Result<(), StatsError> {
+    /// hashed), using the caller's transaction so the scrub and the policy
+    /// marker are atomic with respect to concurrent rollup writers.
+    async fn scrub_rollup_client_names(
+        &self,
+        conn: &mut SqliteConnection,
+    ) -> Result<(), StatsError> {
         let mut last_hour = i64::MIN;
         loop {
             let rows = sqlx::query(
@@ -281,13 +308,12 @@ impl StatsDb {
             )
             .bind(last_hour)
             .bind(ROLLUP_PII_BACKFILL_BATCH)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await?;
             if rows.is_empty() {
                 break;
             }
 
-            let mut tx = self.pool.begin().await?;
             for row in &rows {
                 let hour: i64 = row.get("hour");
                 last_hour = last_hour.max(hour);
@@ -319,10 +345,9 @@ impl StatsDb {
                 sqlx::query("UPDATE stats_hourly SET top_clients = ? WHERE hour = ?")
                     .bind(encode_tops(&transformed))
                     .bind(hour)
-                    .execute(&mut *tx)
+                    .execute(&mut *conn)
                     .await?;
             }
-            tx.commit().await?;
         }
         Ok(())
     }

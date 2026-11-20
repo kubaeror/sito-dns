@@ -59,6 +59,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// `check-config` must reject a rewrite entry that config/API validation
+    /// would reject instead of silently dropping it from the table.
+    #[test]
+    fn test_check_config_rejects_invalid_rewrite_entry() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_check_cfg_rewrites_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let bad_path = temp_dir.join("bad_rewrite.toml");
+        std::fs::write(
+            &bad_path,
+            "config_version = 2\n[server]\nrole = \"master\"\n[rewrites]\nentries = [{ domain = \"bad..name\", type = \"A\", answer = \"192.168.1.1\" }]\n",
+        )
+        .unwrap();
+        let err = run_check_config(&bad_path).expect_err("check-config must reject a bad rewrite");
+        let message = err.to_string();
+        assert!(
+            message.contains("[rewrites]") && message.contains("entry 0"),
+            "the error must name the section and entry: {message}"
+        );
+
+        let valid_path = temp_dir.join("valid_rewrite.toml");
+        std::fs::write(
+            &valid_path,
+            "config_version = 2\n[server]\nrole = \"master\"\n[rewrites]\nentries = [{ domain = \"*.home.arpa\", type = \"A\", answer = \"192.168.1.1\", exception_clients = [\"10.0.0.0/8\"] }]\n",
+        )
+        .unwrap();
+        run_check_config(&valid_path).expect("a valid rewrite entry must pass check-config");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     /// A binary built without the `ha` feature must fail `check-config` for a
     /// document that configures HA. The dependency crate already rejects it;
     /// this pins the end-to-end CLI path operators and packaging scripts use.

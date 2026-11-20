@@ -11,6 +11,10 @@ use super::*;
 pub struct SetupTokenQuery {
     #[serde(default)]
     pub setup_token: Option<String>,
+    /// Optional re-authentication ticket for an Admin recovering first-boot
+    /// setup without the printed setup token.
+    #[serde(default)]
+    pub reauth_token: Option<String>,
 }
 
 pub async fn wizard_page(
@@ -35,6 +39,7 @@ pub async fn wizard_page(
     // Only echo a token the requester already supplied; never reveal the
     // stored setup token in the rendered page on its own.
     let setup_token = params.setup_token.unwrap_or_default();
+    let reauth_token = params.reauth_token.unwrap_or_default();
 
     HtmlTemplate(WizardTemplate {
         is_authenticated: auth_user.is_some(),
@@ -45,6 +50,7 @@ pub async fn wizard_page(
         csrf_token: &csrf,
         setup_required,
         setup_token: &setup_token,
+        reauth_token: &reauth_token,
     })
     .into_response()
 }
@@ -53,6 +59,9 @@ pub async fn wizard_page(
 pub struct WizardCompleteForm {
     /// One-time first-boot setup token (required while setup is pending).
     pub setup_token: Option<String>,
+    /// Alternative proof for an Admin session: a fresh re-authentication
+    /// ticket bound to that session.
+    pub reauth_token: Option<String>,
 
     // 1. Administrator account
     pub admin_user: Option<String>,
@@ -75,15 +84,23 @@ pub struct WizardCompleteForm {
     pub timeout_ms: Option<String>,
 
     // 4. Cache & DNSSEC
+    /// Presence sentinels: an unchecked HTML checkbox is omitted from the
+    /// form, so these hidden fields distinguish "unchecked" from "not part of
+    /// this submission". Without them an unchecked box left the previous value
+    /// unchanged instead of disabling the feature.
+    pub cache_enabled_present: Option<String>,
     pub cache_enabled: Option<String>,
     pub cache_size_mb: Option<String>,
     pub dnssec_mode: Option<String>,
+    pub dnssec_validate_present: Option<String>,
     pub dnssec_validate: Option<String>,
 
     // 5. Filtering
+    pub filtering_enabled_present: Option<String>,
     pub filtering_enabled: Option<String>,
     pub enable_adblock: Option<String>,
     pub blocking_mode: Option<String>,
+    pub cname_cloaking_present: Option<String>,
     pub cname_cloaking: Option<String>,
     pub list_oisd_big: Option<String>,
     pub list_oisd_small: Option<String>,
@@ -265,7 +282,7 @@ impl WizardCompleteForm {
     /// Wizard fields for cache, DNSSEC, and filtering presets.
     fn apply_cache_and_filtering(&self, cfg: &mut Config) -> Result<(), String> {
         // 4. Cache & DNSSEC
-        if self.cache_enabled.is_some() {
+        if self.cache_enabled_present.is_some() || self.cache_enabled.is_some() {
             cfg.dns.cache.enabled = Self::is_checkbox_checked(self.cache_enabled.as_deref());
         }
         if let Some(s) = self
@@ -286,12 +303,12 @@ impl WizardCompleteForm {
         {
             cfg.dns.dnssec.mode = s.to_string();
         }
-        if self.dnssec_validate.is_some() {
+        if self.dnssec_validate_present.is_some() || self.dnssec_validate.is_some() {
             cfg.dns.dnssec.validate = Self::is_checkbox_checked(self.dnssec_validate.as_deref());
         }
 
         // 5. Filtering & Protection
-        if self.filtering_enabled.is_some() {
+        if self.filtering_enabled_present.is_some() || self.filtering_enabled.is_some() {
             cfg.filtering.enabled = Self::is_checkbox_checked(self.filtering_enabled.as_deref());
         } else if self.enable_adblock.is_some() {
             cfg.filtering.enabled = Self::is_checkbox_checked(self.enable_adblock.as_deref());
@@ -318,7 +335,7 @@ impl WizardCompleteForm {
             }
         }
 
-        if self.cname_cloaking.is_some() {
+        if self.cname_cloaking_present.is_some() || self.cname_cloaking.is_some() {
             cfg.filtering.cname_cloaking =
                 Self::is_checkbox_checked(self.cname_cloaking.as_deref());
         }
@@ -476,7 +493,6 @@ pub async fn wizard_complete_handler(
     // are recoverable only with the setup token.
     let bootstrapping = is_first_run || setup_token_required;
     let auth_user = get_session_user(&ctx, &headers);
-    let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
 
     // WP-0.7 (P1-16): completing the wizard mutates the administrator password.
     // It must never be reachable after setup, even for a valid Admin session;
@@ -488,10 +504,11 @@ pub async fn wizard_complete_handler(
         );
     }
 
-    // Bootstrap completion requires the one-time setup token (authenticated
-    // admins and in-memory test managers without a provisioned token are
-    // exempt). The requirement was captured under the completion lock.
-    if setup_token_required && !is_admin {
+    // Bootstrap completion requires the one-time setup token. An Admin session
+    // may instead present a fresh re-authentication ticket (recovery edge:
+    // the printed token was lost but the Admin can still prove their
+    // credential). The requirement was captured under the completion lock.
+    if setup_token_required {
         let config = ctx.config.load();
         let trusted_proxies = config.get_web_config().trusted_proxies.clone();
         drop(config);
@@ -501,20 +518,44 @@ pub async fn wizard_complete_handler(
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty());
-        match ctx.auth_mgr.validate_setup_token(candidate, &client_ip) {
-            crate::auth::SetupTokenStatus::Valid => {}
-            crate::auth::SetupTokenStatus::RateLimited => {
-                return error_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "Too many invalid setup token attempts. Try again later.",
-                );
+
+        let mut authenticated = false;
+        if candidate.is_some() {
+            match ctx.auth_mgr.validate_setup_token(candidate, &client_ip) {
+                crate::auth::SetupTokenStatus::Valid => authenticated = true,
+                crate::auth::SetupTokenStatus::RateLimited => {
+                    return error_response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Too many invalid setup token attempts. Try again later.",
+                    );
+                }
+                _ => {}
             }
-            _ => {
-                return error_response(
-                    StatusCode::FORBIDDEN,
-                    "First-boot setup token required (see server logs).",
-                );
+        }
+
+        if !authenticated
+            && let Some(auth_user) = auth_user.as_ref().filter(|u| u.role == Role::Admin)
+        {
+            let ticket = form
+                .reauth_token
+                .as_deref()
+                .or_else(|| headers.get("x-reauth-token").and_then(|v| v.to_str().ok()))
+                .map(str::trim)
+                .filter(|token| !token.is_empty());
+            if let (Some(ticket), Some(session_id)) = (ticket, current_session_id(&ctx, &headers))
+                && ctx
+                    .auth_mgr
+                    .take_reauth_token(ticket, &auth_user.username, &session_id)
+            {
+                authenticated = true;
             }
+        }
+
+        if !authenticated {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "First-boot setup token required (see server logs), or a fresh re-authentication ticket for an Admin session.",
+            );
         }
     }
 
@@ -589,7 +630,7 @@ pub async fn wizard_complete_handler(
         return error_response(StatusCode::BAD_REQUEST, "Username does not exist.");
     }
 
-    let (report, filtering, credential_undo) = match apply_wizard_configuration(
+    let (report, credential_undo) = match apply_wizard_configuration(
         &ctx,
         &hooks,
         &form,
@@ -602,15 +643,7 @@ pub async fn wizard_complete_handler(
         Ok(result) => result,
         Err(response) => return response,
     };
-    finish_wizard_setup(
-        &ctx,
-        admin_user,
-        bootstrapping,
-        credential_undo,
-        report,
-        filtering,
-    )
-    .await
+    finish_wizard_setup(&ctx, admin_user, bootstrapping, credential_undo, report).await
 }
 
 /// Applies the wizard configuration and persists the administrator credential.
@@ -623,16 +656,9 @@ async fn apply_wizard_configuration(
     admin_user: &str,
     effective_password: &str,
     bootstrapping: bool,
-) -> Result<
-    (
-        crate::config_apply::AppliedReport,
-        sito_core::config::FilteringConfig,
-        WizardCredentialUndo,
-    ),
-    Response,
-> {
+) -> Result<(crate::config_apply::AppliedReport, WizardCredentialUndo), Response> {
     let mut credential_undo = WizardCredentialUndo::default();
-    let (report, filtering) = {
+    let report = {
         let _apply_guard = ctx.lock_config_apply().await;
         let base_cfg = (**ctx.config.load()).clone();
         let new_cfg = match form.build_config(&base_cfg) {
@@ -694,17 +720,12 @@ async fn apply_wizard_configuration(
         }
 
         // Apply first, persist second (WP-4.2): a configuration that cannot be
-        // applied never reaches the file. The blocklist fetch is deferred to a
-        // background refresh so the wizard request does not download lists
-        // synchronously; the DNS listeners are only started after the refresh
-        // finished.
-        let report = match apply_and_persist_config_locked(
-            ctx,
-            &new_cfg,
-            FilterApply::Deferred,
-            hooks.as_dyn(),
-        )
-        .await
+        // applied never reaches the file. Filtering is always synchronous here:
+        // first boot deliberately waits for the initial list fetch (bounded by
+        // the subscription fetch timeout) so setup cannot report success while
+        // the old/empty rule snapshot is still live.
+        match apply_and_persist_config_locked(ctx, &new_cfg, FilterApply::Sync, hooks.as_dyn())
+            .await
         {
             Ok(report) => report,
             Err(e) => {
@@ -718,21 +739,19 @@ async fn apply_wizard_configuration(
                     ),
                 ));
             }
-        };
-        (report, new_cfg.filtering.clone())
+        }
     };
-    Ok((report, filtering, credential_undo))
+    Ok((report, credential_undo))
 }
 
-/// Removes the bootstrap admin, marks setup complete, and starts the deferred
-/// filter refresh. Returns the login redirect.
+/// Removes the bootstrap admin, marks setup complete and starts DNS.
+/// Filtering was already applied synchronously by the caller.
 async fn finish_wizard_setup(
     ctx: &ServerContext,
     admin_user: &str,
     bootstrapping: bool,
     credential_undo: WizardCredentialUndo,
     report: crate::config_apply::AppliedReport,
-    filtering: sito_core::config::FilteringConfig,
 ) -> Response {
     if !report.restart_required.is_empty() {
         tracing::warn!(
@@ -763,24 +782,18 @@ async fn finish_wizard_setup(
     }
 
     // All credential and configuration writes succeeded: only now retire the
-    // setup token and let the server leave setup mode.
+    // setup token and let the server leave setup mode. Any Admin
+    // re-authentication ticket was already consumed when authorizing the
+    // completion.
     ctx.auth_mgr.consume_setup_token();
     ctx.set_setup_pending(false);
 
-    // Queue the blocklist fetch/compile off the request path. When the DNS
-    // listeners are still gated (first boot), start them only after the
-    // filter engine has the new rules.
-    let filter_handle = crate::config_apply::queue_filter_refresh(ctx, filtering);
-    match ctx.dns_starter.clone() {
-        Some(starter) => {
-            tokio::spawn(async move {
-                let _ = filter_handle.await;
-                if let Err(e) = starter.send(()) {
-                    tracing::warn!("Failed to notify DNS listener starter after setup: {e}");
-                }
-            });
-        }
-        None => drop(filter_handle),
+    // First-boot listeners were gated until the filtering refresh above
+    // finished; recovery bootstrap has no starter.
+    if let Some(starter) = ctx.dns_starter.clone()
+        && let Err(e) = starter.send(())
+    {
+        tracing::warn!("Failed to notify DNS listener starter after setup: {e}");
     }
 
     Redirect::to("/login").into_response()

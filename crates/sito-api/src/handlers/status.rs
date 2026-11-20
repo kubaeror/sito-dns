@@ -14,7 +14,8 @@ use axum::extract::State;
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "System"
+    tag = "System",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 #[allow(clippy::unused_async)]
 pub async fn get_status(

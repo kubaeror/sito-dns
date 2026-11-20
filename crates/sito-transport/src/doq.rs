@@ -7,12 +7,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
 
 use sito_core::client::ClientContext;
 use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
+use crate::admission::{AdmissionController, DEFAULT_MAX_CONNECTIONS_PER_IP};
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
 use crate::tcp::frame_prefix;
@@ -67,6 +67,12 @@ pub struct DoqConfig {
     /// when absent.
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub idle_timeout: Duration,
+    /// Maximum lifetime of one QUIC connection, independent of activity.
+    ///
+    /// A peer that keeps a connection busy (or dribbles just enough bytes)
+    /// must still release its connection slot; the default matches the
+    /// TCP/DoH 300 s lifetime. Tests override it to a short value.
+    pub connection_lifetime: Duration,
 }
 
 impl DoqConfig {
@@ -79,6 +85,7 @@ impl DoqConfig {
             rate_limit_per_ip: 20,
             rate_limiter: None,
             idle_timeout: Duration::from_secs(30),
+            connection_lifetime: Duration::from_secs(300),
         }
     }
 
@@ -142,25 +149,25 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
     let local_addr = endpoint.local_addr()?;
     info!("DoQ listener started on {}", local_addr);
 
-    let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
-        Arc::new(RateLimiter::new(
-            config.rate_limit_per_ip,
-            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
-        ))
-    });
-    rate_limiter.spawn_pruner(shutdown_rx.clone());
-    let semaphore = Arc::new(Semaphore::new(config.max_connections));
-    // Global stream budget: bounds buffered query bodies/tasks even when a
-    // client keeps every allowed connection open.
-    let stream_semaphore = Arc::new(Semaphore::new(
+    let admission = AdmissionController::new(
+        config.max_connections,
+        DEFAULT_MAX_CONNECTIONS_PER_IP,
+        config.rate_limiter.clone().unwrap_or_else(|| {
+            Arc::new(RateLimiter::new(
+                config.rate_limit_per_ip,
+                RateLimiter::burst_for_rate(config.rate_limit_per_ip),
+            ))
+        }),
+        // Global stream budget: bounds buffered query bodies/tasks even when a
+        // client keeps every allowed connection open.
         config
             .max_connections
             .saturating_mul(DOQ_STREAMS_PER_CONNECTION)
             .max(1),
-    ));
-    let per_ip_limiter = crate::admission::PerIpConnectionLimiter::new(
-        crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP,
     );
+    admission.spawn_pruner(shutdown_rx.clone());
+    let max_connections = config.max_connections;
+    let connection_lifetime = config.connection_lifetime;
     let acceptor_mgr = config.acceptor_mgr.clone();
 
     let endpoint_accept = endpoint.clone();
@@ -178,30 +185,26 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                     }
                 }
                 Some(incoming) = endpoint_accept.accept() => {
-                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-                        warn!(
-                            "DoQ max connections ({}) reached; rejecting incoming QUIC connection",
-                            config.max_connections
-                        );
-                        incoming.refuse();
-                        continue;
-                    };
-                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(incoming.remote_address().ip()) else {
-                        warn!(
-                            "DoQ per-IP connection limit ({}) reached; rejecting connection",
-                            crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP
-                        );
-                        incoming.refuse();
-                        continue;
+                    let permit = match admission.try_acquire_connection(incoming.remote_address().ip()) {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            warn!(
+                                "DoQ incoming connection rejected: {} (max connections {})",
+                                e, max_connections
+                            );
+                            incoming.refuse();
+                            continue;
+                        }
                     };
 
                     let handler = Arc::clone(&handler);
-                    let rate_limiter = Arc::clone(&rate_limiter);
-                    let stream_semaphore = Arc::clone(&stream_semaphore);
+                    let admission = Arc::clone(&admission);
 
                     connection_tasks.spawn(async move {
                         let _permit = permit;
-                        let _per_ip_permit = per_ip_permit;
+                        let lifetime_exceeded = tokio::time::timeout(
+                            connection_lifetime,
+                            async move {
                         let conn = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
                             Ok(Ok(c)) => c,
                             Ok(Err(e)) => {
@@ -238,7 +241,7 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                                     let Ok((send, recv)) = accept_res else {
                                         break;
                                     };
-                            let Ok(stream_permit) = stream_semaphore.clone().try_acquire_owned() else {
+                            let Ok(stream_permit) = admission.try_acquire_request() else {
                                 warn!(
                                     "DoQ global stream limit reached; abandoning stream from {}",
                                     client_ip
@@ -251,10 +254,10 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                             // Admit the query before reading any body data: a
                             // client must not force buffering by opening
                             // streams while over its rate budget.
-                            if !rate_limiter.check(client_ip) {
+                            if let Err(e) = admission.check_rate(client_ip) {
                                 debug!(
-                                    "DoQ per-query rate limit exceeded for client {}",
-                                    client_ip
+                                    "DoQ per-query admission denied for client {}: {}",
+                                    client_ip, e
                                 );
                                 let mut send = send;
                                 let _ = send.reset(DOQ_EXCESSIVE_LOAD.into());
@@ -393,6 +396,16 @@ pub async fn start_doq_listener<H: QueryHandler + 'static>(
                         // blocked on a peer and wait for their tasks to finish.
                         stream_tasks.abort_all();
                         while stream_tasks.join_next().await.is_some() {}
+                            },
+                        )
+                        .await
+                        .is_err();
+                        if lifetime_exceeded {
+                            debug!(
+                                "DoQ connection reached the {}s lifetime; closing",
+                                connection_lifetime.as_secs()
+                            );
+                        }
                     });
                     crate::admission::reap_finished(&mut connection_tasks);
                 }
@@ -802,6 +815,184 @@ mod tests {
             RecordType::A,
         ));
         query
+    }
+
+    async fn connect_doq_with_alpn(
+        actual_addr: SocketAddr,
+        cert_pem: &str,
+        alpn: Vec<Vec<u8>>,
+    ) -> Result<(quinn::Endpoint, quinn::Connection), quinn::ConnectionError> {
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
+        root_store.add(cert_der).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = alpn;
+
+        let quic_client_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap();
+        let client_cfg = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_cfg);
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await?;
+        Ok((client_endpoint, conn))
+    }
+
+    /// P2-17: an active QUIC connection must be closed at its configured
+    /// lifetime, not held open indefinitely by ongoing traffic.
+    #[tokio::test]
+    async fn test_doq_connection_lifetime_closes_active_connection() {
+        let (acceptor_mgr, cert_pem, temp_dir) = doq_test_acceptor("lifetime");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let mut config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
+        config.connection_lifetime = Duration::from_millis(200);
+        config.rate_limiter = Some(Arc::new(RateLimiter::new(0, 0)));
+        let _handle = start_doq_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (_client_endpoint, conn) = connect_doq(actual_addr, &cert_pem).await;
+        // Keep the connection active with an open bidirectional stream.
+        let _open_stream = conn.open_bi().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), conn.closed())
+            .await
+            .expect("an active connection must be closed at the configured lifetime");
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P1-14/P2-18: a DoQ response over the 65535-byte framing limit must be
+    /// truncated (TC=1) and still framed as a valid length-prefixed message.
+    #[tokio::test]
+    async fn test_doq_oversized_response_is_truncated() {
+        let (acceptor_mgr, cert_pem, temp_dir) = doq_test_acceptor("oversized");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            let qname = query.queries[0].name().clone();
+            for i in 0..6000u32 {
+                resp.answers.push(Record::from_rdata(
+                    qname.clone(),
+                    300,
+                    RData::A(A(std::net::Ipv4Addr::from(i))),
+                ));
+            }
+            Some(resp)
+        });
+
+        let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
+        let _handle = start_doq_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (_client_endpoint, conn) = connect_doq(actual_addr, &cert_pem).await;
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let wire = encode_message(&doq_query(0)).unwrap();
+        send.write_all(&(wire.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(&wire).await.unwrap();
+        send.finish().unwrap();
+
+        let mut len_buf = [0u8; 2];
+        recv.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        recv.read_exact(&mut resp_buf).await.unwrap();
+        let resp = decode_message(&resp_buf).unwrap();
+        assert!(
+            resp.metadata.truncation,
+            "an oversized DoQ response must be truncated with TC=1"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P2-18: DoQ requires the `doq` ALPN. A client offering a different
+    /// protocol, or no protocol at all, must not complete the handshake.
+    #[tokio::test]
+    async fn test_doq_alpn_mismatch_and_missing_alpn_are_rejected() {
+        let (acceptor_mgr, cert_pem, temp_dir) = doq_test_acceptor("alpn");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|_query: Message, _client: ClientContext| async move { None });
+        let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
+        let _handle = start_doq_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mismatched = connect_doq_with_alpn(actual_addr, &cert_pem, vec![b"h3".to_vec()]).await;
+        assert!(
+            mismatched.is_err(),
+            "a DoQ listener must reject a client that offers only h3"
+        );
+
+        let missing = connect_doq_with_alpn(actual_addr, &cert_pem, Vec::new()).await;
+        assert!(
+            missing.is_err(),
+            "QUIC requires ALPN; a client offering no protocol must be rejected"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P2-21: shutdown closes the endpoint and waits for connection tasks,
+    /// even while an active connection/stream is open.
+    #[tokio::test]
+    async fn test_doq_shutdown_awaits_connection_tasks() {
+        let (acceptor_mgr, cert_pem, temp_dir) = doq_test_acceptor("shutdown_await");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|_query: Message, _client: ClientContext| async move { None });
+        let config = DoqConfig::new(actual_addr, Some(acceptor_mgr));
+        let handle = start_doq_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (_client_endpoint, conn) = connect_doq(actual_addr, &cert_pem).await;
+        let (_send, _recv) = conn.open_bi().await.unwrap();
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("the DoQ listener must await its connection tasks on shutdown")
+            .expect("the DoQ listener task panicked");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// P1-10: QUIC flow-control windows and stream caps must be explicit and

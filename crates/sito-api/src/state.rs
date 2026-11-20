@@ -79,6 +79,21 @@ pub struct ServerContext {
     pub apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+impl ServerContext {
+    /// Publishes the current response-cache footprint after a manual flush,
+    /// invalidation or filter/config apply. Without this, `sito_cache_size_bytes`
+    /// keeps reporting memory that was already reclaimed.
+    pub(crate) fn publish_cache_size(&self) {
+        self.metrics
+            .set_cache_size_bytes(cache_size_bytes(&self.cache));
+    }
+}
+
+/// Converts a cache footprint into the `i64` gauge value (saturating).
+pub(crate) fn cache_size_bytes(cache: &DnsCache) -> i64 {
+    i64::try_from(cache.weighted_size()).unwrap_or(i64::MAX)
+}
+
 /// ACME readiness derived from the live challenge-listener state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcmeReadiness {

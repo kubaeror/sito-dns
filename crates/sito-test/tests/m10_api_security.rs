@@ -472,7 +472,7 @@ async fn test_acceptance_m10_concurrent_writes_preserve_both() {
         ))
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::CREATED);
 
     let toggle_app = app.clone();
     let toggle_token = token.clone();
@@ -508,7 +508,7 @@ async fn test_acceptance_m10_concurrent_writes_preserve_both() {
 
     let (toggle_status, client_status) = tokio::join!(toggle, add_client);
     assert_eq!(toggle_status.unwrap(), StatusCode::OK);
-    assert_eq!(client_status.unwrap(), StatusCode::OK);
+    assert_eq!(client_status.unwrap(), StatusCode::CREATED);
 
     let persisted =
         Config::from_toml_str(&tokio::fs::read_to_string(&ctx.config_path).await.unwrap())

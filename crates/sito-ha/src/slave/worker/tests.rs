@@ -3,16 +3,20 @@
 use super::apply::apply_config_push;
 use super::config_merge::{build_persisted_config, local_client_id_secrets};
 use super::session::{
-    connect_and_run, handle_master_message, mark_session_ended, record_master_liveness_loss,
+    CLEAN_CLOSE_RECONNECT_DELAY, connect_and_run, handle_master_message, mark_session_ended,
+    parse_ws_url, record_master_liveness_loss,
 };
 use super::stats::build_stats_report;
 use super::{SlaveAppHandles, SlaveConfigApplier, spawn_slave_worker};
-use crate::bundle::{ConfigBundle, build_and_sign_push, push_payload_hash};
+use crate::bundle::{
+    ConfigBundle, build_and_sign_push, push_payload_hash, shared_config_digest,
+    signing_key_fingerprint,
+};
 use crate::config::HaConfig;
 use crate::error::HaError;
 use crate::protocol::{AckConflict, HaMessage};
 use crate::slave::state::{SlaveState, SlaveStatusTracker};
-use crate::transport::{SLAVE_HANDSHAKE_TIMEOUT, ws_config};
+use crate::transport::{ExponentialBackoff, SLAVE_HANDSHAKE_TIMEOUT, ws_config};
 use futures_util::SinkExt;
 use sito_core::config::Config;
 use sito_filter::HostsFilterEngine;
@@ -195,6 +199,9 @@ fn test_bundle(
     rewrites: Option<toml::Value>,
 ) -> ConfigBundle {
     ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
         version,
         term: 0,
         timestamp: 1,
@@ -1312,6 +1319,8 @@ async fn test_same_version_fork_latches_and_blocks_same_term_versions() {
 
     // Applied state: term 0, version 50, payload B.
     let applied = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 0,
         ..test_bundle(50, config_toml, None, None)
     };
@@ -1382,6 +1391,8 @@ async fn test_same_version_fork_latches_and_blocks_same_term_versions() {
 
     // The forked master's next version in the same term is refused.
     let forked_next = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 0,
         ..test_bundle(51, config_toml, None, None)
     };
@@ -1420,6 +1431,8 @@ async fn test_same_version_fork_latches_and_blocks_same_term_versions() {
     // An explicit higher-term promotion (with a higher version) resumes
     // replication and clears the latch.
     let promoted = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 1,
         ..test_bundle(51, config_toml, None, None)
     };
@@ -1476,6 +1489,8 @@ async fn test_fork_latch_write_failure_still_refuses_same_term_push() {
     let config_toml = "config_version = 2\n[server]\nrole = \"slave\"\n";
 
     let applied = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 0,
         ..test_bundle(50, config_toml, None, None)
     };
@@ -1544,6 +1559,8 @@ async fn test_fork_latch_write_failure_still_refuses_same_term_push() {
     assert_eq!(tracker.get_state(), SlaveState::Degraded);
 
     let forked_next = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 0,
         ..test_bundle(51, config_toml, None, None)
     };
@@ -1606,6 +1623,8 @@ async fn test_stale_master_push_is_rejected_without_overwriting() {
 
     // The slave has applied an epoch-1, version-5 bundle.
     let current = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 1,
         ..test_bundle(
             5,
@@ -1625,6 +1644,8 @@ async fn test_stale_master_push_is_rejected_without_overwriting() {
 
     // A stale epoch-0 master offers a higher version.
     let stale = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 0,
         ..test_bundle(
             6,
@@ -1689,6 +1710,195 @@ async fn test_stale_master_push_is_rejected_without_overwriting() {
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 
+/// An unmodified restart must take the same-version early-ACK path: the
+/// watermark proves the shared configuration already matches, so no full apply
+/// may run.
+#[tokio::test]
+async fn test_unmodified_restart_early_acks_without_full_apply() {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_ha_early_ack_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let watermark_path = dir.join("ha_watermark.toml");
+    let applied_doc = "config_version = 2\n[server]\nrole = \"slave\"\n";
+    let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+    let push = build_and_sign_push(&test_bundle(5, applied_doc, None, None), &signing_key).unwrap();
+    let payload_hash = push_payload_hash(&push).unwrap();
+
+    let original = SlaveStatusTracker::new("slave-restart".to_string(), 0, None)
+        .with_watermark_path(watermark_path.clone())
+        .unwrap();
+    original
+        .persist_watermark_with_identity(
+            5,
+            0,
+            &payload_hash,
+            Some(&shared_config_digest(applied_doc)),
+            Some(&signing_key_fingerprint(&signing_key.public_key())),
+        )
+        .unwrap();
+
+    // Restart restores the watermark; nothing changed on disk.
+    let restarted = SlaveStatusTracker::new("slave-restart".to_string(), 0, None)
+        .with_watermark_path(watermark_path.clone())
+        .unwrap();
+    assert!(
+        !restarted.requires_full_apply(),
+        "an unmodified restart must be eligible for the early-ACK path"
+    );
+
+    let mut handles = test_handles(None).await;
+    let observation = Arc::new(std::sync::Mutex::new(None));
+    handles.applier = Arc::new(RecordingApplier {
+        observation: observation.clone(),
+        tracker: restarted.clone(),
+    });
+
+    let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        slave_socket,
+        Role::Client,
+        Some(ws_config()),
+    )
+    .await;
+    let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        peer_socket,
+        Role::Server,
+        Some(ws_config()),
+    )
+    .await;
+
+    restarted.set_state(SlaveState::HelloSent);
+    handle_master_message(
+        &push.to_json().unwrap(),
+        &mut ws,
+        &restarted,
+        &handles,
+        Some(&signing_key.public_key()),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        observation.lock().unwrap().is_none(),
+        "an unmodified restart must not run the full apply path"
+    );
+    assert_eq!(restarted.get_state(), SlaveState::Synced);
+    let ack = read_ack(&mut peer).await;
+    assert!(matches!(
+        ack,
+        HaMessage::Ack {
+            version: 5,
+            applied: true,
+            ..
+        }
+    ));
+
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+/// A v1 master must be rejected before its first push is applied, and the
+/// rejection must not latch: the next valid v2 push on a later session applies.
+#[tokio::test]
+async fn test_slave_rejects_v1_master_and_accepts_next_valid_push() {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+    let tracker = SlaveStatusTracker::new("slave-v1-master".to_string(), 4, None);
+    let handles = test_handles(None).await;
+
+    let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        slave_socket,
+        Role::Client,
+        Some(ws_config()),
+    )
+    .await;
+    let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        peer_socket,
+        Role::Server,
+        Some(ws_config()),
+    )
+    .await;
+
+    // A v1 master's ConfigPush has no protocol_version (deserialized as 0).
+    let v1_text = r#"{"type":"config_push","version":5,"term":0,"hash_blake3":"h","signature_ed25519":"s","payload_b64":"p","payload_hash_blake3":"h"}"#;
+    tracker.set_state(SlaveState::HelloSent);
+    let err = handle_master_message(v1_text, &mut ws, &tracker, &handles, None)
+        .await
+        .expect_err("a v1 master must be rejected before applying its push");
+    assert!(
+        err.to_string().contains("protocol_mismatch"),
+        "rejection must be actionable: {err}"
+    );
+    assert_eq!(
+        tracker.get_version(),
+        4,
+        "a rejected v1 push must not advance the applied version"
+    );
+    assert_ne!(
+        tracker.get_state(),
+        SlaveState::Synced,
+        "a rejected master must not leave the slave synced"
+    );
+    let readiness = tracker.readiness();
+    assert!(!readiness.ready);
+    assert!(
+        readiness
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("protocol_mismatch"),
+        "readiness must expose the protocol mismatch: {readiness:?}"
+    );
+    assert!(matches!(
+        read_ack(&mut peer).await,
+        HaMessage::Ack {
+            applied: false,
+            error: Some(ref error),
+            ..
+        } if error.contains("protocol_mismatch")
+    ));
+
+    // A later v2 connection (represented here by the next push on the same
+    // socket) is still accepted: the rejection is per-peer, not sticky.
+    let push = build_and_sign_push(
+        &test_bundle(
+            5,
+            "config_version = 2\n[server]\nrole = \"slave\"\n",
+            None,
+            None,
+        ),
+        &signing_key,
+    )
+    .unwrap();
+    tracker.set_state(SlaveState::HelloSent);
+    handle_master_message(
+        &push.to_json().unwrap(),
+        &mut ws,
+        &tracker,
+        &handles,
+        Some(&signing_key.public_key()),
+    )
+    .await
+    .expect("a subsequent v2 push must be accepted");
+    assert_eq!(tracker.get_version(), 5);
+    assert_eq!(tracker.get_state(), SlaveState::Synced);
+    assert!(tracker.readiness().ready);
+    assert!(matches!(
+        read_ack(&mut peer).await,
+        HaMessage::Ack {
+            version: 5,
+            applied: true,
+            ..
+        }
+    ));
+}
+
 /// The early-ACK path must reach `Synced`, but it must never clear a
 /// `Degraded` state without a successful apply.
 #[tokio::test]
@@ -1713,6 +1923,7 @@ async fn test_early_ack_marks_synced_but_keeps_degraded() {
     let tracker = SlaveStatusTracker::new("slave-early".to_string(), 5, None);
     let handles = test_handles(None).await;
     let push = HaMessage::ConfigPush {
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
         version: 5,
         term: 0,
         hash_blake3: "hash".to_string(),
@@ -1750,6 +1961,57 @@ async fn test_early_ack_marks_synced_but_keeps_degraded() {
     assert_eq!(
         tracker.degraded_reason.lock().unwrap().as_deref(),
         Some("previous apply failed")
+    );
+}
+
+/// Bracketed IPv6 master URLs must be parsed into a host/port pair (not a
+/// formatted socket address), and malformed forms must fail loudly.
+#[test]
+fn test_parse_ws_url_ipv6_and_invalid_forms() {
+    assert_eq!(
+        parse_ws_url("wss://[::1]").unwrap(),
+        (true, "::1".to_string(), 8953)
+    );
+    assert_eq!(
+        parse_ws_url("wss://[2001:db8::1]:8953").unwrap(),
+        (true, "2001:db8::1".to_string(), 8953)
+    );
+    assert_eq!(
+        parse_ws_url("ws://[::1]:9000/path").unwrap(),
+        (false, "::1".to_string(), 9000)
+    );
+
+    let err = parse_ws_url("wss://[::1").expect_err("unclosed bracket must fail");
+    assert!(err.to_string().contains("Unclosed IPv6 bracket"));
+
+    let err = parse_ws_url("wss://[::1]:not-a-port").expect_err("invalid port must fail");
+    assert!(err.to_string().contains("Invalid port"));
+
+    let err = parse_ws_url("wss://[::1]:99999").expect_err("out-of-range port must fail");
+    assert!(err.to_string().contains("Invalid port"));
+}
+
+/// A clean master close uses a fixed 1 s reconnect delay and resets the error
+/// backoff, while error paths keep growing exponentially.
+#[test]
+fn test_clean_close_reconnect_is_fixed_and_resets_error_backoff() {
+    assert_eq!(CLEAN_CLOSE_RECONNECT_DELAY, Duration::from_secs(1));
+
+    let mut backoff = ExponentialBackoff::default();
+    let first = backoff.next_delay();
+    let second = backoff.next_delay();
+    assert!(
+        second > first,
+        "error backoff must grow: {first:?} then {second:?}"
+    );
+
+    // A clean close resets the generator, so the next failure starts at the
+    // minimum delay instead of inheriting the clean-close loop.
+    backoff.reset();
+    let after_clean_close = backoff.next_delay();
+    assert!(
+        after_clean_close <= Duration::from_millis(1300),
+        "a clean close must reset the error backoff: {after_clean_close:?}"
     );
 }
 
@@ -1913,6 +2175,7 @@ async fn test_slave_rejects_oversized_push() {
         // Read the Hello, then send a valid but oversized push.
         let _ = ws.next().await;
         let big = HaMessage::ConfigPush {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version: 99,
             term: 0,
             hash_blake3: "h".to_string(),
@@ -1998,6 +2261,8 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
 
     let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
     let bundle = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         clients: Some(toml::Value::Table(clients)),
         ..test_bundle(2, &sanitized, None, None)
     };

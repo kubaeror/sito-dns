@@ -16,6 +16,9 @@ fn test_coordinator() -> MasterCoordinator {
 
 fn test_bundle(version: u64) -> ConfigBundle {
     ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
         version,
         term: 0,
         timestamp: 1,
@@ -145,7 +148,7 @@ fn test_state_persists_and_restores_across_restart() {
 }
 
 #[test]
-fn test_restore_preserves_term_and_legacy_state_defaults_to_zero() {
+fn test_restore_preserves_term_and_rejects_v1_state() {
     let dir = std::env::temp_dir().join(format!(
         "sito_ha_term_state_{}_{}",
         std::process::id(),
@@ -157,7 +160,12 @@ fn test_restore_preserves_term_and_legacy_state_defaults_to_zero() {
 
     let mut promoted = test_bundle(5);
     promoted.term = 2;
-    std::fs::write(&state_path, serde_json::to_vec(&promoted).unwrap()).unwrap();
+    let persisted = PersistedMasterState {
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
+        bundle: promoted,
+        signing_key_pubkey: None,
+    };
+    std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
     let restored = MasterCoordinator::new(
         "test-master".to_string(),
         0,
@@ -168,8 +176,9 @@ fn test_restore_preserves_term_and_legacy_state_defaults_to_zero() {
     assert_eq!(restored.restore_state().unwrap(), Some(5));
     assert_eq!(restored.get_current_term(), 2);
 
-    // State written before terms existed has no `term` field and must load
-    // as epoch 0.
+    // State written by v1 is intentionally incompatible: it must be rejected
+    // with an actionable protocol_mismatch instead of silently restarting at
+    // version 0 or interpreting v1 fields with v2 semantics.
     let legacy = r#"{"version":6,"timestamp":1,"config_toml":"config_version = 2\n[server]\nrole = \"slave\"\n","custom_rules":[],"lists":[]}"#;
     std::fs::write(&state_path, legacy).unwrap();
     let legacy_restored = MasterCoordinator::new(
@@ -179,8 +188,28 @@ fn test_restore_preserves_term_and_legacy_state_defaults_to_zero() {
         sito_stats::MetricsRegistry::new("test", "test"),
     )
     .with_state_path(state_path.clone());
-    assert_eq!(legacy_restored.restore_state().unwrap(), Some(6));
-    assert_eq!(legacy_restored.get_current_term(), 0);
+    let err = legacy_restored
+        .restore_state()
+        .expect_err("v1 master state must not be read by a v2 binary");
+    assert!(
+        matches!(err, HaError::Validation { ref field, ref reason } if field == "ha_protocol_version" && reason.contains("protocol_mismatch")),
+        "unexpected error: {err:?}"
+    );
+
+    // Documented recovery: move the v1 file aside after backup; the next start
+    // is a clean sequence (full resync/replay-guard reset).
+    let backup = state_path.with_extension("v1.bak");
+    std::fs::rename(&state_path, &backup).unwrap();
+    assert!(backup.exists());
+    let clean = MasterCoordinator::new(
+        "test-master".to_string(),
+        0,
+        Arc::new(Ed25519SigningKey::generate().unwrap()),
+        sito_stats::MetricsRegistry::new("test", "test"),
+    )
+    .with_state_path(state_path.clone());
+    assert_eq!(clean.restore_state().unwrap(), None);
+    assert_eq!(clean.get_current_version(), 0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -433,10 +462,10 @@ async fn test_conflict_restore_persists_active_bundle() {
         .clone()
         .expect("active bundle");
     assert_eq!(active.version, 3);
-    let persisted: ConfigBundle =
+    let persisted: PersistedMasterState =
         serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
     assert_eq!(
-        persisted, active,
+        persisted.bundle, active,
         "the restored state file must contain the active bundle"
     );
 
@@ -999,6 +1028,136 @@ async fn test_superseded_session_drain_does_not_charge_new_session() {
     );
 }
 
+/// Reads from a raw TCP connection: EOF/error means the listener rejected it,
+/// a timeout means the connection was accepted and is waiting for the
+/// WebSocket upgrade.
+async fn tcp_connection_rejected(stream: &mut tokio::net::TcpStream) -> bool {
+    use tokio::io::AsyncReadExt as _;
+    let mut byte = [0u8; 1];
+    match tokio::time::timeout(Duration::from_millis(300), stream.read(&mut byte)).await {
+        Ok(Ok(0) | Err(_)) => true,
+        Ok(Ok(_)) | Err(_) => false,
+    }
+}
+
+#[tokio::test]
+async fn test_listener_rejects_ninth_handshake_from_one_ip_and_releases() {
+    let port = sito_test_support::reserve_port_number().unwrap();
+    let coordinator = test_coordinator();
+    let cfg = HaConfig {
+        replication_port: port,
+        listen_addr: "127.0.0.1".to_string(),
+        allow_insecure_ws: true,
+        slave_token: Some("tok".to_string()),
+        ..Default::default()
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let _server = spawn_master_server(cfg, coordinator.clone(), shutdown_rx);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut held = Vec::new();
+    for _ in 0..MAX_HANDSHAKES_PER_IP {
+        held.push(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect to master"),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut ninth = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("the client TCP connect may still succeed");
+    assert!(
+        tcp_connection_rejected(&mut ninth).await,
+        "the ninth simultaneous handshake from one IP must be rejected"
+    );
+
+    // Releasing one slot must let a new handshake through.
+    held.pop();
+    let admitted = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect to master");
+            if !tcp_connection_rejected(&mut stream).await {
+                break stream;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("a released handshake slot must be reusable");
+    drop(admitted);
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_listener_global_connection_limit_and_release() {
+    // Loopback aliases give each accepted connection a distinct peer IP so the
+    // per-IP budget cannot hide the global limit. Skip on hosts without
+    // 127.0.0.0/8 aliasing.
+    if tokio::net::TcpListener::bind(("127.0.0.2", 0))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let port = sito_test_support::reserve_port_number().unwrap();
+    let coordinator = test_coordinator();
+    let cfg = HaConfig {
+        replication_port: port,
+        listen_addr: "0.0.0.0".to_string(),
+        allow_insecure_ws: true,
+        slave_token: Some("tok".to_string()),
+        ..Default::default()
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let _server = spawn_master_server(cfg, coordinator.clone(), shutdown_rx);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut held = Vec::new();
+    for index in 0..super::server::MAX_SLAVE_CONNECTIONS {
+        let ip = format!("127.0.0.{}", 2 + (index % 250));
+        let Ok(stream) = tokio::net::TcpStream::connect((ip.as_str(), port)).await else {
+            // Address aliasing is unavailable: skip rather than report a
+            // misleading limit failure.
+            let _ = shutdown_tx.send(true);
+            return;
+        };
+        held.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut overflow = tokio::net::TcpStream::connect(("127.0.0.70", port))
+        .await
+        .expect("the client TCP connect may still succeed");
+    assert!(
+        tcp_connection_rejected(&mut overflow).await,
+        "the connection above the global limit must be rejected"
+    );
+
+    // Releasing the held connections must let new handshakes through again.
+    drop(held);
+    let admitted = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.70", port)).await else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            if !tcp_connection_rejected(&mut stream).await {
+                break stream;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("a released global connection slot must be reusable");
+    drop(admitted);
+    let _ = shutdown_tx.send(true);
+}
+
 /// Regression (deferred D2): a coalesced fallback task spawned for a
 /// superseded session must stop when it loses ownership, and must not
 /// deliver to or charge the replacement session.
@@ -1104,6 +1263,265 @@ async fn test_pending_coalesced_task_does_not_charge_reconnected_session() {
         new_rx.try_recv().is_err(),
         "the superseded task must not deliver to the replacement session"
     );
+}
+
+#[test]
+fn test_close_reason_truncates_multibyte_on_utf8_boundary() {
+    // A multibyte instance name must not push the close-frame reason past the
+    // 123-byte payload limit or split a UTF-8 code point.
+    let reason = format!(
+        "protocol_mismatch: slave '{}' speaks HA protocol v1 but this master requires v2",
+        "réplica-λ".repeat(50)
+    );
+    assert!(reason.len() > 123);
+    let truncated = super::session::close_reason(&reason);
+    assert!(
+        truncated.len() <= 123,
+        "close reason is {} bytes: {truncated}",
+        truncated.len()
+    );
+    assert!(truncated.ends_with("..."));
+    assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+}
+
+#[tokio::test]
+async fn test_master_pong_watchdog_marks_stale_and_pong_refreshes() {
+    let coordinator = test_coordinator().with_ping_interval_secs(1);
+    let machine = SessionMachine::admit(
+        &coordinator,
+        "127.0.0.1:4321".parse().unwrap(),
+        HelloFields {
+            instance: "slave-heartbeat".to_string(),
+            have_version: 0,
+            have_term: 0,
+            capabilities: vec![],
+            token: None,
+            role: Some("slave".to_string()),
+            protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        },
+    )
+    .expect("a v2 slave must be admitted");
+    let _rx = machine.register();
+    let connection_id = machine.state.connection_id;
+
+    // Simulate three missed ping intervals: the session is stale and the loop
+    // must close it.
+    coordinator
+        .slaves
+        .lock()
+        .unwrap()
+        .get_mut("slave-heartbeat")
+        .unwrap()
+        .last_ping = Instant::now()
+        .checked_sub(Duration::from_secs(4))
+        .expect("test clock must support a four-second subtraction");
+    assert!(matches!(machine.heartbeat(), HeartbeatAction::Stale));
+
+    // Any Pong from the owning session refreshes the watchdog.
+    let pong = HaMessage::Pong { ts: 1 }.to_json().unwrap();
+    assert!(coordinator.process_slave_msg("slave-heartbeat", connection_id, &pong));
+    assert!(matches!(machine.heartbeat(), HeartbeatAction::Ping(_)));
+}
+
+#[test]
+fn test_publish_history_is_capped_and_evicted_fork_ack_is_ignored() {
+    fn push(version: u64) -> HaMessage {
+        HaMessage::ConfigPush {
+            version,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            term: 0,
+            hash_blake3: format!("h{version}"),
+            signature_ed25519: String::new(),
+            payload_b64: String::new(),
+            payload_hash_blake3: format!("h{version}"),
+        }
+    }
+
+    let coordinator = test_coordinator();
+    for version in 1..=(MAX_PUBLISH_HISTORY as u64 + 5) {
+        coordinator.record_published_envelope(&push(version));
+    }
+    {
+        let history = coordinator.active_push_history.lock().unwrap();
+        assert_eq!(history.len(), MAX_PUBLISH_HISTORY);
+        assert_eq!(history.front().unwrap().version, 6);
+        assert_eq!(
+            history.back().unwrap().version,
+            MAX_PUBLISH_HISTORY as u64 + 5
+        );
+    }
+    assert!(
+        coordinator.published_envelope_hash(0, 1).is_none(),
+        "the oldest envelope must be evicted from the ACK-binding history"
+    );
+    let newest = MAX_PUBLISH_HISTORY as u64 + 5;
+    assert_eq!(
+        coordinator.published_envelope_hash(0, newest),
+        Some(format!("h{newest}"))
+    );
+
+    let (tx, _rx) = mpsc::channel::<HaMessage>(4);
+    coordinator.slaves.lock().unwrap().insert(
+        "slave-history".to_string(),
+        ActiveSlave {
+            instance: "slave-history".to_string(),
+            remote_addr: "127.0.0.1:1000".parse().unwrap(),
+            synced_version: 5,
+            last_ping: Instant::now(),
+            connected_at: Utc::now(),
+            last_stats: None,
+            sender: tx,
+            capabilities: vec![],
+            connection_id: 1,
+        },
+    );
+
+    // A fork ACK for an evicted envelope cannot be attributed to a push this
+    // master sent, so it must be ignored.
+    let evicted_fork = HaMessage::Ack {
+        version: 1,
+        term: 0,
+        applied: false,
+        conflict: Some(AckConflict::SameVersionFork),
+        error: Some("fabricated fork".to_string()),
+    }
+    .to_json()
+    .unwrap();
+    assert!(coordinator.process_slave_msg("slave-history", 1, &evicted_fork));
+    assert!(
+        !coordinator.is_diverged(),
+        "an ACK for an evicted envelope must not latch divergence"
+    );
+
+    // A fork ACK for a still-retained envelope is actionable.
+    let retained_fork = HaMessage::Ack {
+        version: newest,
+        term: 0,
+        applied: false,
+        conflict: Some(AckConflict::SameVersionFork),
+        error: Some("real fork".to_string()),
+    }
+    .to_json()
+    .unwrap();
+    assert!(coordinator.process_slave_msg("slave-history", 1, &retained_fork));
+    assert!(coordinator.is_diverged());
+    assert!(
+        coordinator
+            .diverged_reason()
+            .unwrap_or_default()
+            .contains("same-version payload-hash fork")
+    );
+}
+
+#[tokio::test]
+async fn test_publish_outcome_reports_connected_closed_and_queued() {
+    fn slave(instance: &str, connection_id: u64, sender: mpsc::Sender<HaMessage>) -> ActiveSlave {
+        ActiveSlave {
+            instance: instance.to_string(),
+            remote_addr: "127.0.0.1:1000".parse().unwrap(),
+            synced_version: 0,
+            last_ping: Instant::now(),
+            connected_at: Utc::now(),
+            last_stats: None,
+            sender,
+            capabilities: vec![],
+            connection_id,
+        }
+    }
+
+    let coordinator = test_coordinator();
+
+    // No tracked slave: the only honest outcome is NoSlaves.
+    let outcome = coordinator
+        .publish_bundle_async(test_bundle(2))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, PublishOutcome::NoSlaves));
+
+    // A connected slave whose channel is closed must not turn into NoSlaves.
+    let (closed_tx, closed_rx) = mpsc::channel::<HaMessage>(1);
+    drop(closed_rx);
+    coordinator
+        .slaves
+        .lock()
+        .unwrap()
+        .insert("closed".to_string(), slave("closed", 1, closed_tx));
+    let outcome = coordinator
+        .publish_bundle_async(test_bundle(3))
+        .await
+        .unwrap();
+    match outcome {
+        PublishOutcome::Published {
+            version,
+            slaves_connected,
+            slaves_queued,
+            slaves_coalesced,
+            ..
+        } => {
+            assert_eq!(version, 3);
+            assert_eq!(slaves_connected, 1);
+            assert_eq!(slaves_queued, 0);
+            assert_eq!(slaves_coalesced, 0);
+        }
+        other => panic!("expected a queued Published outcome, got {other:?}"),
+    }
+
+    // A full channel is coalesced, not reported as delivered.
+    let (full_tx, _full_rx) = mpsc::channel::<HaMessage>(1);
+    full_tx.try_send(HaMessage::Ping { ts: 1 }).unwrap();
+    coordinator
+        .slaves
+        .lock()
+        .unwrap()
+        .insert("full".to_string(), slave("full", 2, full_tx));
+    let outcome = coordinator
+        .publish_bundle_async(test_bundle(4))
+        .await
+        .unwrap();
+    match outcome {
+        PublishOutcome::Published {
+            slaves_connected,
+            slaves_queued,
+            slaves_coalesced,
+            ..
+        } => {
+            assert_eq!(slaves_connected, 2);
+            assert_eq!(slaves_queued, 0);
+            assert_eq!(slaves_coalesced, 1);
+        }
+        other => panic!("expected a coalesced Published outcome, got {other:?}"),
+    }
+
+    // An idle open channel is a direct queue.
+    let (open_tx, mut open_rx) = mpsc::channel::<HaMessage>(4);
+    coordinator
+        .slaves
+        .lock()
+        .unwrap()
+        .insert("open".to_string(), slave("open", 3, open_tx));
+    let outcome = coordinator
+        .publish_bundle_async(test_bundle(5))
+        .await
+        .unwrap();
+    match outcome {
+        PublishOutcome::Published {
+            version,
+            slaves_connected,
+            slaves_queued,
+            slaves_coalesced,
+            ..
+        } => {
+            assert_eq!(version, 5);
+            assert_eq!(slaves_connected, 3);
+            assert_eq!(slaves_queued, 1);
+            assert_eq!(slaves_coalesced, 1);
+        }
+        other => panic!("expected a Published outcome, got {other:?}"),
+    }
+    assert!(matches!(
+        open_rx.try_recv(),
+        Ok(HaMessage::ConfigPush { version: 5, .. })
+    ));
 }
 
 #[test]
@@ -1236,6 +1654,8 @@ fn test_update_bundle_strips_structured_client_secrets() {
     clients.insert("client_id_secrets".to_string(), toml::Value::Table(secrets));
 
     let bundle = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         clients: Some(toml::Value::Table(clients)),
         ..test_bundle(2)
     };
@@ -2137,6 +2557,88 @@ fn test_slave_summary_flags_diverged_slave() {
 }
 
 #[tokio::test]
+async fn test_master_rejects_v1_slave_and_keeps_listening() {
+    let port = sito_test_support::reserve_port_number().unwrap();
+    let coordinator = test_coordinator();
+    let master_cfg = HaConfig {
+        replication_port: port,
+        listen_addr: "127.0.0.1".to_string(),
+        allow_insecure_ws: true,
+        ..Default::default()
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let _server = spawn_master_server(master_cfg, coordinator.clone(), shutdown_rx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A v1 slave omits `protocol_version`: it must be rejected with an
+    // actionable close frame instead of being admitted with v2 semantics.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("connect to master");
+    let v1_hello = r#"{"type":"hello","instance":"v1-slave","have_version":0,"capabilities":[],"role":"slave"}"#;
+    ws.send(WsMessage::Text(v1_hello.into())).await.unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("master must close a v1 slave")
+        .expect("close frame")
+        .expect("valid frame");
+    match frame {
+        WsMessage::Close(Some(frame)) => assert!(
+            frame.reason.to_string().contains("protocol_mismatch"),
+            "close reason must be actionable: {}",
+            frame.reason
+        ),
+        other => panic!("expected a protocol_mismatch close frame, got {other:?}"),
+    }
+    assert_eq!(coordinator.connected_slave_count(), 0);
+    assert!(
+        coordinator.readiness().ready,
+        "a bad peer must not make the master itself unready"
+    );
+    let rendered = coordinator.metrics.render_prometheus();
+    assert!(
+        rendered.contains(
+            r#"sito_ha_protocol_rejections_total{role="master",reason="version_mismatch"} 1"#
+        ),
+        "the rejection must be observable: {rendered}"
+    );
+
+    // The listener must keep serving: a v2 slave that connects next is
+    // admitted normally.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("listener must stay alive after a rejection");
+    let hello = HaMessage::Hello {
+        instance: "v2-slave".to_string(),
+        have_version: 0,
+        have_term: 0,
+        capabilities: vec![],
+        token: None,
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+    };
+    ws2.send(WsMessage::Text(hello.to_json().unwrap().into()))
+        .await
+        .unwrap();
+    let admitted = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if coordinator.connected_slave_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        admitted.is_ok(),
+        "a subsequent valid connection must not be frozen out"
+    );
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
 async fn test_master_rejects_oversized_websocket_hello() {
     let port = sito_test_support::reserve_port_number().unwrap();
     let coordinator = test_coordinator().with_token(Some("tok".to_string()));
@@ -2222,11 +2724,12 @@ fn test_restore_rejects_u64_max_state_instead_of_freezing() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let state_path = dir.join("ha_state.toml");
-    std::fs::write(
-        &state_path,
-        serde_json::to_vec(&test_bundle(u64::MAX)).unwrap(),
-    )
-    .unwrap();
+    let persisted = PersistedMasterState {
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
+        bundle: test_bundle(u64::MAX),
+        signing_key_pubkey: None,
+    };
+    std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
 
     let coordinator = test_coordinator().with_state_path(state_path);
     let err = coordinator

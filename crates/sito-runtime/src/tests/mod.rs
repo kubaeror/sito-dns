@@ -355,6 +355,88 @@ async fn test_dnssec_policy_change_rejects_in_flight_old_epoch_insert() {
     );
 }
 
+/// P2-22: a cache-policy-only (TTL) apply advances the generation, making old
+/// entries unservable, and the newly published `max_ttl` clamps subsequent
+/// inserts. This documents the O(1) epoch-invalidation equivalence used by
+/// [`RuntimeState::apply`] instead of the warm-entry `DnsCache::update_config`
+/// scan.
+#[tokio::test]
+async fn test_ttl_only_apply_invalidates_old_entries_and_new_inserts_use_new_ttl() {
+    use sito_proto::{DNSClass, Message, MessageType, OpCode, Query, RData, Record, RecordType};
+
+    let (state, cache) = state();
+    state
+        .apply(plan(5306, "||ttl.example^"))
+        .await
+        .expect("initial generation");
+    let old_epoch = state.generation();
+
+    let name = sito_proto::Name::from_ascii("ttl.example.").unwrap();
+    let mut query = Message::new(9, MessageType::Query, OpCode::Query);
+    query
+        .queries
+        .push(Query::query(name.clone(), RecordType::A));
+    let mut response = Message::response(9, OpCode::Query);
+    response.queries = query.queries.clone();
+    response.answers.push(Record::from_rdata(
+        name.clone(),
+        300,
+        RData::A(sito_proto::rdata::A("192.0.2.55".parse().unwrap())),
+    ));
+
+    assert!(
+        cache
+            .insert_with_status_at_epoch(&query, &response, ValidationStatus::Insecure, old_epoch)
+            .await
+    );
+    let before = cache
+        .get_for_query_with_status(&query)
+        .await
+        .expect("entry cached under the old TTL policy");
+    assert!(
+        before.0.answers[0].ttl > 7,
+        "old policy must serve the original TTL"
+    );
+
+    // TTL-only change; keep the filter snapshot so the generation advance is
+    // the only reason the old entry disappears.
+    let current = state.snapshot();
+    let mut next = plan(5306, "||ttl.example^");
+    next.filter = current.filter.clone();
+    next.group_filters = Arc::clone(&current.group_filters);
+    next.config.dns.cache.min_ttl = 0;
+    next.config.dns.cache.max_ttl = 7;
+    next.cache_policy = next.config.dns.cache.clone();
+    let new_epoch = state.apply(next).await.expect("TTL-only apply");
+
+    assert!(new_epoch > old_epoch);
+    assert!(
+        cache.get_for_query_with_status(&query).await.is_none(),
+        "a TTL-only apply must make entries from the old generation unservable"
+    );
+
+    assert!(
+        cache
+            .insert_with_status_at_epoch(&query, &response, ValidationStatus::Insecure, new_epoch)
+            .await
+    );
+    let after = cache
+        .get_for_query_with_status(&query)
+        .await
+        .expect("entry cached under the new TTL policy");
+    assert_eq!(
+        after.0.answers[0].ttl, 7,
+        "new inserts must be clamped by the newly applied max_ttl"
+    );
+    assert!(
+        cache
+            .get(&name, RecordType::A, DNSClass::IN)
+            .await
+            .is_some(),
+        "the status-less getter must serve the new-generation entry"
+    );
+}
+
 /// A config apply advances the filter epoch only when the filter/group
 /// snapshots change; the cache epoch follows the published snapshot.
 #[tokio::test]

@@ -277,6 +277,87 @@ mod tests {
         assert_eq!(remaining.entries[0].qname, "recent.com");
     }
 
+    /// Representative multi-day retention sweep: 72 consecutive expired hours
+    /// are aggregated in one call, one hour at a time, with no double counting
+    /// and no rows left in the detailed log. This is representative multi-day
+    /// coverage, not a 90-day/1M-row scale test (see the retention module docs
+    /// for that documented residual).
+    #[tokio::test]
+    async fn test_retention_handles_multiple_hours_across_days() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        // Align to an hour boundary and stay well outside the 90-day cutoff.
+        let base = ((now - 100 * 86_400_000) / 3_600_000) * 3_600_000;
+        let hours = 72i64;
+        let per_hour = 5i64;
+
+        let mut entries = Vec::new();
+        for hour in 0..hours {
+            for index in 0..per_hour {
+                let ts = base + hour * 3_600_000 + index * 1_000;
+                let qname = format!("day{}-hour{}-{index}.example", hour / 24, hour % 24);
+                let mut entry = retention_entry(
+                    ts,
+                    &qname,
+                    if index == 0 { "blocked" } else { "allowed" },
+                    None,
+                );
+                entry.client_ip = format!("10.0.{}.{}", hour % 256, index + 1);
+                entry.upstream = Some(
+                    if index % 2 == 0 {
+                        "1.1.1.1:53"
+                    } else {
+                        "9.9.9.9:53"
+                    }
+                    .to_string(),
+                );
+                entry.elapsed_us = Some(1_000 + index);
+                entries.push(entry);
+            }
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
+        assert_eq!(
+            report.aggregated_hours,
+            usize::try_from(hours).unwrap(),
+            "every expired hour must be aggregated exactly once"
+        );
+        assert_eq!(
+            report.deleted_records,
+            u64::try_from(hours * per_hour).unwrap()
+        );
+
+        let rollup_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_hourly")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rollup_rows, hours);
+        let total: i64 = sqlx::query_scalar("SELECT SUM(queries) FROM stats_hourly")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(total, hours * per_hour);
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0, "the sweep must delete every expired row");
+
+        let (queries, blocked, top_domains): (i64, i64, String) =
+            sqlx::query_as("SELECT queries, blocked, top_domains FROM stats_hourly WHERE hour = ?")
+                .bind(base)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(queries, per_hour);
+        assert_eq!(blocked, 1);
+        assert!(
+            top_domains.contains("day0-hour0-0.example"),
+            "the first hour's top list must be retained: {top_domains}"
+        );
+    }
+
     #[tokio::test]
     async fn test_persistence_restart() {
         let temp_dir = std::env::temp_dir().join(format!(
@@ -1245,6 +1326,83 @@ mod tests {
         }));
     }
 
+    /// P2-55: NXDOMAIN (rcode 3) is a normal negative answer, not an upstream
+    /// error. The live aggregate and the archived rollup must agree, so the
+    /// live and archived windows are exercised separately.
+    #[tokio::test]
+    async fn test_upstream_error_queries_excludes_nxdomain() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let live_upstream = "1.1.1.1:53";
+        let archived_upstream = "9.9.9.9:53";
+        let entry = |ts: i64, qname: &str, rcode: u8, upstream: &str| {
+            let mut entry = retention_entry(ts, qname, "allowed", None);
+            entry.rcode = Some(rcode);
+            entry.upstream = Some(upstream.to_string());
+            entry.elapsed_us = Some(1_000);
+            entry
+        };
+
+        db.insert_batch(&[
+            entry(now, "noerror.example", 0, live_upstream),
+            entry(now + 1, "nxdomain.example", 3, live_upstream),
+            entry(now + 2, "servfail.example", 2, live_upstream),
+            entry(now + 3, "nxdomain-two.example", 3, live_upstream),
+        ])
+        .await
+        .unwrap();
+
+        let live = db.get_upstream_stats(86_400_000).await.unwrap();
+        let live = live
+            .iter()
+            .find(|stats| stats.upstream == live_upstream)
+            .expect("live upstream must be reported");
+        assert_eq!(live.total_queries, 4);
+        assert_eq!(
+            live.error_queries, 1,
+            "only SERVFAIL counts as an upstream error, not NXDOMAIN"
+        );
+
+        // Archive a second upstream so the archived (rollup) SQL is the only
+        // source for it.
+        let archived_ts = now - 100 * 86_400_000;
+        db.insert_batch(&[
+            entry(archived_ts, "old-noerror.example", 0, archived_upstream),
+            entry(
+                archived_ts + 1,
+                "old-nxdomain.example",
+                3,
+                archived_upstream,
+            ),
+            entry(
+                archived_ts + 2,
+                "old-servfail.example",
+                2,
+                archived_upstream,
+            ),
+            entry(
+                archived_ts + 3,
+                "old-nxdomain-two.example",
+                3,
+                archived_upstream,
+            ),
+        ])
+        .await
+        .unwrap();
+        db.cleanup_detailed_retention(90).await.unwrap();
+
+        let archived = db.get_upstream_stats(200 * 86_400_000).await.unwrap();
+        let archived = archived
+            .iter()
+            .find(|stats| stats.upstream == archived_upstream)
+            .expect("archived upstream must be merged from stats_hourly");
+        assert_eq!(archived.total_queries, 4);
+        assert_eq!(
+            archived.error_queries, 1,
+            "the rollup error count must exclude NXDOMAIN too"
+        );
+    }
+
     /// WP-7.2/7.3: blocked domains are ranked independently of the total-query
     /// ranking, so a heavily blocked domain outside the total top-N is still
     /// reported.
@@ -1987,6 +2145,209 @@ mod tests {
 
         drop(db);
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-19: a live config apply re-applies the policy without reopening the
+    /// database, scrubbing already-written rollup names immediately.
+    #[tokio::test]
+    async fn test_set_rollup_client_names_scrubs_live_rollups() {
+        let db = StatsDb::in_memory_with_rollup_client_names(true)
+            .await
+            .unwrap();
+        let old_ts = chrono::Utc::now().timestamp_millis() - 100 * 86_400_000;
+        let mut entry = retention_entry(old_ts, "live-scrub.example", "allowed", None);
+        entry.client_ip = "10.7.7.9".into();
+        entry.client_name = Some("live-named-device".into());
+        db.insert_batch(&[entry]).await.unwrap();
+        db.cleanup_detailed_retention(90).await.unwrap();
+
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(payload.contains("live-named-device"));
+
+        db.set_rollup_client_names(false).await.unwrap();
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(!payload.contains("live-named-device"));
+        assert!(!payload.contains("10.7.7.9"));
+        assert!(
+            payload.contains("blake3:"),
+            "the scrub must hash the raw IP while removing the name"
+        );
+    }
+
+    /// Important review fix: a sweep that captured `rollup_client_names=true`
+    /// before a live true -> false apply must not re-insert names after the
+    /// scrub. Both the hour-chunked retention path and the keep-aggregates
+    /// clear path consult the live policy at write time.
+    #[tokio::test]
+    async fn test_live_policy_overrides_captured_rollup_name_policy() {
+        let db = StatsDb::in_memory_with_rollup_client_names(true)
+            .await
+            .unwrap();
+        let old_ts = chrono::Utc::now().timestamp_millis() - 100 * 86_400_000;
+        let mut old = retention_entry(old_ts, "race-cleanup.example", "allowed", None);
+        old.client_ip = "10.7.7.10".into();
+        old.client_name = Some("leaked-cleanup-name".into());
+        db.insert_batch(&[old]).await.unwrap();
+
+        // The live apply has already flipped the policy and scrubbed.
+        db.set_rollup_client_names(false).await.unwrap();
+
+        // Simulate the scheduler's captured policy from before the flip.
+        let report = db
+            .cleanup_retention_with_policy(90, 365, true)
+            .await
+            .unwrap();
+        assert_eq!(report.aggregated_hours, 1);
+
+        let cleanup_payload: String =
+            sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            !cleanup_payload.contains("leaked-cleanup-name"),
+            "an in-flight cleanup chunk must not undo the live name scrub: {cleanup_payload}"
+        );
+        assert!(!cleanup_payload.contains("10.7.7.10"));
+        assert!(cleanup_payload.contains("blake3:"));
+
+        // Same guard on the keep-aggregates whole-range clear path.
+        let recent = chrono::Utc::now().timestamp_millis();
+        let mut recent_entry = retention_entry(recent, "race-clear.example", "allowed", None);
+        recent_entry.client_ip = "10.7.7.11".into();
+        recent_entry.client_name = Some("leaked-clear-name".into());
+        db.insert_batch(&[recent_entry]).await.unwrap();
+        db.delete_query_logs_with_policy(true, true).await.unwrap();
+
+        let payloads: Vec<String> = sqlx::query_scalar("SELECT top_clients FROM stats_hourly")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            payloads
+                .iter()
+                .all(|payload| !payload.contains("leaked-clear-name")),
+            "the keep-aggregates clear must also honour the live policy: {payloads:?}"
+        );
+    }
+
+    /// Important review fix: the scrub's `BEGIN IMMEDIATE` transaction must
+    /// wait for an in-flight rollup writer, then include its newly committed
+    /// row in the scan. Before the fix the scrub selected in autocommit (did
+    /// not see the uncommitted row) and only blocked later at the marker
+    /// write, leaving the name-bearing row behind with a `"false"` marker.
+    #[tokio::test]
+    async fn test_name_scrub_waits_for_in_flight_rollup_writer() {
+        use sqlx::Connection;
+        use sqlx::sqlite::SqliteConnectOptions;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-name-scrub-race-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open_with_rollup_client_names(&db_path, true)
+            .await
+            .unwrap();
+        let hour = 1_000_000_000_000i64;
+
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(30));
+        let mut writer = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO stats_hourly \
+             (hour, queries, blocked, cached, top_domains, top_clients, top_upstreams) \
+             VALUES (?, 1, 0, 0, '[]', ?, '[]')",
+        )
+        .bind(hour)
+        .bind(r#"[["10.7.7.12","in-flight-name",1,0,1000]]"#)
+        .execute(&mut writer)
+        .await
+        .unwrap();
+
+        let scrub_db = db.clone();
+        let scrub = tokio::spawn(async move { scrub_db.set_rollup_client_names(false).await });
+        // Give the scrub task time to reach its blocking BEGIN IMMEDIATE. The
+        // writer still holds the lock, so the task cannot have completed.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !scrub.is_finished(),
+            "the scrub must wait for the in-flight rollup writer"
+        );
+
+        sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
+        scrub
+            .await
+            .expect("scrub task must not panic")
+            .expect("scrub must succeed after the writer commits");
+
+        let payload: String =
+            sqlx::query_scalar("SELECT top_clients FROM stats_hourly WHERE hour = ?")
+                .bind(hour)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            !payload.contains("in-flight-name"),
+            "the scrub must include the row committed by the waited-for writer: {payload}"
+        );
+        assert!(!payload.contains("10.7.7.12"));
+        assert!(payload.contains("blake3:"));
+        let marker: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM stats_meta WHERE key = 'rollup_client_names_policy'",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(marker.as_deref(), Some("false"));
+
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P2-58: an IPv4-mapped IPv6 client and its native IPv4 spelling are one
+    /// host, so the rollup must not count them as two clients.
+    #[tokio::test]
+    async fn test_rollup_hash_canonicalizes_ipv4_mapped_client() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let old_ts = chrono::Utc::now().timestamp_millis() - 100 * 86_400_000;
+        let mut mapped = retention_entry(old_ts, "mapped.example", "allowed", None);
+        mapped.client_ip = "::ffff:10.7.7.7".into();
+        let mut native = retention_entry(old_ts + 1, "native.example", "allowed", None);
+        native.client_ip = "10.7.7.7".into();
+        db.insert_batch(&[mapped, native]).await.unwrap();
+        db.cleanup_detailed_retention(90).await.unwrap();
+
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let clients: Vec<(String, Option<String>, i64, i64, i64)> =
+            serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            clients.len(),
+            1,
+            "mapped and native IPv4 must canonicalize to one rollup client"
+        );
+        assert_eq!(clients[0].2, 2);
+        assert!(clients[0].0.starts_with("blake3:"));
+        assert!(
+            !clients[0].0.contains("::ffff"),
+            "the canonical identifier must not keep the mapped spelling"
+        );
     }
 
     /// P1-19: names are preserved by a legacy backfill when explicitly enabled.

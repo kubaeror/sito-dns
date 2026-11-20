@@ -24,6 +24,51 @@ use crate::upstream::{Upstream, is_edns_failure_code, is_retryable_response};
 pub type NamedUpstream = (String, Arc<dyn Upstream>);
 pub type PerDomainRule = (Vec<String>, Vec<NamedUpstream>);
 
+/// One candidate attempt made while resolving a query.
+///
+/// The manager records each attempt separately so the pipeline can emit
+/// per-attempt RTT/error metrics. The successful attempt's `rtt` measures only
+/// that attempt, not the time already spent on failed candidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamAttempt {
+    /// Configured upstream name (the label used by metrics and health).
+    pub name: String,
+    /// Time spent on this attempt alone.
+    pub rtt: Duration,
+    /// `None` on success; the candidate's error otherwise.
+    pub error: Option<UpstreamError>,
+}
+
+impl UpstreamAttempt {
+    fn success(name: String, rtt: Duration) -> Self {
+        Self {
+            name,
+            rtt,
+            error: None,
+        }
+    }
+
+    fn failure(name: String, rtt: Duration, error: UpstreamError) -> Self {
+        Self {
+            name,
+            rtt,
+            error: Some(error),
+        }
+    }
+
+    /// Whether the candidate produced a usable response.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        self.error.is_none()
+    }
+
+    /// Stable, low-cardinality error kind for metrics labels.
+    #[must_use]
+    pub fn error_kind(&self) -> Option<&'static str> {
+        self.error.as_ref().map(UpstreamError::kind)
+    }
+}
+
 /// Failure returned by [`UpstreamManager::resolve_with_upstream`].
 ///
 /// Carries the name of the upstream that produced the final error so callers
@@ -36,6 +81,8 @@ pub struct UpstreamQueryError {
     pub error: UpstreamError,
     /// Name of the upstream entry that produced `error`, when one was tried.
     pub upstream: Option<String>,
+    /// Every candidate attempt made before the failure.
+    pub attempts: Vec<UpstreamAttempt>,
 }
 
 impl UpstreamQueryError {
@@ -44,6 +91,7 @@ impl UpstreamQueryError {
         Self {
             error,
             upstream: Some(entry.name.clone()),
+            attempts: Vec::new(),
         }
     }
 
@@ -53,6 +101,7 @@ impl UpstreamQueryError {
         Self {
             error,
             upstream: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -251,6 +300,8 @@ struct FailoverUpstream {
     timeout: Duration,
     kind: CandidateKind,
     candidates: RwLock<Vec<Arc<dyn Upstream>>>,
+    #[cfg(test)]
+    candidate_ips: RwLock<Vec<std::net::IpAddr>>,
     last_resolve: Mutex<Instant>,
     last_forced_refresh: Mutex<Option<Instant>>,
     re_resolve_interval: Duration,
@@ -290,6 +341,8 @@ impl FailoverUpstream {
             timeout,
             kind,
             candidates: RwLock::new(Vec::new()),
+            #[cfg(test)]
+            candidate_ips: RwLock::new(Vec::new()),
             last_resolve: Mutex::new(Instant::now()),
             last_forced_refresh: Mutex::new(None),
             re_resolve_interval,
@@ -313,6 +366,11 @@ impl FailoverUpstream {
                 "no IP addresses resolved for '{}'",
                 self.host
             )));
+        }
+
+        #[cfg(test)]
+        {
+            *self.candidate_ips.write().await = ips.clone();
         }
 
         // DoH keeps a single client that carries all resolved addresses.
@@ -343,6 +401,11 @@ impl FailoverUpstream {
             candidates.push(upstream);
         }
         Ok(candidates)
+    }
+
+    #[cfg(test)]
+    async fn candidate_ips(&self) -> Vec<std::net::IpAddr> {
+        self.candidate_ips.read().await.clone()
     }
 
     /// Re-resolve if the interval elapsed and no other task holds the refresh
@@ -518,65 +581,90 @@ async fn create_managed_entry(
     let name = server_str.to_string();
     let bootstrap = bootstrap.clone();
 
-    let upstream: Arc<dyn Upstream> = if let Some(tls_target) = server_str.strip_prefix("tls://") {
-        let (host, port) = split_host_port(tls_target, 853);
-        Arc::new(
-            FailoverUpstream::new(
-                bootstrap,
-                host.clone(),
-                port,
-                timeout_duration,
-                CandidateKind::Dot {
-                    server_name: host,
-                    pool_size,
-                },
+    // Match schemes case-insensitively: validation accepts `TLS://` and the
+    // runtime must build the same transport instead of treating it as a
+    // single-label hostname.
+    let (scheme, target) = split_scheme(server_str);
+
+    let upstream: Arc<dyn Upstream> = match scheme.as_deref() {
+        Some("tls") => {
+            reject_path(server_str, target, "tls://")?;
+            let (host, port) = split_host_port(target, 853);
+            Arc::new(
+                FailoverUpstream::new(
+                    bootstrap,
+                    host.clone(),
+                    port,
+                    timeout_duration,
+                    CandidateKind::Dot {
+                        server_name: host,
+                        pool_size,
+                    },
+                )
+                .await?,
             )
-            .await?,
-        )
-    } else if server_str.starts_with("https://") {
-        let (host, port, path) = parse_scheme_target(server_str, "https", 443)?;
-        Arc::new(
-            FailoverUpstream::new(
-                bootstrap,
-                host.clone(),
-                port,
-                timeout_duration,
-                CandidateKind::Https {
-                    url: build_https_url(&host, port, &path),
-                },
+        }
+        Some("https") => {
+            let (host, port, path) = parse_scheme_target(target, 443)?;
+            Arc::new(
+                FailoverUpstream::new(
+                    bootstrap,
+                    host.clone(),
+                    port,
+                    timeout_duration,
+                    CandidateKind::Https {
+                        url: build_https_url(&host, port, &path),
+                    },
+                )
+                .await?,
             )
-            .await?,
-        )
-    } else if server_str.starts_with("quic://") {
-        let (host, port, _path) = parse_scheme_target(server_str, "quic", 853)?;
-        Arc::new(
-            FailoverUpstream::new(
-                bootstrap,
-                host.clone(),
-                port,
-                timeout_duration,
-                CandidateKind::Quic { server_name: host },
+        }
+        Some("quic") => {
+            let (host, port, _path) = parse_scheme_target(target, 853)?;
+            Arc::new(
+                FailoverUpstream::new(
+                    bootstrap,
+                    host.clone(),
+                    port,
+                    timeout_duration,
+                    CandidateKind::Quic { server_name: host },
+                )
+                .await?,
             )
-            .await?,
-        )
-    } else {
-        let target_str = server_str.strip_prefix("udp://").unwrap_or(server_str);
-        if let Some(scheme) = unsupported_scheme(target_str) {
+        }
+        Some("udp") => {
+            reject_path(server_str, target, "udp://")?;
+            let (host, port) = split_host_port(target, 53);
+            Arc::new(
+                FailoverUpstream::new(
+                    bootstrap,
+                    host,
+                    port,
+                    timeout_duration,
+                    CandidateKind::Plain,
+                )
+                .await?,
+            )
+        }
+        Some(other) => {
             return Err(UpstreamError::BadResponse(format!(
-                "unsupported upstream scheme '{scheme}://' in '{server_str}'; supported schemes are tls://, https://, udp:// and plain host/IP"
+                "unsupported upstream scheme '{other}://' in '{server_str}'; supported schemes are tls://, https://, quic://, udp:// and plain host/IP"
             )));
         }
-        let (host, port) = split_host_port(target_str, 53);
-        Arc::new(
-            FailoverUpstream::new(
-                bootstrap,
-                host,
-                port,
-                timeout_duration,
-                CandidateKind::Plain,
+        None => {
+            reject_path(server_str, server_str, "a plain host:port target")?;
+            let (host, port) = split_host_port(server_str, 53);
+            Arc::new(
+                FailoverUpstream::new(
+                    bootstrap,
+                    host,
+                    port,
+                    timeout_duration,
+                    CandidateKind::Plain,
+                )
+                .await?,
             )
-            .await?,
-        )
+        }
     };
 
     Ok(ManagedEntry {
@@ -586,22 +674,38 @@ async fn create_managed_entry(
     })
 }
 
-/// Parses a `scheme://host[:port][/path]` upstream target.
+/// Splits `scheme://rest` into a lowercased scheme (when present) and `rest`.
+fn split_scheme(target: &str) -> (Option<String>, &str) {
+    match target.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme.to_ascii_lowercase()), rest),
+        None => (None, target),
+    }
+}
+
+/// Rejects a URL path on schemes that do not carry one. Validation rejects
+/// these too; the runtime check keeps direct manager callers in agreement.
+fn reject_path(server_str: &str, target: &str, kind: &str) -> Result<(), UpstreamError> {
+    if target.contains('/') {
+        return Err(UpstreamError::BadResponse(format!(
+            "upstream target '{server_str}' uses {kind} and must not include a URL path"
+        )));
+    }
+    Ok(())
+}
+
+/// Parses `host[:port][/path]` for a scheme that accepts an optional path.
 fn parse_scheme_target(
-    url: &str,
-    scheme: &str,
+    target: &str,
     default_port: u16,
 ) -> Result<(String, u16, String), UpstreamError> {
-    let prefix = format!("{scheme}://");
-    let rest = url.strip_prefix(prefix.as_str()).unwrap_or(url);
-    let (authority, path) = match rest.split_once('/') {
+    let (authority, path) = match target.split_once('/') {
         Some((authority, path)) => (authority, format!("/{path}")),
-        None => (rest, DEFAULT_DOH_PATH.to_string()),
+        None => (target, DEFAULT_DOH_PATH.to_string()),
     };
     let (host, port) = split_host_port(authority, default_port);
     if host.is_empty() {
         return Err(UpstreamError::BadResponse(format!(
-            "invalid upstream URL '{url}': missing host"
+            "invalid upstream URL '{target}': missing host"
         )));
     }
     Ok((host, port, path))
@@ -629,6 +733,7 @@ fn build_https_url(host: &str, port: u16, path: &str) -> String {
 }
 
 /// Returns the scheme of an upstream string if it uses an unsupported `xxx://` prefix.
+#[cfg(test)]
 fn unsupported_scheme(target: &str) -> Option<String> {
     let (scheme, _) = target.split_once("://")?;
     if scheme.is_empty()
@@ -876,29 +981,83 @@ impl UpstreamManager {
         &self,
         msg: &Message,
     ) -> Result<(Message, String), UpstreamQueryError> {
+        self.resolve_with_attempts(msg)
+            .await
+            .map(|(response, upstream, _attempts)| (response, upstream))
+    }
+
+    /// Resolve a DNS query and return every candidate attempt alongside the
+    /// response (or failure).
+    ///
+    /// Callers that emit metrics should use this method: each entry in the
+    /// returned attempt list is one candidate, including failures that were
+    /// followed by a successful failover. `resolve_with_upstream` remains the
+    /// compatibility wrapper for callers that only need the winner.
+    pub async fn resolve_with_attempts(
+        &self,
+        msg: &Message,
+    ) -> Result<(Message, String, Vec<UpstreamAttempt>), UpstreamQueryError> {
         let inner = self.inner.load();
-        if let Some(query) = msg.queries.first() {
+        let mut attempts = Vec::new();
+        let result = if let Some(query) = msg.queries.first() {
             // ASCII/punycode form: per-domain rules are normalized to
             // punycode, so a UTS46-decoded IDN would never match them.
             let qname_str = query.name.to_ascii().to_lowercase();
             let qname_clean = qname_str.trim_end_matches('.');
+            let mut routed = None;
             for (domains, group) in &inner.per_domain_rules {
-                for d in domains {
-                    if sito_core::matches_domain_suffix(qname_clean, d) {
-                        debug!(
-                            "Routing query for {} to per-domain upstreams {:?}",
-                            qname_str, domains
-                        );
-                        return self
-                            .resolve_entries(group, msg, inner.strategy, inner.timeout_duration)
-                            .await;
-                    }
+                if domains
+                    .iter()
+                    .any(|d| sito_core::matches_domain_suffix(qname_clean, d))
+                {
+                    debug!(
+                        "Routing query for {} to per-domain upstreams {:?}",
+                        qname_str, domains
+                    );
+                    routed = Some(
+                        self.resolve_entries(
+                            group,
+                            msg,
+                            inner.strategy,
+                            inner.timeout_duration,
+                            &mut attempts,
+                        )
+                        .await,
+                    );
+                    break;
                 }
             }
-        }
-
-        self.resolve_entries(&inner.entries, msg, inner.strategy, inner.timeout_duration)
+            match routed {
+                Some(result) => result,
+                None => {
+                    self.resolve_entries(
+                        &inner.entries,
+                        msg,
+                        inner.strategy,
+                        inner.timeout_duration,
+                        &mut attempts,
+                    )
+                    .await
+                }
+            }
+        } else {
+            self.resolve_entries(
+                &inner.entries,
+                msg,
+                inner.strategy,
+                inner.timeout_duration,
+                &mut attempts,
+            )
             .await
+        };
+
+        match result {
+            Ok((response, upstream)) => Ok((response, upstream, attempts)),
+            Err(mut error) => {
+                error.attempts = attempts;
+                Err(error)
+            }
+        }
     }
 
     /// Runs one resolve across `entries` with the configured `strategy`.
@@ -923,6 +1082,7 @@ impl UpstreamManager {
         msg: &Message,
         strategy: UpstreamStrategy,
         timeout_duration: Duration,
+        attempts: &mut Vec<UpstreamAttempt>,
     ) -> Result<(Message, String), UpstreamQueryError> {
         if entries.is_empty() {
             return Err(UpstreamQueryError::unattributed(UpstreamError::AllDown));
@@ -948,16 +1108,19 @@ impl UpstreamManager {
         match strategy {
             UpstreamStrategy::Parallel => {
                 let mut futs = Vec::with_capacity(candidates.len());
+                let parallel_attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
                 for entry in candidates {
                     let u = Arc::clone(&entry.upstream);
                     let h = Arc::clone(&entry.health);
                     let m = msg.clone();
                     let name = entry.name.clone();
+                    let attempt_log = Arc::clone(&parallel_attempts);
                     futs.push(Box::pin(async move {
-                        match resolve_with_edns_fallback(u.as_ref(), &m).await {
+                        let started = Instant::now();
+                        let result = match resolve_with_edns_fallback(u.as_ref(), &m).await {
                             Ok(resp) if !is_retryable_response(&resp) => {
                                 h.write().await.record_success();
-                                Ok((resp, name))
+                                Ok((resp, name.clone()))
                             }
                             Ok(resp) => {
                                 let error = retryable_status_error(resp.metadata.response_code);
@@ -965,7 +1128,8 @@ impl UpstreamManager {
                                 h.write().await.record_error(&error);
                                 Err(UpstreamQueryError {
                                     error,
-                                    upstream: Some(name),
+                                    upstream: Some(name.clone()),
+                                    attempts: Vec::new(),
                                 })
                             }
                             Err(error) => {
@@ -973,16 +1137,30 @@ impl UpstreamManager {
                                 h.write().await.record_error(&error);
                                 Err(UpstreamQueryError {
                                     error,
-                                    upstream: Some(name),
+                                    upstream: Some(name.clone()),
+                                    attempts: Vec::new(),
                                 })
                             }
+                        };
+                        let rtt = started.elapsed();
+                        let attempt = match &result {
+                            Ok(_) => UpstreamAttempt::success(name, rtt),
+                            Err(error) => UpstreamAttempt::failure(name, rtt, error.error.clone()),
+                        };
+                        if let Ok(mut log) = attempt_log.lock() {
+                            log.push(attempt);
                         }
+                        result
                     }));
                 }
                 // All attempts already run concurrently, so the whole race gets
                 // the full timeout; the deadline only bounds implementations
                 // that ignore their own timeout.
-                match timeout(timeout_duration, futures_util::future::select_ok(futs)).await {
+                let result = timeout(timeout_duration, futures_util::future::select_ok(futs)).await;
+                if let Ok(mut log) = parallel_attempts.lock() {
+                    attempts.append(&mut log);
+                }
+                match result {
                     Ok(Ok((resp, _))) => Ok(resp),
                     Ok(Err(error)) => Err(error),
                     Err(_) => Err(UpstreamQueryError::unattributed(UpstreamError::Timeout)),
@@ -993,9 +1171,11 @@ impl UpstreamManager {
                 let ordered: Vec<&ManagedEntry> = (0..candidates.len())
                     .map(|i| candidates[(start_idx + i) % candidates.len()])
                     .collect();
-                resolve_sequential(&ordered, msg, deadline).await
+                resolve_sequential(&ordered, msg, deadline, attempts).await
             }
-            UpstreamStrategy::Failover => resolve_sequential(&candidates, msg, deadline).await,
+            UpstreamStrategy::Failover => {
+                resolve_sequential(&candidates, msg, deadline, attempts).await
+            }
         }
     }
 
@@ -1099,6 +1279,7 @@ async fn resolve_sequential(
     ordered: &[&ManagedEntry],
     msg: &Message,
     deadline: Instant,
+    attempts: &mut Vec<UpstreamAttempt>,
 ) -> Result<(Message, String), UpstreamQueryError> {
     let mut last_error = None;
     for (i, entry) in ordered.iter().enumerate() {
@@ -1106,9 +1287,14 @@ async fn resolve_sequential(
             break;
         };
         trace!("Querying upstream {}", entry.name);
+        let started = Instant::now();
         match attempt_entry(entry, msg, budget).await {
             Ok(response) if !is_retryable_response(&response) => {
                 entry.health.write().await.record_success();
+                attempts.push(UpstreamAttempt::success(
+                    entry.name.clone(),
+                    started.elapsed(),
+                ));
                 return Ok((response, entry.name.clone()));
             }
             Ok(response) => {
@@ -1118,11 +1304,21 @@ async fn resolve_sequential(
                     entry.name, error
                 );
                 entry.health.write().await.record_error(&error);
+                attempts.push(UpstreamAttempt::failure(
+                    entry.name.clone(),
+                    started.elapsed(),
+                    error.clone(),
+                ));
                 last_error = Some(UpstreamQueryError::from_entry(entry, error));
             }
             Err(error) => {
                 warn!("Upstream {} failed query: {}", entry.name, error);
                 entry.health.write().await.record_error(&error);
+                attempts.push(UpstreamAttempt::failure(
+                    entry.name.clone(),
+                    started.elapsed(),
+                    error.clone(),
+                ));
                 last_error = Some(UpstreamQueryError::from_entry(entry, error));
             }
         }
@@ -1958,6 +2154,159 @@ mod tests {
         );
     }
 
+    /// WP-2.7: forced refresh must also rotate DoT candidates, not only the
+    /// plain UDP path. The live listener counts the connection attempt made to
+    /// the rotated address (the test endpoint cannot complete TLS).
+    /// WP-2.7: every candidate attempt is reported with its own RTT and error
+    /// kind. The winner's RTT excludes the time spent on the failed candidate.
+    #[tokio::test]
+    async fn test_failover_reports_per_attempt_rtt_and_error() {
+        let failed_calls = Arc::new(AtomicU32::new(0));
+        let winner_calls = Arc::new(AtomicU32::new(0));
+        let manager = UpstreamManager::with_upstreams(
+            vec![
+                (
+                    "slow-failure".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: false,
+                        delay: Duration::from_millis(80),
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::clone(&failed_calls),
+                    }),
+                ),
+                (
+                    "winner".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(9, 9, 9, 9),
+                        call_count: Arc::clone(&winner_calls),
+                    }),
+                ),
+            ],
+            UpstreamStrategy::Failover,
+            Duration::from_secs(2),
+        );
+
+        let started = Instant::now();
+        let (response, upstream, attempts) = manager
+            .resolve_with_attempts(&test_query())
+            .await
+            .expect("the second candidate must succeed");
+        let total = started.elapsed();
+
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(upstream, "winner");
+        assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(winner_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.len(), 2, "one attempt per candidate: {attempts:?}");
+
+        let failed = &attempts[0];
+        assert_eq!(failed.name, "slow-failure");
+        assert_eq!(failed.error_kind(), Some("timeout"));
+        assert!(!failed.is_success());
+        assert!(
+            failed.rtt >= Duration::from_millis(80),
+            "the failed attempt must report its own elapsed time: {:?}",
+            failed.rtt
+        );
+
+        let winner = &attempts[1];
+        assert_eq!(winner.name, "winner");
+        assert!(winner.is_success());
+        assert_eq!(winner.error_kind(), None);
+        assert!(
+            winner.rtt < failed.rtt,
+            "the winner RTT must exclude the failed attempt: winner={:?} failed={:?}",
+            winner.rtt,
+            failed.rtt
+        );
+        assert!(
+            winner.rtt < total,
+            "the winner RTT must not be the whole failover duration"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forced_refresh_rotates_dot_candidate() {
+        let blackhole = std::net::Ipv4Addr::new(127, 0, 0, 3);
+        let (live_addr, accepts) = spawn_tcp_accept_counter("127.0.0.2:0").await;
+        let port = live_addr.port();
+        let bootstrap =
+            spawn_rotating_bootstrap(blackhole, std::net::Ipv4Addr::new(127, 0, 0, 2)).await;
+        let resolver = BootstrapResolver::new(vec![bootstrap.ip()], Duration::from_secs(1))
+            .with_port(bootstrap.port())
+            .with_allow_private_targets(true);
+        let upstream = FailoverUpstream::with_interval(
+            resolver,
+            "rotate-dot.test".to_string(),
+            port,
+            Duration::from_millis(400),
+            CandidateKind::Dot {
+                server_name: "rotate-dot.test".to_string(),
+                pool_size: 1,
+            },
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("construct DoT failover upstream");
+
+        assert_eq!(
+            upstream.candidate_ips().await,
+            vec![std::net::IpAddr::V4(blackhole)]
+        );
+        let _ = upstream.resolve(&test_query()).await;
+        assert_eq!(
+            upstream.candidate_ips().await,
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2))],
+            "forced refresh must replace the black-hole DoT candidate"
+        );
+        assert!(
+            accepts.load(Ordering::SeqCst) >= 1,
+            "the rotated DoT candidate must be dialled"
+        );
+    }
+
+    /// WP-2.7: the same forced-refresh rotation for DoH candidates.
+    #[tokio::test]
+    async fn test_forced_refresh_rotates_doh_candidate() {
+        let blackhole = std::net::Ipv4Addr::new(127, 0, 0, 3);
+        let (live_addr, accepts) = spawn_tcp_accept_counter("127.0.0.2:0").await;
+        let port = live_addr.port();
+        let bootstrap =
+            spawn_rotating_bootstrap(blackhole, std::net::Ipv4Addr::new(127, 0, 0, 2)).await;
+        let resolver = BootstrapResolver::new(vec![bootstrap.ip()], Duration::from_secs(1))
+            .with_port(bootstrap.port())
+            .with_allow_private_targets(true);
+        let upstream = FailoverUpstream::with_interval(
+            resolver,
+            "rotate-doh.test".to_string(),
+            port,
+            Duration::from_millis(500),
+            CandidateKind::Https {
+                url: build_https_url("rotate-doh.test", port, "/dns-query"),
+            },
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("construct DoH failover upstream");
+
+        assert_eq!(
+            upstream.candidate_ips().await,
+            vec![std::net::IpAddr::V4(blackhole)]
+        );
+        let _ = upstream.resolve(&test_query()).await;
+        assert_eq!(
+            upstream.candidate_ips().await,
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2))],
+            "forced refresh must replace the black-hole DoH candidate"
+        );
+        assert!(
+            accepts.load(Ordering::SeqCst) >= 1,
+            "the rotated DoH candidate must be dialled"
+        );
+    }
+
     #[tokio::test]
     async fn test_per_domain_routing() {
         let calls_default = Arc::new(AtomicU32::new(0));
@@ -2115,30 +2464,28 @@ mod tests {
     #[test]
     fn test_parse_https_target() {
         assert_eq!(
-            parse_scheme_target("https://dns.quad9.net/dns-query", "https", 443).unwrap(),
+            parse_scheme_target("dns.quad9.net/dns-query", 443).unwrap(),
             ("dns.quad9.net".to_string(), 443, "/dns-query".to_string())
         );
         assert_eq!(
-            parse_scheme_target("https://dns.google:8443/dns-query", "https", 443)
+            parse_scheme_target("dns.google:8443/dns-query", 443)
                 .unwrap()
                 .1,
             8443
         );
         assert_eq!(
-            parse_scheme_target("https://[2606:4700:4700::1111]/dns-query", "https", 443)
+            parse_scheme_target("[2606:4700:4700::1111]/dns-query", 443)
                 .unwrap()
                 .0,
             "2606:4700:4700::1111"
         );
         assert_eq!(
-            parse_scheme_target("https://cloudflare-dns.com", "https", 443)
-                .unwrap()
-                .2,
+            parse_scheme_target("cloudflare-dns.com", 443).unwrap().2,
             "/dns-query"
         );
-        assert!(parse_scheme_target("https:///dns-query", "https", 443).is_err());
+        assert!(parse_scheme_target("/dns-query", 443).is_err());
         assert_eq!(
-            parse_scheme_target("quic://dns.adguard.com", "quic", 853).unwrap(),
+            parse_scheme_target("dns.adguard.com", 853).unwrap(),
             ("dns.adguard.com".to_string(), 853, "/dns-query".to_string())
         );
     }
@@ -2154,6 +2501,91 @@ mod tests {
         assert_eq!(unsupported_scheme("https://dns.quad9.net/dns-query"), None);
         assert_eq!(unsupported_scheme("udp://1.1.1.1"), None);
         assert_eq!(unsupported_scheme("1.1.1.1"), None);
+    }
+
+    /// WP-2.7: the manager accepts the same uppercase schemes as validation and
+    /// rejects the same path-bearing targets instead of failing later at startup.
+    #[tokio::test]
+    async fn test_managed_entry_schemes_and_paths_match_validation() {
+        let bootstrap = BootstrapResolver::new(
+            vec![std::net::Ipv4Addr::LOCALHOST.into()],
+            Duration::from_secs(1),
+        );
+        for target in [
+            "UDP://1.1.1.1:53",
+            "TLS://1.1.1.1:853",
+            "HTTPS://1.1.1.1/dns-query",
+        ] {
+            create_managed_entry(target, &bootstrap, Duration::from_secs(1), 1)
+                .await
+                .unwrap_or_else(|e| panic!("uppercase target '{target}' must build: {e}"));
+        }
+
+        for target in [
+            "UDP://1.1.1.1/dns-query",
+            "TLS://1.1.1.1/dns-query",
+            "1.1.1.1:53/dns-query",
+        ] {
+            assert!(
+                create_managed_entry(target, &bootstrap, Duration::from_secs(1), 1)
+                    .await
+                    .is_err(),
+                "path-bearing target '{target}' must be rejected"
+            );
+        }
+    }
+
+    /// Spawns a mock bootstrap server whose A answer rotates from `first` to
+    /// `second` after the first lookup.
+    async fn spawn_rotating_bootstrap(
+        first: std::net::Ipv4Addr,
+        second: std::net::Ipv4Addr,
+    ) -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut a_index = 0u32;
+            let mut buf = [0u8; 1024];
+            while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+                let Ok(query) = decode_message(&buf[..len]) else {
+                    continue;
+                };
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                if query.queries.first().map(Query::query_type) == Some(RecordType::A) {
+                    let ip = if a_index == 0 { first } else { second };
+                    a_index += 1;
+                    resp.answers.push(Record::from_rdata(
+                        query.queries[0].name().clone(),
+                        300,
+                        RData::A(A(ip)),
+                    ));
+                }
+                if let Ok(encoded) = encode_message(&resp) {
+                    let _ = socket.send_to(&encoded, peer).await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// Binds a TCP listener and counts accepted connections. Used to prove a
+    /// forced refresh actually routes the next attempt at the rotated address
+    /// even when the test endpoint cannot complete a real TLS handshake.
+    async fn spawn_tcp_accept_counter(bind: &str) -> (SocketAddr, Arc<AtomicU32>) {
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (addr, accepts)
     }
 
     /// Spawns a mock bootstrap server returning the given A records in order.
@@ -2182,6 +2614,24 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// WP-2.7: a bootstrap answer with more addresses than the cap keeps only
+    /// the bounded candidate set instead of building one transport per record.
+    #[tokio::test]
+    async fn test_bootstrap_resolution_caps_candidates() {
+        let records: Vec<_> = (1..=20)
+            .map(|last| std::net::Ipv4Addr::new(8, 8, 8, last))
+            .collect();
+        let addr = spawn_bootstrap_records(records).await;
+        let resolver =
+            BootstrapResolver::new(vec![addr.ip()], Duration::from_secs(1)).with_port(addr.port());
+
+        let ips = resolver
+            .resolve_hostname("many-addresses.test")
+            .await
+            .expect("bootstrap lookup must succeed");
+        assert_eq!(ips.len(), crate::bootstrap::MAX_BOOTSTRAP_CANDIDATES);
     }
 
     #[test]

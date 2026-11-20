@@ -46,6 +46,12 @@ export SITO=http://127.0.0.1:8080
 export TOKEN='sito_...'   # an Admin API token, or use a session cookie instead
 ```
 
+Mutating requests authenticated with a **session cookie** must also send the
+session's `X-CSRF-Token` and a same-origin `Origin`/`Referer`; the curl examples
+below use Bearer tokens where the operation allows one and include the CSRF
+header for session-only operations. Browser-generated requests send both
+automatically.
+
 ## 1. Account Lifecycle
 
 1. **Bootstrap.** On a fresh installation the first administrator is created by
@@ -117,6 +123,29 @@ Role checks are enforced by the API extractors (`RequireViewer`,
 treated as that token's role. A role change applies to future requests
 immediately and revokes all existing sessions of the affected account.
 
+### Re-authentication for sensitive changes
+
+A stolen browser session must not be able to change a password, change a role,
+create an Admin account, or mint an Admin-scoped token. When the caller
+authenticates with a **user session**, those operations require a fresh,
+session-bound re-authentication ticket from `POST /api/v1/auth/reauth`
+(`X-Reauth-Token`) or, in the web UI, the caller's current password plus a
+current TOTP/backup code when 2FA is enrolled. The ticket is single-use and is
+consumed atomically at authorization, before the mutation; a failed mutation burns it (fail-closed).
+
+Requests authenticated with an **Admin API token** are deliberately exempt:
+a bearer token is a standalone privileged credential, not a session that can be
+hijacked by a browser-side attacker, and it is already protected as a secret.
+Changing a password still always requires a user session (API tokens are
+rejected with `403`).
+
+A ticket is consumed atomically at authorization, before the mutation runs. It
+is single-use, and a failed mutation still leaves it consumed (fail-closed), so
+the caller must re-authenticate again. The OpenAPI document lists
+`X-Reauth-Token` as `required` on these operations because utoipa cannot express
+conditional-required parameters; it is only required for session callers and
+Admin-only operations.
+
 ## 3. Create, List, and Delete Accounts
 
 Requires an Admin session or an Admin-scoped API token.
@@ -144,6 +173,8 @@ Rules enforced by the API:
   characters, and not the bootstrap password `adminadmin`.
 * Roles: `viewer`, `operator`, or `admin` (case-insensitive).
 * Creating a username that already exists returns `409 Conflict`.
+* Creating an **Admin** account from a user session also requires
+  `X-Reauth-Token` (Admin API tokens are exempt, see above).
 
 Delete an account:
 
@@ -171,11 +202,28 @@ Admin-managed until explicitly revoked.
 ## 4. Change a Role
 
 ```bash
+# Admin API token (exempt from the reauth ticket):
 curl -sS -X PUT "$SITO/api/v1/auth/users/alice" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"role":"viewer"}'
 ```
+
+Every role change from a **user session** instead requires a fresh
+`X-Reauth-Token` plus the session cookie, `X-CSRF-Token` and `Origin`:
+
+```bash
+curl -sS -X PUT "$SITO/api/v1/auth/users/alice" \
+  -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+  -H "X-CSRF-Token: <csrf-token>" \
+  -H "Origin: $SITO" \
+  -H "X-Reauth-Token: <reauth-token>" \
+  -H 'Content-Type: application/json' \
+  -d '{"role":"viewer"}'
+```
+
+Admin API tokens are exempt. The UI users form asks for the caller's current
+password (and TOTP/backup code when enabled) instead of a ticket.
 
 A role change revokes all sessions belonging to the target account **and all
 API tokens it owns**, so the new role (and the loss of old privileges) is
@@ -213,23 +261,31 @@ reported as successful before it is durable.
 ## 5. Change a Password
 
 Requires an authenticated **user session**. API tokens are rejected with
-`403 Forbidden` so a leaked token cannot rotate an account password.
+`403 Forbidden` so a leaked token cannot rotate an account password. Every
+role (Viewer, Operator, Admin) may change its own password.
 
-Self-service (current password required):
+Self-service (current password required; `totp_code` is also required when TOTP
+is enabled):
 
 ```bash
 curl -sS -X POST "$SITO/api/v1/auth/change-password" \
-  -H "Cookie: sito_session=<session-id>" \
+  -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+  -H "X-CSRF-Token: <csrf-token>" \
+  -H "Origin: $SITO" \
   -H 'Content-Type: application/json' \
-  -d '{"current_password":"CorrectHorse1","new_password":"NewCorrectHorse2"}'
+  -d '{"current_password":"CorrectHorse1","totp_code":"123456","new_password":"NewCorrectHorse2"}'
 ```
 
-Administrator override for another account (audited at `warn` level). This also
-requires a user session; API tokens cannot change passwords:
+Administrator override for another account (audited at `warn` level) requires a
+user session **and** a fresh session-bound re-authentication ticket. Non-Admin
+callers receive `403 Forbidden`:
 
 ```bash
 curl -sS -X POST "$SITO/api/v1/auth/change-password" \
-  -H "Cookie: sito_session=<admin-session-id>" \
+  -H "Cookie: sito_session=<admin-session-id>; sito_csrf=<csrf-token>" \
+  -H "X-CSRF-Token: <csrf-token>" \
+  -H "Origin: $SITO" \
+  -H "X-Reauth-Token: <reauth-token>" \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice","new_password":"NewCorrectHorse2"}'
 ```
@@ -265,6 +321,11 @@ curl -sS -X POST "$SITO/api/v1/auth/tokens" \
   -H 'Content-Type: application/json' \
   -d '{"name":"grafana","scope":"viewer"}'
 ```
+
+Creating a token with `"scope":"admin"` from a user session additionally
+requires `X-Reauth-Token`; Admin API tokens are exempt. The `/account` page
+shows the same fields and asks for the current password (plus TOTP/backup code
+when enabled). Lower-scoped tokens do not require a second proof.
 
 The response contains `id`, `name`, `scope`, and the plaintext `token`
 (`sito_...`). Store it in a secret manager; it cannot be retrieved again.
@@ -448,9 +509,9 @@ on the next start (see section 1).
   cannot evict an account whose lockout is still active.
 * Expired tokens are rejected immediately and removed from memory; their
   on-disk snapshot is rewritten by the background pruner within 60 seconds.
-* The legacy `?token=` query parameter is accepted only on a WebSocket upgrade
-  with no `Authorization` header, logs a deprecation warning, and is scheduled
-  for removal in 2.0. Use `Authorization: Bearer` or a session cookie.
+* WebSocket authentication uses only an `Authorization: Bearer` header or the
+  session cookie. The legacy `?token=` query parameter is removed (BC-8); do
+  not put credentials in a URL, where proxies and access logs can capture them.
 
 ## 9. Audit Trail
 

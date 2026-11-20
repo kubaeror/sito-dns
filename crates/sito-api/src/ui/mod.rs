@@ -174,7 +174,6 @@ mod tests {
                 address: "tls://1.1.1.1:853".to_string(),
                 protocol: "DoT (TLS)".to_string(),
                 is_healthy: true,
-                weight: 100,
                 total_queries: 500,
                 avg_latency_ms: 15.2,
             }],
@@ -243,12 +242,21 @@ mod tests {
                 entries: 40,
                 state: "built-in (minimal)".to_string(),
                 last_refresh: "—".to_string(),
+                last_attempt: "2023-11-14 22:13 UTC".to_string(),
+                last_error: Some("fetch failed".to_string()),
             }],
         };
         let filtering_html = filter_tmpl.render().expect("render filtering page");
         assert!(filtering_html.contains("built-in (minimal)"));
+        assert!(
+            filtering_html.contains("Minimal built-in fallback")
+                && filtering_html.contains("not a maintained external dataset"),
+            "bundled lists must be labeled a minimal fallback, not a maintained dataset"
+        );
         assert!(filtering_html.contains("adult"));
         assert!(filtering_html.contains("CC0-1.0"));
+        assert!(filtering_html.contains("Last attempt: 2023-11-14 22:13 UTC"));
+        assert!(filtering_html.contains("Last error: fetch failed"));
 
         let rewrites_tmpl = RewritesTemplate {
             csrf_token: "",
@@ -365,6 +373,7 @@ mod tests {
             csrf_token: "",
             setup_required: true,
             setup_token: "test-token",
+            reauth_token: "",
         };
         assert!(wiz_tmpl.render().unwrap().contains("Welcome to sito DNS"));
     }
@@ -396,6 +405,7 @@ mod tests {
                     is_current: false,
                 },
             ],
+            caller_totp_enabled: true,
             error_message: "Duplicate user",
         };
         let html = users_tmpl.render().expect("render users template");
@@ -413,6 +423,7 @@ mod tests {
             active_tab: "users",
             version: "1.2.1",
             users: Vec::new(),
+            caller_totp_enabled: false,
             error_message: "",
         };
         let viewer_html = viewer_tmpl.render().expect("render viewer users template");
@@ -421,7 +432,46 @@ mod tests {
             "Viewers must not see the Users nav link"
         );
         assert!(viewer_html.contains("href=\"/account\""));
+    }
 
+    /// WP-2.10: the role form's TOTP field must follow the signed-in caller's
+    /// 2FA state, not the target row's. All four caller/target combinations
+    /// must render the field exactly when the caller has TOTP enabled.
+    #[test]
+    fn test_users_template_reauth_code_follows_caller_totp() {
+        for caller_totp_enabled in [false, true] {
+            for target_totp_enabled in [false, true] {
+                let tmpl = UsersTemplate {
+                    csrf_token: "csrf-token",
+                    is_authenticated: true,
+                    username: "admin",
+                    user_role: "admin",
+                    active_tab: "users",
+                    version: "1.2.1",
+                    users: vec![UserViewItem {
+                        username: "alice".to_string(),
+                        role: "operator".to_string(),
+                        totp_enabled: target_totp_enabled,
+                        role_action: "/ui/users/alice/role".to_string(),
+                        delete_action: "/ui/users/alice/delete".to_string(),
+                        is_current: false,
+                    }],
+                    caller_totp_enabled,
+                    error_message: "",
+                };
+                let html = tmpl.render().expect("render users template");
+                assert_eq!(
+                    html.contains("name=\"reauth_code\""),
+                    caller_totp_enabled,
+                    "caller_totp={caller_totp_enabled}, target_totp={target_totp_enabled}: \
+                     the code field must follow the caller"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_render_account_template_after_users() {
         let account_tmpl = AccountTemplate {
             csrf_token: "csrf-token",
             is_authenticated: true,

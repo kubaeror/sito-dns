@@ -58,8 +58,11 @@ pub struct FilterStatusDto {
     pub failed_lists: Vec<String>,
     /// Lists whose newest content was rejected while an older snapshot stayed.
     pub degraded_lists: Vec<String>,
-    /// Groups published without their regex/wildcard (or substring/prefix)
-    /// class after a budget/limit failure.
+    /// Groups that could not be published with their full rule set: a
+    /// budget/limit failure (only a non-regex subset was published), a
+    /// missing/unloaded referenced list, an invalid-only rule set, or a
+    /// group that could not be published at all. The previous snapshot is
+    /// retained when one is available.
     pub degraded_groups: Vec<String>,
     /// Regex/wildcard patterns dropped from the active snapshot.
     pub dropped_regex_patterns: usize,
@@ -110,6 +113,39 @@ pub struct UpdateFilterListRequest {
     pub url: Option<String>,
     pub enabled: Option<bool>,
     pub refresh_hours: Option<u32>,
+}
+
+/// Runtime refresh state of one curated parental/service category.
+///
+/// Mirrors `sito_clients::RuntimeListStatus`; keep the field names stable for
+/// API clients. Optional fields are omitted when unset.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct IntegrationListStatusDto {
+    pub category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub entries: u64,
+    pub bundled: bool,
+}
+
+impl From<sito_clients::RuntimeListStatus> for IntegrationListStatusDto {
+    fn from(status: sito_clients::RuntimeListStatus) -> Self {
+        Self {
+            category: status.category,
+            source_url: status.source_url,
+            last_refresh_unix: status.last_refresh_unix,
+            last_attempt_unix: status.last_attempt_unix,
+            last_error: status.last_error,
+            entries: status.entries,
+            bundled: status.bundled,
+        }
+    }
 }
 
 /// Custom rules collection.
@@ -320,8 +356,14 @@ pub struct UpstreamConfigDto {
     pub servers: Vec<String>,
     pub bootstrap: Vec<String>,
     pub strategy: String,
+    /// Overall per-query budget; bounded to 1..=60000 ms by core validation
+    /// (`MAX_UPSTREAM_TIMEOUT_MS`).
+    #[schema(maximum = 60000, minimum = 1)]
     pub timeout_ms: u64,
     pub probe_domain: String,
+    /// Persistent connections per endpoint; bounded to 1..=64 by core
+    /// validation (`MAX_UPSTREAM_POOL_SIZE`).
+    #[schema(maximum = 64, minimum = 1)]
     pub pool_size: usize,
 }
 
@@ -374,7 +416,9 @@ pub struct ConfigUpdateResponse {
 /// Outcome of publishing a configuration to HA replica slaves.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct HaPublishStatus {
-    /// `published`, `no_slaves` or `failed`.
+    /// `queued`, `connected_no_delivery`, `no_slaves` or `failed`. Neither
+    /// `queued` nor `connected_no_delivery` is delivery proof; delivery is
+    /// confirmed by the slave ACK.
     pub status: String,
     /// Human-readable failure reason. Never contains secret material.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -382,6 +426,15 @@ pub struct HaPublishStatus {
     /// RFC3339 timestamp of the first background retry, when one is scheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_at: Option<String>,
+    /// Connected slaves observed during the publish (including closed channels).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slaves_connected: Option<usize>,
+    /// Slaves with a direct channel enqueue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slaves_queued: Option<usize>,
+    /// Slaves scheduled for coalesced/deferred delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slaves_coalesced: Option<usize>,
 }
 
 /// Full configuration response with secrets masked.
@@ -561,6 +614,10 @@ pub struct ChangePasswordRequest {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_password: Option<String>,
+    /// Current TOTP or backup code; required for self-service when TOTP is
+    /// enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
     pub new_password: String,
 }
 

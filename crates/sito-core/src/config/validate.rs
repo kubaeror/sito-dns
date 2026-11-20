@@ -61,8 +61,9 @@ impl Config {
             ));
         }
         self.dns.validate()?;
+        // `UpstreamConfig::validate` also validates every target (global and
+        // per-domain), so direct callers get the same checks as this pipeline.
         self.upstream.validate()?;
-        self.validate_upstream_targets()?;
         self.filtering.validate()?;
         self.privacy.validate()?;
         if let Some(ref tls) = self.tls {
@@ -126,29 +127,6 @@ impl Config {
         self.validate_full()
     }
 
-    /// Validates every upstream target in every scope (global and per-domain).
-    fn validate_upstream_targets(&self) -> Result<(), ConfigError> {
-        for (index, server) in self.upstream.servers.iter().enumerate() {
-            validate_upstream_target(server).map_err(|reason| {
-                ConfigError::cross_section(
-                    format!("upstream.servers[{index}]"),
-                    format!("invalid upstream target '{server}': {reason}"),
-                )
-            })?;
-        }
-        for (rule_index, rule) in self.upstream.per_domain.iter().enumerate() {
-            for (server_index, server) in rule.servers.iter().enumerate() {
-                validate_upstream_target(server).map_err(|reason| {
-                    ConfigError::cross_section(
-                        format!("upstream.per_domain[{rule_index}].servers[{server_index}]"),
-                        format!("invalid per-domain upstream target '{server}': {reason}"),
-                    )
-                })?;
-            }
-        }
-        Ok(())
-    }
-
     /// Rejects unknown/removed keys in the raw legacy sections and validates
     /// the parts of their schemas that live in dependent crates.
     fn validate_legacy_sections(&self) -> Result<(), ConfigError> {
@@ -182,6 +160,65 @@ impl Config {
         let table = value
             .as_table()
             .ok_or_else(|| ConfigError::validation("clients", "[clients] must be a table"))?;
+
+        let groups = match table.get("groups") {
+            Some(groups) => Some(groups.as_table().ok_or_else(|| {
+                ConfigError::validation(
+                    "clients.groups",
+                    "invalid [clients] configuration: groups must be a table",
+                )
+            })?),
+            None => None,
+        };
+        let group_names: std::collections::HashSet<String> = groups
+            .map(|groups| groups.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // Group list references are validated against the configured
+        // `[filtering]` lists so a typo cannot silently disable a category
+        // (the engine would otherwise ignore the unknown source).
+        if let Some(groups) = groups {
+            let filter_list_names: std::collections::HashSet<&str> = self
+                .filtering
+                .lists
+                .iter()
+                .map(|list| list.name.as_str())
+                .collect();
+            for (group_name, group) in groups {
+                let group_table = group.as_table().ok_or_else(|| {
+                    ConfigError::validation(
+                        format!("clients.groups.{group_name}"),
+                        "each clients.groups entry must be a table",
+                    )
+                })?;
+                let Some(lists) = group_table.get("lists") else {
+                    continue;
+                };
+                let lists = lists.as_array().ok_or_else(|| {
+                    ConfigError::validation(
+                        format!("clients.groups.{group_name}.lists"),
+                        "group lists must be an array of filter-list names",
+                    )
+                })?;
+                for (index, list) in lists.iter().enumerate() {
+                    let list = list.as_str().ok_or_else(|| {
+                        ConfigError::validation(
+                            format!("clients.groups.{group_name}.lists[{index}]"),
+                            "group list names must be strings",
+                        )
+                    })?;
+                    if !filter_list_names.contains(list) {
+                        return Err(ConfigError::cross_section(
+                            format!("clients.groups.{group_name}.lists[{index}]"),
+                            format!(
+                                "group '{group_name}' references unknown filter list '{list}'; configure [[filtering.lists]] with name = \"{list}\""
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
         let Some(entries) = table.get("entries") else {
             return Ok(());
         };
@@ -191,21 +228,6 @@ impl Config {
                 "invalid [clients] configuration: entries must be an array",
             )
         })?;
-
-        let group_names: std::collections::HashSet<String> = match table.get("groups") {
-            Some(groups) => groups
-                .as_table()
-                .ok_or_else(|| {
-                    ConfigError::validation(
-                        "clients.groups",
-                        "invalid [clients] configuration: groups must be a table",
-                    )
-                })?
-                .keys()
-                .cloned()
-                .collect(),
-            None => std::collections::HashSet::new(),
-        };
 
         let mut names = std::collections::HashSet::new();
         for (index, entry) in entries.iter().enumerate() {
@@ -302,12 +324,22 @@ impl Config {
                             "client upstream targets must be strings",
                         )
                     })?;
-                    validate_upstream_target(upstream).map_err(|reason| {
+                    let host = upstream_target_host(upstream).map_err(|reason| {
                         ConfigError::cross_section(
                             format!("clients.entries[{index}].upstreams[{upstream_index}]"),
                             format!("invalid per-client upstream target '{upstream}': {reason}"),
                         )
                     })?;
+                    if self.upstream.bootstrap.is_empty() && host.parse::<IpAddr>().is_err() {
+                        return Err(ConfigError::validation(
+                            "upstream.bootstrap",
+                            format!(
+                                "per-client upstream target '{upstream}' is a hostname but \
+                                 upstream.bootstrap is empty; add at least one bootstrap resolver \
+                                 IP or use an IP literal"
+                            ),
+                        ));
+                    }
                 }
                 Some(upstreams)
             } else {
@@ -359,6 +391,17 @@ impl Config {
                         "refresh_hours must be greater than 0",
                     ));
                 }
+                // TOML integers are i64; a value that cannot be represented as
+                // u64 (only possible for a negative, already rejected above)
+                // fails the cap check below.
+                if u64::try_from(refresh).unwrap_or(u64::MAX) > MAX_REFRESH_HOURS {
+                    return Err(ConfigError::validation(
+                        "integrations.lists.refresh_hours",
+                        format!(
+                            "refresh_hours must be at most {MAX_REFRESH_HOURS} hours (one year)"
+                        ),
+                    ));
+                }
             }
             if let Some(categories) = lists.get("categories") {
                 let categories = categories.as_table().ok_or_else(|| {
@@ -403,6 +446,15 @@ impl Config {
                             return Err(ConfigError::cross_section(
                                 format!("integrations.lists.categories.{category}.refresh_hours"),
                                 "refresh_hours must be greater than 0",
+                            ));
+                        }
+                        // TOML integers are i64; see the global check above.
+                        if u64::try_from(refresh).unwrap_or(u64::MAX) > MAX_REFRESH_HOURS {
+                            return Err(ConfigError::validation(
+                                format!("integrations.lists.categories.{category}.refresh_hours"),
+                                format!(
+                                    "refresh_hours must be at most {MAX_REFRESH_HOURS} hours (one year) when set"
+                                ),
                             ));
                         }
                     }
@@ -764,29 +816,64 @@ fn web_conflicts_with_dns_bind(web: IpAddr, dns: IpAddr) -> bool {
 /// `udp://`/`tls://`/`https://`/`quic://` URL.
 ///
 /// Lives in `sito-core` so startup, `check-config`, the API, restore and HA
-/// all use the same validator (WP-1.3).
+/// all use the same validator (WP-1.3). Schemes are matched case-insensitively.
+/// Only `https://` and `quic://` accept a URL path; `udp://`, `tls://` and bare
+/// `host[:port]` targets reject one so configuration cannot pass validation and
+/// then fail when the manager builds the transport.
 pub fn validate_upstream_target(target: &str) -> Result<(), String> {
+    parse_upstream_target(target).map(|_| ())
+}
+
+/// Returns the host portion of a validated upstream target.
+///
+/// Used by `UpstreamConfig::validate` to reject hostname targets when no
+/// bootstrap resolver is configured.
+pub(crate) fn upstream_target_host(target: &str) -> Result<String, String> {
+    parse_upstream_target(target).map(|parsed| parsed.host)
+}
+
+/// A parsed upstream target. Only the host is needed outside this module;
+/// keeping the rest here means validation and host extraction share one parser.
+struct ParsedUpstreamTarget {
+    host: String,
+}
+
+fn parse_upstream_target(target: &str) -> Result<ParsedUpstreamTarget, String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("target is empty".to_string());
     }
 
-    let mut rest = target;
-    if let Some((scheme, after)) = target.split_once("://") {
-        let scheme = scheme.to_ascii_lowercase();
-        if !matches!(scheme.as_str(), "udp" | "tls" | "https" | "quic") {
-            return Err(format!(
-                "unsupported scheme '{scheme}://' (supported: udp://, tls://, https://, quic://)"
-            ));
+    let (scheme, rest) = match target.split_once("://") {
+        Some((scheme, after)) => {
+            let scheme = scheme.to_ascii_lowercase();
+            if !matches!(scheme.as_str(), "udp" | "tls" | "https" | "quic") {
+                return Err(format!(
+                    "unsupported scheme '{scheme}://' (supported: udp://, tls://, https://, quic://)"
+                ));
+            }
+            if after.is_empty() {
+                return Err("missing host".to_string());
+            }
+            (Some(scheme), after)
         }
-        if after.is_empty() {
-            return Err("missing host".to_string());
-        }
-        rest = after;
-    }
+        None => (None, target),
+    };
 
-    // Drop a URL path for DoH-style targets.
-    let authority = rest.split('/').next().unwrap_or(rest);
+    let (authority, has_path) = match rest.split_once('/') {
+        Some((authority, _path)) => (authority, true),
+        None => (rest, false),
+    };
+    if has_path && !matches!(scheme.as_deref(), Some("https" | "quic")) {
+        let kind = scheme
+            .as_deref()
+            .map_or("a plain host:port target".to_string(), |scheme| {
+                format!("{scheme}://")
+            });
+        return Err(format!(
+            "URL paths are not supported for {kind}; use https:// for DoH paths or remove the path"
+        ));
+    }
     if authority.is_empty() {
         return Err("missing host".to_string());
     }
@@ -824,10 +911,10 @@ pub fn validate_upstream_target(target: &str) -> Result<(), String> {
         }
     }
 
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(());
+    if host.parse::<std::net::IpAddr>().is_err() {
+        validate_hostname(&host)?;
     }
-    validate_hostname(&host)
+    Ok(ParsedUpstreamTarget { host })
 }
 
 /// Hostnames must be FQDN-like (at least one dot). A single-label name such as

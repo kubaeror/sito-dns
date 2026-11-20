@@ -432,6 +432,8 @@ jobs:
             scripts/test-verify-release-gate.sh \
             scripts/test-release-workflow.sh \
             scripts/test-sqlite-advisory-pin.sh \
+            scripts/test-compose-defaults.sh \
+            scripts/test-systemd-hardening.sh \
             scripts/save-bench-baseline.sh
       - name: Test AdGuard converter against the fixture
         run: |
@@ -439,6 +441,10 @@ jobs:
           python3 contrib/tests/test_adguard_to_sito.py
       - name: Test the installer end to end
         run: bash contrib/tests/test-installer.sh
+      - name: Test compose and systemd defaults
+        run: |
+          bash scripts/test-compose-defaults.sh
+          bash scripts/test-systemd-hardening.sh
       - name: Test release verification helpers
         run: |
           bash scripts/test-check-release-platforms.sh

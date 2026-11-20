@@ -1,17 +1,20 @@
 # Security Review and Threat Model (current)
 
 This document summarizes the **implemented** security controls and known
-limitations of the current development tree (**2.0.0-alpha.1**, Phase 1
-foundations) and calls out where the published stable **1.9.5** line differs.
-It replaces an earlier v1.0.0/v1.2.1 audit record whose claims had drifted from
-the code. Point-in-time audits with file/line evidence and remediation status
-live in the [historical documentation index](history/README.md); they are
-leads, not current evidence.
+limitations of the current development tree (**2.0.0-alpha.1**, Phase 2 core
+hardening; WP-2.1 through WP-2.13 are delivered) and calls out where the
+published stable **1.9.5** line differs. It replaces an earlier v1.0.0/v1.2.1
+audit record whose claims had drifted from the code. Point-in-time audits with
+file/line evidence and remediation status live in the
+[historical documentation index](history/README.md); they are leads, not
+current evidence.
 
 Current contracts:
 
-* [`docs/2.0-migration.md`](2.0-migration.md) — breaking changes and the Phase
-  1/Phase 2 boundary.
+* [`docs/2.0-migration.md`](2.0-migration.md) — breaking changes, the Phase 2
+  delivered set and the deferred Phase 3 work.
+* [`docs/2.0-claim-matrix.md`](2.0-claim-matrix.md) — current Phase 2 claims
+  mapped to code, tests and documentation.
 * [`docs/config-v2.md`](config-v2.md) — config v2 validation, unknown-key policy
   and restart-only matrix.
 * [`docs/runbook-ha.md`](runbook-ha.md#health-and-status-endpoint-semantics-wp-17)
@@ -28,18 +31,18 @@ implementation of record.
 
 | Domain | Control | Implementation |
 |---|---|---|
-| **SSRF** | Subscription schemes restricted to `http://`, `https://`, `file://`. HTTP fetches disable redirects and proxies, resolve and pin the target address, and deny loopback, RFC 1918/ULA, link-local/metadata (including CGNAT, reserved, documentation, and IPv4 embeddings via IPv4-mapped, NAT64, 6to4 and Teredo). `file://` is allowlisted to the data directory plus explicit programmatic roots, rejecting pseudo-filesystems. | `sito-filter::subscription`, `sito-core::config` |
+| **SSRF** | Subscription schemes restricted to `http://`, `https://`, `file://`. HTTP fetches disable redirects and proxies, resolve and pin the target address, and deny loopback, RFC 1918/ULA, link-local/metadata (including CGNAT, reserved, documentation, and IPv4 embeddings via IPv4-mapped, NAT64, 6to4 and Teredo). Upstream hostname bootstrap answers apply the same denylist and denied-only answers are not cached; `upstream.allow_private_targets` is the only hostname opt-in, while explicit IP literals are the documented operator allowlist path. `file://` is allowlisted to the data directory plus explicit programmatic roots, rejecting pseudo-filesystems. | `sito-filter::subscription`, `sito-core::config`, `sito-upstream::bootstrap` |
 | **ReDoS** | User regex and ABP wildcards compile to dense DFAs with hard budgets (≤ 10k patterns, ≤ 4 MiB pattern bytes, ≤ 16 KiB per pattern, ≤ 10 MiB per DFA and ≤ 60 MiB total per compiled rule set) and a bounded per-pattern fallback. Linear-time matching, no backtracking. A budget-truncated `RuleSetBuilder` result exposes `dropped_regex_patterns`, `dropped_prefix_rules`, `dropped_substring_rules` and `has_dropped_classes()`; direct callers must check them, so a partial set cannot be mistaken for a complete one. | `sito-filter::structures::compiled` |
-| **Auth timing** | Argon2id ($m=64$ MiB, $t=3$, $p=4$) for passwords; constant-time comparisons (`subtle`) for API tokens, session cookies, setup tokens and TOTP codes. Login usernames/passwords are length-capped before hashing. | `sito-api::auth` |
-| **2FA** | TOTP with replay cache, BLAKE3 (`b3:`) backup-code digests (not Argon2id), lockout and IP throttling; verification serialized so codes/backup codes are single-use under concurrency. Setup, enable, replacement and disable require a short-lived re-authentication ticket bound to the account, session and credential epoch. | `sito-api::auth::manager`, `auth::totp` |
+| **Auth timing** | Argon2id ($m=64$ MiB, $t=3$, $p=4$) for passwords; constant-time comparisons (`subtle`) for API tokens, session cookies, setup tokens and TOTP codes. Login usernames/passwords are length-capped before hashing. Concurrent hash/verify work is bounded to **4** operations (`ARGON2_MAX_CONCURRENCY`), capping the Argon2 working set at roughly 256 MiB under a login burst. The current password in login, re-auth and both change-password paths is capped at 1024 bytes before verification; TOTP/backup codes in the re-authentication and change-password paths are capped at 256 bytes and override usernames at 64 bytes. Password changes are self-service for Viewer/Operator/Admin and reuse the re-authentication path, so wrong passwords/codes share the login lockout; resetting another account requires a session-bound re-authentication ticket consumed atomically at authorization. | `sito-api::auth` |
+| **2FA** | TOTP with replay cache, BLAKE3 (`b3:`) backup-code digests (not Argon2id), lockout and IP throttling; verification serialized so codes/backup codes are single-use under concurrency. Setup, enable, replacement and disable require a short-lived re-authentication ticket bound to the account, session and credential epoch. The same session-bound ticket is required for password changes that override another account, role changes, Admin user creation and Admin-scoped token creation; self-service password changes require the current password plus TOTP when enrolled. Admin API tokens are exempt (documented in `user-management.md`). | `sito-api::auth::manager`, `auth::totp` |
 | **First boot** | One-time setup token (CSPRNG, console-printed, per-IP rate-limited) gates the wizard until setup completes; the token is not pruned while first-run is pending. The wizard is strictly bootstrap-only: after setup it returns `403` even for an Admin session, and admin password changes use the authenticated account flow. | `sito-api::auth::manager`, `sito-api::router` |
-| **CSRF / browser** | Strict same-origin `Origin`/`Referer` checks (missing origin fails closed for cookie sessions), session-bound CSRF tokens for mutating requests, `__Host-` cookies on TLS, `HttpOnly`, `SameSite=Strict`, `no-store` on auth/config responses, CSP/HSTS/X-Frame-Options/nosniff. | `sito-api::security`, `auth::session` |
+| **CSRF / browser** | Strict same-origin `Origin`/`Referer` checks (missing origin fails closed for cookie sessions), session-bound CSRF tokens for mutating requests, `__Host-` cookies on TLS, `HttpOnly`, `SameSite=Strict`, `Cache-Control: no-store` and `Vary: Cookie` on every authenticated `/api/v1/` response plus `/metrics` and `/ui/`, CSP/HSTS/X-Frame-Options/nosniff. Querylog WebSocket upgrades reject cross-origin and `Origin: null`, require a same-origin Origin for session clients, and accept credentials only from a Bearer header or cookie (never `?token=`). | `sito-api::security`, `auth::session`, `handlers::querylog` |
 | **DoS / flooding** | One shared token bucket across UDP/TCP/DoT/DoH/DoQ/DoH3, keyed by IPv4 `/24` and IPv6 `/64` and checked before reading request bodies on DoH/DoQ; per-source connection caps, handshake/request deadlines, maximum connection lifetimes, bounded QUIC windows/streams, and approximate-LRU rate-limit eviction. | `sito-transport`, `crates/sito/src/server.rs` |
 | **HA security** | mTLS with BLAKE3 certificate pinning (optional explicit insecure WS for isolated networks), constant-time shared-token check, Ed25519-signed bundles with monotonic versions, master-loss heartbeat deadline (`3 × ping_interval_secs`), applied-config digest drift detection, per-slave publish outcomes that make `/health` false on failure, 64-global/8-per-IP session admission, and a bounded signing-key identity check on state restore. | `sito-ha` |
 | **Secrets** | HA bundles strip TLS/web keys, auth hashes/tokens, RouterOS credentials and per-client shared secrets (`${SECRET:*}` placeholders where applicable; node-local values are restored on the slave). Config/users/tokens/sessions and ACME keys are written 0600 atomically. Headers and cookies are never logged. | `sito-ha::bundle`, `sito-api::config_writer`, `sito-transport::acme` |
 | **TLS/ACME readiness** | rustls-only, TLS 1.2/1.3, AEAD cipher suites, RPK/SNI certificate support, atomic certificate reload, native ACME (TLS-ALPN-01 with a bound TCP 443 listener, otherwise HTTP-01). Bootstrap certificates are 7-day self-signed placeholders and are not served unless `acme.allow_bootstrap_cert = true`; invalid, expired, or mismatched configured TLS material is a startup error. A successful issuance reloads DoT, DoH, DoQ, and DoH3. Readiness distinguishes current-with-renewal-failure (`acme_renewal_failed`, degraded), expiring within 30 days (`acme_cert_expiring`/`tls_cert_expiring`, degraded), and expired/unparseable (`acme_cert_expired`/`tls_cert_expired`, not ready); there is no self-signed fallback for an expired ACME certificate. | `sito-transport::tls`, `::acme`, `sito-api::readiness` |
 | **DNSSEC** | Fail-closed validation with trust-anchor chains, DS/DNSKEY walking, NSEC/NSEC3 denial proofs (including wildcard denial and delegation-boundary checks), algorithm/digest policy, key-cache bounds, a 5-second per-query validation deadline, CD/DO semantics and AD only for validated answers. | `sito-dnssec` |
-| **Supply chain** | `cargo deny` (advisories/bans/licenses/sources) in CI, SHA-pinned GitHub Actions, digest-pinned container bases, signed (cosign) release archives. The **installer** requires signatures by default (`SITO_REQUIRE_SIGNATURE=1`, explicit `=0` opt-out); the **self-updater** uses `server.update_require_signature = true` by default (explicit `false` opt-out). When verification runs, a signature that is present is always checked. With `required = false` and no verifier configured, the updater logs a warning and proceeds without verification; this is an explicit operator opt-out, not a silent downgrade. Release tags are gated on the required branch plus green CI/security checks, and container images are scanned and cosign-signed. | `deny.toml`, `.github/workflows`, `contrib/install.sh`, `sito-api::updater` |
+| **Supply chain** | `cargo deny` (advisories/bans/licenses/sources) in CI, SHA-pinned GitHub Actions, digest-pinned container bases, signed (cosign) release archives. The **installer** requires signatures by default (`SITO_REQUIRE_SIGNATURE=1`, explicit `=0` opt-out); the **self-updater** uses `server.update_require_signature = true` by default (explicit `false` opt-out). A signature pair that is present is always verified even when optional; a present pair without a verifier or an incomplete `.sig`/`.pem` pair is an error; only no signature assets + optional may proceed checksum-only. In-app apply is disabled on Docker and detected systemd services; the updater serializes applies, verifies the staged binary, backs up/restores the old binary, writes temp assets `0600` in a `0700` signature directory, and preserves the existing executable's mode/xattrs (including `security.capability`). The installer records an installer-owned cosign marker so `--uninstall` removes only that copy. Release tags are gated on the required branch plus green CI/security checks, and container images are scanned and cosign-signed. | `deny.toml`, `.github/workflows`, `contrib/install.sh`, `sito-api::updater` |
 | **API integrity** | Config writes run the same deep typed-section validation as startup, invalid configs are rejected before persisting, restart-only writes return 409 and persist nothing, restore archives are decompression-capped, unknown keys are rejected everywhere except the explicit migration flag, tokens expire by default (90 days), deleting a user revokes sessions. `/metrics` requires a Viewer-or-higher token or session by default (`web.metrics_auth = true`). | `sito-api::config_validation`, `config_apply`, `handlers::config`, `auth::manager`, `handlers::metrics` |
 | **Health/status split** | `/health` is generic (`200`/`503` only) and leaks no setup state, component names, reasons, paths or configuration values. Authenticated `GET /api/v1/status` carries `ready`/`reasons[]`; `GET /api/v1/ha/status` carries the detailed HA reason. A stats outage is advisory and never makes DNS unhealthy. | `sito-api::readiness`, `handlers::status`, `handlers::ha` |
 
@@ -57,16 +60,20 @@ implementation of record.
 * **Compromised client identity claims:** DoH path segments and DoT/DoQ SNI
   only identify a client when they match a configured shared secret; filter
   `$client=` matching uses only registry-resolved identity.
-* **First-boot exposure:** the web UI binds `0.0.0.0:8080` during setup but no
-  DNS listener is bound and the wizard is token-gated. Operators exposing the
-  setup endpoint beyond a trusted network should treat the printed token as
-  the only credential until setup completes.
+* **First-boot exposure:** during setup no DNS listener is bound and the wizard
+  is token-gated. The 1.9.5 line binds the setup panel on `0.0.0.0:8080`; the
+  2.0 config-v2 safe default is `web.bind = "127.0.0.1"`. The shipped Compose
+  file publishes the admin port only on loopback either way. Operators
+  exposing the setup endpoint beyond a trusted network should treat the printed
+  token as the only credential until setup completes.
 * **Container isolation:** images run as nonroot (uid/gid 65532) with
-  `NET_BIND_SERVICE` required for ports < 1024; `/var/lib/sito` and `/etc/sito`
-  are owned by that uid so fresh named volumes are writable. Docker's `ports`
-  mapping controls host exposure; keep `web.bind = "0.0.0.0"` inside the
-  container and publish the admin port only on loopback
-  (`-p 127.0.0.1:8080:8080`).
+  `NET_BIND_SERVICE` required for ports < 1024. Compose adds
+  `no-new-privileges`, a read-only root filesystem and a small `/tmp` tmpfs;
+  `/etc/sito` is the named `sito-config` volume and `/var/lib/sito` the named
+  data volume, both initialised with uid/gid 65532. HA bind mounts still need
+  `chown 65532:65532` on config and certificate directories, with keys `0600`.
+  Docker's `ports` mapping controls host exposure; publish the admin port only
+  on loopback (`127.0.0.1:8080:8080`).
 
 ---
 
@@ -92,10 +99,9 @@ the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
 
 ## 4. Known accepted limitations
 
-* The deprecated `?token=` query parameter is accepted **only** on the
-  WebSocket upgrade when no `Authorization` header is present, logs a warning,
-  and is scheduled for removal in 2.0. Use `Authorization` headers or
-  `__Host-` session cookies.
+* Query-string credentials are not accepted. The querylog WebSocket upgrade
+  requires an `Authorization: Bearer` header or the `__Host-` session cookie
+  (BC-8); `?token=` is ignored and an unauthenticated upgrade is rejected.
 * Rate-limiting budgets are enforced per network prefix (IPv4 `/24`, IPv6
   `/64`), not per authenticated account.
 * The account lockout map is bounded at 10,000 entries. If every entry is an
@@ -109,11 +115,22 @@ the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
   proofs are incomplete are treated as `Bogus` (fail closed) rather than
   downgraded to `Insecure`.
 * Self-update under systemd requires running `sito update` as root with the
-  service stopped (the unit keeps `ProtectSystem=strict`).
+  service stopped (the unit keeps `ProtectSystem=strict`). The updater writes a
+  temporary executable next to the target, copies the existing mode and xattrs
+  (including `security.capability`), then renames; a missing attribute or
+  failed rename aborts and removes the temp file. The installer backs up the
+  config only after stopping the service and restores it with temp-file +
+  rename. `setcap`/`getcap` problems are printed as warnings rather than
+  swallowed.
 * Statistics retention and rollup privacy (P1-19/P1-23/P1-24) now use keyed
   rollup hashes, rollup retention, clear/vacuum, optional query-log totals,
-  cached dashboard aggregates, and bounded retention chunks. See the
-  [1.9.4 release notes](release-notes-1.9.4.md#stats-privacy-retention-and-polling).
+  bounded retention chunks, and a 30 s cached dashboard aggregate. Query-log
+  anonymization remains forward-only: enabling `privacy.anonymize_querylog`
+  masks new rows but does not rewrite existing detailed rows (a documented
+  residual). See the
+  [1.9.4 release notes](release-notes-1.9.4.md#stats-privacy-retention-and-polling)
+  and the WP-2.12 status in
+  [`docs/audit6-followup-plan.md`](audit6-followup-plan.md#wp-212--stats-retention-pii-and-polling).
 * RouterOS integration is experimental/niche and is not part of the core
   security posture. It now lives in the optional `sito-routeros` crate and is
   absent from the default build. If enabled, only a verified `https://` lease

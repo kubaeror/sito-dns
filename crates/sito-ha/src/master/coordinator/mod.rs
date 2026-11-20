@@ -25,14 +25,14 @@ use tracing::{debug, error, info, warn};
 
 use sito_stats::MetricsRegistry;
 
-use crate::bundle::{ConfigBundle, build_and_sign_push};
+use crate::bundle::{ConfigBundle, build_and_sign_push, seal_bundle_identity};
 use crate::config::HaConfig;
 use crate::crypto::Ed25519SigningKey;
 use crate::error::HaError;
 use crate::master::tracker::{ActiveSlave, SlaveStatsSummary, SlaveSummary};
 use crate::protocol::{AckConflict, HaMessage};
 use crate::readiness::{HaReadiness, HaReadinessState};
-use crate::session::{frame_text, send_ha_message, wire_size};
+use crate::session::{frame_text, send_frame, send_ha_message, wire_size};
 use crate::transport::{MAX_WS_MESSAGE_SIZE, build_server_tls_config, ws_config};
 
 pub use sito_ha_types::status::{PublishOutcome, ResyncOutcome};
@@ -46,13 +46,21 @@ pub use sito_ha_types::status::{PublishOutcome, ResyncOutcome};
 pub const MAX_PUBLISH_HISTORY: usize = 64;
 
 /// Maximum bytes queued for one slave before the master falls back to
-/// coalesced delivery.
+/// coalesced delivery (4 MiB, i.e. four maximum-size 1 MiB messages).
 ///
 /// The channel capacity alone bounds the number of queued pushes, not their
 /// size: with 1 MiB bundles a slow peer could otherwise pin tens of MiB.
+/// A send that cannot fit this budget is deferred through the coalesced
+/// fallback, which delivers only the latest active bundle when the channel has
+/// room.
 pub const MAX_SLAVE_QUEUE_BYTES: usize = MAX_WS_MESSAGE_SIZE * 4;
 
-/// Maximum concurrently unauthenticated/active handshake slots per source IP.
+/// Maximum concurrently admitted/handshaking HA sessions per source IP.
+///
+/// The permit is held for the whole WebSocket session (not only the handshake
+/// upgrade), so one source cannot consume the global 64-session budget with
+/// idle authenticated sessions. A rejected peer's slot is released when its
+/// connection closes.
 const MAX_HANDSHAKES_PER_IP: usize = 8;
 
 /// Identifies one slave session for queue accounting.
@@ -75,14 +83,15 @@ struct PublishedEnvelope {
     payload_hash: String,
 }
 
-/// On-disk master state.
+/// On-disk master state for HA protocol v2.
 ///
-/// `ConfigBundle` is flattened so files written by 1.9.3 (a bare bundle JSON
-/// document) still deserialize. New writes add the signing-key identity; an
-/// older reader ignores the unknown top-level field.
+/// The bundle is nested instead of flattened so a v1 binary (which expects a
+/// bare `ConfigBundle` at the top level) fails with missing fields instead of
+/// silently reading v2 state. `protocol_version` is required and checked on
+/// restore; v1 files are rejected with an actionable `protocol_mismatch`.
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedMasterState {
-    #[serde(flatten)]
+    protocol_version: u32,
     bundle: ConfigBundle,
     /// Hex Ed25519 public key that signed the persisted bundle/state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,8 +138,9 @@ struct Divergence {
 /// Per-IP accounting for accepted HA connections.
 ///
 /// The global connection semaphore bounds total slots, but a single source
-/// could still consume all of them before authenticating. This budget makes
-/// the unauthenticated handshake/session surface per-IP as well.
+/// could still consume all of them before authenticating. This budget bounds
+/// concurrent sessions per IP; the permit is held for the whole session, so it
+/// limits authenticated idle sessions too, not only the handshake window.
 #[derive(Debug, Default)]
 struct HandshakeBudget {
     active: Mutex<HashMap<IpAddr, usize>>,

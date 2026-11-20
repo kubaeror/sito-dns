@@ -902,6 +902,20 @@ pub struct PerDomainUpstream {
     pub servers: Vec<String>,
 }
 
+/// Largest accepted `upstream.timeout_ms` (60 seconds).
+///
+/// The timeout is the overall budget for one logical resolve. A larger value
+/// lets one stalled upstream hold the query pipeline (and its tasks) for an
+/// unbounded time, so configuration is rejected instead of silently accepting
+/// an effectively disabled timeout.
+pub const MAX_UPSTREAM_TIMEOUT_MS: u64 = 60_000;
+
+/// Largest accepted `upstream.pool_size` (64 connections per endpoint).
+///
+/// Each pooled connection is a live TLS/TCP socket; an unbounded pool would let
+/// a typo exhaust file descriptors and memory on every configured upstream.
+pub const MAX_UPSTREAM_POOL_SIZE: usize = 64;
+
 /// Upstream resolvers and forwarding configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -996,10 +1010,28 @@ impl UpstreamConfig {
                 "timeout_ms must be greater than 0",
             ));
         }
+        if self.timeout_ms > MAX_UPSTREAM_TIMEOUT_MS {
+            return Err(ConfigError::validation(
+                "upstream.timeout_ms",
+                format!(
+                    "timeout_ms must be at most {MAX_UPSTREAM_TIMEOUT_MS} (got {}); a larger budget lets one stalled upstream hold the query pipeline indefinitely",
+                    self.timeout_ms
+                ),
+            ));
+        }
         if self.pool_size == 0 {
             return Err(ConfigError::validation(
                 "upstream.pool_size",
                 "pool_size must be greater than 0",
+            ));
+        }
+        if self.pool_size > MAX_UPSTREAM_POOL_SIZE {
+            return Err(ConfigError::validation(
+                "upstream.pool_size",
+                format!(
+                    "pool_size must be at most {MAX_UPSTREAM_POOL_SIZE} (got {})",
+                    self.pool_size
+                ),
             ));
         }
         let probe_domain = self.probe_domain.trim();
@@ -1021,7 +1053,25 @@ impl UpstreamConfig {
             )
         })?;
 
+        // Target validation lives here (not only in `Config::validate_full`) so
+        // direct callers — the API DTO, restore and tests — get the same rules.
+        let bootstrap_configured = !self.bootstrap.is_empty();
+        for (index, server) in self.servers.iter().enumerate() {
+            Self::validate_target(
+                server,
+                &format!("upstream.servers[{index}]"),
+                bootstrap_configured,
+            )?;
+        }
+
         for (i, rule) in self.per_domain.iter().enumerate() {
+            for (server_index, server) in rule.servers.iter().enumerate() {
+                Self::validate_target(
+                    server,
+                    &format!("upstream.per_domain[{i}].servers[{server_index}]"),
+                    bootstrap_configured,
+                )?;
+            }
             if rule.domains.iter().all(|d| d.trim().is_empty()) {
                 return Err(ConfigError::validation(
                     format!("upstream.per_domain[{i}].domains"),
@@ -1034,6 +1084,32 @@ impl UpstreamConfig {
                     "per-domain rule must list at least one non-empty upstream server",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Validates one configured target and enforces the bootstrap requirement
+    /// for hostname-based upstreams.
+    fn validate_target(
+        server: &str,
+        field: &str,
+        bootstrap_configured: bool,
+    ) -> Result<(), ConfigError> {
+        let host = super::validate::upstream_target_host(server).map_err(|reason| {
+            ConfigError::cross_section(
+                field,
+                format!("invalid upstream target '{server}': {reason}"),
+            )
+        })?;
+        if !bootstrap_configured && host.parse::<IpAddr>().is_err() {
+            return Err(ConfigError::validation(
+                "upstream.bootstrap",
+                format!(
+                    "upstream target '{server}' is a hostname but upstream.bootstrap is empty; \
+                     add at least one bootstrap resolver IP (for example bootstrap = [\"9.9.9.9\"]) \
+                     or use an IP literal"
+                ),
+            ));
         }
         Ok(())
     }
@@ -1136,6 +1212,17 @@ impl<'de> Deserialize<'de> for BlockingMode {
     }
 }
 
+/// Maximum accepted refresh interval in hours (one year).
+///
+/// Applies to `filtering.refresh_interval_hours`,
+/// `filtering.lists[].refresh_hours` and the `[integrations.lists]` default and
+/// per-category refresh values. The schedulers convert hours to a
+/// [`std::time::Duration`] and add it to an [`std::time::Instant`]. Both config
+/// validation and the runtime interval helpers reject or clamp to this cap so
+/// an enormous value cannot overflow that arithmetic (or make a refresh
+/// deadline unreachable).
+pub const MAX_REFRESH_HOURS: u64 = 8760;
+
 /// A filter list definition to download and compile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1146,7 +1233,8 @@ pub struct FilterListConfig {
     pub enabled: bool,
     /// Per-list refresh interval in hours. When unset, the global
     /// `FilteringConfig.refresh_interval_hours` is used. Must be greater than
-    /// 0 when set; the scheduler would otherwise silently clamp it to 1 hour.
+    /// 0 and at most [`MAX_REFRESH_HOURS`] when set; the scheduler would
+    /// otherwise silently clamp it.
     #[serde(default)]
     pub refresh_hours: Option<u64>,
 }
@@ -1157,6 +1245,9 @@ pub struct FilterListConfig {
 pub struct FilteringConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Interval between automated list re-downloads in hours.
+    ///
+    /// Must be greater than 0 and at most [`MAX_REFRESH_HOURS`] (one year).
     #[serde(default = "default_filtering_refresh_interval_hours")]
     pub refresh_interval_hours: u64,
     #[serde(default)]
@@ -1243,6 +1334,15 @@ impl FilteringConfig {
                 "refresh_interval_hours must be greater than 0",
             ));
         }
+        if self.refresh_interval_hours > MAX_REFRESH_HOURS {
+            return Err(ConfigError::validation(
+                "filtering.refresh_interval_hours",
+                format!(
+                    "refresh_interval_hours must be at most {MAX_REFRESH_HOURS} hours (one year), got {}",
+                    self.refresh_interval_hours
+                ),
+            ));
+        }
         if self.max_rules == 0 {
             return Err(ConfigError::validation(
                 "filtering.max_rules",
@@ -1294,11 +1394,21 @@ impl FilteringConfig {
                     "filter list URL must use http://, https://, or file:// scheme",
                 ));
             }
-            if list.refresh_hours == Some(0) {
-                return Err(ConfigError::validation(
-                    format!("filtering.lists[{i}].refresh_hours"),
-                    "refresh_hours must be greater than 0 when set (omit it to use filtering.refresh_interval_hours)",
-                ));
+            if let Some(hours) = list.refresh_hours {
+                if hours == 0 {
+                    return Err(ConfigError::validation(
+                        format!("filtering.lists[{i}].refresh_hours"),
+                        "refresh_hours must be greater than 0 when set (omit it to use filtering.refresh_interval_hours)",
+                    ));
+                }
+                if hours > MAX_REFRESH_HOURS {
+                    return Err(ConfigError::validation(
+                        format!("filtering.lists[{i}].refresh_hours"),
+                        format!(
+                            "refresh_hours must be at most {MAX_REFRESH_HOURS} hours (one year) when set, got {hours}"
+                        ),
+                    ));
+                }
             }
         }
         match self.anti_doh_bypass.as_str() {

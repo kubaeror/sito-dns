@@ -83,7 +83,8 @@ fn resync_slave(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "HA",
 )]
 pub async fn get_ha_status(
     _admin: RequireAdmin,
@@ -171,7 +172,8 @@ pub async fn get_ha_status(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "HA",
 )]
 pub async fn get_ha_slaves(
     _admin: RequireAdmin,
@@ -200,7 +202,8 @@ pub async fn get_ha_slaves(
         (status = 429, description = "A resync is already queued", body = ProblemDetails),
         (status = 503, description = "HA replication is not active or the resync could not be queued", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "HA",
 )]
 pub async fn trigger_ha_resync(
     _admin: RequireAdmin,
@@ -242,6 +245,9 @@ mod tests {
 
     fn test_bundle(version: u64) -> sito_ha::ConfigBundle {
         sito_ha::ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
+            protocol_version: sito_ha::PROTOCOL_VERSION,
             version,
             term: 0,
             timestamp: 1,

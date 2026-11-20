@@ -28,13 +28,19 @@ impl PipelineContext<'_> {
         let upstream_start = std::time::Instant::now();
         match self
             .effective_upstream
-            .resolve_with_upstream(&upstream_query)
+            .resolve_with_attempts(&upstream_query)
             .await
         {
-            Ok((mut upstream_resp, upstream_name)) => {
-                if let Some(ref m) = pipeline.metrics {
-                    m.observe_upstream_rtt(&upstream_name, upstream_start.elapsed().as_secs_f64());
-                    m.set_upstream_health(&upstream_name, 1.0);
+            Ok((mut upstream_resp, upstream_name, attempts)) => {
+                if !policy.ignore_stats
+                    && let Some(ref m) = pipeline.metrics
+                {
+                    record_resolution_metrics(
+                        m,
+                        &upstream_name,
+                        upstream_start.elapsed(),
+                        &attempts,
+                    );
                 }
                 upstream_resp.metadata.id = query_id;
 
@@ -48,6 +54,7 @@ impl PipelineContext<'_> {
                         &domain_str,
                         qtype,
                         "upstream",
+                        policy.ignore_stats,
                     )
                 {
                     return outcome;
@@ -79,19 +86,9 @@ impl PipelineContext<'_> {
                     );
                 }
 
-                // DNSSEC validation
-                let dnssec_outcome = self
-                    .validate_upstream_response(&mut upstream_resp, &upstream_name)
-                    .await;
-                let dnssec_str = dnssec_outcome
-                    .as_ref()
-                    .map(sito_dnssec::ValidationOutcome::as_str);
-                let cache_status = validation_status(dnssec_outcome.as_ref());
-
-                // Shape before caching so the stored entry never carries
-                // upstream-only EDNS options; a DO=0 client never receives
-                // DNSSEC records and the stripped form is what is cached.
-                self.shape_and_insert(&mut upstream_resp, cache_status)
+                // DNSSEC validation, shaping, and cache insertion.
+                let dnssec_str = self
+                    .validate_and_cache_upstream(&mut upstream_resp, &upstream_name)
                     .await;
 
                 QueryOutcome {
@@ -113,12 +110,10 @@ impl PipelineContext<'_> {
                     error = %e,
                     "Upstream resolution failed"
                 );
-                if let Some(ref m) = pipeline.metrics {
-                    let label = e.upstream.as_deref().unwrap_or("unattributed");
-                    m.inc_upstream_errors(label, e.kind());
-                    if e.upstream.is_some() {
-                        m.set_upstream_health(label, 0.0);
-                    }
+                if !policy.ignore_stats
+                    && let Some(ref m) = pipeline.metrics
+                {
+                    record_failure_metrics(m, &e);
                 }
 
                 if self.cache_enabled
@@ -140,6 +135,7 @@ impl PipelineContext<'_> {
                                 &domain_str,
                                 qtype,
                                 "stale_cache",
+                                policy.ignore_stats,
                             )
                         {
                             return outcome;
@@ -171,7 +167,9 @@ impl PipelineContext<'_> {
                             qname = %qname,
                             "Upstream failed, serving stale cached response (RFC 8767)"
                         );
-                        if let Some(ref m) = pipeline.metrics {
+                        if !policy.ignore_stats
+                            && let Some(ref m) = pipeline.metrics
+                        {
                             m.inc_cache_stale_served();
                         }
                         ResponseShaper::shape_with_payload(
@@ -202,5 +200,59 @@ impl PipelineContext<'_> {
                 QueryOutcome::servfail(query, domain_str, qtype)
             }
         }
+    }
+}
+
+/// Records a successful resolution: per attempt when the manager reported
+/// them, or the historical single winner sample as a compatibility fallback.
+fn record_resolution_metrics(
+    metrics: &sito_stats::MetricsRegistry,
+    upstream: &str,
+    elapsed: std::time::Duration,
+    attempts: &[sito_upstream::UpstreamAttempt],
+) {
+    if attempts.is_empty() {
+        metrics.observe_upstream_rtt(upstream, elapsed.as_secs_f64());
+        metrics.set_upstream_health(upstream, 1.0);
+    } else {
+        for attempt in attempts {
+            record_upstream_attempt(metrics, attempt);
+        }
+    }
+}
+
+/// Records a failed resolution: per attempt when available, otherwise the
+/// attributed final error (or the constant `unattributed` label).
+fn record_failure_metrics(
+    metrics: &sito_stats::MetricsRegistry,
+    error: &sito_upstream::UpstreamQueryError,
+) {
+    if error.attempts.is_empty() {
+        let label = error.upstream.as_deref().unwrap_or("unattributed");
+        metrics.inc_upstream_errors(label, error.kind());
+        if error.upstream.is_some() {
+            metrics.set_upstream_health(label, 0.0);
+        }
+    } else {
+        for attempt in &error.attempts {
+            record_upstream_attempt(metrics, attempt);
+        }
+    }
+}
+
+/// Emits one candidate attempt: its own RTT, error kind (if any) and health.
+///
+/// Failed-attempt time is therefore never included in the winner's RTT.
+fn record_upstream_attempt(
+    metrics: &sito_stats::MetricsRegistry,
+    attempt: &sito_upstream::UpstreamAttempt,
+) {
+    metrics.observe_upstream_rtt(&attempt.name, attempt.rtt.as_secs_f64());
+    match attempt.error_kind() {
+        Some(kind) => {
+            metrics.inc_upstream_errors(&attempt.name, kind);
+            metrics.set_upstream_health(&attempt.name, 0.0);
+        }
+        None => metrics.set_upstream_health(&attempt.name, 1.0),
     }
 }

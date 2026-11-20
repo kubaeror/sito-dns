@@ -15,10 +15,11 @@ pub struct QueryLogParams {
     pub qtype: Option<String>,
 }
 
-pub(crate) async fn fetch_query_rows(
-    ctx: &ServerContext,
-    p: &QueryLogParams,
-) -> Vec<QueryLogRowItem> {
+/// Builds the query-log filter used by the live UI refresh.
+///
+/// Exposed to the tests so a regression cannot silently re-enable the
+/// `COUNT(*)` on every poll; the 3 s HTMX refresh must not run it.
+pub(crate) fn live_query_log_filter(p: &QueryLogParams) -> QueryLogFilter {
     let qtype_num = p.qtype.as_deref().and_then(|s| {
         if s == "all" || s.is_empty() {
             None
@@ -35,7 +36,7 @@ pub(crate) async fn fetch_query_rows(
         }
     });
 
-    let filter = QueryLogFilter {
+    QueryLogFilter {
         client: p.client.clone().filter(|s| !s.is_empty()),
         domain: p.domain.clone().filter(|s| !s.is_empty()),
         status: status_filter,
@@ -46,7 +47,14 @@ pub(crate) async fn fetch_query_rows(
         limit: Some(50),
         // Live 3 s polling must not run a filtered COUNT(*) over query_log.
         include_total: Some(false),
-    };
+    }
+}
+
+pub(crate) async fn fetch_query_rows(
+    ctx: &ServerContext,
+    p: &QueryLogParams,
+) -> Vec<QueryLogRowItem> {
+    let filter = live_query_log_filter(p);
 
     let page_res = ctx.stats_db.query_logs(&filter).await;
     let entries = match page_res {

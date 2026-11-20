@@ -179,6 +179,7 @@ impl MasterCoordinator {
             return Ok(None);
         };
         let state = PersistedMasterState {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             bundle: bundle.clone(),
             signing_key_pubkey: Some(self.signing_key.public_key_hex()),
         };
@@ -243,6 +244,31 @@ impl MasterCoordinator {
         let state: PersistedMasterState = match serde_json::from_str(&data) {
             Ok(state) => state,
             Err(e) => {
+                // A v1 state file is a bare flattened bundle. Do not silently
+                // back it up and restart the sequence at version 0: make the
+                // protocol break explicit so the operator can migrate/restore.
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if value.get("bundle").is_some() {
+                        return Err(HaError::Validation {
+                            field: "ha_protocol_version".to_string(),
+                            reason: format!(
+                                "protocol_mismatch: HA state at {} is missing the protocol v{} signed identity fields (config_digest/signing_key_fingerprint); restore a current state file/backup or re-enroll every slave after an explicit version promotion",
+                                path.display(),
+                                crate::protocol::PROTOCOL_VERSION
+                            ),
+                        });
+                    }
+                    if value.get("version").is_some() || value.get("config_toml").is_some() {
+                        return Err(HaError::Validation {
+                            field: "ha_protocol_version".to_string(),
+                            reason: format!(
+                                "protocol_mismatch: HA state at {} uses the v1 format (no protocol_version/bundle wrapper); this node requires HA protocol v{}. Restore a v2 state file/backup or re-enroll every slave after an explicit version promotion",
+                                path.display(),
+                                crate::protocol::PROTOCOL_VERSION
+                            ),
+                        });
+                    }
+                }
                 let backup = path.with_extension(format!("corrupt.{}", Utc::now().timestamp()));
                 if let Err(rename_err) = std::fs::rename(&path, &backup) {
                     warn!(error = %rename_err, "Failed to move corrupt HA state aside");
@@ -255,6 +281,28 @@ impl MasterCoordinator {
                 return Ok(None);
             }
         };
+        if state.protocol_version != crate::protocol::PROTOCOL_VERSION {
+            return Err(HaError::Validation {
+                field: "ha_protocol_version".to_string(),
+                reason: format!(
+                    "protocol_mismatch: HA state at {} was written by protocol v{} but this node requires v{}; restore a matching state file/backup",
+                    path.display(),
+                    state.protocol_version,
+                    crate::protocol::PROTOCOL_VERSION
+                ),
+            });
+        }
+        if state.bundle.protocol_version != state.protocol_version {
+            return Err(HaError::Validation {
+                field: "ha_protocol_version".to_string(),
+                reason: format!(
+                    "protocol_mismatch: HA state at {} declares protocol v{} but its bundle declares v{}",
+                    path.display(),
+                    state.protocol_version,
+                    state.bundle.protocol_version
+                ),
+            });
+        }
         if let Some(expected) = state.signing_key_pubkey {
             let actual = self.signing_key.public_key_hex();
             if expected != actual {
@@ -296,6 +344,9 @@ impl MasterCoordinator {
         // client secrets; strip them before signing/broadcasting.
         let mut bundle = bundle;
         bundle.strip_structured_secrets();
+        // Upgrade/repair the persisted identity: the state file must name the
+        // key and digest that the restored push actually carries.
+        crate::bundle::seal_bundle_identity(&mut bundle, &self.signing_key.public_key());
         let push = build_and_sign_push(&bundle, &self.signing_key)?;
         Self::ensure_push_fits(&push)?;
         self.current_version.store(bundle.version, Ordering::SeqCst);

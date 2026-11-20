@@ -151,7 +151,8 @@ pub fn parse_window_ms(window: Option<&str>) -> Result<i64, ProblemDetails> {
         (status = 429, description = "Rate limited", body = ProblemDetails,
             headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
-    tag = "Stats"
+    tag = "Stats",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_stats(
     viewer: RequireViewer,
@@ -183,7 +184,8 @@ pub async fn get_stats(
         (status = 429, description = "Rate limited", body = ProblemDetails,
             headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
-    tag = "Stats"
+    tag = "Stats",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_client_stats(
     viewer: RequireViewer,
@@ -220,7 +222,8 @@ pub async fn get_client_stats(
         (status = 429, description = "Rate limited", body = ProblemDetails,
             headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
-    tag = "Stats"
+    tag = "Stats",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_upstream_stats(
     viewer: RequireViewer,

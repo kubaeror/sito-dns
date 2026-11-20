@@ -458,7 +458,7 @@ schedule = "0 0 15-21 * * MON-FRI"   # sec min hour dom mon dow
 | YouTube | `restrict.youtube.com` or `restrictmoderate.youtube.com` (UI choice) |
 | DuckDuckGo | `safe.duckduckgo.com` |
 
-Implemented as system `$dnsrewrite` entries with highest priority, hidden from the rule editor (separate UI tab).
+Implemented as system rewrites evaluated at stage 4, after `$important`, local rewrites, and standard/parental/service blocking. They are not shown in the rule editor and there is no separate safe-search UI tab; safe search is a per-group toggle (`clients.groups.<name>.safe_search`). Provider targets such as `safe.duckduckgo.com` resolve normally and are never rewritten to themselves.
 
 ### 9.4 Parental control
 

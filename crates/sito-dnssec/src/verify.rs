@@ -398,10 +398,10 @@ impl DnssecValidator {
     /// Validates a response, resolving missing DNSKEY/DS records through the
     /// fetcher when the in-response chain is incomplete.
     ///
-    /// The synchronous chain walk runs first. Only an `Indeterminate` result
-    /// (signatures verified but not linked to an anchor) triggers network
-    /// fetches, bounded to a small per-query budget; fetched records are
-    /// appended temporarily for validation and removed again.
+    /// This compatibility wrapper applies [`DEFAULT_KEY_FETCH_DEADLINE`] as a
+    /// bounded per-query deadline. Callers that already have an absolute
+    /// per-query deadline should call
+    /// [`Self::validate_with_key_fetcher_deadline`] instead.
     pub async fn validate_with_key_fetcher(
         &self,
         response: &mut Message,
@@ -409,11 +409,40 @@ impl DnssecValidator {
         now: u32,
         fetcher: &dyn DnssecKeyFetcher,
     ) -> ValidationOutcome {
+        let deadline = Instant::now() + DEFAULT_KEY_FETCH_DEADLINE;
+        self.validate_with_key_fetcher_deadline(response, upstream, now, fetcher, deadline)
+            .await
+    }
+
+    /// Validates a response under an absolute deadline shared by every key
+    /// fetch made for the query.
+    ///
+    /// The synchronous chain walk runs first. Only an `Indeterminate` result
+    /// (signatures verified but not linked to an anchor) triggers network
+    /// fetches, bounded to a small per-query budget; fetched records are
+    /// appended temporarily for validation and removed again. Every fetch is
+    /// passed `deadline`, so a stalled upstream cannot extend the query past
+    /// its budget.
+    pub async fn validate_with_key_fetcher_deadline(
+        &self,
+        response: &mut Message,
+        upstream: Option<&str>,
+        now: u32,
+        fetcher: &dyn DnssecKeyFetcher,
+        deadline: Instant,
+    ) -> ValidationOutcome {
         // A response without RRSIGs is either a stripped-signature downgrade
         // or a legitimate unsigned delegation. Probe the delegation status
         // regardless of prior signed-zone evidence: only an authenticated DS
         // denial may downgrade it to Insecure, otherwise `validate_response`
         // keeps the fail-closed Bogus decision.
+        // One fetch budget covers every DS/DNSKEY lookup this query makes:
+        // the early CNAME probes, every cold-start signer walk and the
+        // post-fetch probes all draw from it, so a probe fan-out can only
+        // shorten the walk that follows. The deadline is the caller's own
+        // absolute bound, never a fresh per-probe timeout.
+        let mut chain =
+            TrustChain::with_metrics(deadline, MAX_FETCHES_PER_QUERY, Arc::clone(&self.metrics));
         let mut probe_failed = false;
         let mut budget_exhausted = false;
         let mut has_rrsigs = true;
@@ -449,7 +478,7 @@ impl DnssecValidator {
                         budget_exhausted = true;
                         break;
                     }
-                    match self.prepare_unsigned_response(&lower, fetcher, now).await {
+                    match chain.probe_unsigned(self, fetcher, &lower, now).await {
                         UnsignedProbe::Covered => {}
                         UnsignedProbe::Probed => probes += 1,
                         UnsignedProbe::Failed => {
@@ -517,27 +546,13 @@ impl DnssecValidator {
             return self.indeterminate_outcome(response, upstream);
         }
 
-        let anchors = self.trust_anchors.load();
-        let mut visited = HashSet::new();
+        // The shared budget was sized for the largest old per-signer allowance
+        // (`MAX_SIGNER_CHAIN_FETCHES`) plus the bounded CNAME probe share, so
+        // reaching the root from any signer still fits. Multi-signer responses
+        // cannot multiply cold-start fetch work: every signer draws from the
+        // same budget the probes already used.
         for signer in signers.iter().take(4) {
-            // Reaching the root costs one DNSKEY lookup per label plus one DS
-            // lookup per non-root level; a fixed budget of 6 could not reach
-            // the root from a signer with three or more labels, leaving
-            // otherwise valid zones Indeterminate on a cold cache.
-            let mut budget = signer
-                .num_labels()
-                .saturating_mul(2)
-                .saturating_add(1)
-                .min(31);
-            let _ = fetch_zone_chain(
-                &anchors,
-                fetcher,
-                signer,
-                &mut budget,
-                &mut visited,
-                response,
-            )
-            .await;
+            let _ = chain.fetch_path(self, fetcher, signer, response).await;
         }
 
         // This is the post-fetch pass: the "relevant RRSIG is present but not
@@ -580,7 +595,7 @@ impl DnssecValidator {
                         post_budget_exhausted = true;
                         break;
                     }
-                    match self.prepare_unsigned_response(&lower, fetcher, now).await {
+                    match chain.probe_unsigned(self, fetcher, &lower, now).await {
                         UnsignedProbe::Covered => {}
                         UnsignedProbe::Probed => probes += 1,
                         UnsignedProbe::Failed => {
@@ -875,9 +890,11 @@ impl DnssecValidator {
     /// result is converted to the same fail-closed outcome
     /// [`Self::validate_with_key_fetcher`] produces after its fetch: Bogus with
     /// SERVFAIL and no answer. Direct library callers that want to try the
-    /// chain walk must use [`Self::validate_with_key_fetcher`]; callers that
-    /// intentionally serve unvalidated data use [`DnssecMode::LogOnly`], which
-    /// keeps `Indeterminate` with AD=0.
+    /// chain walk must use [`Self::validate_with_key_fetcher`], or
+    /// [`Self::validate_with_key_fetcher_deadline`] when they already have an
+    /// absolute per-query deadline; callers that intentionally serve
+    /// unvalidated data use [`DnssecMode::LogOnly`], which keeps
+    /// `Indeterminate` with AD=0.
     ///
     /// `validate_response_inner` returns `Indeterminate` provisionally so the
     /// chain-walking caller can still fetch keys. This entry point is the

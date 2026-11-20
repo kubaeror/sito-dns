@@ -5,10 +5,27 @@
 //! Hot-path metrics inter their label values (`proto`, `verdict`, `upstream`,
 //! `method`, ...) into dense integer ids once and keep the counters in
 //! `RwLock` maps of atomics, so a per-query observation performs no `String`
-//! allocation and never takes a global exclusive lock. Rendering is the only
+//! allocation and never takes a *global* exclusive lock. Rendering is the only
 //! place that materializes label strings and it sorts them, keeping the
 //! exposition output byte-for-byte equivalent to the previous `BTreeMap`
 //! implementation.
+//!
+//! Latency histograms are the one exception to lock-free updates: each
+//! interned label (verdict for `sito_query_duration_seconds`, upstream for
+//! `sito_upstream_rtt_seconds`) owns a small [`HistogramState`] behind its own
+//! mutex (P2-62). The hot `allowed` path therefore serializes only with other
+//! queries that share that verdict, not with cache/upstream/filter metrics or
+//! other labels. The critical section is a fixed 14-bucket compare-and-add loop
+//! and is never held across I/O, formatting or rendering. Both histogram maps
+//! are read-mostly `RwLock`s: the write lock is taken only when a label is
+//! first observed, and the label sets are bounded (verdicts are a closed set;
+//! upstream labels pass through the same bounded interner as the other metric
+//! families). Sharding by label would add memory/indirection without removing
+//! the per-label serialization that the exposition requires, so the per-label
+//! mutex is kept deliberately. `metrics_bench` records the single-threaded
+//! per-update cost of `observe_query_duration("allowed", ...)`; the actual
+//! contention evidence is `test_histogram_concurrent_updates_are_not_lost`,
+//! which pins losslessness for same-label writers.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -83,6 +100,16 @@ struct InternerState {
 const MAX_INTERNER_LABELS: usize = 4_096;
 /// Label value used once [`MAX_INTERNER_LABELS`] is reached.
 const INTERNER_OVERFLOW_LABEL: &str = "__other__";
+
+/// Maximum distinct upstream labels in `sito_dnssec_bogus_total`.
+///
+/// Upstream names come from configuration, but a bug or a future dynamically
+/// named upstream source must not be able to grow this standalone map without
+/// bound. New labels beyond the cap are collapsed into
+/// [`DNSSEC_BOGUS_OVERFLOW_LABEL`] so the total observation count is kept.
+const MAX_DNSSEC_BOGUS_UPSTREAMS: usize = 256;
+/// Upstream label used for `sito_dnssec_bogus_total` overflow.
+const DNSSEC_BOGUS_OVERFLOW_LABEL: &str = "__other__";
 
 /// Query types that keep an exact numeric `qtype` label on
 /// `sito_queries_total`. The DNS wire type is a free 16-bit field, so exposing
@@ -233,6 +260,14 @@ impl LabelInterner {
             .cloned()
             .unwrap_or_else(|| Arc::from(""))
     }
+
+    /// Looks up an existing label id without adding a new interned value.
+    fn lookup(&self, value: &str) -> Option<u32> {
+        sito_core::sync::read_or_recover(&self.state)
+            .ids
+            .get(value)
+            .copied()
+    }
 }
 
 /// Increments the counter for `key`, creating it on first use.
@@ -258,6 +293,11 @@ where
 }
 
 /// Observes `value` in the histogram for interned label id `id`.
+///
+/// The map lookup takes a shared lock on the hot path; the per-label mutex is
+/// then held only for [`HistogramState::observe`]'s fixed bucket loop. See the
+/// module documentation for why per-verdict/per-upstream serialization is
+/// bounded and preferable to sharding this small state.
 fn observe_histogram(map: &HistogramMap, id: u32, value: f64) {
     let histogram = {
         if let Ok(guard) = map.read()
@@ -295,6 +335,12 @@ pub struct MetricsRegistry {
     cache_size_bytes: Arc<AtomicI64>,
     dnssec_key_cache_hits: Arc<AtomicU64>,
     dnssec_key_cache_misses: Arc<AtomicU64>,
+    dnssec_validations_secure: Arc<AtomicU64>,
+    dnssec_validations_insecure: Arc<AtomicU64>,
+    dnssec_validations_bogus: Arc<AtomicU64>,
+    dnssec_validations_indeterminate: Arc<AtomicU64>,
+    dnssec_fetch_budget_failures: Arc<AtomicU64>,
+    dnssec_fetch_deadline_failures: Arc<AtomicU64>,
     cache_stale_served: Arc<AtomicU64>,
     dnssec_bogus: Arc<Mutex<BTreeMap<String, u64>>>,
     clients_identified: Arc<CounterMap<u32>>,
@@ -307,6 +353,9 @@ pub struct MetricsRegistry {
     ha_diverged: Arc<Mutex<BTreeMap<String, bool>>>,
     /// HA startup paths that left replication inactive, keyed by (role, reason).
     ha_startup_noop: Arc<Mutex<BTreeMap<(String, String), u64>>>,
+    /// HA peers rejected for an incompatible protocol version, keyed by
+    /// (role, reason code).
+    ha_protocol_rejections: Arc<Mutex<BTreeMap<(String, String), u64>>>,
     querylog_dropped: Arc<AtomicU64>,
     stats_retention_last_success_seconds: Arc<AtomicU64>,
     stats_retention_last_failure_seconds: Arc<AtomicU64>,
@@ -332,6 +381,9 @@ pub struct MetricsRegistry {
 pub struct FilterStatusMetrics {
     /// `0 = disabled`, `1 = loading`, `2 = ready`, `3 = failed`.
     pub state: u8,
+    /// Active compiled rules. `None` leaves the existing
+    /// `sito_filter_rules{list="total"}` gauge untouched.
+    pub rule_count: Option<usize>,
     /// Configured lists that loaded successfully.
     pub loaded_lists: u64,
     /// Configured lists that failed.
@@ -364,6 +416,12 @@ impl MetricsRegistry {
             cache_size_bytes: Arc::new(AtomicI64::new(0)),
             dnssec_key_cache_hits: Arc::new(AtomicU64::new(0)),
             dnssec_key_cache_misses: Arc::new(AtomicU64::new(0)),
+            dnssec_validations_secure: Arc::new(AtomicU64::new(0)),
+            dnssec_validations_insecure: Arc::new(AtomicU64::new(0)),
+            dnssec_validations_bogus: Arc::new(AtomicU64::new(0)),
+            dnssec_validations_indeterminate: Arc::new(AtomicU64::new(0)),
+            dnssec_fetch_budget_failures: Arc::new(AtomicU64::new(0)),
+            dnssec_fetch_deadline_failures: Arc::new(AtomicU64::new(0)),
             cache_stale_served: Arc::new(AtomicU64::new(0)),
             dnssec_bogus: Arc::new(Mutex::new(BTreeMap::new())),
             clients_identified: Arc::new(RwLock::new(HashMap::new())),
@@ -373,6 +431,7 @@ impl MetricsRegistry {
             ha_config_version: Arc::new(Mutex::new(BTreeMap::new())),
             ha_diverged: Arc::new(Mutex::new(BTreeMap::new())),
             ha_startup_noop: Arc::new(Mutex::new(BTreeMap::new())),
+            ha_protocol_rejections: Arc::new(Mutex::new(BTreeMap::new())),
             querylog_dropped: Arc::new(AtomicU64::new(0)),
             stats_retention_last_success_seconds: Arc::new(AtomicU64::new(0)),
             stats_retention_last_failure_seconds: Arc::new(AtomicU64::new(0)),
@@ -420,6 +479,27 @@ impl MetricsRegistry {
         increment_counter(&self.upstream_errors, (upstream_id, kind_id));
     }
 
+    /// Removes every per-upstream series for `upstream`: the health gauge, the
+    /// RTT histogram, all error-kind counters and the DNSSEC bogus counter.
+    ///
+    /// Called after a config apply/publish for upstream names that no longer
+    /// exist, so removed servers cannot leave stale labels in the exposition
+    /// forever. Unknown names are a no-op.
+    pub fn remove_upstream_health(&self, upstream: &str) {
+        // `dnssec_bogus` is keyed by the raw upstream string rather than an
+        // interned label, so prune it even when the interner never saw the name.
+        sito_core::sync::lock_or_recover(&self.dnssec_bogus).remove(upstream);
+
+        let Some(upstream_id) = self.labels.lookup(upstream) else {
+            return;
+        };
+
+        sito_core::sync::write_or_recover(&self.upstream_health).remove(&upstream_id);
+        sito_core::sync::write_or_recover(&self.upstream_rtt).remove(&upstream_id);
+        sito_core::sync::write_or_recover(&self.upstream_errors)
+            .retain(|(label, _kind), _| *label != upstream_id);
+    }
+
     pub fn set_upstream_health(&self, upstream: &str, health: f64) {
         let upstream_id = self.labels.intern(upstream);
         let bits = health.to_bits();
@@ -452,19 +532,72 @@ impl MetricsRegistry {
     }
 
     /// Publishes DNSSEC validated-key cache hit/miss counters.
+    ///
+    /// Node-wide: the validator and its key cache are shared by all clients,
+    /// so this cannot honour a per-client `ignore_stats`.
     pub fn set_dnssec_key_cache(&self, hits: u64, misses: u64) {
         self.dnssec_key_cache_hits.store(hits, Ordering::Relaxed);
         self.dnssec_key_cache_misses
             .store(misses, Ordering::Relaxed);
     }
 
+    /// Publishes the cumulative DNSSEC validation outcome counters.
+    ///
+    /// This is the outcome view. It is independent of
+    /// `sito_dnssec_bogus_total{upstream}`, which counts bogus answers per
+    /// upstream; the two families overlap conceptually and must not be summed.
+    /// Node-wide: the validator is shared by all clients, so this cannot
+    /// honour a per-client `ignore_stats`.
+    pub fn set_dnssec_validations(
+        &self,
+        secure: u64,
+        insecure: u64,
+        bogus: u64,
+        indeterminate: u64,
+    ) {
+        self.dnssec_validations_secure
+            .store(secure, Ordering::Relaxed);
+        self.dnssec_validations_insecure
+            .store(insecure, Ordering::Relaxed);
+        self.dnssec_validations_bogus
+            .store(bogus, Ordering::Relaxed);
+        self.dnssec_validations_indeterminate
+            .store(indeterminate, Ordering::Relaxed);
+    }
+
+    /// Publishes the cumulative DNSSEC key-fetch refusal counters,
+    /// distinguishing count-budget exhaustion from an expired deadline.
+    ///
+    /// Node-wide like the other validator counters; not per-client.
+    pub fn set_dnssec_fetch_failures(&self, budget: u64, deadline: u64) {
+        self.dnssec_fetch_budget_failures
+            .store(budget, Ordering::Relaxed);
+        self.dnssec_fetch_deadline_failures
+            .store(deadline, Ordering::Relaxed);
+    }
+
     pub fn inc_cache_stale_served(&self) {
         self.cache_stale_served.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a bogus answer per upstream.
+    ///
+    /// This per-upstream view is independent of
+    /// `sito_dnssec_validations_total{result="bogus"}`; the two families
+    /// overlap and must not be summed. Labels are capped at
+    /// [`MAX_DNSSEC_BOGUS_UPSTREAMS`]; surplus upstreams are counted under the
+    /// constant `__other__` label.
     pub fn inc_dnssec_bogus(&self, upstream: &str) {
         let mut map = sito_core::sync::lock_or_recover(&self.dnssec_bogus);
-        *map.entry(upstream.to_string()).or_insert(0) += 1;
+        let key = if map.contains_key(upstream)
+            || upstream == DNSSEC_BOGUS_OVERFLOW_LABEL
+            || map.len() < MAX_DNSSEC_BOGUS_UPSTREAMS
+        {
+            upstream
+        } else {
+            DNSSEC_BOGUS_OVERFLOW_LABEL
+        };
+        *map.entry(key.to_string()).or_insert(0) += 1;
     }
 
     pub fn inc_clients_identified(&self, method: &str) {
@@ -513,6 +646,17 @@ impl MetricsRegistry {
     /// `tls_init_failed`, `bind_failed`).
     pub fn inc_ha_startup_noop(&self, role: &str, reason: &str) {
         let mut map = sito_core::sync::lock_or_recover(&self.ha_startup_noop);
+        *map.entry((role.to_string(), reason.to_string()))
+            .or_insert(0) += 1;
+    }
+
+    /// Counts an HA peer rejected for an incompatible protocol version.
+    ///
+    /// `role` is the local side (`master`/`slave`) and `reason` is a fixed,
+    /// low-cardinality identifier (`version_mismatch`); the detailed,
+    /// operator-facing explanation is logged and sent in the close frame.
+    pub fn inc_ha_protocol_rejection(&self, role: &str, reason: &str) {
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_protocol_rejections);
         *map.entry((role.to_string(), reason.to_string()))
             .or_insert(0) += 1;
     }
@@ -583,6 +727,9 @@ impl MetricsRegistry {
     ///
     /// `state` is `0 = disabled`, `1 = loading`, `2 = ready`, `3 = failed`.
     pub fn set_filter_status(&self, status: FilterStatusMetrics) {
+        if let Some(rule_count) = status.rule_count {
+            self.set_filter_rules(rule_count);
+        }
         self.filter_state
             .store(u64::from(status.state), Ordering::Relaxed);
         self.filter_lists_loaded
@@ -1071,7 +1218,7 @@ impl MetricsRegistry {
             self.filter_lists_failed.load(Ordering::Relaxed)
         );
         out.push_str(
-            "# HELP sito_filter_degraded_groups Groups published with a partial rule class\n",
+            "# HELP sito_filter_degraded_groups Groups with degraded or unpublishable rules (budget/limit, missing list, invalid-only)\n",
         );
         out.push_str("# TYPE sito_filter_degraded_groups gauge\n");
         let _ = writeln!(
@@ -1121,6 +1268,24 @@ impl MetricsRegistry {
 
     /// DNSSEC, client, and DoH bypass families.
     fn render_dnssec_client_family(&self, out: &mut String) {
+        // 11a. sito_dnssec_validations_total
+        out.push_str(
+            "# HELP sito_dnssec_validations_total Total DNSSEC validation outcomes (NTA bypasses excluded)\n",
+        );
+        out.push_str("# TYPE sito_dnssec_validations_total counter\n");
+        for (result, value) in [
+            ("secure", &self.dnssec_validations_secure),
+            ("insecure", &self.dnssec_validations_insecure),
+            ("bogus", &self.dnssec_validations_bogus),
+            ("indeterminate", &self.dnssec_validations_indeterminate),
+        ] {
+            let _ = writeln!(
+                out,
+                "sito_dnssec_validations_total{{result=\"{result}\"}} {}",
+                value.load(Ordering::Relaxed)
+            );
+        }
+
         // 11. sito_dnssec_bogus_total
         out.push_str("# HELP sito_dnssec_bogus_total Total DNSSEC bogus responses detected\n");
         out.push_str("# TYPE sito_dnssec_bogus_total counter\n");
@@ -1138,6 +1303,22 @@ impl MetricsRegistry {
                 }
             }
         }
+
+        // 11b. sito_dnssec_fetch_failures_total
+        out.push_str(
+            "# HELP sito_dnssec_fetch_failures_total Total DNSSEC key fetches refused by budget or deadline\n",
+        );
+        out.push_str("# TYPE sito_dnssec_fetch_failures_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_dnssec_fetch_failures_total{{kind=\"budget\"}} {}",
+            self.dnssec_fetch_budget_failures.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "sito_dnssec_fetch_failures_total{{kind=\"deadline\"}} {}",
+            self.dnssec_fetch_deadline_failures.load(Ordering::Relaxed)
+        );
 
         // 12. sito_clients_identified_total
         out.push_str("# HELP sito_clients_identified_total Total clients successfully identified by method\n");
@@ -1238,6 +1419,25 @@ impl MetricsRegistry {
                     escape_label_value(role),
                     escape_label_value(reason)
                 );
+            }
+        }
+
+        // 17b. sito_ha_protocol_rejections_total
+        {
+            let map = sito_core::sync::lock_or_recover(&self.ha_protocol_rejections);
+            if !map.is_empty() {
+                out.push_str(
+                    "# HELP sito_ha_protocol_rejections_total HA peers rejected for an incompatible protocol version\n",
+                );
+                out.push_str("# TYPE sito_ha_protocol_rejections_total counter\n");
+                for ((role, reason), count) in map.iter() {
+                    let _ = writeln!(
+                        out,
+                        "sito_ha_protocol_rejections_total{{role=\"{}\",reason=\"{}\"}} {count}",
+                        escape_label_value(role),
+                        escape_label_value(reason)
+                    );
+                }
             }
         }
 
@@ -1486,6 +1686,77 @@ fn escape_label_value(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// DNSSEC outcomes and fetch-budget/deadline refusals must be exposed as
+    /// stable counter families so an operator can alert on validation failures
+    /// separately from upstream stalls.
+    #[test]
+    fn test_dnssec_validation_and_fetch_failure_metrics_render() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.set_dnssec_validations(7, 3, 2, 1);
+        reg.set_dnssec_fetch_failures(5, 4);
+
+        let rendered = reg.render_prometheus();
+        // Compare whole lines so a value such as `7` cannot also satisfy a
+        // prefix of `70`.
+        let assert_line = |line: &str| {
+            assert!(
+                rendered.lines().any(|rendered_line| rendered_line == line),
+                "missing metric line {line:?}:\n{rendered}"
+            );
+        };
+        for (result, value) in [
+            ("secure", 7),
+            ("insecure", 3),
+            ("bogus", 2),
+            ("indeterminate", 1),
+        ] {
+            assert_line(&format!(
+                "sito_dnssec_validations_total{{result=\"{result}\"}} {value}"
+            ));
+        }
+        assert_line("sito_dnssec_fetch_failures_total{kind=\"budget\"} 5");
+        assert_line("sito_dnssec_fetch_failures_total{kind=\"deadline\"} 4");
+    }
+
+    /// P2-62 rationale test: the per-verdict histogram mutex may serialize
+    /// same-verdict observations, but it must not lose any of them. Distinct
+    /// verdicts use distinct mutexes and remain independent.
+    #[test]
+    fn test_histogram_concurrent_updates_are_not_lost() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 1_000;
+
+        let reg = std::sync::Arc::new(MetricsRegistry::new("1.0.0", "test"));
+        let mut handles = Vec::new();
+        for thread in 0..THREADS {
+            let reg = std::sync::Arc::clone(&reg);
+            handles.push(std::thread::spawn(move || {
+                let verdict = if thread % 2 == 0 {
+                    "allowed"
+                } else {
+                    "blocked"
+                };
+                for _ in 0..PER_THREAD {
+                    reg.observe_query_duration(verdict, 0.001);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("histogram writer thread");
+        }
+
+        let rendered = reg.render_prometheus();
+        for verdict in ["allowed", "blocked"] {
+            assert!(
+                rendered.contains(&format!(
+                    "sito_query_duration_seconds_count{{verdict=\"{verdict}\"}} {}",
+                    THREADS / 2 * PER_THREAD
+                )),
+                "every observation for {verdict} must be retained: {rendered}"
+            );
+        }
+    }
+
     #[test]
     fn test_metrics_registry_contains_table_14_2() {
         let reg = MetricsRegistry::new("0.1.0", "abc1234");
@@ -1500,6 +1771,8 @@ mod tests {
         reg.inc_cache_stale_served();
         reg.inc_dnssec_bogus("tls://dns.quad9.net");
         reg.set_dnssec_key_cache(7, 3);
+        reg.set_dnssec_validations(7, 3, 2, 1);
+        reg.set_dnssec_fetch_failures(5, 4);
         reg.inc_clients_identified("ip");
         reg.inc_doh_bypass_blocked();
         reg.set_ha_slaves_connected(2);
@@ -1525,6 +1798,10 @@ mod tests {
         assert!(rendered.contains("sito_dnssec_bogus_total"));
         assert!(rendered.contains("sito_dnssec_key_cache_hits_total 7"));
         assert!(rendered.contains("sito_dnssec_key_cache_misses_total 3"));
+        assert!(rendered.contains("sito_dnssec_validations_total{result=\"secure\"} 7"));
+        assert!(rendered.contains("sito_dnssec_validations_total{result=\"indeterminate\"} 1"));
+        assert!(rendered.contains("sito_dnssec_fetch_failures_total{kind=\"budget\"} 5"));
+        assert!(rendered.contains("sito_dnssec_fetch_failures_total{kind=\"deadline\"} 4"));
         assert!(rendered.contains("sito_clients_identified_total"));
         assert!(rendered.contains("sito_doh_bypass_blocked_total"));
         assert!(rendered.contains("sito_ha_slaves_connected"));
@@ -1556,6 +1833,8 @@ mod tests {
         reg.inc_cache_stale_served();
         reg.inc_dnssec_bogus("tls://dns.quad9.net");
         reg.set_dnssec_key_cache(7, 3);
+        reg.set_dnssec_validations(7, 3, 2, 1);
+        reg.set_dnssec_fetch_failures(5, 4);
         reg.inc_clients_identified("ip");
         reg.inc_doh_bypass_blocked();
         reg.set_ha_slaves_connected(2);
@@ -1565,6 +1844,7 @@ mod tests {
         reg.set_querylog_dropped(1);
         reg.set_filter_status(FilterStatusMetrics {
             state: 2,
+            rule_count: None,
             loaded_lists: 3,
             failed_lists: 1,
             degraded_groups: 1,
@@ -1673,7 +1953,7 @@ sito_filter_lists_loaded 3
 # HELP sito_filter_lists_failed Configured filter lists that failed in the last reload
 # TYPE sito_filter_lists_failed gauge
 sito_filter_lists_failed 1
-# HELP sito_filter_degraded_groups Groups published with a partial rule class
+# HELP sito_filter_degraded_groups Groups with degraded or unpublishable rules (budget/limit, missing list, invalid-only)
 # TYPE sito_filter_degraded_groups gauge
 sito_filter_degraded_groups 1
 # HELP sito_filter_dropped_regex_patterns Regex/wildcard patterns dropped from the active snapshot
@@ -1701,9 +1981,19 @@ sito_filter_compile_seconds_bucket{le="5"} 0
 sito_filter_compile_seconds_bucket{le="+Inf"} 0
 sito_filter_compile_seconds_sum 0
 sito_filter_compile_seconds_count 0
+# HELP sito_dnssec_validations_total Total DNSSEC validation outcomes (NTA bypasses excluded)
+# TYPE sito_dnssec_validations_total counter
+sito_dnssec_validations_total{result="secure"} 7
+sito_dnssec_validations_total{result="insecure"} 3
+sito_dnssec_validations_total{result="bogus"} 2
+sito_dnssec_validations_total{result="indeterminate"} 1
 # HELP sito_dnssec_bogus_total Total DNSSEC bogus responses detected
 # TYPE sito_dnssec_bogus_total counter
 sito_dnssec_bogus_total{upstream="tls://dns.quad9.net"} 1
+# HELP sito_dnssec_fetch_failures_total Total DNSSEC key fetches refused by budget or deadline
+# TYPE sito_dnssec_fetch_failures_total counter
+sito_dnssec_fetch_failures_total{kind="budget"} 5
+sito_dnssec_fetch_failures_total{kind="deadline"} 4
 # HELP sito_clients_identified_total Total clients successfully identified by method
 # TYPE sito_clients_identified_total counter
 sito_clients_identified_total{method="ip"} 1
@@ -1766,6 +2056,27 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         reg.remove_ha_config_version(hostile);
         let rendered_after = reg.render_prometheus();
         assert!(!rendered_after.contains("evil"));
+    }
+
+    #[test]
+    fn test_ha_protocol_rejection_counter_renders_only_when_used() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        assert!(
+            !reg.render_prometheus()
+                .contains("sito_ha_protocol_rejections_total"),
+            "an unused rejection counter must not churn the scrape output"
+        );
+
+        reg.inc_ha_protocol_rejection("master", "version_mismatch");
+        reg.inc_ha_protocol_rejection("master", "version_mismatch");
+        reg.inc_ha_protocol_rejection("slave", "version_mismatch");
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains(
+            r#"sito_ha_protocol_rejections_total{role="master",reason="version_mismatch"} 2"#
+        ));
+        assert!(rendered.contains(
+            r#"sito_ha_protocol_rejections_total{role="slave",reason="version_mismatch"} 1"#
+        ));
     }
 
     #[test]
@@ -1919,6 +2230,42 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         assert!(!rendered.contains(r#"qtype="40000""#));
     }
 
+    /// WP-2.7: removing an upstream prunes its health gauge, RTT histogram and
+    /// every error-kind series, while other upstreams are untouched.
+    #[test]
+    fn test_removed_upstream_health_series_is_pruned() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        for name in ["removed.example", "kept.example"] {
+            reg.observe_upstream_rtt(name, 0.010);
+            reg.inc_upstream_errors(name, "timeout");
+            reg.set_upstream_health(name, 0.0);
+        }
+
+        reg.remove_upstream_health("removed.example");
+        // Removing an unknown name must be a no-op, not a panic or a new label.
+        reg.remove_upstream_health("never-seen.example");
+
+        let rendered = reg.render_prometheus();
+        assert!(
+            !rendered.contains("removed.example"),
+            "all removed upstream series must be pruned: {rendered}"
+        );
+        assert!(
+            !rendered.contains("never-seen.example"),
+            "the removal helper must not intern unknown names: {rendered}"
+        );
+        for family in [
+            "sito_upstream_health{upstream=\"kept.example\"}",
+            "sito_upstream_errors_total{upstream=\"kept.example\",kind=\"timeout\"}",
+            "sito_upstream_rtt_seconds_count{upstream=\"kept.example\"}",
+        ] {
+            assert!(
+                rendered.contains(family),
+                "unrelated upstream series must survive: missing {family}: {rendered}"
+            );
+        }
+    }
+
     #[test]
     fn test_filter_metrics_are_reported() {
         let reg = MetricsRegistry::new("1.0.0", "test");
@@ -1990,7 +2337,7 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
 
 #[cfg(test)]
 mod allocation_tests {
-    use super::MetricsRegistry;
+    use super::{FilterStatusMetrics, MAX_DNSSEC_BOGUS_UPSTREAMS, MetricsRegistry};
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 
@@ -2094,6 +2441,97 @@ mod allocation_tests {
             reg.stats_retention_last_failure_seconds
                 .load(Ordering::Relaxed)
                 > 0
+        );
+    }
+
+    /// P2-63: removing an upstream from the config must also drop its
+    /// `sito_dnssec_bogus_total` series, which uses its own string-keyed map.
+    #[test]
+    fn test_remove_upstream_health_prunes_dnssec_bogus_series() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.inc_dnssec_bogus("gone.example:53");
+        reg.inc_dnssec_bogus("kept.example:53");
+        reg.set_upstream_health("gone.example:53", 0.0);
+        reg.set_upstream_health("kept.example:53", 1.0);
+
+        reg.remove_upstream_health("gone.example:53");
+
+        let rendered = reg.render_prometheus();
+        assert!(
+            !rendered.contains(r#"sito_dnssec_bogus_total{upstream="gone.example:53"}"#),
+            "a removed upstream must not keep a bogus series: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"sito_upstream_health{upstream="gone.example:53"}"#),
+            "the health gauge is pruned too: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_dnssec_bogus_total{upstream="kept.example:53"} 1"#),
+            "unrelated bogus series must survive: {rendered}"
+        );
+    }
+
+    /// P2-63: the standalone bogus map is capped and overflow is collapsed
+    /// into a constant label without losing observations.
+    #[test]
+    fn test_dnssec_bogus_cardinality_is_capped() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        let overflow = 20usize;
+        for i in 0..(MAX_DNSSEC_BOGUS_UPSTREAMS + overflow) {
+            reg.inc_dnssec_bogus(&format!("bogus-upstream-{i}:53"));
+        }
+
+        let rendered = reg.render_prometheus();
+        let lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("sito_dnssec_bogus_total{"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            MAX_DNSSEC_BOGUS_UPSTREAMS + 1,
+            "the map must keep at most the cap plus the overflow series: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_dnssec_bogus_total{upstream="__other__"} 20"#),
+            "surplus labels must collapse into the constant overflow label: {rendered}"
+        );
+        let total: u64 = lines
+            .iter()
+            .map(|line| line.rsplit_once(' ').unwrap().1.parse::<u64>().unwrap())
+            .sum();
+        assert_eq!(
+            total,
+            (MAX_DNSSEC_BOGUS_UPSTREAMS + overflow) as u64,
+            "collapsing must not lose bogus observations: {rendered}"
+        );
+    }
+
+    /// P2-63: the status observer carries the compiled rule count so a
+    /// scheduled refresh cannot leave `sito_filter_rules` stale.
+    #[test]
+    fn test_filter_status_updates_rule_gauge() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.set_filter_status(FilterStatusMetrics {
+            state: 2,
+            rule_count: Some(42),
+            ..Default::default()
+        });
+        assert!(
+            reg.render_prometheus()
+                .contains(r#"sito_filter_rules{list="total"} 42"#),
+            "the status publication must update the rule gauge"
+        );
+
+        // A status without a rule count must leave the previous value alone.
+        reg.set_filter_status(FilterStatusMetrics {
+            state: 2,
+            rule_count: None,
+            ..Default::default()
+        });
+        assert!(
+            reg.render_prometheus()
+                .contains(r#"sito_filter_rules{list="total"} 42"#),
+            "a partial status must not reset the rule gauge to zero"
         );
     }
 }

@@ -14,7 +14,7 @@ use crate::bundle::watermark_covers;
 use crate::config::HaConfig;
 use crate::crypto::parse_public_key;
 use crate::error::HaError;
-use crate::protocol::{AckConflict, HaMessage};
+use crate::protocol::{AckConflict, HaMessage, PROTOCOL_VERSION};
 use crate::session::{frame_text, send_frame, send_ha_message};
 use crate::slave::state::{SlaveState, SlaveStatusTracker};
 use crate::transport::{
@@ -24,6 +24,14 @@ use crate::transport::{
 use super::SlaveAppHandles;
 use super::apply::apply_config_push;
 use super::stats::build_stats_report;
+
+/// Delay before reconnecting after a clean master close.
+///
+/// A clean close usually means a master restart/rollout, so reconnect promptly
+/// with a fixed delay instead of growing an error backoff. Error paths still
+/// use the exponential backoff; a clean close resets it so a later failure
+/// starts from the minimum.
+pub(super) const CLEAN_CLOSE_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// Spawns the slave replication worker loop.
 pub fn spawn_slave_worker(
@@ -86,9 +94,11 @@ pub fn spawn_slave_worker(
                     // A failed apply stays Degraded with its reason.
                     mark_session_ended(&tracker);
                     // Avoid a tight reconnect loop when the master accepts and
-                    // immediately closes the connection.
+                    // immediately closes the connection. A clean close is a
+                    // fixed-delay reconnect (master restart/rollout), not an
+                    // error backoff.
                     tokio::select! {
-                        () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        () = tokio::time::sleep(CLEAN_CLOSE_RECONNECT_DELAY) => {}
                         msg = resync_rx.recv(), if resync_open => {
                             if msg.is_none() {
                                 resync_open = false;
@@ -130,7 +140,7 @@ pub fn spawn_slave_worker(
     })
 }
 
-fn parse_ws_url(url: &str) -> Result<(bool, String, u16), HaError> {
+pub(super) fn parse_ws_url(url: &str) -> Result<(bool, String, u16), HaError> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| HaError::Connection(format!("Invalid URL: missing '://' in '{url}'")))?;
@@ -180,10 +190,16 @@ pub(super) async fn connect_and_run(
     let (is_secure, host, port) = parse_ws_url(master_url)?;
     let addr_str = format!("{host}:{port}");
 
-    let tcp_stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr_str))
-        .await
-        .map_err(|_| HaError::Timeout(format!("Connection to master '{addr_str}' timed out")))?
-        .map_err(|e| HaError::Connection(format!("TCP connect error to '{addr_str}': {e}")))?;
+    // Resolve and connect with the host/port pair instead of formatting a
+    // socket address: bracketed IPv6 literals (`[::1]`) must not become
+    // `::1:8953`, and DNS names must still go through the resolver.
+    let tcp_stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| HaError::Timeout(format!("Connection to master '{addr_str}' timed out")))?
+    .map_err(|e| HaError::Connection(format!("TCP connect error to '{addr_str}': {e}")))?;
 
     if is_secure {
         let tls_cfg = build_client_tls_config(
@@ -479,12 +495,41 @@ where
         }
         HaMessage::ConfigPush {
             ref version,
+            protocol_version,
             ref term,
             ref payload_hash_blake3,
             ..
         } => {
             let target_version = *version;
             let push_term = *term;
+
+            // Verify the master's protocol before applying the first (or any)
+            // config push. A v1 master omits the field (deserialized as 0) and
+            // must never have its bundle interpreted with v2 semantics.
+            let master_version = if protocol_version == 0 {
+                1
+            } else {
+                protocol_version
+            };
+            if master_version != PROTOCOL_VERSION {
+                let reason = format!(
+                    "protocol_mismatch: master speaks HA protocol v{master_version} but this slave requires v{PROTOCOL_VERSION}; upgrade the master or this slave so both run the same HA protocol"
+                );
+                tracker.set_connection_error(Some(reason.clone()));
+                handles
+                    .metrics
+                    .inc_ha_protocol_rejection("slave", "version_mismatch");
+                warn!(instance = %tracker.instance_name, "{reason}");
+                let ack = HaMessage::Ack {
+                    version: tracker.get_version(),
+                    term: tracker.get_term(),
+                    applied: false,
+                    conflict: None,
+                    error: Some(reason.clone()),
+                };
+                send_ack!(ack);
+                return Err(HaError::Protocol(reason));
+            }
 
             // A push from an older epoch is a stale master and must never
             // overwrite newer configuration, even when its version counter is

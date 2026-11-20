@@ -30,6 +30,6 @@ pub use dnssec_fetch::DnssecKeyFetcher;
 pub use domain::{DomainError, NormalizedDomain, matches_domain_suffix, matches_strict_subdomain};
 pub use engine::FilterEngine;
 pub use error::{ConfigError, UpstreamError};
-pub use net::{CidrError, IpNetwork, ip_in_subnet};
+pub use net::{CidrError, IpNetwork, ip_in_subnet, is_strict_mac, normalize_mac, normalize_mac_id};
 pub use ssrf::is_denied_target_ip;
 pub use verdict::{BlockReason, RewriteAction, RuleRef, Verdict};

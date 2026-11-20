@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::canonical_config_path;
+use super::startup::should_gate_dns;
 use super::*;
 use std::path::Path;
 
@@ -629,6 +630,22 @@ async fn test_tls_acceptors_rebuilt_from_updated_config() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A persisted config does not by itself mean setup finished: an active setup
+/// token must keep DNS gated after a failed first-boot refresh and restart.
+#[test]
+fn test_active_setup_token_keeps_dns_gated_with_persisted_config() {
+    assert!(should_gate_dns(true, false, false));
+    assert!(
+        should_gate_dns(false, true, true),
+        "an active setup token must gate DNS when config.toml exists"
+    );
+    assert!(
+        !should_gate_dns(false, true, false),
+        "a programmatic in-memory config stays ungated unless the caller requests setup mode"
+    );
+    assert!(!should_gate_dns(false, false, true));
+}
+
 /// Regression: the DNS warning must not claim listeners exist during
 /// setup-pending mode, and the post-wizard transition must use the
 /// configuration the wizard actually wrote.
@@ -976,4 +993,170 @@ fn test_refresh_tls_readiness_clears_stale_cert_reason_when_material_removed() {
         readiness.tls().code.is_none(),
         "an incomplete pair must not retain a certificate reason"
     );
+}
+
+fn listener_test_acceptors(alpn: Vec<Vec<u8>>, dir: &Path) -> TlsAcceptorManager {
+    let (cert_pem, key_pem) = generate_self_signed_cert(&["localhost".to_string()]).unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    std::fs::write(&cert, cert_pem).unwrap();
+    std::fs::write(&key, key_pem).unwrap();
+    let config = load_server_config(&cert, &key, &[], alpn).unwrap();
+    TlsAcceptorManager::new(config)
+}
+
+async fn listener_test_pipeline(config: &Config, dir: &Path) -> Arc<DnsPipeline> {
+    use sito_clients::{ClientRegistry, ParentalRegistry, ServiceRegistry};
+    use sito_filter::HostsFilterEngine;
+    use sito_rewrites::{RewriteTable, RewritesConfig};
+    use std::sync::atomic::AtomicUsize;
+
+    std::fs::create_dir_all(dir).unwrap();
+    let mut config = config.clone();
+    config.server.data_dir = dir.to_path_buf();
+    config.filtering.enabled = false;
+    config.dns.dnssec.validate = false;
+    if config.upstream.servers.is_empty() {
+        config.upstream.servers = vec!["1.1.1.1".to_string()];
+    }
+
+    let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(100));
+    let upstream = Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+    let filter =
+        Arc::new(HostsFilterEngine::init(config.filtering.clone(), dir.to_path_buf()).await);
+    Arc::new(DnsPipeline::new(
+        Arc::new(ArcSwap::new(Arc::new(config.clone()))),
+        filter,
+        Arc::new(DnsCache::new(config.dns.cache.clone())),
+        upstream,
+        Arc::new(DnssecValidator::from_config(&config.dns.dnssec)),
+        Arc::new(ArcSwap::new(Arc::new(ClientRegistry::new(
+            sito_clients::ClientsConfig::default(),
+        )))),
+        Arc::new(ParentalRegistry::try_bundled().expect("bundled parental lists must load")),
+        Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load")),
+        Arc::new(ArcSwap::new(Arc::new(RewriteTable::new(
+            RewritesConfig::default(),
+        )))),
+        Arc::new(AtomicUsize::new(0)),
+    ))
+}
+
+/// P2-20: a configured DoQ listener whose port cannot bind must make listener
+/// startup fail instead of logging and reporting ready without the endpoint.
+#[tokio::test]
+async fn test_configured_doq_bind_failure_is_visible() {
+    let port = sito_test_support::reserve_udp_port_number().unwrap();
+    let occupied = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+
+    let mut config = Config::default();
+    config.dns.bind = vec![std::net::Ipv4Addr::LOCALHOST.into()];
+    config.dns.port = sito_test_support::reserve_port_number().unwrap();
+    config.dns.dot_port = 0;
+    config.dns.doh_port = 0;
+    config.dns.doq_port = port;
+    config.dns.doh3_port = 0;
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_doq_bind_{}_{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    let acceptors = listener_test_acceptors(vec![b"doq".to_vec()], &dir);
+    let pipeline = listener_test_pipeline(&config, &dir).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let error = start_dns_listeners(
+        &config,
+        pipeline,
+        shutdown_rx,
+        None,
+        None,
+        Some(acceptors),
+        None,
+        AcmeChallengeAvailability::default(),
+    )
+    .await
+    .expect_err("a configured DoQ bind failure must abort listener startup");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("DoQ") && rendered.contains(&port.to_string()),
+        "the startup error must name the configured DoQ listener: {rendered}"
+    );
+
+    let _ = shutdown_tx.send(true);
+    drop(occupied);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// P2-20: a configured DoH3 listener that cannot bind must abort startup, and
+/// DoH must not run advertising Alt-Svc for an endpoint that never bound.
+#[tokio::test]
+async fn test_doh_alt_svc_not_advertised_when_doh3_fails() {
+    let doh3_port = sito_test_support::reserve_udp_port_number().unwrap();
+    let occupied = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, doh3_port))
+        .await
+        .unwrap();
+    let doh_port = sito_test_support::reserve_port_number().unwrap();
+
+    let mut config = Config::default();
+    config.dns.bind = vec![std::net::Ipv4Addr::LOCALHOST.into()];
+    config.dns.port = sito_test_support::reserve_port_number().unwrap();
+    config.dns.dot_port = 0;
+    config.dns.doh_port = doh_port;
+    config.dns.doq_port = 0;
+    config.dns.doh3_port = doh3_port;
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_doh3_bind_{}_{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    let doh_acceptor =
+        listener_test_acceptors(vec![b"h2".to_vec(), b"http/1.1".to_vec()], &dir.join("doh"));
+    let doh3_acceptor = listener_test_acceptors(vec![b"h3".to_vec()], &dir.join("doh3"));
+    let pipeline = listener_test_pipeline(&config, &dir).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let error = start_dns_listeners(
+        &config,
+        pipeline,
+        shutdown_rx,
+        None,
+        Some(doh_acceptor),
+        None,
+        Some(doh3_acceptor),
+        AcmeChallengeAvailability::default(),
+    )
+    .await
+    .expect_err("a configured DoH3 bind failure must abort listener startup");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("DoH3"),
+        "the startup error must name the configured DoH3 listener: {rendered}"
+    );
+
+    // DoH3 is started before DoH, so the failed bind prevents the DoH listener
+    // from existing at all: there is no endpoint left to advertise Alt-Svc.
+    let doh_addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, doh_port));
+    let connect = tokio::time::timeout(
+        Duration::from_millis(500),
+        tokio::net::TcpStream::connect(doh_addr),
+    )
+    .await;
+    assert!(
+        matches!(connect, Ok(Err(_)) | Err(_)),
+        "DoH must not be serving (or advertising Alt-Svc) after the DoH3 bind failure"
+    );
+
+    let _ = shutdown_tx.send(true);
+    drop(occupied);
+    let _ = std::fs::remove_dir_all(dir);
 }

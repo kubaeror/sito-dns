@@ -128,6 +128,8 @@ impl SlaveStatusTracker {
         #[allow(clippy::cast_sign_loss)]
         let timestamp = Utc::now().timestamp_millis() as u64;
         let mut watermark = self.get_watermark().unwrap_or(AppliedWatermark {
+            signing_key_fingerprint: None,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version,
             term,
             payload_hash: String::new(),
@@ -174,20 +176,52 @@ impl SlaveStatusTracker {
         self.persist_watermark_with_config_digest(version, term, payload_hash, None)
     }
 
-    /// Persists the applied watermark together with the BLAKE3 digest of the
-    /// exact configuration document that was persisted for this bundle.
+    /// Persists the applied watermark together with a BLAKE3 digest of the
+    /// shared projection of the configuration document persisted for this
+    /// bundle.
     ///
     /// The digest is what makes restart-time drift detection possible: a local
     /// edit to a shared field (or a local revert) no longer matches and forces
-    /// a re-apply instead of an early `Synced` ACK. Passing `None` preserves
-    /// legacy callers and clears the drift flag because the caller explicitly
-    /// says it has no document to verify.
+    /// a re-apply instead of an early `Synced` ACK. Node-local fields are
+    /// excluded by [`crate::bundle::shared_config_digest`]. Passing `None`
+    /// preserves legacy callers and clears the drift flag because the caller
+    /// explicitly says it has no document to verify.
+    ///
+    /// Prefer [`Self::persist_watermark_with_identity`] on apply paths. This
+    /// wrapper preserves any existing signing-key fingerprint instead of
+    /// clearing it: an unrelated watermark refresh must not erase the identity
+    /// needed to detect a same-term key change.
     pub fn persist_watermark_with_config_digest(
         &self,
         version: u64,
         term: u64,
         payload_hash: &str,
         config_digest: Option<&str>,
+    ) -> Result<(), HaError> {
+        let existing_fingerprint = self
+            .get_watermark()
+            .and_then(|watermark| watermark.signing_key_fingerprint);
+        self.persist_watermark_with_identity(
+            version,
+            term,
+            payload_hash,
+            config_digest,
+            existing_fingerprint.as_deref(),
+        )
+    }
+
+    /// Persists the applied watermark including the signing-key fingerprint of
+    /// the master that produced the bundle.
+    ///
+    /// The fingerprint makes a same-term key change (lost/replaced signing key
+    /// without an explicit promotion) detectable on the next push.
+    pub fn persist_watermark_with_identity(
+        &self,
+        version: u64,
+        term: u64,
+        payload_hash: &str,
+        config_digest: Option<&str>,
+        signing_key_fingerprint: Option<&str>,
     ) -> Result<(), HaError> {
         if version == u64::MAX {
             return Err(HaError::Validation {
@@ -204,9 +238,11 @@ impl SlaveStatusTracker {
         #[allow(clippy::cast_sign_loss)]
         let timestamp = Utc::now().timestamp_millis() as u64;
         let watermark = AppliedWatermark {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version,
             term,
             payload_hash: payload_hash.trim_start_matches("blake3:").to_string(),
+            signing_key_fingerprint: signing_key_fingerprint.map(str::to_string),
             timestamp,
             forked: false,
             forked_at_version: 0,
@@ -234,8 +270,14 @@ impl SlaveStatusTracker {
         Ok(())
     }
 
-    /// Compares `document` with the digest persisted for the last applied
-    /// bundle.
+    /// Compares `document`'s shared projection with the digest persisted for
+    /// the last applied bundle.
+    ///
+    /// Node-local fields (identity, `[ha]`, listener/TLS/ACME, web bind
+    /// settings, MikroTik credentials and per-client secrets) are excluded:
+    /// editing only those must not force a full re-apply. A shared-field edit
+    /// (upstreams, filtering, shared runtime policy) changes the projection and
+    /// forces a full apply.
     ///
     /// Returns `true` when drift was detected (and marks the tracker
     /// `Degraded`/not-ready). A node with no watermark, or a watermark written
@@ -248,7 +290,7 @@ impl SlaveStatusTracker {
         else {
             return Ok(false);
         };
-        let actual = crate::bundle::config_digest(document);
+        let actual = crate::bundle::shared_config_digest(document);
         if actual == expected {
             self.local_config_drift
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -414,6 +456,9 @@ mod tests {
 
     fn bundle(version: u64) -> ConfigBundle {
         ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version,
             term: 0,
             timestamp: 1,
@@ -502,6 +547,96 @@ mod tests {
     }
 
     #[test]
+    fn test_node_local_edits_do_not_force_full_apply_but_shared_edits_do() {
+        let path = temp_path("shared-projection");
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        let applied = r#"config_version = 2
+[server]
+role = "slave"
+instance_name = "slave-1"
+
+[ha]
+master_url = "wss://master:8953"
+
+[upstream]
+servers = ["9.9.9.9"]
+"#;
+        tracker
+            .persist_watermark_with_config_digest(
+                5,
+                0,
+                "payload",
+                Some(&crate::bundle::shared_config_digest(applied)),
+            )
+            .unwrap();
+
+        let node_local = applied
+            .replace("slave-1", "slave-renamed")
+            .replace("wss://master:8953", "wss://other:8953");
+        assert!(
+            !tracker
+                .verify_applied_config(&node_local)
+                .expect("digest check"),
+            "node-local edits must not force a full apply"
+        );
+        assert!(!tracker.requires_full_apply());
+
+        let shared = applied.replace("9.9.9.9", "1.1.1.1");
+        assert!(
+            tracker
+                .verify_applied_config(&shared)
+                .expect("digest check"),
+            "a shared-field edit must be detected as drift"
+        );
+        assert!(tracker.requires_full_apply());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_watermark_persists_signing_key_fingerprint() {
+        let path = temp_path("fingerprint");
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        let fingerprint = "blake3:abc123";
+        tracker
+            .persist_watermark_with_identity(5, 0, "payload", Some("digest"), Some(fingerprint))
+            .unwrap();
+
+        let restarted = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        assert_eq!(
+            restarted
+                .get_watermark()
+                .unwrap()
+                .signing_key_fingerprint
+                .as_deref(),
+            Some(fingerprint)
+        );
+
+        // The compatibility wrapper must preserve the recorded identity rather
+        // than clearing it.
+        tracker
+            .persist_watermark_with_config_digest(6, 0, "payload2", None)
+            .unwrap();
+        assert_eq!(
+            tracker
+                .get_watermark()
+                .unwrap()
+                .signing_key_fingerprint
+                .as_deref(),
+            Some(fingerprint),
+            "a config-digest-only refresh must not erase the signing-key fingerprint"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn test_stale_master_term_is_rejected_and_new_term_wins() {
         let path = temp_path("term");
         let signing_key = Ed25519SigningKey::generate().unwrap();
@@ -511,6 +646,8 @@ mod tests {
 
         // The slave is at epoch 2, version 10.
         let current = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             term: 2,
             ..bundle(10)
         };
@@ -521,6 +658,8 @@ mod tests {
         // A stale master from epoch 1 with a higher version must not overwrite
         // the newer configuration.
         let stale = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             term: 1,
             ..bundle(11)
         };
@@ -536,6 +675,8 @@ mod tests {
         // A term bump alone is not permission to roll the version back: a
         // promoted master with a stale state file is rejected.
         let stale_promotion = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             term: 3,
             ..bundle(1)
         };
@@ -551,6 +692,8 @@ mod tests {
         // An explicit promotion must raise both term and version above the
         // applied high-water mark.
         let promoted = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             term: 3,
             ..bundle(11)
         };
@@ -633,6 +776,8 @@ mod tests {
         // Same version, different signed content: a content replay.
         let other = build_and_sign_push(
             &ConfigBundle {
+                config_digest: String::new(),
+                signing_key_fingerprint: String::new(),
                 custom_rules: vec!["||evil.example^".to_string()],
                 ..bundle(5)
             },
@@ -651,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_watermark_without_term_loads_as_term_zero() {
+    fn test_v1_watermark_is_rejected_by_protocol_v2() {
         let path = temp_path("legacy");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -660,12 +805,25 @@ mod tests {
         )
         .unwrap();
 
-        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+        let err = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
             .with_watermark_path(path.clone())
-            .expect("a pre-term watermark must remain loadable");
-        assert_eq!(tracker.get_version(), 5);
-        assert_eq!(tracker.get_term(), 0);
-        assert_eq!(tracker.get_watermark().unwrap().term, 0);
+            .expect_err("a v1 watermark must not be read by a v2 binary");
+        assert!(
+            matches!(err, HaError::Validation { ref field, ref reason } if field == "ha_watermark" && reason.contains("protocol_version")),
+            "unexpected error: {err:?}"
+        );
+
+        // Documented recovery: move the v1 watermark aside after backup; the
+        // next start begins at version 0 with no local replay guard and must
+        // take a full resync.
+        let backup = path.with_extension("v1.bak");
+        std::fs::rename(&path, &backup).unwrap();
+        assert!(backup.exists());
+        let clean = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .expect("a missing watermark is a clean start");
+        assert_eq!(clean.get_version(), 0);
+        assert!(clean.get_watermark().is_none());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

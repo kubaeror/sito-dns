@@ -200,7 +200,7 @@ The catalog lists every material finding from the eight audits. Some P2/P3 items
 | **P2-25** | Filter | Group standard `$dnsrewrite` can override a global block; group `$important @@` cannot override a global `$important` block. |
 | **P2-26** | Filter | Group snapshot rebuild can race with list reload and publish a snapshot compiled from stale list rules. |
 | **P2-27** | Filter | Huge `refresh_hours` can panic on `Instant + Duration` overflow; config validation only rejects zero. |
-| **P2-28** | Filter | `apply_content_forced` is never used by production refresh, so a legitimate >50% shrink is rejected forever. |
+| **P2-28** | Filter | `apply_content_forced` was never used by production refresh, so a legitimate >50% shrink was rejected forever. **Resolved by WP-2.5:** the operator-initiated curated-list refresh endpoint (`POST /api/v1/integrations/lists/{category}/refresh`) uses the forced path; the periodic task keeps the guarded path. |
 | **P2-29** | Filter | Disk cache identity is keyed only by list name, not URL; changing URL while keeping the name serves stale/foreign rules. |
 | **P2-30** | Filter | RouterOS client uses env proxies, silently falls through when `token_env` is missing, and reads unbounded error bodies. |
 | **P2-31** | Rewrites | Local `TXT` rewrites do not split into 255-byte character-strings; long TXT values fail encoding. |
@@ -282,7 +282,7 @@ The catalog lists every material finding from the eight audits. Some P2/P3 items
 | P3-2 | Code | 114 functions >100 lines; `DnsPipeline::handle` 669, `validate_response_inner` 585, `render_prometheus` 501, `run_server_full` 437, `start_doh3_listener` 395. |
 | P3-3 | Code | Workspace production: 63 `unwrap`, 26 `expect`, 2 panic sites, 147 `let _ =`, 96 `.ok()`, 41 `unwrap_or_default`, 24 `#[allow]`. |
 | P3-4 | Code | `sito-ha` has 20 `Mutex::lock().unwrap()` calls; poison would abort release. `pktinfo.rs` has 17 unsafe sites, blanket `clippy::all`/`pedantic` allow, no SAFETY comments. |
-| P3-5 | Code | Dead/test-only APIs: `run_server`, `run_healthcheck` re-export, `Config::network_exposure_warnings`, `DnsPipeline::with_anti_bypass`, `extract_query_info`, `RewriteAction::SynthesizeAnswer`, `RuntimeLists::apply_content_forced`, `FilterStatus` external use, `MAX_REGEX_BATCHES`, `config_writer::save_config_atomic`, `Session::to_cookie_header`, `AuthManager::admin_count`. |
+| P3-5 | Code | Dead/test-only APIs: `run_server`, `run_healthcheck` re-export, `Config::network_exposure_warnings`, `DnsPipeline::with_anti_bypass`, `extract_query_info`, `RewriteAction::SynthesizeAnswer`, `FilterStatus` external use, `MAX_REGEX_BATCHES`, `config_writer::save_config_atomic`, `Session::to_cookie_header`, `AuthManager::admin_count`. |
 | P3-6 | Code | Duplicated logic: three DNSSEC chain walkers, TCP/DoT writer loops, DoH/DoH3 request parsing, DoQ/DoH3 cert polling, four TLS acceptor sets, three CIDR parsers, two suffix matchers, six `mock_context` helpers, 22 hardcoded `"1.2.1"` test fixtures. |
 | P3-7 | Code | Unused dependencies: `sito-stats` declares `sito-core`; `sito-rewrites` declares `serde_json`/`thiserror`. `tokio full` used workspace-wide. `rust-version = "1.99.1"` is an exact pin, not a minimum. |
 | P3-8 | Code | Hardcoded values: 20+ transport timeouts/caps, 16 DNSSEC policy constants, `0.0.0.0` ACME bind, `127.0.0.1:8080`/`:53` health probe, `admin@example.com`, `example.com`, `localhost.`, 3600000 repeated in SQL, `HOUR_MS` absent. |
@@ -385,7 +385,7 @@ This is the explicit cleanup list for the refactor. Each item is either removed,
 | Three CIDR parsers and two suffix matchers | `filter/parser.rs`, `clients/registry.rs`, `rewrites/table.rs`, `parental.rs`, `services.rs` | Shared `IpNetwork`/`DomainSuffix`; WP-1.2. |
 | Two atomic state writers and three secret-strip copies | `ha/coordinator.rs`, `ha/slave/state.rs`, `ha/bundle.rs`, `api/state.rs` | One `AtomicFile`/`SecretSanitizer`; WP-2.9. |
 | Two hook systems | `.pre-commit-config.yaml`, `scripts/git-hooks` | Keep one; WP-1.9. |
-| `stats_watermark` written but never read | `sito-stats/src/db.rs` | Delete or wire to retention; WP-2.12. |
+| `stats_watermark` written but never read | `sito-stats/src/db/retention.rs` | Kept as a progress/diagnostic record and v1.9 compatibility; not read to skip rows because aggregate/delete share a transaction and backdated rows must re-aggregate (documented in the retention module and WP-2.12 status). |
 | `RuntimeState` separate 225-LOC crate | `sito-runtime` | Keep if generation/apply grows; otherwise merge into `sito-core`; WP-1.4. |
 | Six `mock_context` helpers / 22 `"1.2.1"` fixtures | `sito-api` test modules | Consolidate into `test_support`; WP-1.8. |
 | `sito-test` 45 dependencies | `crates/sito-test/Cargo.toml` | Split harness/mocks; remove unused; WP-1.8. |
@@ -399,7 +399,7 @@ This is the explicit cleanup list for the refactor. Each item is either removed,
 | `DnsPipeline::with_anti_bypass` | `sito/src/pipeline.rs:679` | Test-only; delete; WP-1.1. |
 | `extract_query_info` | `sito-proto/src/wire.rs:22` | Delete; WP-1.1. |
 | `RewriteAction::SynthesizeAnswer` | `sito-core/src/verdict.rs:62` | Never constructed; delete; WP-1.1. |
-| `RuntimeLists::apply_content_forced` | `sito-clients/src/runtime_lists.rs:239-242` | Wire force refresh or delete; WP-2.5. |
+| `RuntimeLists::apply_content_forced` | `sito-clients/src/runtime_lists.rs` | Wired: operator-initiated curated-list refresh uses the forced path; the periodic task keeps the guarded path. WP-2.5. |
 | `FilterStatus` external use | `sito-filter` | Expose via API/metrics; WP-2.3. |
 | `MAX_REGEX_BATCHES` | `sito-filter/src/structures/compiled.rs` | Dead limit; delete or derive; WP-2.3. |
 | `config_writer::save_config_atomic` | `sito-api/src/config_writer.rs` | No production caller; delete; WP-1.1. |
@@ -482,9 +482,10 @@ Startup, check-config, API writes, restore, and HA apply all reject unknown keys
 ### D7 — HA protocol v2 upgrade/downgrade
 
 - Upgrade order: **master first**, then slaves. A v2 master rejects v1 slaves with `protocol_mismatch` and a readiness reason; a v2 slave rejects a v1 master the same way. The cluster is upgraded one node at a time with replication intentionally degraded during the window.
+- Before the first v2 start, back up and move aside `ha_state.toml` on the master and `ha_watermark.toml` on every slave. There is no in-place state-migration command; the master sequence resets, each slave replay guard resets, and a full resync/full apply is required. Keep the v1 files for downgrade.
 - Downgrade is **not supported in place**. Restore the pre-upgrade backup of `config.toml`, `ha_state.toml`, `ha_watermark.toml`, and certificates, then run 1.9.3.
 - `ha_state.toml`/`ha_watermark.toml` carry `protocol_version = 2`; v1 files are refused with migration instructions rather than guessed at.
-- Shared config fields on a slave are read-only. A local edit to a shared field marks the slave `Degraded` and requires a full resync; node-local fields remain editable.
+- A local edit to a shared field is detected as drift after the write, marks the slave `Degraded`, and requires a full resync; node-local fields remain editable. Edit-time read-only enforcement is future work.
 
 ### D8 — HA publish failure semantics
 
@@ -827,9 +828,9 @@ UI/live refresh sets `include_total=false`; retention processes bounded hour chu
 - Bind bundle `term`, `version`, `config_digest`, `signing_key_fingerprint` into the signed payload.
 - Require local config digest match on restart.
 - Add heartbeat/pong deadline and per-slave ACK history.
-- Require CA or pin+CA semantics; no “unpinned without CA” unless an explicit `allow_no_verification` flag is set.
-- Upgrade order: master first, then slaves; downgrade is not supported in place. Restore config/HA state/certs backups to return to 1.9.3.
-- Shared config fields are read-only on slaves; local shared-field edits mark `Degraded` and require resync.
+- Require CA or pin+CA semantics; no “unpinned without CA” unless the explicit `allow_unpinned_tls` opt-out is set. A configured CA is always enforced.
+- Upgrade order: master first, then slaves; before the first v2 start, back up and move aside v1 `ha_state.toml`/`ha_watermark.toml` (no in-place state migration; master sequence and slave replay guards reset, full resync required). Downgrade is not supported in place; restore config/HA state/certs backups to return to 1.9.3.
+- A local shared-field edit is detected as post-edit drift, marks the slave `Degraded`, and requires resync; edit-time read-only enforcement is future work.
 - Coordinated cluster upgrade documented in `docs/runbook-ha.md`.
 
 ## 12. Fail-Closed Policy
@@ -1028,7 +1029,7 @@ The safety gate is the only work done before the 2.0 refactor. It closes all P0 
 
 ### WP-1.2 — Normalized domain and client identity model
 
-**Addresses:** P1-9, P2-31..P2-35, P2-97..P2-99, IDN gaps.
+**Addresses:** P1-9, P2-97..P2-99, IDN gaps.
 **Files:** `sito-core/src/{domain,client}.rs`, `sito-clients/src/{registry,mac,schedule}.rs`, `sito-filter/src/parser.rs`, `sito-rewrites/src/table.rs`.
 **Interfaces:** `NormalizedDomain`, `ClientIdentity`, `IdentitySource`.
 **Steps:**
@@ -1163,8 +1164,10 @@ The safety gate is the only work done before the 2.0 refactor. It closes all P0 
 **Files:** `sito-dnssec/src/chain_cache.rs`, `sito-cache/src/{entry,cache}.rs`, `sito/src/pipeline.rs`.
 **Steps:**
 - [ ] Add `DnssecPolicyEpoch` to cache entries; flush/reject on validator/anchor change.
-- [ ] Cache `Bogus`/`Indeterminate` with explicit policy and short TTL; never serve stale Indeterminate.
-- [ ] Add metrics for `Secure/Insecure/Bogus/Indeterminate`, key fetch budget, deadline failures.
+- [x] Cache strict-mode `Bogus` SERVFAILs for 5 s (`DNSSEC_BOGUS_CACHE_TTL`)
+  and cap log-only `Indeterminate` entries at 30 s
+  (`DNSSEC_INDETERMINATE_CACHE_TTL`); never serve stale `Bogus`/`Indeterminate`.
+- [x] Add metrics for `Secure/Insecure/Bogus/Indeterminate`, key fetch budget, deadline failures.
 - **Acceptance:** policy-change race test passes; stale cache never serves unvalidated data.
 **Estimate:** M.
 
@@ -1173,49 +1176,98 @@ The safety gate is the only work done before the 2.0 refactor. It closes all P0 
 **Addresses:** P1-7, P1-8, P2-24..P2-29, P2-95, P2-96.
 **Files:** `sito-filter/src/{parser,engine,structures/*,subscription,downloader}.rs`.
 **Steps:**
-- [ ] Stream list parsing; enforce per-line/pattern/byte/rule/regex/DFA/compile budgets.
-- [ ] Reject empty/zero-yield lists unless allowed; apply drop guard to all remote reload paths.
-- [ ] Store URL in cache metadata; invalidate on URL change.
-- [ ] Expose status/degraded counts and per-list errors via API/metrics.
-- [ ] Cap `refresh_hours` and use checked time arithmetic.
+- [x] Stream list parsing; enforce per-line/pattern/byte/rule/regex/DFA/compile budgets.
+- [x] Reject empty/zero-yield lists unless allowed; apply drop guard to all remote reload paths.
+- [x] Store URL in cache metadata; invalidate on URL change.
+- [x] Expose status/degraded counts and per-list errors via API/metrics (existing API: failed/degraded list names plus the latest reload error; metrics: aggregate filter-health gauges; per-list error labels and a degraded-lists gauge remain follow-up metrics work).
+- [x] Cap `refresh_hours` and use checked time arithmetic.
 - **Acceptance:** hostile/empty/URL-change tests pass; status truthful; no OOM.
 **Estimate:** L.
+
+**Status (2026-11-18):** Complete. The downloader streams the response body
+under the hard `max_list_bytes` cap and the parser iterates lines with
+per-line/pattern/rule and regex/DFA compile budgets; empty/zero-yield rejection
+and the drop guard are in place. URL-keyed cache identity and the one-year
+refresh cap landed in this slice. The existing API exposes failed/degraded list
+names and the latest reload error, and metrics expose aggregate filter-health
+gauges; the runtime status is truthful for URL changes. Per-list error labels
+and a degraded-lists gauge remain follow-up metrics work. Evidence: Phase 2 —
+filter section in `docs/audit6-test-matrix.md` and §17 of
+`docs/2.0-public-api-diff.md`.
 
 ### WP-2.4 — Filter precedence, groups, and rewrites
 
 **Addresses:** P1-9, P2-24..P2-26, P2-31..P2-33, P2-35.
 **Files:** `sito-filter/src/engine.rs`, `sito-rewrites/src/table.rs`, `sito/src/pipeline.rs`.
 **Steps:**
-- [ ] Define global/group precedence table; test `$important @@`, `$dnsrewrite`, `$denyallow`, `$client`.
-- [ ] Never drop a whole group on compile failure; publish non-regex subset + degraded status.
-- [ ] Add authenticated identity gate for rewrite exceptions.
-- [ ] Chunk TXT records; local owner NODATA for unconfigured qtypes; safe search only A/AAAA/HTTPS.
+- [x] Define global/group precedence table; test `$important @@`, `$dnsrewrite`, `$denyallow`, `$client`.
+- [x] Never drop a whole group on compile failure; publish non-regex subset + degraded status.
+- [x] Add authenticated identity gate for rewrite exceptions.
+- [x] Chunk TXT records; local owner NODATA for unconfigured qtypes; safe search only A/AAAA/HTTPS.
 - **Acceptance:** precedence matrix tests pass; no group fail-open; rewrite exception spoof test passes.
 **Estimate:** M–L.
+
+**Status (2026-11-19):** Complete. Parsed-rule end-to-end tests pin
+`Allow > Rewrite > Block` within a tier, group-overlay tie-breaking and the
+`$important` tier; the code and ADR-0007 record the P2-25 direct-path
+resolution (a group standard `$dnsrewrite` overrides a global standard block,
+while an important block still wins). Groups retain the previous snapshot when
+one exists and report `degraded_groups` on missing/unloaded lists, invalid-only
+rules and compile-budget failures; a first failure reports the group degraded
+without publishing an empty snapshot, and publication is generation-guarded and
+serialized.
+Local A/AAAA/PTR/TXT owners return NODATA for unconfigured qtypes with an
+exception-client fall-through, TXT values are chunked, rewrite config/API
+validation rejects inert entries, and safe search is limited to A/AAAA/HTTPS.
+Evidence: Phase 2 — rewrites and policy section in
+`docs/audit6-test-matrix.md` and §18 of `docs/2.0-public-api-diff.md`.
 
 ### WP-2.5 — Client policy, schedules, parental/service lists
 
 **Addresses:** P2-34..P2-37, P2-97..P2-99.
 **Files:** `sito-clients/src/*`, `sito-filter/data/*`, docs.
 **Steps:**
-- [ ] Strict MAC parsing and ARP-snapshot invalidation.
-- [ ] Add IANA timezone support or document fixed-offset only; validate cron window semantics.
-- [ ] Replace tiny bundled parental/service data with a maintained manifest or mark experimental in UI/docs.
-- [ ] Add force-refresh/status for runtime lists; validate category keys.
-- [ ] Expand safe search coverage; remove self-CNAME.
+- [x] Strict MAC parsing and ARP-snapshot invalidation.
+- [x] Add IANA timezone support or document fixed-offset only; validate cron window semantics.
+- [x] Replace tiny bundled parental/service data with a maintained manifest or mark experimental in UI/docs. **D15 descope:** bundled parental/service data is labeled a minimal built-in fallback in UI/docs; a maintained external dataset is deferred past WP-2.5 (manifest/count checks shipped instead).
+- [x] Add force-refresh/status for runtime lists; validate category keys.
+- [x] Expand safe search coverage; remove self-CNAME.
 - **Acceptance:** parental/service tests and data manifest checks pass; UI no longer overclaims.
 **Estimate:** L.
+
+**Status (2026-11-20):** Complete. Operator MAC IDs use one strict shape parser
+(6×2 `:`/`-` or 3×4 `.`, explicit `mac:` marker only) and a changed ARP
+snapshot invalidates positive and negative caches. Runtime-list status keys are
+case-insensitive, record `last_attempt`/`last_error` (cleared only on success),
+reject empty/unknown/duplicate categories, guard services by effective rule
+count, and expose `GET`/`POST /api/v1/integrations/lists` status/force-refresh
+for Operators. Safe search has a self-CNAME guard (`safe.duckduckgo.com` passes
+through) and remains A/AAAA/HTTPS-only. Numeric reversed cron ranges are
+rejected with field attribution, split overnight windows are documented, and
+`schedule_enabled` without a schedule is pinned as always active. Bundled
+parental/service data is labeled minimal with manifest consistency checks, and
+the anti-bypass dataset has a companion metadata file with exact counts
+(29 exact + 1 wildcard + 70 IPs). Evidence: Phase 2 — clients, schedules and
+curated data section in `docs/audit6-test-matrix.md` and §19 of
+`docs/2.0-public-api-diff.md`.
 
 ### WP-2.6 — Transport admission and TLS hardening
 
 **Addresses:** P1-10..P1-14, P2-15..P2-21.
 **Files:** `sito-transport/src/{udp,tcp,dot,doh,doh3,doq,tls,acme,limiter,handler}.rs`, `sito/src/server.rs`.
+**Status (2026-11-20): complete.** `AdmissionController` publishes the
+connection/per-source/request permits and prefix `RateKey`; TCP/DoT admit on
+the length prefix before allocating a body; DoQ/DoH3 connections are bounded
+by a 300 s lifetime; configured DoQ/DoH3 bind failures abort startup and DoH
+only advertises Alt-Svc after a successful DoH3 bind. Evidence: Phase 2 —
+transport admission and TLS (WP-2.6) in `docs/audit6-test-matrix.md` and §20 of
+`docs/2.0-public-api-diff.md`.
 **Steps:**
-- [ ] Implement `AdmissionController` permits before handshake/body; per-prefix rate keys.
-- [ ] Set QUIC windows/stream caps; total request/connection deadlines.
-- [ ] Reject QR=1/multi-question; enforce 65,535-byte responses.
-- [ ] Validate cert/key pair and ALPN; one `TlsManagerSet` reloads all protocols.
-- [ ] Add accept-error backoff, slowloris caps, ACME HTTP-01 limits.
+- [x] Implement `AdmissionController` permits before handshake/body; per-prefix rate keys.
+- [x] Set QUIC windows/stream caps; total request/connection deadlines.
+- [x] Reject QR=1/multi-question; enforce 65,535-byte responses.
+- [x] Validate cert/key pair and ALPN; one `TlsManagerSet` reloads all protocols.
+- [x] Add accept-error backoff, slowloris caps, ACME HTTP-01 limits.
 - **Acceptance:** DoS/slowloris/EDNS/TLS tests pass; no listener silently disappears.
 **Estimate:** L.
 
@@ -1224,94 +1276,252 @@ The safety gate is the only work done before the 2.0 refactor. It closes all P0 
 **Addresses:** P1-25, P2-7..P2-12.
 **Files:** `sito-upstream/src/{manager,bootstrap,plain,dot,doh,doq,health,key_fetch}.rs`, `sito-core/src/ssrf.rs`.
 **Steps:**
-- [ ] Set RD=1 on bootstrap/probes; force refresh on candidate failure; apply SSRF denylist with explicit private-upstream allowlist.
-- [ ] Fix bare DoH `/dns-query`; disable system proxy; verify ALPN.
-- [ ] Loop UDP receives until deadline; ignore mismatched datagrams.
-- [ ] Add EDNS/FORMERR fallback; bound timeout/pool; validate targets in config.
-- [ ] Per-attempt RTT/error metrics; remove stale health series.
+- [x] Set RD=1 on bootstrap/probes; force refresh on candidate failure; apply SSRF denylist with explicit private-upstream allowlist.
+- [x] Fix bare DoH `/dns-query`; disable system proxy; verify ALPN.
+- [x] Loop UDP receives until deadline; ignore mismatched datagrams.
+- [x] Add EDNS/FORMERR fallback; bound timeout/pool; validate targets in config.
+- [x] Per-attempt RTT/error metrics; remove stale health series.
 - **Acceptance:** bootstrap/DoH/EDNS/failover tests pass; no private-target redirect.
 **Estimate:** L.
+
+**Status (2026-11-20): complete.** Bootstrap and health/key/probe queries set
+RD=1 in every path. Bootstrap answers apply the shared SSRF denylist (including
+IPv4-mapped, NAT64, 6to4 and Teredo embeddings), denied-only answers are not
+cached, and `upstream.allow_private_targets` is the only hostname opt-in; an
+explicit IP literal remains the documented operator allowlist path. Forced
+refresh is covered for plain UDP, DoT and DoH. DoH uses `/dns-query` for bare
+hosts and ignores ambient proxies; UDP receives loop until the deadline; FORMERR
+retries without EDNS; DoT/DoQ verify ALPN and DoQ reconnects once on stream-open
+failure. `timeout_ms`/`pool_size` are bounded, target validation moved into
+`UpstreamConfig::validate`, and bootstrap candidates are capped at 16. Metrics
+are per attempt, and a successful config apply prunes health/RTT/error series for
+removed upstream names. Evidence is in
+`docs/audit6-test-matrix.md` (P1-25 and the WP-2.7 section) and §21 of
+`docs/2.0-public-api-diff.md`.
+
+**Residuals (later work):** stale-series pruning covers global and per-domain
+upstream names, not per-client scoped names recovered from the raw `[clients]`
+section; parallel races record only attempts that complete before the winner, so
+cancelled losers may not get an attempt entry.
 
 ### WP-2.8 — Cache and response shaping
 
 **Addresses:** P1-13, P1-14, P1-18, P2-22, P2-23, P2-84.
-**Files:** `sito-cache/src/*`, `sito-proto/src/wire.rs`, `sito/src/pipeline.rs`.
+**Files:** `crates/sito-cache/src/*`, `crates/sito-proto/src/{wire,shaping}.rs`,
+`crates/sito/src/pipeline/*`, `crates/sito-api/src/handlers/cache.rs`,
+`crates/sito-transport/src/{udp,tcp,dot,doh,doh3,doq}.rs`.
 **Steps:**
-- [ ] Enable moka invalidation closures; add non-root test.
-- [ ] Rebuild question/flags/OPT per client; strip upstream EDNS options.
-- [ ] Add policy epoch and TTL re-clamp; sanitize public helpers.
-- [ ] Enforce response size on DoH/DoH3/TCP/DoT.
+- [x] Enable moka invalidation closures; add non-root test.
+- [x] Rebuild question/flags/OPT per client; strip upstream EDNS options.
+- [x] Add policy epoch and TTL re-clamp; sanitize public helpers.
+- [x] Enforce response size on DoH/DoH3/TCP/DoT.
 - **Acceptance:** cache invalidation/shaping/size tests pass.
 **Estimate:** M.
+
+**Status (2026-11-20): complete.** Non-root invalidation is exercised for the
+exact name, subdomains, IDN/punycode, every key variant (plain, EDNS/DO, CD=1,
+ECS, Secure) and after a cache resize, plus the REST seed/invalidate path.
+Every result path uses the shared shaper; the multi-question FORMERR path is
+shaped with `dns.edns_udp_size` and echoes no client options. Cache inserts now
+store `AD=1` only for `Secure` decisions without mutating the caller, the
+status-less fresh/stale getters hide `Bogus`/`Indeterminate`, and the
+status-aware getters remain the raw inspection form. TTL-only runtime applies
+invalidate old entries by epoch (documented and tested) while direct
+`update_config` re-clamps TTL, negative and stale windows; stale responses use
+`min(30 s, max_ttl)`. CD=1-triggered prefetches refresh the triggering key
+instead of writing the CD=0 key. UDP, TCP, DoT, DoH, DoH3 and DoQ all enforce
+the 65,535-byte framing fallback, with direct `truncate_for_framing` over/under/
+undecodable tests. Evidence is in the Phase 2 — cache and response shaping
+(WP-2.8) section of `docs/audit6-test-matrix.md` and §23 of
+`docs/2.0-public-api-diff.md`.
+
+**Residuals (later work):** runtime cache-policy applies remain
+epoch-invalidating rather than warm-entry re-clamping, so a TTL-only apply
+drops warm entries by design; the over-limit `truncate_for_framing` test pads a
+decodable wire buffer because Hickory's encoder itself caps output at 65,535
+bytes.
 
 ### WP-2.9 — HA protocol v2 and failover
 
 **Addresses:** P1-3..P1-6, plus HA hardening H-05..H-23 (bundle size, send timeout, handshake limits, signing-key identity, resync clearing, CA/key permissions, IPv6 URL, backoff, divergence cleanup, metrics).
 **Files:** `sito-ha/src/*`, `sito-api/src/handlers/ha.rs`, `docs/runbook-ha.md`.
 **Steps:**
-- [ ] Add heartbeat/pong deadline, applied config digest, bounded publish history.
-- [ ] `publish` returns `Result`; oversized bundle rejected before persist.
-- [ ] Send timeouts, per-slave queue bytes, handshake rate limits.
-- [ ] Per-slave resync ACK clears divergence; signing key fingerprint persisted.
-- [ ] CA/pin/SAN policy and key permissions; IPv6 URL; clean-close backoff.
-- [ ] Protocol v2; coordinated upgrade docs.
+- [x] Add heartbeat/pong deadline, applied config digest, bounded publish history.
+- [x] `publish` returns `Result`; oversized bundle rejected before persist.
+- [x] Send timeouts, per-slave queue bytes, handshake rate limits.
+- [x] Per-slave resync ACK clears divergence; signing key fingerprint persisted.
+- [x] CA/pin/SAN policy and key permissions; IPv6 URL; clean-close backoff.
+- [x] Protocol v2; coordinated upgrade docs.
 - **Acceptance:** partition/fork/drift/publish/oversize/IPv6 tests pass; health truthful.
 **Estimate:** L.
+
+**Status (2026-11-20):** Complete. HA protocol v2 is implemented: v1 peers
+and v1 state/watermark files are rejected with `protocol_mismatch`, the signed
+bundle binds `protocol_version`, `config_digest` and
+`signing_key_fingerprint`, and the watermark persists the key fingerprint.
+The pong watchdog, bounded 64-envelope publish history, honest
+`PublishOutcome` counts (`queued`/`connected_no_delivery` vs
+connected/queued/coalesced), 64/8 listener session limits, 10 s send/handshake
+deadlines, 1 MiB message and 4 MiB per-slave queue budgets, IPv6 URLs,
+CA/SAN/pin policy, `ca.key` repair and fixed 1 s clean-close reconnect are
+covered by tests. Evidence:
+[`docs/audit6-test-matrix.md`](audit6-test-matrix.md#phase-2--ha-protocol-v2-and-failover-wp-29),
+[`docs/runbook-ha.md`](runbook-ha.md#7-ha-protocol-v2-upgrade-and-downgrade),
+[`docs/2.0-migration.md`](2.0-migration.md#82-ha-protocol-v2-upgrade) and the
+[API diff](2.0-public-api-diff.md#25-phase-2--ha-protocol-v2-and-failover-wp-29).
+Residuals: edit-time read-only enforcement for shared fields on slaves remains
+post-edit drift detection; the published API status is `queued` only when a
+slave was enqueued and `connected_no_delivery` when connected channels were
+closed (delivery is confirmed only by the slave ACK), and downgrade requires
+restoring pre-upgrade state/watermark and certificate backups rather than an
+in-place rollback. The first v2 start requires moving v1 state/watermark files
+aside after backup (no in-place state migration), which resets the master
+sequence and slave replay guards and forces a full resync.
 
 ### WP-2.10 — Auth, RBAC, and self-service 2FA
 
 **Addresses:** P1-15, P1-16, P1-20, P2-52, P2-54.
 **Files:** `sito-api/src/{auth/*,handlers/auth_handlers.rs,ui/*}`, templates.
 **Steps:**
-- [ ] Re-auth for TOTP enable/disable, password, wizard, role changes.
-- [ ] Wizard bootstrap-only; self-service TOTP for all roles; UI enrollment.
-- [ ] Login length/lockout digest keys; Argon2 semaphore.
-- [ ] Status codes 201/202/409; `totp_enabled` truthful.
+- [x] Re-auth for TOTP enable/disable, password, wizard, role changes.
+- [x] Wizard bootstrap-only; self-service TOTP for all roles; UI enrollment.
+- [x] Login length/lockout digest keys; Argon2 semaphore.
+- [x] Status codes 201/202/409; `totp_enabled` truthful.
 - **Acceptance:** stolen-session/reauth tests pass; all roles can enroll 2FA.
 **Estimate:** M.
 
-### WP-2.11 — API v2, OpenAPI, config apply, updater
+**Status (2026-11-20):** Complete. Password changes are self-service for every
+role with current-password proof and a required TOTP/backup code when enrolled;
+Admin overrides, role changes, Admin creation and Admin-scoped token creation
+from a browser session require a fresh session-bound `X-Reauth-Token` (Admin API
+tokens are exempt). Argon2 hash/verify work is bounded to four concurrent
+operations and all login/re-auth/change-password inputs are length-capped.
+The wizard now treats an unchecked cache/filtering/DNSSEC/CNAME box as an
+explicit disable, and the unimplemented upstream weight control is removed.
+`create_client`, `add_client_group`, `add_filter_list` and `add_rewrite` return
+`201`; the TOTP challenge remains `202`, duplicate groups remain `409`, and
+`update_user` reports the real TOTP state. Evidence: Phase 2 — auth, RBAC and
+self-service 2FA section in `docs/audit6-test-matrix.md` and §22 of
+`docs/2.0-public-api-diff.md`. Deferred residuals: second proof for
+`delete_user`/`delete_token` and real weighted upstream balancing remain
+unimplemented beyond Phase 2 (they were not delivered by WP-2.11).
+
+### WP-2.11 — API hardening, OpenAPI, config apply, updater
 
 **Addresses:** P2-38..P2-55, P2-44.
 **Files:** `sito-api/src/{router,openapi,handlers/*,config_apply,updater}.rs`, `docs/openapi.json`.
 **Steps:**
-- [ ] Add OpenAPI security schemes/tags/path coverage; drift validator.
-- [ ] Reject unknown config keys; restart-only changes return 409 with no persistence; invalid references/rewrites rejected.
-- [ ] Deferred filter apply for unrelated settings; apply lock in refresh/update-all.
-- [ ] Cache-Control private/no-store on authenticated GETs; WebSocket Origin.
-- [ ] Updater: disable in-app apply on systemd/Docker, version truth, update lock, rollback, 0600 temp.
+- [x] Add OpenAPI security schemes/tags/path coverage; drift validator.
+- [x] Reject unknown config keys; restart-only changes return 409 with no persistence; invalid references/rewrites rejected.
+- [x] Deferred filter apply for unrelated settings; apply lock in refresh/update-all.
+- [x] Cache-Control private/no-store on authenticated GETs; WebSocket Origin.
+- [x] Updater: disable in-app apply on systemd/Docker, version truth, update lock, rollback, 0600 temp.
 - **Acceptance:** API/OpenAPI/updater tests pass; no false success.
 **Estimate:** L.
+
+**Status (2026-11-20):** Complete. The admin API now returns 409 with
+`restart_required` for restart-only writes, rejects unknown keys and broken
+references/rewrites before persisting, and defers filter work only when
+`[filtering]` is unchanged. First boot deliberately uses a synchronous filter
+apply and waits for the initial list fetch up to the subscription fetch
+timeout; a failure keeps setup pending and DNS gated instead of reporting
+success. OpenAPI declares bearer/cookie security, stable
+tags and the previously missing WebSocket and alias paths, with structural
+drift tests. Authenticated responses are `no-store`/`Vary: Cookie`; the
+querylog WebSocket validates Origin. WP-2.11 initially confined the legacy
+`?token=` parameter to that path; WP-2.14 now rejects it entirely (cookie or
+Bearer only). The updater detects systemd/Docker, refuses in-app apply with CLI
+instructions, never claims an unknown version is current, serializes applies,
+verifies the staged binary, backs up/restores the old binary, and enforces
+0600/0700 temp modes plus strict signature-pair policy. Viewer subscription
+URLs are redacted. Evidence: Phase 2 — API hardening, OpenAPI, config apply,
+updater section in `docs/audit6-test-matrix.md` and §26 of
+`docs/2.0-public-api-diff.md`. Residuals: `/api/v2` and the API v1
+compatibility facade are absent and deferred; systemd unit/installer E2E and
+atomic installer rollback are WP-2.13; the update lock is process-wide (no
+cross-process file lock); legacy `?token=` WebSocket authentication removal is
+implemented by WP-2.14; weighted upstream balancing remains unimplemented.
 
 ### WP-2.12 — Stats retention, PII, and polling
 
 **Addresses:** P1-19, P1-23, P1-24, P2-55..P2-63.
 **Files:** `sito-stats/src/{db,writer,metrics,anonymize,lib}.rs`, `sito-api/src/ui/handlers.rs`.
 **Steps:**
-- [ ] Write a failing test: after retention, `stats_hourly` contains no raw client IP/client name and old rollups are deleted per `rollup_retention_days`.
-- [ ] Write a failing test: “clear query log” empties both `query_log` and `stats_hourly` by default; `--keep-aggregates` keeps rollups.
-- [ ] Write a failing test: a 90-day retention sweep completes in bounded chunks without holding a write lock long enough to drop a concurrent insert.
-- [ ] Write a failing test: live query-log refresh does not execute a `COUNT(*)`; dashboard polling is served from cache within 30s.
-- [ ] Incremental retention with bounded chunks/commits, startup catch-up, metrics.
-- [ ] Rollup PII policy: keyed hash IPs, optional client names/domains, rollup retention, clear/vacuum.
-- [ ] `include_total=false` for live UI; cache dashboard aggregates; rate-limit stats.
-- [ ] Fix error definition, failover attribution, ignore_stats, mapped IPv6.
-- [ ] Remove per-verdict mutex or document/shard it.
+- [x] Write a failing test: after retention, `stats_hourly` contains no raw client IP/client name and old rollups are deleted per `rollup_retention_days`.
+- [x] Write a failing test: “clear query log” empties both `query_log` and `stats_hourly` by default; `--keep-aggregates` keeps rollups.
+- [x] Write a failing test: a 90-day retention sweep completes in bounded chunks without holding a write lock long enough to drop a concurrent insert.
+- [x] Write a failing test: live query-log refresh does not execute a `COUNT(*)`; dashboard polling is served from cache within 30s.
+- [x] Incremental retention with bounded chunks/commits, startup catch-up, metrics.
+- [x] Rollup PII policy: keyed hash IPs, optional client names/domains, rollup retention, clear/vacuum.
+- [x] `include_total=false` for live UI; cache dashboard aggregates; rate-limit stats.
+- [x] Fix error definition, failover attribution, ignore_stats, mapped IPv6.
+- [x] Remove per-verdict mutex or document/shard it.
 - **Acceptance:** retention scale/PII/polling/metrics tests pass; no dropped batches on normal sweep.
 **Estimate:** L.
+
+**Status (2026-11-20): complete; residuals documented.** Evidence is in the
+WP-2.12 section of [`docs/audit6-test-matrix.md`](audit6-test-matrix.md#phase-2--stats-retention-pii-and-polling-wp-212)
+and the three WP commits (`a385e76`, `7d7d6ec`, `dfd7b7e`) on
+`feat/2.0-phase2-wp212`. Residual decisions:
+
+- **P2-59 (forward-only anonymization):** enabling `privacy.anonymize_querylog`
+  affects new writes only; existing `query_log` rows are not rewritten. Safe
+  retroactive anonymization needs a bounded, crash-resumable rewrite and is
+  deferred (documented in `sito-stats/src/anonymize.rs` and the config
+  reference).
+- **P2-61 (keep-aggregates clear):** the operator-requested
+  `keep_aggregates=true` clear is deliberately one whole-range transaction and
+  loads all affected hours' top lists in memory; normal retention remains
+  hour-bounded with per-hour temp tables. The whole-range cost is a documented
+  residual.
+- **90-day / 1M scale:** a 72-hour multi-day retention test covers the
+  hour-chunked algorithm; a 1M-row/90-day soak remains a capacity-testing
+  residual (sweep cost is linear in expired rows; each transaction is
+  row-bounded).
+- **`stats_watermark`:** still written for progress diagnostics and v1.9
+  compatibility but intentionally not read to skip rows; aggregate/delete share
+  a transaction and backdated rows must be re-aggregated.
+- **P2-62 (histogram contention):** retained the per-verdict/per-upstream
+  mutex and documented the bounded critical section, read-mostly maps and hot
+  `allowed` single-threaded cost; the concurrent-update test is the
+  contention/losslessness evidence rather than the benchmark.
 
 ### WP-2.13 — Ops, Docker, systemd, installer, release
 
 **Addresses:** P1-17, P1-21, P2-67..P2-83, P3-20..P3-26.
 **Files:** `contrib/install.sh`, `contrib/systemd/sito.service`, Dockerfiles/compose, workflows, docs.
 **Steps:**
-- [ ] Atomic install/rollback, stop/start service, preserve capabilities.
-- [ ] Compose defaults loopback admin; named volume/init for config; valid DHCP hex.
-- [ ] Systemd `EnvironmentFile`, hardening directives, `UMask`.
-- [ ] Installer E2E, image scan/sign, release gate on tested main.
-- [ ] Pin `latest`/digest; verify install commands.
+- [x] Atomic install/rollback, stop/start service, preserve capabilities.
+- [x] Compose defaults loopback admin; named volume/init for config; valid DHCP hex.
+- [x] Systemd `EnvironmentFile`, hardening directives, `UMask`.
+- [x] Installer E2E, image scan/sign, release gate on tested main.
+- [x] Pin `latest`/digest; verify install commands.
 - **Acceptance:** fresh install/upgrade/rollback/uninstall E2E passes; image scan clean; docs commands work.
 **Estimate:** L.
+
+**Status (2026-11-20): complete; residuals documented.** Evidence is in the
+WP-2.13 section of [`docs/audit6-test-matrix.md`](audit6-test-matrix.md#phase-2--ops-docker-systemd-installer-release-wp-213)
+and the WP commits (`e26e342`, `7e380f4`, and this docs/evidence commit) on
+`feat/2.0-phase2-wp213`. The compose files keep the admin UI on loopback and use
+a named config volume; HA uses valid `0xc0a8010ac0a8010b` DHCP hex and
+`SITO_HA_*` topology variables; the systemd unit, installer fallback and docs
+share the hardening directives and `/etc/sito/sito.env`; the updater preserves
+mode/xattrs; and the installer E2E covers stop-before-backup, atomic config
+restore, setcap/getcap, no-systemd, cosign ownership and uninstall. Residual
+decisions:
+
+- **WP-3.1 full Docker/image E2E:** release vulnerability scanning uses
+  `--platform linux/amd64` only, and the published-image smoke is
+  `--version`/`check-config` rather than start/healthcheck/DNS. Extending the
+  scan to arm64/armv7 and running a live release-image DNS query is deferred to
+  WP-3.1 (documented in the release workflow and matrix P2-70/P3-26).
+- **Root HA lane:** `scripts/test-ha-ownership-root.sh` remains a root-gated
+  manual/weekly operator step; wiring it into a root-capable CI runner is
+  deferred to WP-3.1 (P3-21).
+- **Digest-pin docs:** the shipped examples use pinned release tags and explain
+  digest pinning, but do not hardcode a per-release digest. Operators should
+  resolve and record the published digest at deploy time; a generated
+  digest-pinned example remains a WP-3.1 documentation follow-up.
 
 ### WP-2.14 — Documentation, migration, and final truth pass
 
@@ -1424,7 +1634,7 @@ No deadline is assumed. Phase 0 is shippable as **1.9.4** (with P1-19/P1-23/P1-2
 2. Baseline commands pass; fuzz targets run 24h clean; benchmarks pass the stored baseline.
 3. ACME staging issues/renews/reloads all transports; DNSSEC hostile-chain and real signed-zone tests pass; HA partition/fork/drift/promotion tests pass; `/health` false on a dead master.
 4. Installer fresh/upgrade/rollback/uninstall and Docker health/DNS tests pass.
-5. Config v1→v2, SQLite migration, API v2, and HA protocol v2 migration/rollback tests pass on a copy of a real 1.9.4 data dir.
+5. Config v1→v2 and HA protocol v2 migration/rollback tests pass on a copy of a real 1.9.4 data dir. SQLite migration and API v2 remain deferred; `/api/v1` is canonical.
 6. OpenAPI has security schemes and route coverage; docs commands execute; historical audits are marked.
 7. Threat model/security review signed off.
 

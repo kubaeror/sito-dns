@@ -15,6 +15,14 @@ use sito_core::ssrf::is_denied_target_ip;
 use sito_proto::rdata::{A, AAAA};
 use sito_proto::{Message, MessageType, Name, OpCode, Query, RData, RecordType};
 
+/// Upper bound on the number of addresses kept from one bootstrap answer.
+///
+/// A hostile or misconfigured zone can return dozens of A/AAAA records; each
+/// one becomes a separately connected candidate, so failover latency and
+/// resource use must stay bounded. The manager re-resolves periodically, so
+/// truncation does not permanently hide rotated addresses.
+pub(crate) const MAX_BOOTSTRAP_CANDIDATES: usize = 16;
+
 struct CachedEntry {
     ips: Vec<IpAddr>,
     expires_at: Instant,
@@ -251,6 +259,16 @@ impl BootstrapResolver {
             if !resolved_ips.is_empty() {
                 resolved_ips.sort();
                 resolved_ips.dedup();
+                if resolved_ips.len() > MAX_BOOTSTRAP_CANDIDATES {
+                    warn!(
+                        "Bootstrap answer for '{}' via {} returned {} addresses; keeping {} candidates",
+                        trimmed,
+                        ip,
+                        resolved_ips.len(),
+                        MAX_BOOTSTRAP_CANDIDATES
+                    );
+                    resolved_ips.truncate(MAX_BOOTSTRAP_CANDIDATES);
+                }
                 debug!(
                     "Bootstrap resolved '{}' via {} to {:?}",
                     trimmed, ip, resolved_ips

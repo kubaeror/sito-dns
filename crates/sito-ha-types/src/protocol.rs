@@ -5,8 +5,13 @@ use std::collections::HashMap;
 
 use crate::error::HaError;
 
-/// Protocol version number.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Current HA wire/state protocol version.
+///
+/// Version 2 is intentionally incompatible with v1: peers must negotiate it in
+/// `Hello`, every signed push carries it, and persisted state files are tagged
+/// with it. A v1 peer (or a v1 state file) is rejected with an actionable
+/// `protocol_mismatch` reason instead of being interpreted with v2 semantics.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Structured reason a slave rejected a pushed bundle.
 ///
@@ -45,7 +50,8 @@ pub enum HaMessage {
         /// Node role ("slave" for replicas). Optional for backwards compatibility.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
-        /// HA protocol version of the sender.
+        /// HA protocol version of the sender. Missing on v1 peers, which are
+        /// treated as protocol version 1 and rejected by a v2 master.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         protocol_version: Option<u32>,
     },
@@ -54,6 +60,12 @@ pub enum HaMessage {
     #[serde(rename = "config_push")]
     ConfigPush {
         version: u64,
+        /// HA protocol version of the pushing master.
+        ///
+        /// Missing on v1 masters, which deserialize as `0` and are rejected by
+        /// a v2 slave with an actionable `protocol_mismatch` reason.
+        #[serde(default)]
+        protocol_version: u32,
         /// Cluster epoch/term bound to the signed bundle. Missing on older
         /// masters, which are treated as term 0.
         #[serde(default)]
@@ -157,7 +169,8 @@ mod tests {
         let deserialized = HaMessage::from_json(&json).unwrap();
         assert_eq!(hello, deserialized);
 
-        // Older peers omit the new fields: they must deserialize as term 0.
+        // Older v1 peers omit the new fields: they must deserialize as term 0
+        // and carry no protocol version, which a v2 master treats as v1.
         let legacy_hello =
             HaMessage::from_json(r#"{"type":"hello","instance":"legacy","have_version":7}"#)
                 .unwrap();
@@ -166,12 +179,14 @@ mod tests {
             HaMessage::Hello {
                 have_term: 0,
                 have_version: 7,
+                protocol_version: None,
                 ..
             }
         ));
 
         let push = HaMessage::ConfigPush {
             version: 42,
+            protocol_version: PROTOCOL_VERSION,
             term: 3,
             hash_blake3: "hash1".to_string(),
             signature_ed25519: "sig1".to_string(),
@@ -180,7 +195,23 @@ mod tests {
         };
         let push_json = push.to_json().unwrap();
         assert!(push_json.contains("\"type\":\"config_push\""));
+        assert!(push_json.contains("\"protocol_version\":2"));
         assert_eq!(push, HaMessage::from_json(&push_json).unwrap());
+
+        // A v1 push has no protocol version: it deserializes as 0 so the
+        // slave can name the version in its rejection instead of failing to
+        // parse the frame.
+        let legacy_push = HaMessage::from_json(
+            r#"{"type":"config_push","version":42,"term":3,"hash_blake3":"h","signature_ed25519":"s","payload_b64":"p","payload_hash_blake3":"h"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy_push,
+            HaMessage::ConfigPush {
+                protocol_version: 0,
+                ..
+            }
+        ));
 
         let ack = HaMessage::Ack {
             version: 42,

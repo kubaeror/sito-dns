@@ -15,6 +15,9 @@ To establish what is true now:
 
 1. Read the implementation and the tests at `HEAD`.
 2. Use the current reference documents below for the operator-facing contract.
+   The [current 2.0 claim matrix](../2.0-claim-matrix.md) maps the Phase 2 claims
+   to code, named tests and docs. The [audit 6 claim matrix](../audit6-claim-matrix.md)
+   below is the older v1.9.3/1.9.4 snapshot, not current evidence.
 3. Run the named check/test for the claim. The
    [P0/P1 test evidence matrix](../audit6-test-matrix.md) maps findings to named
    tests and commands; the [best-effort allowlist](../audit6-best-effort.md)

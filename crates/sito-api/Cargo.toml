@@ -18,6 +18,7 @@ chrono.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+libc.workspace = true
 rand.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 ring.workspace = true
@@ -47,6 +48,9 @@ utoipa-swagger-ui = { version = "10.0", features = ["axum"] }
 rust-embed = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 askama = { workspace = true, optional = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [features]
 default = []

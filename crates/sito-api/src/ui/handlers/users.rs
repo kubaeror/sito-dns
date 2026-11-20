@@ -37,6 +37,7 @@ pub(crate) fn render_users_page(
         active_tab: "users",
         version: env!("CARGO_PKG_VERSION"),
         users,
+        caller_totp_enabled: ctx.auth_mgr.totp_enabled(&user.username),
         error_message,
     })
     .into_response();
@@ -79,10 +80,17 @@ pub struct CreateUserForm {
     pub username: String,
     pub password: String,
     pub role: String,
+    /// Caller's current password; required when creating an Admin.
+    #[serde(default)]
+    pub reauth_password: Option<String>,
+    /// Caller's TOTP or backup code when TOTP is enabled.
+    #[serde(default)]
+    pub reauth_code: Option<String>,
 }
 
 pub async fn users_create_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Form(form): Form<CreateUserForm>,
 ) -> Response {
@@ -101,6 +109,22 @@ pub async fn users_create_handler(
         Ok(role) => role,
         Err(problem) => return users_problem_page(&ctx, &user, &csrf, problem),
     };
+
+    // Creating an Admin is a privilege escalation primitive; prove the caller's
+    // own credential before doing it. Admin API tokens do not reach the UI.
+    if role == Role::Admin
+        && let Err(problem) = ui_reauth(
+            &ctx,
+            &user,
+            &headers,
+            peer_addr,
+            form.reauth_password.as_deref(),
+            form.reauth_code.as_deref(),
+        )
+        .await
+    {
+        return users_problem_page(&ctx, &user, &csrf, problem);
+    }
 
     if ctx.auth_mgr.has_user(username) {
         return users_problem_page(
@@ -135,10 +159,17 @@ pub async fn users_create_handler(
 #[derive(Deserialize)]
 pub struct UpdateUserRoleForm {
     pub role: String,
+    /// Caller's current password; every UI role change requires it.
+    #[serde(default)]
+    pub reauth_password: Option<String>,
+    /// Caller's TOTP or backup code when TOTP is enabled.
+    #[serde(default)]
+    pub reauth_code: Option<String>,
 }
 
 pub async fn users_role_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Path(username): Path<String>,
     Form(form): Form<UpdateUserRoleForm>,
@@ -159,6 +190,18 @@ pub async fn users_role_handler(
             );
         }
     };
+    if let Err(problem) = ui_reauth(
+        &ctx,
+        &user,
+        &headers,
+        peer_addr,
+        form.reauth_password.as_deref(),
+        form.reauth_code.as_deref(),
+    )
+    .await
+    {
+        return users_problem_page(&ctx, &user, &csrf, problem);
+    }
     if let Err(err) = ctx.auth_mgr.set_user_role_checked(&username, role).await {
         let problem = user_mutation_problem(&username, "demote", err);
         return users_problem_page(&ctx, &user, &csrf, problem);

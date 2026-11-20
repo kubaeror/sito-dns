@@ -30,7 +30,6 @@ pub struct UpstreamViewItem {
     pub address: String,
     pub protocol: String,
     pub is_healthy: bool,
-    pub weight: u32,
     pub total_queries: u64,
     pub avg_latency_ms: f64,
 }
@@ -201,6 +200,10 @@ pub struct BundledListView {
     /// `built-in (minimal)` until the category is refreshed from a configured source.
     pub state: String,
     pub last_refresh: String,
+    /// Last fetch/apply attempt, successful or not (`—` before any attempt).
+    pub last_attempt: String,
+    /// Most recent fetch/apply error, when the last attempt failed.
+    pub last_error: Option<String>,
 }
 
 #[derive(Template)]
@@ -306,6 +309,9 @@ pub struct UsersTemplate<'a> {
     pub active_tab: &'a str,
     pub version: &'a str,
     pub users: Vec<UserViewItem>,
+    /// Whether the signed-in caller (not the target row) has TOTP enabled;
+    /// role changes require the caller's TOTP code, not the target's.
+    pub caller_totp_enabled: bool,
     pub error_message: &'a str,
 }
 
@@ -349,6 +355,8 @@ pub struct WizardTemplate<'a> {
     pub setup_required: bool,
     /// Setup token supplied by the requester (never revealed on its own).
     pub setup_token: &'a str,
+    /// Optional re-authentication ticket supplied by an Admin.
+    pub reauth_token: &'a str,
 }
 
 #[cfg(test)]

@@ -22,7 +22,6 @@
           <th>Endpoint URL / Address</th>
           <th>Protocol</th>
           <th>Health Status</th>
-          <th>Weight</th>
           <th style="text-align: center;">Actions</th>
         </tr>
       </thead>
@@ -38,7 +37,6 @@
             <span class="badge badge-danger">Degraded / Unreachable</span>
             {% endif %}
           </td>
-          <td>{{ u.weight }}</td>
           <td style="text-align: center;">
             <button class="btn btn-outline btn-sm"
                     hx-post="/ui/upstreams/test"
@@ -74,10 +72,6 @@
             <label class="form-label" for="up-addr">Resolver Address or URL</label>
             <input type="text" id="up-addr" name="address" class="form-input mono" required placeholder="tls://1.1.1.1:853 or 1.1.1.1:53">
             <div class="form-help">Supports UDP (1.1.1.1:53) and DoT (tls://...).</div>
-          </div>
-          <div class="form-group">
-            <label class="form-label" for="up-weight">Load Balancing Weight</label>
-            <input type="number" id="up-weight" name="weight" class="form-input" value="100" min="1" max="1000">
           </div>
         </div>
         <div class="modal-footer">

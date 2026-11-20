@@ -367,7 +367,8 @@ impl AuthManager {
         role: Role,
     ) -> Result<(), String> {
         let _mutation = self.user_mutation_lock.lock().await;
-        let (hash, is_default) = hash_password_blocking(password.to_string())
+        let (hash, is_default) = self
+            .hash_password_blocking(password.to_string())
             .await
             .map_err(|e| format!("failed to hash password for '{username}': {e}"))?;
         let mutated_epoch = self.next_credential_epoch();
