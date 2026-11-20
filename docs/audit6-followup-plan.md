@@ -1275,13 +1275,33 @@ transport admission and TLS (WP-2.6) in `docs/audit6-test-matrix.md` and §20 of
 **Addresses:** P1-25, P2-7..P2-12.
 **Files:** `sito-upstream/src/{manager,bootstrap,plain,dot,doh,doq,health,key_fetch}.rs`, `sito-core/src/ssrf.rs`.
 **Steps:**
-- [ ] Set RD=1 on bootstrap/probes; force refresh on candidate failure; apply SSRF denylist with explicit private-upstream allowlist.
-- [ ] Fix bare DoH `/dns-query`; disable system proxy; verify ALPN.
-- [ ] Loop UDP receives until deadline; ignore mismatched datagrams.
-- [ ] Add EDNS/FORMERR fallback; bound timeout/pool; validate targets in config.
-- [ ] Per-attempt RTT/error metrics; remove stale health series.
+- [x] Set RD=1 on bootstrap/probes; force refresh on candidate failure; apply SSRF denylist with explicit private-upstream allowlist.
+- [x] Fix bare DoH `/dns-query`; disable system proxy; verify ALPN.
+- [x] Loop UDP receives until deadline; ignore mismatched datagrams.
+- [x] Add EDNS/FORMERR fallback; bound timeout/pool; validate targets in config.
+- [x] Per-attempt RTT/error metrics; remove stale health series.
 - **Acceptance:** bootstrap/DoH/EDNS/failover tests pass; no private-target redirect.
 **Estimate:** L.
+
+**Status (2026-11-20): complete.** Bootstrap and health/key/probe queries set
+RD=1 in every path. Bootstrap answers apply the shared SSRF denylist (including
+IPv4-mapped, NAT64, 6to4 and Teredo embeddings), denied-only answers are not
+cached, and `upstream.allow_private_targets` is the only hostname opt-in; an
+explicit IP literal remains the documented operator allowlist path. Forced
+refresh is covered for plain UDP, DoT and DoH. DoH uses `/dns-query` for bare
+hosts and ignores ambient proxies; UDP receives loop until the deadline; FORMERR
+retries without EDNS; DoT/DoQ verify ALPN and DoQ reconnects once on stream-open
+failure. `timeout_ms`/`pool_size` are bounded, target validation moved into
+`UpstreamConfig::validate`, and bootstrap candidates are capped at 16. Metrics
+are per attempt, and a successful config apply prunes health/RTT/error series for
+removed upstream names. Evidence is in
+`docs/audit6-test-matrix.md` (P1-25 and the WP-2.7 section) and §21 of
+`docs/2.0-public-api-diff.md`.
+
+**Residuals (later work):** stale-series pruning covers global and per-domain
+upstream names, not per-client scoped names recovered from the raw `[clients]`
+section; parallel races record only attempts that complete before the winner, so
+cancelled losers may not get an attempt entry.
 
 ### WP-2.8 — Cache and response shaping
 
