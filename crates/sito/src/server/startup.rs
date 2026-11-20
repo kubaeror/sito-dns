@@ -3,6 +3,20 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// True when DNS listeners must stay gated because setup is still pending.
+/// A persisted configuration can exist after a failed first-boot refresh, so
+/// the startup flag alone is not authoritative; an active setup token keeps a
+/// deployment with a persisted config gated across restarts. Programmatic
+/// callers that pass `requested_setup_pending = false` and supply their config
+/// in memory keep the historical ungated behavior.
+pub(super) fn should_gate_dns(
+    requested_setup_pending: bool,
+    setup_token_required: bool,
+    persisted_config: bool,
+) -> bool {
+    requested_setup_pending || (setup_token_required && persisted_config)
+}
+
 /// Runs the DNS server with an optional custom shutdown receiver (useful for testing).
 pub async fn run_server_with_shutdown(
     config: Config,
@@ -249,6 +263,15 @@ pub async fn run_server_with_lease(
         auth_cfg.token_default_ttl_days,
     )?);
     auth_mgr.spawn_pruner(shutdown_rx.clone());
+
+    // A failed first-boot refresh can leave config.toml persisted while setup
+    // is still incomplete. The setup token (or the caller's explicit flag) is
+    // authoritative; never bind DNS just because a config file now exists.
+    let setup_pending = should_gate_dns(
+        setup_pending,
+        auth_mgr.setup_token_required(),
+        config_path_buf.exists(),
+    );
 
     let (dns_start_tx, mut dns_start_rx) = tokio::sync::mpsc::unbounded_channel();
     let dns_starter = if setup_pending {

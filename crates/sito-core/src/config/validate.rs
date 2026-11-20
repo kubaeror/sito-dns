@@ -160,6 +160,65 @@ impl Config {
         let table = value
             .as_table()
             .ok_or_else(|| ConfigError::validation("clients", "[clients] must be a table"))?;
+
+        let groups = match table.get("groups") {
+            Some(groups) => Some(groups.as_table().ok_or_else(|| {
+                ConfigError::validation(
+                    "clients.groups",
+                    "invalid [clients] configuration: groups must be a table",
+                )
+            })?),
+            None => None,
+        };
+        let group_names: std::collections::HashSet<String> = groups
+            .map(|groups| groups.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // Group list references are validated against the configured
+        // `[filtering]` lists so a typo cannot silently disable a category
+        // (the engine would otherwise ignore the unknown source).
+        if let Some(groups) = groups {
+            let filter_list_names: std::collections::HashSet<&str> = self
+                .filtering
+                .lists
+                .iter()
+                .map(|list| list.name.as_str())
+                .collect();
+            for (group_name, group) in groups {
+                let group_table = group.as_table().ok_or_else(|| {
+                    ConfigError::validation(
+                        format!("clients.groups.{group_name}"),
+                        "each clients.groups entry must be a table",
+                    )
+                })?;
+                let Some(lists) = group_table.get("lists") else {
+                    continue;
+                };
+                let lists = lists.as_array().ok_or_else(|| {
+                    ConfigError::validation(
+                        format!("clients.groups.{group_name}.lists"),
+                        "group lists must be an array of filter-list names",
+                    )
+                })?;
+                for (index, list) in lists.iter().enumerate() {
+                    let list = list.as_str().ok_or_else(|| {
+                        ConfigError::validation(
+                            format!("clients.groups.{group_name}.lists[{index}]"),
+                            "group list names must be strings",
+                        )
+                    })?;
+                    if !filter_list_names.contains(list) {
+                        return Err(ConfigError::cross_section(
+                            format!("clients.groups.{group_name}.lists[{index}]"),
+                            format!(
+                                "group '{group_name}' references unknown filter list '{list}'; configure [[filtering.lists]] with name = \"{list}\""
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
         let Some(entries) = table.get("entries") else {
             return Ok(());
         };
@@ -169,21 +228,6 @@ impl Config {
                 "invalid [clients] configuration: entries must be an array",
             )
         })?;
-
-        let group_names: std::collections::HashSet<String> = match table.get("groups") {
-            Some(groups) => groups
-                .as_table()
-                .ok_or_else(|| {
-                    ConfigError::validation(
-                        "clients.groups",
-                        "invalid [clients] configuration: groups must be a table",
-                    )
-                })?
-                .keys()
-                .cloned()
-                .collect(),
-            None => std::collections::HashSet::new(),
-        };
 
         let mut names = std::collections::HashSet::new();
         for (index, entry) in entries.iter().enumerate() {

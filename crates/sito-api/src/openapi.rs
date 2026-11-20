@@ -1,10 +1,37 @@
 //! OpenAPI specification generator via utoipa.
 
-use utoipa::OpenApi;
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi};
+
+/// Declares the two authentication schemes used by every protected operation.
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.security_schemes.insert(
+            "bearer_auth".to_string(),
+            utoipa::openapi::RefOr::T(SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .description(Some("API token in `Authorization: Bearer <token>`"))
+                    .build(),
+            )),
+        );
+        components.security_schemes.insert(
+            "cookie_auth".to_string(),
+            utoipa::openapi::RefOr::T(SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new(
+                "sito_session",
+            )))),
+        );
+    }
+}
 
 /// Documentation shared by every build.
 #[derive(OpenApi)]
 #[openapi(
+    modifiers(&SecurityAddon),
     paths(
         crate::handlers::status::get_status,
         crate::handlers::stats::get_stats,
@@ -12,6 +39,8 @@ use utoipa::OpenApi;
         crate::handlers::stats::get_upstream_stats,
         crate::handlers::querylog::get_querylog,
         crate::handlers::querylog::delete_querylog,
+        crate::handlers::querylog::clear_querylog,
+        crate::handlers::querylog::stream_querylog,
         crate::handlers::filtering::get_filtering_status,
         crate::handlers::filtering::get_filter_lists,
         crate::handlers::filtering::add_filter_list,
@@ -40,6 +69,8 @@ use utoipa::OpenApi;
         crate::handlers::rewrites::delete_rewrite,
         crate::handlers::upstream::get_upstream_config,
         crate::handlers::upstream::update_upstream_config,
+        crate::router::redirect_upstream_config_get,
+        crate::router::redirect_upstream_config_put,
         crate::handlers::upstream::test_upstream_servers,
         crate::handlers::cache::flush_cache,
         crate::handlers::cache::invalidate_cache,
@@ -185,5 +216,191 @@ impl OpenApi for ApiDoc {
         #[cfg(feature = "ha")]
         let document = document.merge_from(HaApiDoc::openapi());
         document
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const HTTP_METHODS: &[&str] = &["get", "post", "put", "delete", "patch"];
+
+    fn document() -> serde_json::Value {
+        serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes")
+    }
+
+    fn operations(document: &serde_json::Value) -> BTreeMap<(String, String), serde_json::Value> {
+        let mut operations = BTreeMap::new();
+        for (path, item) in document["paths"].as_object().expect("paths object") {
+            for method in HTTP_METHODS {
+                if let Some(operation) = item.get(method) {
+                    operations.insert((path.clone(), method.to_string()), operation.clone());
+                }
+            }
+        }
+        operations
+    }
+
+    fn security_names(operation: &serde_json::Value) -> BTreeSet<String> {
+        operation["security"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_object)
+            .flat_map(|requirement| requirement.keys().cloned())
+            .collect()
+    }
+
+    #[test]
+    fn test_openapi_security_schemes_and_operation_security() {
+        let document = document();
+        let schemes = &document["components"]["securitySchemes"];
+        assert_eq!(schemes["bearer_auth"]["type"], "http");
+        assert_eq!(schemes["bearer_auth"]["scheme"], "bearer");
+        assert_eq!(schemes["cookie_auth"]["type"], "apiKey");
+        assert_eq!(schemes["cookie_auth"]["in"], "cookie");
+        assert_eq!(schemes["cookie_auth"]["name"], "sito_session");
+
+        let public: BTreeSet<(String, String)> = [
+            ("/api/v1/auth/login", "post"),
+            ("/api/v1/auth/totp/verify", "post"),
+            ("/api/v1/auth/logout", "post"),
+        ]
+        .into_iter()
+        .map(|(path, method)| (path.to_string(), method.to_string()))
+        .collect();
+
+        for (key, operation) in operations(&document) {
+            let names = security_names(&operation);
+            if public.contains(&key) {
+                assert!(
+                    names.is_empty(),
+                    "{} {} must stay public, got {names:?}",
+                    key.1,
+                    key.0
+                );
+            } else {
+                assert!(
+                    names.contains("bearer_auth") && names.contains("cookie_auth"),
+                    "{} {} must declare bearer_auth and cookie_auth, got {names:?}",
+                    key.1,
+                    key.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_openapi_operations_use_declared_tags() {
+        let document = document();
+        let declared: BTreeSet<String> = document["tags"]
+            .as_array()
+            .expect("tags")
+            .iter()
+            .filter_map(|tag| tag["name"].as_str().map(ToString::to_string))
+            .collect();
+        assert!(!declared.is_empty());
+
+        for (key, operation) in operations(&document) {
+            let tags: Vec<&str> = operation["tags"]
+                .as_array()
+                .expect("operation tags")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            assert!(!tags.is_empty(), "{} {} has no tag", key.1, key.0);
+            for tag in tags {
+                assert!(
+                    !tag.starts_with("crate::"),
+                    "{} {} uses a module-path tag '{tag}'",
+                    key.1,
+                    key.0
+                );
+                assert_ne!(tag, "system", "{} {} uses lowercase 'system'", key.1, key.0);
+                assert!(
+                    declared.contains(tag),
+                    "{} {} uses undeclared tag '{tag}'",
+                    key.1,
+                    key.0
+                );
+            }
+        }
+    }
+
+    /// Extracts `.route("<path>", <chain>)` paths and methods from the router
+    /// source. Axum's `Router` is opaque after construction, so the route table
+    /// is the source of truth for structural drift.
+    fn router_operations() -> BTreeMap<String, BTreeSet<String>> {
+        let source = include_str!("router.rs");
+        let start = source
+            .find("fn create_router_inner")
+            .expect("router constructor");
+        let source = &source[start..];
+        let mut occurrences = Vec::new();
+        let mut search = 0;
+        while let Some(found) = source[search..].find(".route(") {
+            let position = search + found;
+            occurrences.push(position);
+            search = position + ".route(".len();
+        }
+
+        let mut routes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (index, position) in occurrences.iter().enumerate() {
+            let position = *position;
+            let end = occurrences.get(index + 1).copied().unwrap_or(source.len());
+            let segment = &source[position..end];
+            let after = segment[".route(".len()..].trim_start();
+            let Some(rest) = after.strip_prefix('"') else {
+                continue;
+            };
+            let Some(quote) = rest.find('"') else {
+                continue;
+            };
+            let route = &rest[..quote];
+            let path = match route {
+                "/health" | "/metrics" => continue,
+                _ => format!("/api/v1{route}"),
+            };
+            let methods = routes.entry(path).or_default();
+            for method in HTTP_METHODS {
+                if segment.contains(&format!("{method}(")) {
+                    methods.insert((*method).to_string());
+                }
+            }
+        }
+        routes
+    }
+
+    #[test]
+    fn test_openapi_paths_match_router() {
+        let document = document();
+        let mut documented: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (path, method) in operations(&document).keys() {
+            documented
+                .entry(path.clone())
+                .or_default()
+                .insert(method.clone());
+        }
+
+        #[allow(unused_mut)]
+        let mut routed = router_operations();
+        // A no-HA build intentionally omits the HA operations from the spec
+        // while keeping the routes mounted as 501 stubs.
+        #[cfg(not(feature = "ha"))]
+        routed.retain(|path, _| !path.starts_with("/api/v1/ha/"));
+
+        assert_eq!(
+            documented.keys().collect::<Vec<_>>(),
+            routed.keys().collect::<Vec<_>>(),
+            "OpenAPI paths and router paths must match"
+        );
+        for (path, methods) in routed {
+            assert_eq!(
+                documented.get(&path),
+                Some(&methods),
+                "method drift for {path}"
+            );
+        }
     }
 }

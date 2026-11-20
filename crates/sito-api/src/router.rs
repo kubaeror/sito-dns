@@ -10,6 +10,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::auth::client_ip::resolve_client_ip;
+use crate::auth::rbac::RequireOperator;
 use crate::auth::session::extract_session_cookie;
 use crate::auth::token::Role;
 use crate::error::ProblemDetails;
@@ -265,12 +266,46 @@ async fn not_found_handler() -> impl IntoResponse {
 }
 
 /// Legacy alias for `GET|PUT /api/v1/upstream`; kept as a permanent redirect.
-async fn redirect_upstream_config() -> Response {
+fn redirect_upstream_config() -> Response {
     (
         StatusCode::PERMANENT_REDIRECT,
         [(axum::http::header::LOCATION, "/api/v1/upstream")],
     )
         .into_response()
+}
+
+/// Documented GET alias for `/api/v1/upstream`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/upstream/config",
+    responses(
+        (status = 308, description = "Permanent redirect to /api/v1/upstream", headers(("Location", description = "Canonical upstream-config path"))),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden")
+    ),
+    tag = "Upstream",
+    security(("bearer_auth" = []), ("cookie_auth" = []))
+)]
+#[allow(clippy::unused_async)]
+pub(crate) async fn redirect_upstream_config_get(_operator: RequireOperator) -> Response {
+    redirect_upstream_config()
+}
+
+/// Documented PUT alias for `/api/v1/upstream`.
+#[utoipa::path(
+    put,
+    path = "/api/v1/upstream/config",
+    responses(
+        (status = 308, description = "Permanent redirect to /api/v1/upstream", headers(("Location", description = "Canonical upstream-config path"))),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden")
+    ),
+    tag = "Upstream",
+    security(("bearer_auth" = []), ("cookie_auth" = []))
+)]
+#[allow(clippy::unused_async)]
+pub(crate) async fn redirect_upstream_config_put(_operator: RequireOperator) -> Response {
+    redirect_upstream_config()
 }
 
 /// Constructs the complete administrative HTTP router.
@@ -301,7 +336,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
             "/querylog",
             get(querylog::get_querylog).delete(querylog::delete_querylog),
         )
-        .route("/querylog/clear", post(querylog::delete_querylog))
+        .route("/querylog/clear", post(querylog::clear_querylog))
         .route("/querylog/stream", get(querylog::stream_querylog))
         // Filtering
         .route("/filtering/status", get(filtering::get_filtering_status))
@@ -369,7 +404,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
         )
         .route(
             "/upstream/config",
-            get(redirect_upstream_config).put(redirect_upstream_config),
+            get(redirect_upstream_config_get).put(redirect_upstream_config_put),
         )
         .route("/upstream/test", post(upstream::test_upstream_servers))
         // Cache
@@ -520,6 +555,63 @@ mod tests {
         assert!(
             !body.to_string().contains("listener_bind_failed"),
             "the public probe must not leak readiness reasons: {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// The documented `/upstream/config` redirect alias must require the same
+    /// authentication as the canonical upstream operations it points at.
+    #[tokio::test]
+    async fn test_upstream_config_alias_requires_operator_authentication() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let temp_dir = crate::test_support::temp_dir("sito_upstream_alias_auth");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .update_user_password("admin", "TestPassword123!")
+            .await;
+        ctx.set_setup_pending(false);
+        let token = ctx
+            .auth_mgr
+            .create_token("operator", Role::Operator, None)
+            .await
+            .expect("token")
+            .1
+            .token;
+        let app = create_router(ctx);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/upstream/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/upstream/config")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            authenticated
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap(),
+            "/api/v1/upstream"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

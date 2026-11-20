@@ -21,6 +21,8 @@ fn test_update_install_form_carries_csrf_token_and_uses_htmx() {
         release_notes: "notes".to_string(),
         published_at: None,
         is_docker: false,
+        is_systemd: false,
+        in_app_update_disabled: false,
         instructions: None,
         version_comparison_unknown: false,
     };
@@ -51,11 +53,38 @@ fn test_update_install_form_carries_csrf_token_and_uses_htmx() {
 
     let docker = crate::updater::UpdateInfo {
         is_docker: true,
-        ..info
+        in_app_update_disabled: true,
+        ..info.clone()
     };
     let docker_html = update_action_html(&docker, "csrf-token-123");
     assert!(!docker_html.contains("<form"), "{docker_html}");
     assert!(docker_html.contains("docker compose pull"), "{docker_html}");
+
+    let unknown = crate::updater::UpdateInfo {
+        version_comparison_unknown: true,
+        update_available: false,
+        ..info.clone()
+    };
+    let unknown_html = update_check_html(&unknown, "csrf-token-123");
+    assert!(
+        !unknown_html.to_ascii_lowercase().contains("up to date"),
+        "unknown comparison must not render an up-to-date badge: {unknown_html}"
+    );
+    assert!(unknown_html.contains("Version comparison unknown"));
+    assert!(unknown_html.contains("--force"));
+
+    let systemd = crate::updater::UpdateInfo {
+        is_systemd: true,
+        in_app_update_disabled: true,
+        ..info
+    };
+    let systemd_html = update_action_html(&systemd, "csrf-token-123");
+    assert!(!systemd_html.contains("<form"), "{systemd_html}");
+    assert!(
+        systemd_html.contains("systemctl stop sito"),
+        "{systemd_html}"
+    );
+    assert!(systemd_html.contains("sito update"), "{systemd_html}");
 }
 
 async fn mock_context(temp_dir: &std::path::Path) -> ServerContext {
@@ -145,7 +174,7 @@ fn test_bundled_list_views_corrupt_manifest_returns_runtime_rows_without_panic()
         bundled: false,
     }];
 
-    let views = bundled_list_views(Err(corrupt), &statuses);
+    let views = bundled_list_views(Err(corrupt), &statuses, true);
     assert_eq!(
         views.len(),
         1,
@@ -166,7 +195,7 @@ fn test_bundled_list_views_corrupt_manifest_returns_runtime_rows_without_panic()
     // The healthy path still merges bundled metadata with runtime status.
     let manifest =
         sito_clients::BundledManifest::try_bundled().expect("bundled manifest must parse");
-    let views = bundled_list_views(Ok(manifest), &[]);
+    let views = bundled_list_views(Ok(manifest), &[], true);
     assert!(views.iter().any(|view| view.id == "adult"));
     assert!(
         views.iter().all(|view| view.kind != "custom"),
@@ -974,6 +1003,104 @@ async fn test_wizard_invalid_ports_and_ips() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// P2-41/viewer: the filtering page shows only scheme+host to Viewers while
+/// Operators keep the full subscription URL.
+#[test]
+fn test_redact_text_urls_preserves_punctuation_and_hides_credentials() {
+    assert_eq!(
+        redact_text_urls("failed (https://user:pass@lists.example/private?token=x); retry"),
+        "failed (https://lists.example); retry"
+    );
+    assert_eq!(redact_text_urls("plain error"), "plain error");
+}
+
+#[tokio::test]
+async fn test_filtering_page_redacts_subscription_urls_below_operator() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_filter_urls_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let mut config = (**ctx.config.load()).clone();
+    config.filtering.lists = vec![sito_core::config::FilterListConfig {
+        name: "Private".to_string(),
+        url: "https://lists.example.net/subscriptions/private-token.txt".to_string(),
+        enabled: false,
+        refresh_hours: None,
+    }];
+    ctx.set_config(config);
+    ctx.runtime_lists.mark_refreshed(
+        "adult",
+        "https://bundled.example.net/source/runtime-secret-token.txt",
+    );
+    ctx.runtime_lists.record_attempt(
+        "adult",
+        Some(
+            "fetch failed for https://bundled.example.net/source/runtime-secret-token.txt"
+                .to_string(),
+        ),
+    );
+
+    ctx.auth_mgr
+        .create_user("view_user", "pass", Role::Viewer)
+        .await;
+    ctx.auth_mgr
+        .create_user("oper_user", "pass", Role::Operator)
+        .await;
+
+    let render = |session: crate::auth::session::Session| {
+        let ctx = ctx.clone();
+        async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
+            let response = filtering_page(State(ctx), headers).await;
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        }
+    };
+
+    let LoginResult::Success(viewer_session) =
+        ctx.auth_mgr.login("view_user", "pass", "127.0.0.1").await
+    else {
+        panic!("viewer login failed");
+    };
+    let viewer_html = String::from_utf8(render(viewer_session).await.to_vec()).unwrap();
+    assert!(
+        viewer_html.contains("https://lists.example.net"),
+        "a Viewer may see the source host"
+    );
+    assert!(
+        !viewer_html.contains("private-token"),
+        "a Viewer must not see the full subscription URL: {viewer_html}"
+    );
+    assert!(
+        viewer_html.contains("https://bundled.example.net"),
+        "a Viewer may see the runtime source host"
+    );
+    assert!(
+        !viewer_html.contains("runtime-secret-token"),
+        "a Viewer must not see the runtime source URL or error URL: {viewer_html}"
+    );
+
+    let LoginResult::Success(oper_session) =
+        ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1").await
+    else {
+        panic!("operator login failed");
+    };
+    let operator_html = String::from_utf8(render(oper_session).await.to_vec()).unwrap();
+    assert!(
+        operator_html.contains("https://lists.example.net/subscriptions/private-token.txt"),
+        "an Operator must see the full subscription URL"
+    );
+    assert!(
+        operator_html.contains("https://bundled.example.net/source/runtime-secret-token.txt"),
+        "an Operator must see the full runtime source URL"
+    );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

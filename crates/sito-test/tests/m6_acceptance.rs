@@ -266,6 +266,21 @@ async fn test_wizard_gate_forbidden_after_setup() {
     // Simulate the genuine first-run bootstrap regardless of the configured
     // password used by the router test helper.
     ctx.auth_mgr = Arc::new(AuthManager::new());
+    ctx.set_setup_pending(true);
+
+    // Point the preserved local list at new content without reloading the
+    // filter engine. The wizard's deferred refresh must pick up this changed
+    // filtering config; checking the preloaded rule count would be vacuous.
+    let refreshed_list = temp_dir.join("wizard-refreshed-list.txt");
+    tokio::fs::write(
+        &refreshed_list,
+        "||ads.example^\n||tracker.example^\n||wizard-refresh.example^\n",
+    )
+    .await
+    .unwrap();
+    let mut changed = (**ctx.config.load()).clone();
+    changed.filtering.lists[0].url = format!("file://{}", refreshed_list.display());
+    ctx.set_config(changed);
 
     // 1. In first-run, unauthenticated POST /ui/wizard/complete succeeds.
     //    `filtering_enabled=on` keeps the seeded local `file://` list instead
@@ -290,17 +305,11 @@ async fn test_wizard_gate_forbidden_after_setup() {
         persisted.contains("file://"),
         "wizard must preserve the seeded local list: {persisted}"
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if ctx.filter.rule_count() >= 2 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "background filter refresh did not compile the local list in time"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert_eq!(
+        ctx.filter.rule_count(),
+        3,
+        "first boot must synchronously load the changed list before returning success"
+    );
 
     // 2. After setup is complete, unauthenticated POST /ui/wizard/complete is rejected with 403
     let app2 = create_router(ctx.clone());
@@ -843,6 +852,19 @@ async fn test_setup_token_wizard_works_without_any_admin_account() {
     let token = mgr.setup_token().expect("setup token provisioned");
     ctx.auth_mgr = Arc::new(mgr);
     ctx.set_setup_pending(false);
+    // Recovery bootstrap has no gated DNS starter, so a changed filtering
+    // config must be applied synchronously rather than reported as a deferred
+    // success with the old snapshot still live.
+    let recovery_list = temp_dir.join("recovery-refreshed-list.txt");
+    tokio::fs::write(
+        &recovery_list,
+        "||ads.example^\n||tracker.example^\n||recovery-refresh.example^\n",
+    )
+    .await
+    .unwrap();
+    let mut changed = (**ctx.config.load()).clone();
+    changed.filtering.lists[0].url = format!("file://{}", recovery_list.display());
+    ctx.set_config(changed);
     let app = create_router(ctx.clone());
 
     let resp = app
@@ -875,6 +897,11 @@ async fn test_setup_token_wizard_works_without_any_admin_account() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        ctx.filter.rule_count(),
+        3,
+        "recovery bootstrap must apply changed filtering synchronously before reporting success"
+    );
     assert!(!ctx.auth_mgr.setup_token_required());
     assert!(ctx.auth_mgr.has_user("admin"));
     assert!(ctx.auth_mgr.has_user("viewer"));
@@ -885,6 +912,115 @@ async fn test_setup_token_wizard_works_without_any_admin_account() {
         sito_api::auth::LoginResult::Success(_)
     ));
 
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// First boot must not claim success when the initial list fetch fails. Setup
+/// stays pending, the token stays active and DNS is not started.
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn test_first_boot_filter_failure_keeps_setup_pending_and_dns_gated() {
+    let (mut ctx, temp_dir) = create_test_context().await;
+    {
+        let seed = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        seed.create_user("viewer", "ViewerPassword123!", sito_api::auth::Role::Viewer)
+            .await;
+        assert!(seed.delete_user("admin").await);
+    }
+    let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+    let token = mgr.setup_token().expect("setup token provisioned");
+    ctx.auth_mgr = Arc::new(mgr);
+    ctx.set_setup_pending(true);
+    let (dns_tx, mut dns_rx) = tokio::sync::mpsc::unbounded_channel();
+    ctx.dns_starter = Some(dns_tx);
+
+    let missing = temp_dir.join("missing-first-boot-list.txt");
+    let mut broken = (**ctx.config.load()).clone();
+    // Use a new list name so no cached copy from the seeded Local list can
+    // satisfy the fetch.
+    broken.filtering.lists[0].name = "MissingFirstBoot".to_string();
+    broken.filtering.lists[0].url = format!("file://{}", missing.display());
+    ctx.set_config(broken);
+
+    let app = create_router(ctx.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/wizard/complete")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "setup_token={token}&admin_user=admin&admin_password=RecoveredPassword123!&confirm_password=RecoveredPassword123!&filtering_enabled=on"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        ctx.auth_mgr.setup_token_required(),
+        "a failed first-boot refresh must not consume the setup token"
+    );
+    assert!(ctx.is_setup_pending(), "setup must remain pending");
+    assert!(
+        dns_rx.try_recv().is_err(),
+        "DNS must not be started after a failed first-boot refresh"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// P2-11 review regression: recovery bootstrap has no gated DNS starter, so a
+/// changed filtering config must be compiled synchronously. A deferred apply
+/// would report success while the old rules remain live.
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn test_recovery_bootstrap_applies_changed_filtering_synchronously() {
+    let (mut ctx, temp_dir) = create_test_context().await;
+    {
+        let seed = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        seed.create_user("viewer", "ViewerPassword123!", sito_api::auth::Role::Viewer)
+            .await;
+        assert!(seed.delete_user("admin").await);
+    }
+    let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+    let token = mgr.setup_token().expect("setup token provisioned");
+    ctx.auth_mgr = Arc::new(mgr);
+    ctx.set_setup_pending(false);
+
+    let recovery_list = temp_dir.join("recovery-sync-list.txt");
+    tokio::fs::write(
+        &recovery_list,
+        "||ads.example^\n||tracker.example^\n||recovery-sync.example^\n",
+    )
+    .await
+    .unwrap();
+    let mut changed = (**ctx.config.load()).clone();
+    changed.filtering.lists[0].url = format!("file://{}", recovery_list.display());
+    ctx.set_config(changed);
+
+    let app = create_router(ctx.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/wizard/complete")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "setup_token={token}&admin_user=admin&admin_password=RecoveredPassword123!&confirm_password=RecoveredPassword123!"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        ctx.filter.rule_count(),
+        3,
+        "recovery bootstrap must not report success with the old filter snapshot"
+    );
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
@@ -941,28 +1077,45 @@ async fn test_sensitive_responses_have_no_store_and_vary_cookie() {
     let (ctx, temp_dir) = create_test_context().await;
     let app = create_router(ctx);
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/clients")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        resp.headers()
-            .get(header::CACHE_CONTROL)
-            .and_then(|v| v.to_str().ok()),
-        Some("no-store")
-    );
-    assert_eq!(
-        resp.headers()
-            .get(header::VARY)
-            .and_then(|v| v.to_str().ok()),
-        Some("Cookie")
-    );
+    // Every authenticated surface (including the newer filtering,
+    // integrations, upstream, rewrites, cache and status routes) and /metrics
+    // must be uncacheable. Methods differ where the route only supports POST.
+    for (method, path) in [
+        ("GET", "/api/v1/clients"),
+        ("GET", "/api/v1/filtering/lists"),
+        ("GET", "/api/v1/integrations/lists"),
+        ("GET", "/api/v1/upstream"),
+        ("GET", "/api/v1/rewrites"),
+        ("POST", "/api/v1/cache/flush"),
+        ("GET", "/api/v1/status"),
+        ("GET", "/metrics"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "{path} must be no-store"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("Cookie"),
+            "{path} must vary on Cookie"
+        );
+    }
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

@@ -12,7 +12,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use sito_core::client::ClientContext;
-use sito_core::config::FilterListConfig;
+use sito_core::config::{Config, FilterListConfig};
 use sito_core::engine::FilterEngine;
 use sito_proto::{Name, RecordType};
 use std::net::IpAddr;
@@ -21,6 +21,27 @@ use std::str::FromStr;
 /// True when a filter-list name is safe to use as a URL path segment/key.
 pub(crate) fn valid_filter_list_name(name: &str) -> bool {
     !name.is_empty() && !name.contains(['/', '?', '#', '%']) && !name.chars().any(char::is_control)
+}
+
+/// Client groups that reference `list_name` in their `lists` array.
+///
+/// Renaming or deleting a referenced list would leave the group pointing at a
+/// source the engine cannot resolve, so the admin endpoints reject the change
+/// with 409 until the groups are updated first.
+pub(crate) fn groups_referencing_filter_list(cfg: &Config, list_name: &str) -> Vec<String> {
+    let Some(clients) = cfg
+        .clients
+        .as_ref()
+        .and_then(|value| value.clone().try_into::<sito_clients::ClientsConfig>().ok())
+    else {
+        return Vec::new();
+    };
+    clients
+        .groups
+        .into_iter()
+        .filter(|(_, group)| group.lists.iter().any(|name| name == list_name))
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// Resolves a filter-list id: the stable key is the (unique) list name, while
@@ -75,7 +96,8 @@ async fn filter_list_dto(ctx: &ServerContext, list: &FilterListConfig) -> Filter
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 #[allow(clippy::unused_async)]
 pub async fn get_filtering_status(
@@ -111,7 +133,8 @@ pub async fn get_filtering_status(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_filter_lists(
     _operator: RequireOperator,
@@ -133,7 +156,8 @@ pub async fn get_filter_lists(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Integrations"
+    tag = "Integrations",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 #[allow(clippy::unused_async)]
 pub async fn get_integration_lists(
@@ -161,7 +185,8 @@ pub async fn get_integration_lists(
         (status = 404, description = "Category is not configured in [integrations.lists]"),
         (status = 502, description = "Source could not be fetched")
     ),
-    tag = "Integrations"
+    tag = "Integrations",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn refresh_integration_list(
     _operator: RequireOperator,
@@ -266,7 +291,8 @@ pub async fn refresh_integration_list(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn add_filter_list(
     _operator: RequireOperator,
@@ -316,7 +342,8 @@ pub async fn add_filter_list(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn update_filter_list(
     _operator: RequireOperator,
@@ -329,6 +356,7 @@ pub async fn update_filter_list(
     let idx = resolve_filter_list_index(&new_cfg, &id)
         .ok_or_else(|| ProblemDetails::not_found(format!("Filter list with ID {id} not found")))?;
 
+    let old_name = new_cfg.filtering.lists[idx].name.clone();
     if let Some(ref new_name) = payload.name {
         if !valid_filter_list_name(new_name.trim()) {
             return Err(ProblemDetails::bad_request(
@@ -345,6 +373,15 @@ pub async fn update_filter_list(
             return Err(ProblemDetails::conflict(format!(
                 "Filter list '{new_name}' already exists"
             )));
+        }
+        if *new_name != old_name {
+            let groups = groups_referencing_filter_list(&new_cfg, &old_name);
+            if !groups.is_empty() {
+                return Err(ProblemDetails::conflict(format!(
+                    "Filter list '{old_name}' is referenced by client group(s) {}; update the groups before renaming it",
+                    groups.join(", ")
+                )));
+            }
         }
     }
 
@@ -378,7 +415,8 @@ pub async fn update_filter_list(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn delete_filter_list(
     _operator: RequireOperator,
@@ -389,6 +427,15 @@ pub async fn delete_filter_list(
     let mut new_cfg = (**ctx.config.load()).clone();
     let idx = resolve_filter_list_index(&new_cfg, &id)
         .ok_or_else(|| ProblemDetails::not_found(format!("Filter list with ID {id} not found")))?;
+
+    let list_name = new_cfg.filtering.lists[idx].name.clone();
+    let groups = groups_referencing_filter_list(&new_cfg, &list_name);
+    if !groups.is_empty() {
+        return Err(ProblemDetails::conflict(format!(
+            "Filter list '{list_name}' is referenced by client group(s) {}; update the groups before deleting it",
+            groups.join(", ")
+        )));
+    }
 
     let removed = new_cfg.filtering.lists.remove(idx);
     apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await?;
@@ -406,7 +453,8 @@ pub async fn delete_filter_list(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn refresh_filtering(
     _operator: RequireOperator,
@@ -456,7 +504,8 @@ pub async fn refresh_filtering(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_filtering_rules(
     _operator: RequireOperator,
@@ -477,7 +526,8 @@ pub async fn get_filtering_rules(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn set_filtering_rules(
     _operator: RequireOperator,
@@ -505,7 +555,8 @@ pub async fn set_filtering_rules(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn check_filtering(
     _viewer: RequireViewer,
@@ -648,6 +699,75 @@ mod tests {
         let missing = dtos.iter().find(|d| d.name == "Missing").unwrap();
         assert_eq!(local.rule_count, 3);
         assert_eq!(missing.rule_count, 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P2-41: renaming or deleting a list still referenced by a client group
+    /// is a 409 and changes neither the live config nor the persisted file.
+    #[tokio::test]
+    async fn test_referenced_filter_list_rename_and_delete_return_conflict() {
+        let temp_dir = crate::test_support::temp_dir("sito_filter_references");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let list_path = temp_dir.join("referenced-list.txt");
+        std::fs::write(&list_path, "||ads.example^\n").unwrap();
+        let mut seed = (**ctx.config.load()).clone();
+        seed.filtering.enabled = true;
+        seed.filtering.lists = vec![FilterListConfig {
+            name: "Local".to_string(),
+            url: format!("file://{}", list_path.display()),
+            enabled: true,
+            refresh_hours: None,
+        }];
+        let mut clients = sito_clients::ClientsConfig::default();
+        clients.groups.insert(
+            "kids".to_string(),
+            sito_clients::ClientGroupConfig {
+                lists: vec!["Local".to_string()],
+                ..Default::default()
+            },
+        );
+        seed.clients = Some(toml::Value::try_from(&clients).unwrap());
+        crate::config_apply::apply_and_persist_config(
+            &ctx,
+            &seed,
+            crate::config_apply::FilterApply::Sync,
+            None,
+        )
+        .await
+        .expect("seed with a referenced list");
+        let persisted_before = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+
+        let err = update_filter_list(
+            operator(),
+            State(ctx.clone()),
+            Path("Local".to_string()),
+            Json(UpdateFilterListRequest {
+                name: Some("Renamed".to_string()),
+                url: None,
+                enabled: None,
+                refresh_hours: None,
+            }),
+        )
+        .await
+        .expect_err("renaming a referenced list must conflict");
+        assert_eq!(err.status, 409);
+        assert!(err.detail.contains("kids"), "got: {}", err.detail);
+
+        let err = delete_filter_list(operator(), State(ctx.clone()), Path("Local".to_string()))
+            .await
+            .expect_err("deleting a referenced list must conflict");
+        assert_eq!(err.status, 409);
+        assert!(err.detail.contains("kids"), "got: {}", err.detail);
+
+        assert_eq!(ctx.config.load().filtering.lists.len(), 1);
+        assert_eq!(ctx.config.load().filtering.lists[0].name, "Local");
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            persisted_before,
+            "a conflicting rename/delete must not persist anything"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

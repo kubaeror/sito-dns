@@ -135,7 +135,8 @@ fn validate_rewrite_entry(entry: &RewriteEntryConfig) -> Result<(), ProblemDetai
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Rewrites"
+    tag = "Rewrites",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_rewrites(
     _operator: RequireOperator,
@@ -161,7 +162,8 @@ pub async fn get_rewrites(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Rewrites"
+    tag = "Rewrites",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn add_rewrite(
     _operator: RequireOperator,
@@ -208,7 +210,8 @@ pub async fn add_rewrite(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Rewrites"
+    tag = "Rewrites",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn update_rewrite(
     _operator: RequireOperator,
@@ -250,7 +253,8 @@ pub async fn update_rewrite(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Rewrites"
+    tag = "Rewrites",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn delete_rewrite(
     _operator: RequireOperator,

@@ -241,7 +241,8 @@ fn group_to_dto(name: &str, group: &ClientGroupConfig) -> ClientGroupDto {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_clients(
     _operator: RequireOperator,
@@ -265,7 +266,8 @@ pub async fn get_clients(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_unidentified_clients(
     _operator: RequireOperator,
@@ -308,7 +310,8 @@ pub async fn get_unidentified_clients(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn create_client(
     _operator: RequireOperator,
@@ -368,7 +371,8 @@ pub async fn create_client(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 #[allow(clippy::unused_async)]
 pub async fn get_client_by_name(
@@ -417,7 +421,8 @@ pub async fn get_client_by_name(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn update_client(
     _operator: RequireOperator,
@@ -510,7 +515,8 @@ pub async fn update_client(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn delete_client(
     _operator: RequireOperator,
@@ -542,7 +548,8 @@ pub async fn delete_client(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_client_groups(
     _operator: RequireOperator,
@@ -581,7 +588,8 @@ pub async fn get_client_groups(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 #[allow(clippy::unused_async)]
 pub async fn get_client_group_by_name(
@@ -621,7 +629,8 @@ pub async fn get_client_group_by_name(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn update_client_group(
     _operator: RequireOperator,
@@ -691,7 +700,8 @@ pub async fn update_client_group(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn add_client_group(
     _operator: RequireOperator,
@@ -745,7 +755,8 @@ pub async fn add_client_group(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn delete_client_group(
     _operator: RequireOperator,
@@ -760,6 +771,18 @@ pub async fn delete_client_group(
     }
     let _apply_guard = ctx.lock_config_apply().await;
     let mut cfg = load_clients_config(&ctx);
+    let referenced_by: Vec<String> = cfg
+        .entries
+        .iter()
+        .filter(|entry| entry.group == name)
+        .map(|entry| entry.name.clone())
+        .collect();
+    if !referenced_by.is_empty() {
+        return Err(ProblemDetails::conflict(format!(
+            "Group '{name}' is referenced by client(s) {}; move or delete them before deleting the group",
+            referenced_by.join(", ")
+        )));
+    }
     if cfg.groups.remove(&name).is_some() {
         save_clients_config_locked(&ctx, &cfg, hooks.as_dyn()).await?;
         Ok(Json(crate::models::GenericMessageResponse {
@@ -1308,6 +1331,17 @@ mod tests {
             std::env::temp_dir().join(format!("sito_group_partial_{}", rand::random::<u64>()));
         let _ = std::fs::create_dir_all(&temp_dir);
         let ctx = mock_context(&temp_dir).await;
+        let mut seeded = (**ctx.config.load()).clone();
+        seeded
+            .filtering
+            .lists
+            .push(sito_core::config::FilterListConfig {
+                name: "OISD".to_string(),
+                url: format!("file://{}", temp_dir.join("oisd.txt").display()),
+                enabled: false,
+                refresh_hours: None,
+            });
+        ctx.set_config(seeded);
 
         let mut cfg = load_clients_config(&ctx);
         cfg.groups.insert(
@@ -1408,6 +1442,56 @@ mod tests {
             load_clients_config(&ctx).groups.len(),
             1,
             "the duplicate must not alter the stored groups"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P2-41: deleting a client group that still owns clients is a 409 and
+    /// leaves the group and the persisted file untouched.
+    #[tokio::test]
+    async fn test_delete_referenced_client_group_returns_conflict() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_group_ref_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        let mut cfg = load_clients_config(&ctx);
+        cfg.groups.insert(
+            "kids".to_string(),
+            ClientGroupConfig {
+                filtering: true,
+                ..Default::default()
+            },
+        );
+        cfg.entries.push(ClientEntryConfig {
+            name: "phone".to_string(),
+            ids: vec!["10.0.0.5".to_string()],
+            group: "kids".to_string(),
+            ignore_query_log: false,
+            ignore_stats: false,
+            use_global_upstreams: true,
+            upstreams: None,
+            trusted: false,
+        });
+        save_clients_config(&ctx, &cfg).await.expect("seed group");
+        let persisted_before = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+
+        let err = delete_client_group(
+            operator(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Path("kids".to_string()),
+        )
+        .await
+        .expect_err("deleting a referenced group must conflict");
+        assert_eq!(err.status, 409);
+        assert!(err.detail.contains("phone"), "got: {}", err.detail);
+        assert!(load_clients_config(&ctx).groups.contains_key("kids"));
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            persisted_before,
+            "a conflicting group delete must not persist anything"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

@@ -187,6 +187,40 @@ lists = [
     Config::from_toml_str(ok).expect("distinct list names must parse");
 }
 
+/// P2-41: a client group may only reference configured filter lists. An
+/// unknown name would be silently ignored by the engine and disable the
+/// category the operator thought they selected.
+#[test]
+fn test_client_group_lists_must_reference_configured_filter_lists() {
+    let toml_str = r#"
+config_version = 2
+[upstream]
+servers = ["1.1.1.1"]
+
+[filtering]
+[[filtering.lists]]
+name = "ads"
+url = "https://example.com/a.txt"
+
+[clients.groups.kids]
+lists = ["missing"]
+"#;
+    let err = Config::from_toml_str(toml_str).expect_err("unknown group list must be rejected");
+    match err {
+        ConfigError::CrossSection { field, message } => {
+            assert_eq!(field, "clients.groups.kids.lists[0]");
+            assert!(
+                message.contains("unknown filter list 'missing'"),
+                "{message}"
+            );
+        }
+        other => panic!("expected cross-section error for the group list, got: {other:?}"),
+    }
+
+    let accepted = toml_str.replace("[\"missing\"]", "[\"ads\"]");
+    Config::from_toml_str(&accepted).expect("a configured list name must be accepted");
+}
+
 #[test]
 fn test_blocking_mode_deserialization() {
     let toml_null = "config_version = 2\n[filtering]\nblocking_mode = \"null_rdata\"\n[upstream]\nservers = [\"1.1.1.1\"]";

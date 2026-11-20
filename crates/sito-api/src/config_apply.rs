@@ -105,9 +105,24 @@ impl ApplyHooks {
 pub enum FilterApply {
     /// Fetch/compile blocklists before returning (API writes, watcher).
     Sync,
-    /// Apply everything else and let the caller queue the list fetch (wizard
-    /// first boot: the request must not download blocklists synchronously).
+    /// Apply everything else and let the caller queue the list fetch. Valid
+    /// only when `[filtering]` is unchanged (clients, upstreams, rewrites...).
     Deferred,
+}
+
+/// Chooses the filter mode for an apply based on whether `[filtering]` changed.
+///
+/// A deferred apply reuses the already-loaded rule snapshot, so it is only
+/// valid when the filtering configuration is unchanged. Any filtering change
+/// (including a list toggle or custom rule edit) must fetch/compile
+/// synchronously instead of silently keeping stale rules.
+#[must_use]
+pub fn filter_apply_for(previous: &Config, candidate: &Config) -> FilterApply {
+    if previous.filtering == candidate.filtering {
+        FilterApply::Deferred
+    } else {
+        FilterApply::Sync
+    }
 }
 
 /// Result of a successful apply.
@@ -784,6 +799,21 @@ async fn stage_config(
 ) -> Result<StagedApply, ProblemDetails> {
     let expected = ctx.runtime.generation();
 
+    // A deferred apply reuses the currently loaded filter rules, so it must
+    // never be used to publish a changed `[filtering]` section. Fail loudly
+    // instead of leaving the runtime snapshot and filter engine disagreeing.
+    match filter_apply {
+        FilterApply::Sync => {}
+        FilterApply::Deferred => {
+            let current = ctx.config.load();
+            if candidate.filtering != current.filtering {
+                return Err(ProblemDetails::internal_error(
+                    "Deferred filter apply cannot change [filtering]; use FilterApply::Sync",
+                ));
+            }
+        }
+    }
+
     // Typed dependent-crate sections are validated by the single validator
     // (`validate_full_config` above); here they are converted for the plan.
     let clients = clients_from_config(candidate)?;
@@ -899,6 +929,7 @@ fn rewrites_from_config(cfg: &Config) -> Result<sito_rewrites::RewritesConfig, P
     }
 }
 
+<<<<<<< HEAD
 /// Queues a background blocklist refresh for the given filtering config and
 /// returns its join handle. Used by the wizard so the HTTP request does not
 /// download lists synchronously; the caller can await the handle to know when
@@ -940,6 +971,8 @@ pub fn queue_filter_refresh(
     })
 }
 
+=======
+>>>>>>> feat/2.0-phase2-wp211
 /// Stages and publishes one filter refresh, tied to `expected` (the config
 /// generation the caller captured together with `filtering`).
 ///
@@ -947,6 +980,7 @@ pub fn queue_filter_refresh(
 /// the engine guard is acquired. A refresh whose `filtering` value came from an
 /// older config therefore cannot overwrite the newer generation's filter, even
 /// when its own generation read happened after that apply committed.
+#[cfg(test)]
 pub(crate) async fn apply_filter_refresh(
     engine: &sito_filter::HostsFilterEngine,
     runtime: &sito_runtime::RuntimeState,
@@ -1103,8 +1137,10 @@ pub fn restart_required_field_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sito_core::config::FilterListConfig;
     use std::time::Duration;
 
+<<<<<<< HEAD
     /// The publish report must say "queued", not "delivered", and expose the
     /// connected/queued/coalesced distinction.
     #[test]
@@ -1138,6 +1174,120 @@ mod tests {
         assert_eq!(no_delivery.status, "connected_no_delivery");
         assert_eq!(no_delivery.slaves_connected, Some(2));
         assert_eq!(no_delivery.slaves_queued, Some(0));
+=======
+    #[test]
+    fn test_filter_apply_for_defers_only_when_filtering_is_unchanged() {
+        let previous = Config::default();
+
+        let mut unrelated = previous.clone();
+        unrelated.dns.cache.min_ttl = unrelated.dns.cache.min_ttl.saturating_add(1);
+        unrelated.upstream.servers = vec!["9.9.9.9".to_string()];
+        assert_eq!(
+            filter_apply_for(&previous, &unrelated),
+            FilterApply::Deferred,
+            "unrelated cache/upstream edits may reuse the loaded rules"
+        );
+
+        let mut filtering = unrelated.clone();
+        filtering
+            .filtering
+            .custom_rules
+            .push("||changed.example^".to_string());
+        assert_eq!(
+            filter_apply_for(&previous, &filtering),
+            FilterApply::Sync,
+            "a filtering change must fetch/compile synchronously"
+        );
+    }
+
+    /// P2-40 regression: an unrelated apply must not fail because a filter
+    /// source went away since the last refresh.
+    #[tokio::test]
+    async fn test_unrelated_apply_succeeds_while_filter_source_is_unavailable() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_deferred_outage");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let list_path = temp_dir.join("outage-list.txt");
+        std::fs::write(&list_path, "||ads.example^\n").unwrap();
+        let mut seed = (**ctx.config.load()).clone();
+        seed.filtering.enabled = true;
+        seed.filtering.lists = vec![FilterListConfig {
+            name: "Local".to_string(),
+            url: format!("file://{}", list_path.display()),
+            enabled: true,
+            refresh_hours: None,
+        }];
+        apply_and_persist_config(&ctx, &seed, FilterApply::Sync, None)
+            .await
+            .expect("seed filter list loads");
+        std::fs::remove_file(&list_path).expect("simulate an unavailable source");
+
+        let mut candidate = seed.clone();
+        candidate.upstream.servers = vec!["9.9.9.9".to_string()];
+        candidate.dns.cache.min_ttl = candidate.dns.cache.min_ttl.saturating_add(5);
+        candidate.dns.dnssec.validate = !seed.dns.dnssec.validate;
+        let filter_apply = filter_apply_for(&ctx.config.load(), &candidate);
+        assert_eq!(filter_apply, FilterApply::Deferred);
+
+        apply_and_persist_config(&ctx, &candidate, filter_apply, None)
+            .await
+            .expect("an unrelated change must apply without refetching the missing list");
+        let live = ctx.config.load();
+        assert_eq!(live.upstream.servers, vec!["9.9.9.9"]);
+        assert_eq!(live.dns.cache.min_ttl, candidate.dns.cache.min_ttl);
+        assert_eq!(live.dns.dnssec.validate, candidate.dns.dnssec.validate);
+
+        let mut filtered = candidate.clone();
+        filtered
+            .filtering
+            .custom_rules
+            .push("||new-filter.example^".to_string());
+        assert_eq!(
+            filter_apply_for(&live, &filtered),
+            FilterApply::Sync,
+            "a filtering change must switch back to a synchronous apply"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A caller that wrongly defers a filtering change must get an explicit
+    /// error instead of a runtime/config pair compiled from different rules.
+    #[tokio::test]
+    async fn test_deferred_apply_rejects_filtering_change() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_deferred_unsafe");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut seed = (**ctx.config.load()).clone();
+        seed.filtering.enabled = true;
+        seed.filtering.custom_rules = vec!["||keep.example^".to_string()];
+        apply_and_persist_config(&ctx, &seed, FilterApply::Sync, None)
+            .await
+            .expect("seed apply");
+        let persisted_before = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+
+        let mut candidate = seed.clone();
+        candidate
+            .filtering
+            .custom_rules
+            .push("||must-not-stick.example^".to_string());
+        let err = apply_and_persist_config(&ctx, &candidate, FilterApply::Deferred, None)
+            .await
+            .expect_err("a deferred filtering change must be rejected");
+        assert_eq!(err.status, 500);
+        assert_eq!(
+            ctx.config.load().filtering.custom_rules,
+            seed.filtering.custom_rules,
+            "the rejected change must not reach the live config"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            persisted_before,
+            "the rejected change must not be persisted"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+>>>>>>> feat/2.0-phase2-wp211
     }
 
     /// Deferred D4b: `retry_at` must reflect the retry loop that was actually

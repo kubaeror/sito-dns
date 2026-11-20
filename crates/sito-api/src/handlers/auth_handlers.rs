@@ -190,7 +190,8 @@ fn append_session_cookies(response: &mut Response, session: &Session, secure: bo
         (status = 202, description = "Password accepted; TOTP verification required", body = LoginResponse),
         (status = 401, description = "Invalid credentials", body = ProblemDetails),
         (status = 429, description = "Locked out or rate limited", body = ProblemDetails)
-    )
+    ),
+    tag = "Auth",
 )]
 pub async fn login(
     State(ctx): State<ServerContext>,
@@ -269,7 +270,8 @@ pub async fn login(
     responses(
         (status = 200, description = "TOTP verified, session established", body = LoginResponse),
         (status = 401, description = "Invalid or expired code", body = ProblemDetails)
-    )
+    ),
+    tag = "Auth",
 )]
 pub async fn verify_totp(
     State(ctx): State<ServerContext>,
@@ -343,7 +345,8 @@ pub async fn verify_totp(
     path = "/api/v1/auth/logout",
     responses(
         (status = 200, description = "Logged out successfully", body = GenericMessageResponse)
-    )
+    ),
+    tag = "Auth",
 )]
 pub async fn logout(
     State(ctx): State<ServerContext>,
@@ -385,7 +388,8 @@ pub async fn logout(
         (status = 403, description = "A user session is required", body = ProblemDetails),
         (status = 429, description = "Locked out or rate limited", body = ProblemDetails)
     ),
-    security(("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn reauth(
     State(ctx): State<ServerContext>,
@@ -449,7 +453,8 @@ pub async fn reauth(
         (status = 401, description = "Missing, invalid, or expired re-authentication ticket", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn get_totp_setup(
     viewer: RequireViewer,
@@ -481,7 +486,8 @@ pub async fn get_totp_setup(
         (status = 401, description = "Missing, invalid, or expired re-authentication ticket", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn enable_totp(
     viewer: RequireViewer,
@@ -528,7 +534,8 @@ pub async fn enable_totp(
         (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 404, description = "User account not found", body = ProblemDetails)
     ),
-    security(("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn disable_totp(
     viewer: RequireViewer,
@@ -577,7 +584,8 @@ fn session_username(user: &crate::auth::rbac::AuthUser) -> Result<&str, ProblemD
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn list_tokens(
     _admin: RequireAdmin,
@@ -604,7 +612,8 @@ pub async fn list_tokens(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn create_token(
     admin: RequireAdmin,
@@ -666,7 +675,8 @@ pub async fn create_token(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn delete_token(
     _admin: RequireAdmin,
@@ -765,7 +775,8 @@ pub(crate) fn user_mutation_problem(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn list_users(
     _admin: RequireAdmin,
@@ -787,7 +798,8 @@ pub async fn list_users(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn create_user(
     admin: RequireAdmin,
@@ -847,7 +859,8 @@ pub async fn create_user(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn update_user(
     admin: RequireAdmin,
@@ -893,7 +906,8 @@ pub async fn update_user(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn delete_user(
     admin: RequireAdmin,
@@ -930,7 +944,8 @@ pub async fn delete_user(
         (status = 401, description = "Missing/wrong current password or second factor", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Auth",
 )]
 pub async fn change_password(
     caller: RequireViewer,

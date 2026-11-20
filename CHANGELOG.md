@@ -32,6 +32,22 @@ as a prerelease. Phase 1 work packages land as separate commits on
   admin writes return 409 with `restart_required` and are not persisted;
   `GET /api/v1/config/restart-required` previews the matrix. See
   `docs/config-v2.md` and `docs/2.0-public-api-diff.md`.
+- WP-2.11: the admin API now declares bearer/cookie OpenAPI security on every
+  protected operation, documents the querylog WebSocket/clear aliases and
+  upstream-config redirect, and returns `no-store`/`Vary: Cookie` for all
+  authenticated `/api/v1/` responses. Querylog WebSocket upgrades validate
+  Origin and restrict legacy `?token=` to that path. Unrelated config changes
+  defer blocklist work; referenced list/group changes and restart-only writes
+  return 409; get-config/backup reads fail closed and backups are `0600`.
+  Viewer sessions no longer see full subscription URLs. First boot now applies
+  filtering synchronously and waits for the initial list fetch (bounded by the
+  subscription fetch timeout); a failure keeps setup pending and DNS gated.
+  The updater now refuses in-app apply on systemd/Docker with instructions,
+  never reports an
+  unknown version as current, serializes applies, verifies the staged binary,
+  backs up/restores the old binary, enforces `0600`/`0700` temp modes and
+  always verifies a present signature pair. See §26 of
+  `docs/2.0-public-api-diff.md`.
 
 ## [1.9.5] - 2026-11-10
 

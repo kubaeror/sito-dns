@@ -361,7 +361,21 @@ SHA-256-only integrity.
 
 The web UI's update button uses the same updater and signature policy. Under
 the hardened systemd unit the unprivileged service still cannot replace the
-root-owned binary, so use the CLI path above for system installs.
+root-owned binary: the updater detects the systemd service environment and
+refuses in-app apply with the stop/CLI/start commands above. Docker deployments
+are refused for the same reason and must pull a new image. `GET
+/api/v1/system/update/check` and `sito update --check` remain available to
+preview a release.
+
+The CLI updater downloads assets with `0600` permissions, verifies the staged
+binary with `--version`, keeps a backup of the current executable and restores
+it if replacement fails, then renames the verified binary into place. It also
+refuses to report “up to date” when the release tag cannot be compared as
+semver; use `sito update --force` for an explicit reinstall. The updater does
+not preserve file capabilities; if you installed the binary manually with
+`setcap`, re-apply
+`sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito` after the update.
+The installer restores capabilities itself.
 
 The installer stops the service first, then backs up the previous binary to
 `/usr/local/bin/sito.bak` and `/etc/sito/config.toml` to
