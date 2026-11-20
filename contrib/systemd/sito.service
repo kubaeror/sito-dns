@@ -9,6 +9,9 @@ Type=simple
 User=sito
 Group=sito
 ExecStart=/usr/local/bin/sito --config /etc/sito/config.toml
+# Optional environment overrides (for example RUST_LOG). The leading '-' keeps
+# the unit valid when the file is absent; the installer creates it mode 0600.
+EnvironmentFile=-/etc/sito/sito.env
 # HA mTLS certificates must be readable by User=sito. Generate them as root
 # with ownership transfer, or chown the files before starting the service:
 #   sudo sito ha gen-certs --dir /etc/sito/certs --master --slave \
@@ -31,8 +34,15 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
+SystemCallArchitectures=native
+UMask=0077
+PrivateTmp=true
 ReadWritePaths=/var/lib/sito /etc/sito
 LimitNOFILE=1048576
 Restart=on-failure

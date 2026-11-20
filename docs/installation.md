@@ -85,8 +85,9 @@ restrict the DNS ports to those client addresses at the firewall.
 
 Docker users: `-p 8080:8080` publishes the panel on every host interface.
 Prefer `-p 127.0.0.1:8080:8080` plus an SSH tunnel or reverse proxy, and publish
-DNS only to the interface your clients use. The compose file documents this
-choice without changing the historical mapping.
+DNS only to the interface your clients use. The shipped compose file binds the
+admin UI to `127.0.0.1:8080` and keeps configuration in a named volume, so the
+safe choice is the default; a bind-mounted `./config` needs an explicit chown.
 
 > [!NOTE]
 > The loopback admin default is already in the **2.0** config v2 schema. A
@@ -269,6 +270,9 @@ Type=simple
 User=sito
 Group=sito
 ExecStart=/usr/local/bin/sito --config /etc/sito/config.toml
+# Optional environment overrides (for example RUST_LOG). The leading '-' keeps
+# the unit valid when the file is absent; the installer creates it mode 0600.
+EnvironmentFile=-/etc/sito/sito.env
 # The service runs unprivileged with ProtectSystem=strict, so in-app updates
 # cannot replace the binary in /usr/local/bin. Updates must be applied as root
 # while the service is stopped: sudo systemctl stop sito && sudo sito update
@@ -283,16 +287,30 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
+SystemCallArchitectures=native
+UMask=0077
+PrivateTmp=true
 ReadWritePaths=/var/lib/sito /etc/sito
 LimitNOFILE=1048576
 Restart=on-failure
 RestartSec=2s
+# Allow the bounded query-log shutdown flush to finish before systemd kills the
+# process. The writer bounds its own final flush to 3 s; this is a safety net.
+TimeoutStopSec=180
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+The unit reads optional overrides from `/etc/sito/sito.env`. The installer
+creates that file mode `0600` only when it is absent, preserves it on upgrade,
+and leaves it in place on `--uninstall` alongside `config.toml`.
 
 Enable and start:
 ```bash
@@ -405,11 +423,16 @@ accepts the admin web interface while the API reports first-boot setup pending
 ```yaml
 services:
   sito:
+    # Pinned release tag. Pin the digest as well for reproducible deploys:
+    # ghcr.io/kubaeror/sito-dns:1.9.5@sha256:<digest>
     image: ghcr.io/kubaeror/sito-dns:1.9.5
-    container_name: sito
-    restart: unless-stopped
     cap_add:
       - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     ports:
       - "53:53/udp"
       - "53:53/tcp"
@@ -417,23 +440,39 @@ services:
       - "853:853/udp"
       - "443:443/tcp"
       - "443:443/udp"
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8080:8080/tcp"   # loopback-only admin UI
     volumes:
-      - ./config:/etc/sito
+      - sito-config:/etc/sito
       - sito-data:/var/lib/sito
+    restart: unless-stopped
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "/usr/bin/sito", "--config", "/etc/sito/config.toml", "healthcheck", "--setup-fallback"]
       interval: 30s
       timeout: 5s
+      start_period: 30s
       retries: 3
 
 volumes:
+  sito-config:
   sito-data:
 ```
 
 The `--setup-fallback` healthcheck flag keeps the container healthy while the
 first-boot wizard is active; once setup completes the DNS probe must succeed, so
 a broken DNS listener still turns the container unhealthy.
+
+`/etc/sito` defaults to the named `sito-config` volume, which the image
+initialises with uid/gid `65532` ownership. To keep configuration on the host,
+replace it with `./config:/etc/sito` and hand the directory to the container
+user once: `sudo chown -R 65532:65532 ./config`.
+
+To build and run the working tree instead of the pinned release image, layer
+the build override:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
 
 > **Host binding vs in-container binding.** Docker's `ports` mapping controls
 > which host interface accepts connections; `web.bind` controls where the
@@ -451,23 +490,26 @@ networks:
   lan:
     driver: macvlan
     driver_opts:
-      parent: eth0
+      parent: ${SITO_HA_PARENT:-eth0}
     ipam:
       config:
-        - subnet: 192.168.1.0/24
-          gateway: 192.168.1.1
+        - subnet: ${SITO_HA_SUBNET:-192.168.1.0/24}
+          gateway: ${SITO_HA_GATEWAY:-192.168.1.1}
 
 services:
   sito-master:
     image: ghcr.io/kubaeror/sito-dns:1.9.5
     container_name: sito-master
     cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    read_only: true
     networks:
       lan:
-        ipv4_address: 192.168.1.10
+        ipv4_address: ${SITO_HA_MASTER_IP:-192.168.1.10}
     volumes:
-      - ./master-config:/etc/sito
-      - master-data:/var/lib/sito
+      - ./ha/master/config:/etc/sito
+      - ./ha/master/certs:/etc/sito/certs:ro
+      - sito-master-data:/var/lib/sito
     healthcheck:
       test: ["CMD", "/usr/bin/sito", "--config", "/etc/sito/config.toml", "healthcheck", "--setup-fallback"]
       interval: 15s
@@ -478,27 +520,43 @@ services:
     image: ghcr.io/kubaeror/sito-dns:1.9.5
     container_name: sito-slave
     cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    read_only: true
     networks:
       lan:
-        ipv4_address: 192.168.1.11
+        ipv4_address: ${SITO_HA_SLAVE_IP:-192.168.1.11}
     volumes:
-      - ./slave-config:/etc/sito
-      - slave-data:/var/lib/sito
+      - ./ha/slave/config:/etc/sito
+      - ./ha/slave/certs:/etc/sito/certs:ro
+      - sito-slave-data:/var/lib/sito
     healthcheck:
       test: ["CMD", "/usr/bin/sito", "--config", "/etc/sito/config.toml", "healthcheck", "--setup-fallback"]
       interval: 15s
       timeout: 5s
       retries: 3
+
+volumes:
+  sito-master-data:
+  sito-slave-data:
 ```
+
+Set the topology in the shell or a `.env` file next to the compose file:
+`SITO_HA_PARENT`, `SITO_HA_SUBNET`, `SITO_HA_GATEWAY`,
+`SITO_HA_MASTER_IP`, `SITO_HA_SLAVE_IP` (and `SITO_HA_SLAVE2_IP` for the
+optional third node). If you change the IPs, regenerate the RouterOS DHCP
+Option 6 hex value; the shipped example `0xc0a8010ac0a8010b` is
+`192.168.1.10,192.168.1.11` and must have an even number of hex digits.
 
 > [!NOTE]
 > Configuration, including `[ha] master_url`, is read exclusively from the
 > mounted `config.toml`; environment overrides (for example
-> `DNSD__HA__MASTER_URL`) are not supported. Make the host config directories
-> writable by uid/gid 65532 once:
-> `sudo chown -R 65532:65532 ./master-config ./slave-config`. The full macvlan
-> reference deployment, including certificate handling and the RouterOS DHCP
-> hints, is in `docker-compose.ha.yml`. RouterOS lease sync is an optional,
+> `DNSD__HA__MASTER_URL`) are not supported: `SITO_HA_*` only parameterizes the
+> compose topology. Make the host config and certificate directories writable
+> by uid/gid 65532 once:
+> `sudo chown -R 65532:65532 ha/master/config ha/master/certs ha/slave/config ha/slave/certs`,
+> then `sudo chmod 0600 ha/master/certs/*.key ha/slave/certs/*.key`. The full
+> macvlan reference deployment, including certificate handling and the RouterOS
+> DHCP hints, is in `docker-compose.ha.yml`. RouterOS lease sync is an optional,
 > experimental integration: the default binary does not include it. Build with
 > `cargo build -p sito --features routeros` to enable it.
 

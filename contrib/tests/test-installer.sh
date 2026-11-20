@@ -196,6 +196,9 @@ assert_file_exists "${SANDBOX}/systemd/sito.service"
 assert_eq "sito 1.9.3" "$(installed_version)" "fresh install binary version"
 grep -q 'enable sito' "${SANDBOX}/logs/systemctl.log" || fail "fresh install did not enable the service"
 grep -q 'start sito' "${SANDBOX}/logs/systemctl.log" || fail "fresh install did not start the service"
+assert_file_exists "${SANDBOX}/etc/sito/sito.env"
+assert_eq "600" "$(stat -c '%a' "${SANDBOX}/etc/sito/sito.env")" "fresh install env file mode"
+printf 'RUST_LOG=info\n' >"${SANDBOX}/etc/sito/sito.env"
 
 # Hold the installed inode open as an executing process. A `cp -f` replacement
 # now fails with ETXTBSY; the atomic rename must succeed and leave the running
@@ -210,6 +213,7 @@ write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.4"
 FAKE_CP_ETXTBSY=1 SITO_VERSION_FOR_TEST=1.9.4 run_installer >"${INSTALLER_OUT}" 2>&1 || \
     fail "live upgrade failed while the old binary was executing"
 assert_eq "sito 1.9.4" "$(installed_version)" "upgraded binary version"
+assert_eq "RUST_LOG=info" "$(cat "${SANDBOX}/etc/sito/sito.env")" "upgrade must preserve sito.env"
 grep -q 'stop sito' "${SANDBOX}/logs/systemctl.log" || fail "upgrade did not stop the service before replacing the binary"
 kill -0 "${HOLD_PID}" 2>/dev/null || fail "upgrade killed the previously executing process"
 kill "${HOLD_PID}" 2>/dev/null || true
@@ -271,6 +275,7 @@ assert_file_missing "${SANDBOX}/install/sito"
 assert_file_missing "${SANDBOX}/install/sito.bak"
 assert_file_missing "${SANDBOX}/systemd/sito.service"
 assert_file_exists "${SANDBOX}/etc/sito"
+assert_file_exists "${SANDBOX}/etc/sito/sito.env"
 assert_file_exists "${SANDBOX}/var/lib/sito"
 grep -q 'stop sito' "${SANDBOX}/logs/systemctl.log" || fail "uninstall did not stop the service"
 grep -q 'disable sito' "${SANDBOX}/logs/systemctl.log" || fail "uninstall did not disable the service"

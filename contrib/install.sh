@@ -25,6 +25,7 @@ DATA_DIR="${SITO_DATA_DIR:-/var/lib/sito}"
 SERVICE_PATH="${SITO_SERVICE_PATH:-/etc/systemd/system/sito.service}"
 SYSTEMCTL="${SITO_SYSTEMCTL:-systemctl}"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
+ENV_FILE="${CONFIG_DIR}/sito.env"
 BACKUP_BIN="${INSTALL_BIN}.bak"
 CONFIG_BACKUP="${CONFIG_FILE}.bak"
 SERVICE_STOPPED=0
@@ -38,7 +39,7 @@ for arg in "$@"; do
             ;;
         -h|--help)
             echo "Usage: install.sh [--uninstall]"
-            echo "  --uninstall  Remove the sito binary and systemd unit (keeps config/data)"
+            echo "  --uninstall  Remove the sito binary and systemd unit (keeps config, env and data)"
             echo "  SITO_VERSION=<version>  Pin a specific release version (default: latest)"
             echo "  SITO_INSTALL_COSIGN=0   Skip automatic cosign installation"
             echo "  COSIGN_VERSION=<tag>    Pin the cosign release (default: v2.6.5)"
@@ -107,7 +108,7 @@ if [ "${UNINSTALL}" -eq 1 ]; then
         fi
     fi
 
-    echo "Configuration (${CONFIG_DIR}) and data (${DATA_DIR}) were kept."
+    echo "Configuration (${CONFIG_DIR}, including sito.env) and data (${DATA_DIR}) were kept."
     exit 0
 fi
 
@@ -311,6 +312,17 @@ if [ "$(id -u)" -eq 0 ]; then
     chown -R sito:sito "${CONFIG_DIR}" "${DATA_DIR}"
 fi
 chmod 750 "${CONFIG_DIR}" "${DATA_DIR}"
+
+# Optional systemd environment file. Create it empty with mode 0600 only when
+# it is missing: upgrades must preserve operator-provided values, and the unit
+# reads it with `EnvironmentFile=-`, so an absent file is equally valid.
+if [ ! -e "${ENV_FILE}" ] && [ ! -L "${ENV_FILE}" ]; then
+    (umask 077 && : >"${ENV_FILE}")
+    if [ "$(id -u)" -eq 0 ]; then
+        chown sito:sito "${ENV_FILE}"
+    fi
+    chmod 0600 "${ENV_FILE}"
+fi
 
 # 5. Detect upgrade vs fresh install and backup existing binary
 IS_UPGRADE=0
@@ -579,6 +591,9 @@ Type=simple
 User=sito
 Group=sito
 ExecStart=/usr/local/bin/sito --config /etc/sito/config.toml
+# Optional environment overrides (for example RUST_LOG). The leading '-' keeps
+# the unit valid when the file is absent; the installer creates it mode 0600.
+EnvironmentFile=-/etc/sito/sito.env
 # The service runs unprivileged with ProtectSystem=strict, so in-app updates
 # cannot replace the binary in /usr/local/bin. Updates must be applied as root
 # while the service is stopped: sudo systemctl stop sito && sudo sito update
@@ -593,12 +608,20 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
+SystemCallArchitectures=native
+UMask=0077
+PrivateTmp=true
 ReadWritePaths=/var/lib/sito /etc/sito
 LimitNOFILE=1048576
 Restart=on-failure
 RestartSec=2s
+TimeoutStopSec=180
 
 [Install]
 WantedBy=multi-user.target

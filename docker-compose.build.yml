@@ -1,0 +1,12 @@
+# Development override: build sito from the working tree instead of pulling
+# the pinned release image from docker-compose.yml.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# Never publish a local build as the shipped default.
+services:
+  sito:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sito:local

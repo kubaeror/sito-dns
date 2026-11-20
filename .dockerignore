@@ -1,4 +1,8 @@
 target/
+# Cargo artifacts can also appear in nested workspaces (fuzz/ has its own
+# target directory); never ship them in a build context.
+**/target/
+fuzz/target/
 .git/
 .github/
 data/

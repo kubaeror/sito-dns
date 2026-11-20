@@ -138,11 +138,14 @@ unless `--adopt-safe-defaults` is used. See the
 ```yaml
 services:
   sito:
+    # Pinned release tag; add @sha256:<digest> for a reproducible deploy.
     image: ghcr.io/kubaeror/sito-dns:1.9.5
-    container_name: sito
     restart: unless-stopped
     cap_add:
       - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
     ports:
       - "53:53/udp"       # DNS (UDP)
       - "53:53/tcp"       # DNS (TCP)
@@ -152,18 +155,20 @@ services:
       - "443:443/udp"     # DoH3 (dns.doh3_port, default 443)
       - "127.0.0.1:8080:8080/tcp"   # Web UI / REST API (loopback; use SSH tunnel/TLS proxy)
     volumes:
-      # Host bind mounts must be handed to the container user once:
+      # Named config volume: the image initialises /etc/sito with uid/gid
+      # 65532. For a host bind mount instead, chown it once:
       #   sudo chown -R 65532:65532 ./config
-      - ./config:/etc/sito
+      - sito-config:/etc/sito
       - sito-data:/var/lib/sito
     healthcheck:
       test: ["CMD", "/usr/bin/sito", "--config", "/etc/sito/config.toml", "healthcheck", "--setup-fallback"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 30s
 
 volumes:
+  sito-config:
   sito-data:
 ```
 
