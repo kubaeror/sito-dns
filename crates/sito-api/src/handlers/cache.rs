@@ -113,4 +113,92 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    /// The REST invalidation path must evict seeded entries (including a
+    /// non-plain key variant) and leave unrelated names alone.
+    #[tokio::test]
+    async fn test_invalidate_cache_evicts_seeded_entries() {
+        use sito_proto::rdata::A;
+        use sito_proto::{
+            DNSClass, Edns, Message, MessageType, Name, OpCode, Query, RData, Record, RecordType,
+        };
+        use std::str::FromStr;
+
+        let temp_dir = crate::test_support::temp_dir("sito_cache_invalidate_seeded");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let name = Name::from_str("example.com.").unwrap();
+        let other = Name::from_str("other.example.").unwrap();
+
+        let mut plain = Message::new(1, MessageType::Query, OpCode::Query);
+        plain
+            .queries
+            .push(Query::query(name.clone(), RecordType::A));
+        let mut plain_response = Message::response(1, OpCode::Query);
+        plain_response.queries = plain.queries.clone();
+        plain_response.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A("192.0.2.1".parse().unwrap())),
+        ));
+        ctx.cache.insert(&plain, &plain_response).await;
+
+        let mut edns_query = plain.clone();
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        edns_query.set_edns(edns);
+        let mut edns_response = Message::response(2, OpCode::Query);
+        edns_response.queries = edns_query.queries.clone();
+        edns_response.answers.push(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::A(A("192.0.2.2".parse().unwrap())),
+        ));
+        ctx.cache.insert(&edns_query, &edns_response).await;
+
+        let mut other_query = Message::new(3, MessageType::Query, OpCode::Query);
+        other_query
+            .queries
+            .push(Query::query(other.clone(), RecordType::A));
+        let mut other_response = Message::response(3, OpCode::Query);
+        other_response.queries = other_query.queries.clone();
+        other_response.answers.push(Record::from_rdata(
+            other.clone(),
+            300,
+            RData::A(A("192.0.2.3".parse().unwrap())),
+        ));
+        ctx.cache.insert(&other_query, &other_response).await;
+
+        assert!(ctx.cache.get_for_query(&plain).await.is_some());
+        assert!(ctx.cache.get_for_query(&edns_query).await.is_some());
+
+        let ok = invalidate_cache(
+            operator(),
+            State(ctx.clone()),
+            Query(InvalidateCacheQuery {
+                domain: "example.com".to_string(),
+            }),
+        )
+        .await
+        .expect("valid domain accepted");
+        assert!(ok.0.message.contains("example.com"));
+
+        assert!(
+            ctx.cache
+                .get(&name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "the plain entry must be evicted"
+        );
+        assert!(
+            ctx.cache.get_for_query(&edns_query).await.is_none(),
+            "DO/EDNS key variants must be evicted too"
+        );
+        assert!(
+            ctx.cache.get_for_query(&other_query).await.is_some(),
+            "an unrelated name must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

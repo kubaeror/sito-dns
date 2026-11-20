@@ -14,9 +14,15 @@ impl QueryHandler for DnsPipeline {
             debug!("Dropping non-query DNS message (QR=1)");
             return None;
         }
+        // One snapshot per query: config, clients and rewrites cannot be torn
+        // apart by a concurrent hot reload.
+        let runtime_snapshot = self.runtime.snapshot();
+
         // Multi-question messages are not resolvable by this pipeline (and
         // are used by DoS probes to amplify work). Reject with FORMERR at the
-        // start; the question section is deliberately not echoed.
+        // start. Shape through the shared path so the response advertises the
+        // configured UDP payload instead of echoing the client's OPT/options;
+        // the question section stays empty because FORMERR is question-less.
         if query.queries.len() != 1 {
             debug!(
                 questions = query.queries.len(),
@@ -28,21 +34,15 @@ impl QueryHandler for DnsPipeline {
                 query.metadata.op_code,
             );
             response.metadata.response_code = ResponseCode::FormErr;
-            response.metadata.recursion_desired = query.metadata.recursion_desired;
-            response.metadata.recursion_available = true;
-            response.metadata.checking_disabled = query.metadata.checking_disabled;
-            if let Some(client_edns) = &query.edns {
-                let mut edns = Edns::new();
-                edns.set_max_payload(client_edns.max_payload());
-                edns.set_dnssec_ok(client_edns.flags().dnssec_ok);
-                response.set_edns(edns);
-            }
+            ResponseShaper::shape_with_payload(
+                &mut response,
+                &query,
+                runtime_snapshot.dnssec_policy.mode(),
+                runtime_snapshot.config.dns.edns_udp_size,
+            );
+            response.queries.clear();
             return Some(response);
         }
-
-        // One snapshot per query: config, clients and rewrites cannot be torn
-        // apart by a concurrent hot reload.
-        let runtime_snapshot = self.runtime.snapshot();
 
         let mut client = client;
         // Evaluate schedules against the configured `clients.timezone`

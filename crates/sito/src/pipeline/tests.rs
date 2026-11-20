@@ -3669,6 +3669,7 @@ async fn test_pipeline_rejects_qr1_and_multi_question_queries() {
     let mut config = Config::default();
     config.filtering.enabled = false;
     config.dns.dnssec.validate = false;
+    let edns_udp_size = config.dns.edns_udp_size;
     let (pipeline, calls, temp_dir) = test_pipeline(config).await;
     let client = ClientContext::new("127.0.0.1".parse().unwrap());
     let name = Name::from_str("reject.example.").unwrap();
@@ -3693,6 +3694,15 @@ async fn test_pipeline_rejects_qr1_and_multi_question_queries() {
         Name::from_str("second.example.").unwrap(),
         RecordType::AAAA,
     ));
+    // A client OPT with a different payload and a COOKIE option must not be
+    // echoed by the FORMERR path.
+    let mut client_edns = Edns::new();
+    client_edns.set_max_payload(4096);
+    client_edns.set_dnssec_ok(true);
+    client_edns
+        .options_mut()
+        .insert(EdnsOption::Unknown(10, vec![1, 2, 3, 4]));
+    multi.set_edns(client_edns);
     let resp = pipeline
         .handle(multi, client.clone())
         .await
@@ -3705,6 +3715,20 @@ async fn test_pipeline_rejects_qr1_and_multi_question_queries() {
     assert!(
         resp.queries.is_empty(),
         "a multi-question FORMERR must not echo questions"
+    );
+    let edns = resp.edns.expect("EDNS client gets an OPT record");
+    assert_eq!(
+        edns.max_payload(),
+        edns_udp_size,
+        "FORMERR must advertise the configured UDP payload, not the client's"
+    );
+    assert!(
+        edns.options().options.is_empty(),
+        "FORMERR must not echo client EDNS options"
+    );
+    assert!(
+        edns.flags().dnssec_ok,
+        "the DO bit is client-signalled and may be reflected"
     );
 
     let zero = Message::new(11, MessageType::Query, OpCode::Query);

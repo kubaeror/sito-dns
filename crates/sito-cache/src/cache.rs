@@ -54,18 +54,18 @@ fn failure_lifespan_cap(status: ValidationStatus) -> Option<u32> {
     }
 }
 
-/// Whether a stale entry may be returned by a status-less getter.
+/// Whether a status-less getter may return an entry with this status.
 ///
 /// This is an allow-list: only statuses that are authenticated answers
 /// (`Secure`/`Insecure`) or, when validation is inactive, a genuinely
 /// unvalidated answer (`Unchecked`) are returnable. `Bogus` is a fail-closed
 /// SERVFAIL and `Indeterminate` is unservable/inconclusive (in log-only mode it
-/// can still carry the answer data), so the status-less stale getters hide
-/// both. A caller that needs to inspect them — stale-serving tests and other
-/// inspection code — uses the status-aware stale getter. (The background
-/// prefetch never reads stale entries: it re-resolves and consults the fresh
-/// status-aware getter.)
-fn stale_statusless_servable(status: ValidationStatus) -> bool {
+/// can still carry the answer data), so both the fresh and stale status-less
+/// getters hide them. A caller that needs to inspect them — pipeline gates,
+/// stale-serving tests and other inspection code — uses the corresponding
+/// status-aware getter. (The background prefetch never reads stale entries: it
+/// re-resolves and consults the fresh status-aware getter.)
+fn statusless_servable(status: ValidationStatus) -> bool {
     matches!(
         status,
         ValidationStatus::Secure | ValidationStatus::Insecure | ValidationStatus::Unchecked
@@ -346,6 +346,12 @@ impl DnsCache {
     }
 
     /// Retrieve a response for the given query from cache, adjusting TTLs according to elapsed time.
+    ///
+    /// This is the shaped, status-less form: it never returns a fail-closed
+    /// `Bogus` SERVFAIL or an inconclusive `Indeterminate` entry. Use
+    /// [`Self::get_for_query_with_status`] when the validation status is needed
+    /// (for example to apply the pipeline's status gate) or when inspecting
+    /// entries that the status-less form hides.
     pub async fn get(&self, name: &Name, qtype: RecordType, qclass: DNSClass) -> Option<Message> {
         self.get_by_key(&CacheKey::new(name, qtype, qclass))
             .await
@@ -353,16 +359,22 @@ impl DnsCache {
     }
 
     /// Retrieve a response for `query`, honouring its DO/CD/ECS cache key.
+    ///
+    /// Like [`Self::get`], this status-less form hides `Bogus` and
+    /// `Indeterminate` entries; only
+    /// [`Self::get_for_query_with_status`] exposes them.
     pub async fn get_for_query(&self, query: &Message) -> Option<Message> {
-        self.get_for_query_with_status(query)
+        self.get_by_key(&CacheKey::for_query(query)?)
             .await
             .map(|(message, _)| message)
     }
 
     /// Retrieve a response and its recorded DNSSEC validation status.
     ///
-    /// The pipeline uses the status to decide whether the entry may be served
-    /// when validation is active (see [`ValidationStatus`]).
+    /// This is the raw, unfiltered inspection form: unlike [`Self::get`] and
+    /// [`Self::get_for_query`] it also returns `Bogus`/`Indeterminate` entries,
+    /// because the pipeline needs the status to decide whether they may be
+    /// served. Callers must apply that gate themselves.
     pub async fn get_for_query_with_status(
         &self,
         query: &Message,
@@ -390,6 +402,7 @@ impl DnsCache {
     async fn get_by_key(&self, key: &CacheKey) -> Option<(Message, ValidationStatus)> {
         self.get_by_key_with_status(key)
             .await
+            .filter(|(_, status, _)| statusless_servable(*status))
             .map(|(message, status, _)| (message, status))
     }
 
@@ -531,7 +544,7 @@ impl DnsCache {
     ) -> Option<Message> {
         self.get_stale_by_key(&CacheKey::new(name, qtype, qclass))
             .await
-            .filter(|(_, status, _)| stale_statusless_servable(*status))
+            .filter(|(_, status, _)| statusless_servable(*status))
             .map(|(message, _, _)| message)
     }
 
@@ -543,7 +556,7 @@ impl DnsCache {
     pub async fn get_stale_for_query(&self, query: &Message) -> Option<Message> {
         self.get_stale_for_query_with_status(query)
             .await
-            .filter(|(_, status)| stale_statusless_servable(*status))
+            .filter(|(_, status)| statusless_servable(*status))
             .map(|(message, _)| message)
     }
 
@@ -696,6 +709,11 @@ impl DnsCache {
     /// * NoError responses without an RRset of the queried type are treated as
     ///   NODATA and require an SOA in the authority section (RFC 2308);
     ///   negative answers without an SOA are not cached.
+    ///
+    /// The stored copy always has `AD=0`: the caller's response is not
+    /// mutated, and an `Unchecked` entry may not claim authentication it never
+    /// received. Use [`Self::insert_with_status`] with [`ValidationStatus::Secure`]
+    /// to preserve an authenticated answer's AD bit.
     pub async fn insert(&self, query: &Message, response: &Message) {
         self.insert_with_status(query, response, ValidationStatus::Unchecked)
             .await;
@@ -704,8 +722,12 @@ impl DnsCache {
     /// Insert a response together with its DNSSEC validation status.
     ///
     /// The extra parameter lets the pipeline distinguish a validated insecure
-    /// answer from one that was never validated, which the plain [`insert`]
-    /// convenience method cannot express.
+    /// answer from one that was never validated, which the plain
+    /// [`Self::insert`] convenience method cannot express.
+    ///
+    /// The stored copy keeps `AD` only for [`ValidationStatus::Secure`]; every
+    /// other status is stored with `AD=0` so a forged upstream bit cannot be
+    /// replayed from the cache. The caller's message is not mutated.
     pub async fn insert_with_status(
         &self,
         query: &Message,
@@ -949,7 +971,17 @@ impl DnsCache {
             }
         }
 
-        let serialized_len = encode_message(response).map_or(256, |b| b.len());
+        // The stored envelope must not claim authentication that the resolver
+        // did not prove. Only a `Secure` decision may keep the AD bit; an
+        // upstream- or caller-supplied AD on an `Unchecked`/`Insecure` answer
+        // is forged from the cache's point of view. Clone so the caller's
+        // message is never mutated.
+        let mut message = response.clone();
+        if validation_status != ValidationStatus::Secure {
+            message.metadata.authentic_data = false;
+        }
+
+        let serialized_len = encode_message(&message).map_or(256, |b| b.len());
         let estimated_bytes = (serialized_len + key.qname.len() + 128) as u32;
 
         // Re-check immediately before the insert. The caller captured the
@@ -976,7 +1008,7 @@ impl DnsCache {
         }
 
         let entry = CacheEntry {
-            message: response.clone(),
+            message,
             stored_at: Instant::now(),
             max_lifespan_secs,
             answer_ttls,

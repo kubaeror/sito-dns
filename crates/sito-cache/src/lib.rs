@@ -432,6 +432,106 @@ mod tests {
         }
     }
 
+    /// Non-root invalidation must evict every cache-key variant of a name, not
+    /// only the plain one. `invalidate_domain` matches on `CacheKey::qname`, so
+    /// EDNS/DO, CD, ECS and Secure entries must disappear too. The scenario is
+    /// repeated after a resize because invalidation closures are attached to
+    /// the current moka generation.
+    #[tokio::test]
+    async fn test_invalidate_domain_removes_all_key_variants_before_and_after_resize() {
+        let config = make_test_config(10, 3600, 1800);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("example.com.").unwrap();
+        let other = Name::from_str("other.example.").unwrap();
+
+        for resize_first in [false, true] {
+            if resize_first {
+                // Rebuild the cache generation. Live entries are carried over,
+                // and invalidation must still work on the new generation.
+                cache.resize(8).await;
+            }
+
+            for query in seed_key_variants(&cache, &qname).await {
+                assert!(
+                    cache.get_for_query_with_status(&query).await.is_some(),
+                    "variant key must be cached before invalidation"
+                );
+            }
+            insert_answer(&cache, 63, "other.example.").await;
+
+            cache.invalidate_domain("example.com");
+
+            for (query, _) in key_variant_queries(&qname) {
+                assert!(
+                    cache.get_for_query_with_status(&query).await.is_none(),
+                    "invalidate_domain must evict every key variant for {qname}"
+                );
+            }
+            assert!(
+                cache
+                    .get_for_query_with_status(&query_for(63, &other))
+                    .await
+                    .is_some(),
+                "an unrelated name must survive invalidation"
+            );
+        }
+    }
+
+    /// Builds one query per key dimension: plain, EDNS/DO, CD=1, ECS, and a
+    /// Secure-status insert. Returns the queries with the status to store.
+    fn key_variant_queries(name: &Name) -> Vec<(Message, ValidationStatus)> {
+        let plain = query_for(60, name);
+
+        let mut do_query = query_for(61, name);
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        do_query.set_edns(edns);
+
+        let mut cd_query = query_for(62, name);
+        cd_query.metadata.checking_disabled = true;
+
+        let mut ecs_query = query_for(64, name);
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(
+                "192.0.2.0".parse().unwrap(),
+                24,
+                0,
+            )));
+        ecs_query.set_edns(edns);
+
+        // Secure status is not part of the key, so use a distinct DO+CD
+        // variant to keep this entry addressable independently of the others.
+        let mut secure_query = query_for(65, name);
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        secure_query.set_edns(edns);
+        secure_query.metadata.checking_disabled = true;
+
+        vec![
+            (plain, ValidationStatus::Unchecked),
+            (do_query, ValidationStatus::Unchecked),
+            (cd_query, ValidationStatus::Unchecked),
+            (ecs_query, ValidationStatus::Unchecked),
+            (secure_query, ValidationStatus::Secure),
+        ]
+    }
+
+    async fn seed_key_variants(cache: &DnsCache, name: &Name) -> Vec<Message> {
+        let mut queries = Vec::new();
+        for (query, status) in key_variant_queries(name) {
+            let response = answer_response(
+                query.metadata.id,
+                name,
+                [192, 0, 2, query.metadata.id as u8],
+            );
+            cache.insert_with_status(&query, &response, status).await;
+            queries.push(query);
+        }
+        queries
+    }
+
     /// The cache API supplies Unicode names (`Name::to_string()`), while
     /// cache keys are punycode (`Name::to_ascii()`). Invalidation must normalize
     /// the request through IDNA or an IDN entry can never be evicted.
@@ -498,6 +598,174 @@ mod tests {
             status,
             ValidationStatus::Unchecked,
             "insert() must not turn an unvalidated upstream AD bit into Secure"
+        );
+        // The forged bit must not be replayed from the cache either.
+        let (forged_cached, _) = cache
+            .get_for_query_with_status(&forged_query)
+            .await
+            .expect("cache hit");
+        assert!(
+            !forged_cached.metadata.authentic_data,
+            "an Unchecked entry must be stored and served with AD=0"
+        );
+        assert!(
+            forged.metadata.authentic_data,
+            "the caller's message must not be mutated by insert()"
+        );
+    }
+
+    /// Only a `Secure` decision may keep the AD bit in the stored entry. A
+    /// forged upstream AD on an `Unchecked`/`Insecure` answer must come back
+    /// clear, and the caller's message must never be mutated.
+    #[tokio::test]
+    async fn test_non_secure_inserts_clear_forged_ad() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+
+        for (id, status) in [
+            (80u16, ValidationStatus::Unchecked),
+            (81, ValidationStatus::Insecure),
+        ] {
+            let qname = Name::from_str(&format!("ad-{id}.example.")).unwrap();
+            let query = query_for(id, &qname);
+            let mut response = answer_response(id, &qname, [192, 0, 2, id as u8]);
+            response.metadata.authentic_data = true;
+
+            cache.insert_with_status(&query, &response, status).await;
+
+            let (cached, stored) = cache
+                .get_for_query_with_status(&query)
+                .await
+                .expect("cache hit");
+            assert_eq!(stored, status);
+            assert!(
+                !cached.metadata.authentic_data,
+                "{status:?} must be stored and served with AD=0"
+            );
+            assert!(
+                response.metadata.authentic_data,
+                "the caller's message must not be mutated"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_secure_insert_preserves_ad() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("secure-ad.example.").unwrap();
+        let query = query_for(82, &qname);
+        let mut response = answer_response(82, &qname, [192, 0, 2, 82]);
+        response.metadata.authentic_data = true;
+
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Secure)
+            .await;
+
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("cache hit");
+        assert_eq!(status, ValidationStatus::Secure);
+        assert!(
+            cached.metadata.authentic_data,
+            "a Secure entry must keep its authenticated-data bit"
+        );
+        let statusless = cache
+            .get_for_query(&query)
+            .await
+            .expect("Secure entries are servable by the status-less getter");
+        assert!(statusless.metadata.authentic_data);
+    }
+
+    /// The fresh status-less getters must hide fail-closed (`Bogus`) and
+    /// inconclusive (`Indeterminate`) entries, mirroring the stale getters.
+    /// The status-aware getter remains the unfiltered inspection form.
+    #[tokio::test]
+    async fn test_fresh_statusless_getters_hide_failure_entries() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+
+        let bogus_name = Name::from_str("fresh-bogus-getter.example.").unwrap();
+        let bogus_query = query_for(83, &bogus_name);
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &bogus_query,
+                    &servfail_response(83, &bogus_query),
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await
+        );
+
+        let indeterminate_name = Name::from_str("fresh-indeterminate-getter.example.").unwrap();
+        let indeterminate_query = query_for(84, &indeterminate_name);
+        cache
+            .insert_with_status(
+                &indeterminate_query,
+                &answer_response(84, &indeterminate_name, [192, 0, 2, 84]),
+                ValidationStatus::Indeterminate,
+            )
+            .await;
+
+        let unchecked_name = Name::from_str("fresh-unchecked-getter.example.").unwrap();
+        let unchecked_query = query_for(85, &unchecked_name);
+        cache
+            .insert(
+                &unchecked_query,
+                &answer_response(85, &unchecked_name, [192, 0, 2, 85]),
+            )
+            .await;
+
+        assert_eq!(
+            cache
+                .get_for_query_with_status(&bogus_query)
+                .await
+                .map(|(_, status)| status),
+            Some(ValidationStatus::Bogus),
+            "the status-aware getter must still expose a fresh Bogus entry"
+        );
+        assert_eq!(
+            cache
+                .get_for_query_with_status(&indeterminate_query)
+                .await
+                .map(|(_, status)| status),
+            Some(ValidationStatus::Indeterminate),
+            "the status-aware getter must still expose a fresh Indeterminate entry"
+        );
+
+        assert!(
+            cache
+                .get(&bogus_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "get must not return a fresh Bogus entry"
+        );
+        assert!(
+            cache.get_for_query(&bogus_query).await.is_none(),
+            "get_for_query must not return a fresh Bogus entry"
+        );
+        assert!(
+            cache
+                .get(&indeterminate_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "get must not return a fresh Indeterminate entry"
+        );
+        assert!(
+            cache.get_for_query(&indeterminate_query).await.is_none(),
+            "get_for_query must not return a fresh Indeterminate entry"
+        );
+        assert!(
+            cache
+                .get(&unchecked_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_some(),
+            "Unchecked must remain returnable from the status-less getters"
+        );
+        assert!(
+            cache.get_for_query(&unchecked_query).await.is_some(),
+            "Unchecked must remain returnable from the status-less getters"
         );
     }
 
@@ -1798,13 +2066,15 @@ mod tests {
             },
         ));
         response.metadata.authentic_data = true;
-        cache.insert(&query, &response).await;
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Secure)
+            .await;
 
         let fresh = cache
             .get(&qname, RecordType::A, DNSClass::IN)
             .await
             .expect("fresh hit");
-        assert!(fresh.metadata.authentic_data, "fresh entry keeps AD");
+        assert!(fresh.metadata.authentic_data, "fresh Secure entry keeps AD");
 
         tokio::time::sleep(Duration::from_millis(1100)).await;
 
