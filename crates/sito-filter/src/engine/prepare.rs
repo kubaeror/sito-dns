@@ -108,9 +108,9 @@ impl HostsFilterEngine {
 
     /// Stages the current live filter state without compiling anything.
     ///
-    /// Used by deferred applies (wizard first boot) where the list fetch is
-    /// queued after the request returns; the snapshot still carries a coherent
-    /// filter value for the new configuration.
+    /// Used by deferred applies (clients/upstream/rewrite saves) where the
+    /// loaded rules are intentionally reused; the snapshot still carries a
+    /// coherent filter value for the new configuration.
     pub async fn prepare_current(&self) -> PreparedFilterSnapshot {
         self.prepare_current_with_groups(None).await
     }

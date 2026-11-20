@@ -39,8 +39,11 @@ as a prerelease. Phase 1 work packages land as separate commits on
   Origin and restrict legacy `?token=` to that path. Unrelated config changes
   defer blocklist work; referenced list/group changes and restart-only writes
   return 409; get-config/backup reads fail closed and backups are `0600`.
-  Viewer sessions no longer see full subscription URLs. The updater now
-  refuses in-app apply on systemd/Docker with instructions, never reports an
+  Viewer sessions no longer see full subscription URLs. First boot now applies
+  filtering synchronously and waits for the initial list fetch (bounded by the
+  subscription fetch timeout); a failure keeps setup pending and DNS gated.
+  The updater now refuses in-app apply on systemd/Docker with instructions,
+  never reports an
   unknown version as current, serializes applies, verifies the staged binary,
   backs up/restores the old binary, enforces `0600`/`0700` temp modes and
   always verifies a present signature pair. See §26 of

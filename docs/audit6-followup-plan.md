@@ -1397,7 +1397,10 @@ self-service 2FA section in `docs/audit6-test-matrix.md` and §20 of
 **Status (2026-11-20):** Complete. The admin API now returns 409 with
 `restart_required` for restart-only writes, rejects unknown keys and broken
 references/rewrites before persisting, and defers filter work only when
-`[filtering]` is unchanged. OpenAPI declares bearer/cookie security, stable
+`[filtering]` is unchanged. First boot deliberately uses a synchronous filter
+apply and waits for the initial list fetch up to the subscription fetch
+timeout; a failure keeps setup pending and DNS gated instead of reporting
+success. OpenAPI declares bearer/cookie security, stable
 tags and the previously missing WebSocket and alias paths, with structural
 drift tests. Authenticated responses are `no-store`/`Vary: Cookie`; the
 querylog WebSocket validates Origin and restricts legacy `?token=` to its own

@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::canonical_config_path;
+use super::startup::should_gate_dns;
 use super::*;
 use std::path::Path;
 
@@ -627,6 +628,22 @@ async fn test_tls_acceptors_rebuilt_from_updated_config() {
 
     drop(watchers);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A persisted config does not by itself mean setup finished: an active setup
+/// token must keep DNS gated after a failed first-boot refresh and restart.
+#[test]
+fn test_active_setup_token_keeps_dns_gated_with_persisted_config() {
+    assert!(should_gate_dns(true, false, false));
+    assert!(
+        should_gate_dns(false, true, true),
+        "an active setup token must gate DNS when config.toml exists"
+    );
+    assert!(
+        !should_gate_dns(false, true, false),
+        "a programmatic in-memory config stays ungated unless the caller requests setup mode"
+    );
+    assert!(!should_gate_dns(false, false, true));
 }
 
 /// Regression: the DNS warning must not claim listeners exist during

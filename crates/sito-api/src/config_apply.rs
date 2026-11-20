@@ -108,11 +108,6 @@ pub enum FilterApply {
     /// Apply everything else and let the caller queue the list fetch. Valid
     /// only when `[filtering]` is unchanged (clients, upstreams, rewrites...).
     Deferred,
-    /// First-boot exception used by the setup wizard: no DNS traffic is served
-    /// yet, so the candidate filtering config may be published while the
-    /// caller queues the initial list fetch (the listeners are only started
-    /// after that refresh). Rejected once a filter snapshot is live.
-    DeferredFirstBoot,
 }
 
 /// Chooses the filter mode for an apply based on whether `[filtering]` changed.
@@ -757,18 +752,6 @@ async fn stage_config(
     // instead of leaving the runtime snapshot and filter engine disagreeing.
     match filter_apply {
         FilterApply::Sync => {}
-        FilterApply::DeferredFirstBoot => {
-            // Only the genuine first boot may publish a changed filtering
-            // config with the old snapshot still live. In recovery bootstrap
-            // (no setup-pending flag and no gated DNS starter) the wizard must
-            // use `Sync`, otherwise success would be reported while the old
-            // rules keep serving.
-            if !(ctx.is_setup_pending() || ctx.dns_starter.is_some()) {
-                return Err(ProblemDetails::internal_error(
-                    "DeferredFirstBoot is only valid during first-boot setup; use FilterApply::Sync",
-                ));
-            }
-        }
         FilterApply::Deferred => {
             let current = ctx.config.load();
             if candidate.filtering != current.filtering {
@@ -795,7 +778,7 @@ async fn stage_config(
                 )
                 .await
         }
-        FilterApply::Deferred | FilterApply::DeferredFirstBoot => {
+        FilterApply::Deferred => {
             ctx.filter
                 .prepare_current_with_groups(Some(sito_runtime::group_rule_sets(&clients)))
                 .await
@@ -894,49 +877,6 @@ fn rewrites_from_config(cfg: &Config) -> Result<sito_rewrites::RewritesConfig, P
     }
 }
 
-/// Queues a background blocklist refresh for the given filtering config and
-/// returns its join handle. Used by the wizard so the HTTP request does not
-/// download lists synchronously; the caller must await the handle and check
-/// its result before reporting setup success.
-pub fn queue_filter_refresh(
-    ctx: &ServerContext,
-    filtering: sito_core::config::FilteringConfig,
-) -> tokio::task::JoinHandle<Result<(), ApplyError>> {
-    let engine = ctx.filter.clone();
-    let metrics = ctx.metrics.clone();
-    let cache = ctx.cache.clone();
-    let runtime = ctx.runtime.clone();
-    tokio::spawn(async move {
-        // Capture the generation the caller's `filtering` value belongs to
-        // before staging. The helper re-checks both the generation and the
-        // filtering config after acquiring the engine guard: an apply that
-        // committed before this task started makes the refresh stale even
-        // though the generation read here is already the new one.
-        let expected = runtime.generation();
-        match apply_filter_refresh(&engine, &runtime, &filtering, expected).await {
-            Ok(_) => {
-                cache.flush();
-                metrics.set_filter_rules(engine.rule_count());
-                tracing::info!("Background blocklist refresh completed");
-                Ok(())
-            }
-            Err(error @ ApplyError::GenerationConflict { .. }) => {
-                tracing::debug!(
-                    "Discarding a background blocklist refresh compiled for an older configuration"
-                );
-                Err(error)
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Background blocklist refresh failed; the filter engine keeps its previous \
-                     snapshot: {error}"
-                );
-                Err(error)
-            }
-        }
-    })
-}
-
 /// Stages and publishes one filter refresh, tied to `expected` (the config
 /// generation the caller captured together with `filtering`).
 ///
@@ -944,6 +884,7 @@ pub fn queue_filter_refresh(
 /// the engine guard is acquired. A refresh whose `filtering` value came from an
 /// older config therefore cannot overwrite the newer generation's filter, even
 /// when its own generation read happened after that apply committed.
+#[cfg(test)]
 pub(crate) async fn apply_filter_refresh(
     engine: &sito_filter::HostsFilterEngine,
     runtime: &sito_runtime::RuntimeState,

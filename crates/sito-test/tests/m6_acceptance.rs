@@ -266,6 +266,7 @@ async fn test_wizard_gate_forbidden_after_setup() {
     // Simulate the genuine first-run bootstrap regardless of the configured
     // password used by the router test helper.
     ctx.auth_mgr = Arc::new(AuthManager::new());
+    ctx.set_setup_pending(true);
 
     // Point the preserved local list at new content without reloading the
     // filter engine. The wizard's deferred refresh must pick up this changed
@@ -304,21 +305,10 @@ async fn test_wizard_gate_forbidden_after_setup() {
         persisted.contains("file://"),
         "wizard must preserve the seeded local list: {persisted}"
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if ctx.filter.rule_count() >= 3 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "deferred refresh did not apply the changed filtering config in time"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     assert_eq!(
         ctx.filter.rule_count(),
         3,
-        "the filter engine must load the changed list, not the preloaded one"
+        "first boot must synchronously load the changed list before returning success"
     );
 
     // 2. After setup is complete, unauthenticated POST /ui/wizard/complete is rejected with 403
@@ -921,6 +911,62 @@ async fn test_setup_token_wizard_works_without_any_admin_account() {
             .await,
         sito_api::auth::LoginResult::Success(_)
     ));
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// First boot must not claim success when the initial list fetch fails. Setup
+/// stays pending, the token stays active and DNS is not started.
+#[cfg(feature = "embed-ui")]
+#[tokio::test]
+async fn test_first_boot_filter_failure_keeps_setup_pending_and_dns_gated() {
+    let (mut ctx, temp_dir) = create_test_context().await;
+    {
+        let seed = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+        seed.create_user("viewer", "ViewerPassword123!", sito_api::auth::Role::Viewer)
+            .await;
+        assert!(seed.delete_user("admin").await);
+    }
+    let mgr = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
+    let token = mgr.setup_token().expect("setup token provisioned");
+    ctx.auth_mgr = Arc::new(mgr);
+    ctx.set_setup_pending(true);
+    let (dns_tx, mut dns_rx) = tokio::sync::mpsc::unbounded_channel();
+    ctx.dns_starter = Some(dns_tx);
+
+    let missing = temp_dir.join("missing-first-boot-list.txt");
+    let mut broken = (**ctx.config.load()).clone();
+    // Use a new list name so no cached copy from the seeded Local list can
+    // satisfy the fetch.
+    broken.filtering.lists[0].name = "MissingFirstBoot".to_string();
+    broken.filtering.lists[0].url = format!("file://{}", missing.display());
+    ctx.set_config(broken);
+
+    let app = create_router(ctx.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/wizard/complete")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "setup_token={token}&admin_user=admin&admin_password=RecoveredPassword123!&confirm_password=RecoveredPassword123!&filtering_enabled=on"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        ctx.auth_mgr.setup_token_required(),
+        "a failed first-boot refresh must not consume the setup token"
+    );
+    assert!(ctx.is_setup_pending(), "setup must remain pending");
+    assert!(
+        dns_rx.try_recv().is_err(),
+        "DNS must not be started after a failed first-boot refresh"
+    );
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
