@@ -195,6 +195,9 @@ pub(super) async fn start_dns_listeners(
 
     for bind_ip in &config.dns.bind {
         let addr = SocketAddr::new(*bind_ip, config.dns.port);
+        // Whether the DoH3 listener for this bind address actually started.
+        // Alt-Svc is gated on this, never on configuration alone.
+        let mut doh3_bound = false;
 
         // Start UDP listener
         let udp_config = UdpConfig {
@@ -240,6 +243,52 @@ pub(super) async fn start_dns_listeners(
             handles.push(dot_handle);
         }
 
+        // Start DoQ listener if doq_port > 0 and TLS is configured. A
+        // configured listener that fails to bind aborts startup: logging and
+        // continuing would report ready while the configured endpoint is
+        // missing.
+        if config.dns.doq_port > 0
+            && let Some(ref doq_mgr) = doq_acceptor_mgr
+        {
+            let doq_addr = SocketAddr::new(*bind_ip, config.dns.doq_port);
+            let mut doq_config = DoqConfig::new(doq_addr, Some(doq_mgr.clone()));
+            doq_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doq_config.rate_limiter = Some(shared_limiter.clone());
+            doq_config.max_connections = config.dns.max_tcp_connections;
+            let doq_handle = start_doq_listener(doq_config, pipeline.clone(), shutdown_rx.clone())
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to start configured DoQ listener on {doq_addr}: {e}")
+                })?;
+            handles.push(doq_handle);
+        }
+
+        // Start DoH3 before DoH: DoH's Alt-Svc is gated on the actual DoH3
+        // bind outcome for this address. A configured DoH3 bind failure aborts
+        // startup instead of advertising an endpoint that is not serving.
+        if config.dns.doh3_port > 0
+            && let Some(ref doh3_mgr) = doh3_acceptor_mgr
+        {
+            let doh3_addr = SocketAddr::new(*bind_ip, config.dns.doh3_port);
+            let dedicated_host = (!config.dns.doh_dedicated_hostname.trim().is_empty())
+                .then(|| config.dns.doh_dedicated_hostname.trim().to_string());
+            let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()))
+                .with_dedicated_hostname(dedicated_host);
+            doh3_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
+            doh3_config.rate_limiter = Some(shared_limiter.clone());
+            doh3_config.max_connections = config.dns.max_tcp_connections;
+            let doh3_handle =
+                start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone())
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to start configured DoH3 listener on {doh3_addr}: {e}"
+                        )
+                    })?;
+            handles.push(doh3_handle);
+            doh3_bound = true;
+        }
+
         // Start DoH listener if doh_port > 0. Plaintext HTTP DoH is only
         // started on unprivileged loopback ports or when explicitly opted in.
         if config.dns.doh_port > 0 {
@@ -254,11 +303,11 @@ pub(super) async fn start_dns_listeners(
                 let doh_addr = SocketAddr::new(*bind_ip, config.dns.doh_port);
                 let dedicated_host = (!config.dns.doh_dedicated_hostname.trim().is_empty())
                     .then(|| config.dns.doh_dedicated_hostname.trim().to_string());
-                // Only advertise HTTP/3 when a DoH3 listener can actually be
-                // started (port configured and TLS material available); a
-                // bind failure is logged at error level below.
-                let alt_svc_port = (config.dns.doh3_port > 0 && doh3_acceptor_mgr.is_some())
-                    .then_some(config.dns.doh3_port);
+                // Only advertise HTTP/3 when the DoH3 listener for this bind
+                // address actually bound. DoH3 is started before DoH so a
+                // failed configured DoH3 bind aborts startup instead of
+                // advertising an endpoint that is not serving.
+                let alt_svc_port = doh3_bound.then_some(config.dns.doh3_port);
                 let mut doh_config = DohConfig::new(doh_addr, doh_acceptor_mgr.clone())
                     .with_alt_svc_port(alt_svc_port)
                     .with_dedicated_hostname(dedicated_host);
@@ -270,41 +319,6 @@ pub(super) async fn start_dns_listeners(
                 handles.push(doh_handle);
                 if config.dns.doh_port == 443 {
                     doh_443_bound = true;
-                }
-            }
-        }
-
-        // Start DoQ listener if doq_port > 0 and TLS is configured
-        if config.dns.doq_port > 0
-            && let Some(ref doq_mgr) = doq_acceptor_mgr
-        {
-            let doq_addr = SocketAddr::new(*bind_ip, config.dns.doq_port);
-            let mut doq_config = DoqConfig::new(doq_addr, Some(doq_mgr.clone()));
-            doq_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-            doq_config.rate_limiter = Some(shared_limiter.clone());
-            doq_config.max_connections = config.dns.max_tcp_connections;
-            match start_doq_listener(doq_config, pipeline.clone(), shutdown_rx.clone()).await {
-                Ok(doq_handle) => handles.push(doq_handle),
-                Err(e) => error!("Failed to start the configured DoQ listener on {doq_addr}: {e}"),
-            }
-        }
-
-        // Start DoH3 listener if doh3_port > 0 and TLS is configured
-        if config.dns.doh3_port > 0
-            && let Some(ref doh3_mgr) = doh3_acceptor_mgr
-        {
-            let doh3_addr = SocketAddr::new(*bind_ip, config.dns.doh3_port);
-            let dedicated_host = (!config.dns.doh_dedicated_hostname.trim().is_empty())
-                .then(|| config.dns.doh_dedicated_hostname.trim().to_string());
-            let mut doh3_config = Doh3Config::new(doh3_addr, Some(doh3_mgr.clone()))
-                .with_dedicated_hostname(dedicated_host);
-            doh3_config.rate_limit_per_ip = config.dns.rate_limit_per_ip;
-            doh3_config.rate_limiter = Some(shared_limiter.clone());
-            doh3_config.max_connections = config.dns.max_tcp_connections;
-            match start_doh3_listener(doh3_config, pipeline.clone(), shutdown_rx.clone()).await {
-                Ok(doh3_handle) => handles.push(doh3_handle),
-                Err(e) => {
-                    error!("Failed to start the configured DoH3 listener on {doh3_addr}: {e}");
                 }
             }
         }

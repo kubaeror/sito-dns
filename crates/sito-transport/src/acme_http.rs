@@ -467,4 +467,26 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
+
+    /// P2-20: a configured ACME HTTP-01 address that cannot bind must surface
+    /// an error instead of silently leaving the challenge unreachable.
+    #[tokio::test]
+    async fn test_acme_http01_bind_failure_is_visible() {
+        let challenges: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+        // Occupy the exact address the listener will be asked to bind.
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupied.local_addr().unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let error = start_acme_http01_listener(addr, challenges, shutdown_rx)
+            .await
+            .expect_err("a bound address must make the configured listener start fail");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "the bind failure must preserve the OS error kind"
+        );
+
+        drop(occupied);
+    }
 }

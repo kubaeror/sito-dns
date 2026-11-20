@@ -1195,6 +1195,161 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// P1-14/P2-18: a DoT response over 65535 bytes must be returned as a
+    /// valid length-prefixed frame with TC=1, never as an unframable message.
+    #[tokio::test]
+    async fn test_dot_oversized_response_is_truncated() {
+        use crate::tls::generate_test_cert;
+        use rustls_pki_types::ServerName;
+        use tokio_rustls::TlsConnector;
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_dot_huge_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let server_config =
+            load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()]).unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = DotConfig::new(actual_addr, acceptor_mgr);
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            let qname = query.queries[0].name().clone();
+            for i in 0..6000u32 {
+                resp.answers.push(Record::from_rdata(
+                    qname.clone(),
+                    300,
+                    RData::A(A(std::net::Ipv4Addr::from(i))),
+                ));
+            }
+            Some(resp)
+        });
+
+        let _handle = start_dot_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in load_certificates(&cert_file).unwrap() {
+            root_store.add(cert).unwrap();
+        }
+        let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"dot".to_vec()];
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp_stream = TcpStream::connect(actual_addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+        let mut tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
+
+        let mut query = Message::new(91, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("huge-dot.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let encoded = encode_message(&query).unwrap();
+        tls_stream
+            .write_all(&(encoded.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        tls_stream.write_all(&encoded).await.unwrap();
+        tls_stream.flush().await.unwrap();
+
+        let mut len_buf = [0u8; 2];
+        tls_stream.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        tls_stream.read_exact(&mut resp_buf).await.unwrap();
+        let resp = decode_message(&resp_buf).unwrap();
+        assert!(
+            resp.metadata.truncation,
+            "an oversized DoT response must be truncated with TC=1"
+        );
+        assert_eq!(resp.queries.len(), 1, "the question must be preserved");
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P2-18: DoH must reject a TLS client that offers an incompatible ALPN.
+    #[tokio::test]
+    async fn test_doh_alpn_mismatch_rejected() {
+        use crate::tls::generate_test_cert;
+        use rustls_pki_types::ServerName;
+        use tokio_rustls::TlsConnector;
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_doh_alpn_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let server_config = load_server_config(
+            &cert_file,
+            &key_file,
+            &[],
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        )
+        .unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = DohConfig::new(actual_addr, Some(acceptor_mgr));
+
+        let handler = Arc::new(|_query: Message, _client: ClientContext| async move { None });
+        let _handle = start_doh_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in load_certificates(&cert_file).unwrap() {
+            root_store.add(cert).unwrap();
+        }
+        let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        // The DoH listener only speaks h2/http1.1.
+        client_config.alpn_protocols = vec![b"dot".to_vec()];
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp_stream = TcpStream::connect(actual_addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+        let connect_res = connector.connect(server_name, tcp_stream).await;
+        assert!(
+            connect_res.is_err(),
+            "a DoH handshake with a mismatched ALPN must fail"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[tokio::test]
     async fn test_doh_plain_post_and_get() {
         use base64::Engine;
