@@ -342,6 +342,15 @@ fn expect_validation_field(toml: &str, expected: &str) {
     }
 }
 
+fn expect_cross_section_field(toml: &str, expected: &str) {
+    let err = Config::from_toml_str(toml)
+        .expect_err(&format!("config must be rejected (expected {expected})"));
+    match err {
+        ConfigError::CrossSection { field, .. } => assert_eq!(field, expected),
+        other => panic!("expected cross-section error on {expected}, got {other:?}"),
+    }
+}
+
 /// Audit 6 / WP-6.5: the transports size the token-bucket burst as
 /// `rate_limit_per_ip * 2`, so the value must be bounded.
 #[test]
@@ -617,6 +626,114 @@ fn test_upstream_per_domain_requires_domains_and_servers() {
         "{TEST_BASE}[[upstream.per_domain]]\ndomains = [\"lan\"]\nservers = [\"192.168.1.1\"]\n"
     ))
     .expect("a complete per-domain rule must be accepted");
+}
+
+/// WP-2.7: an unbounded timeout or pool size is a resource-exhaustion foot-gun,
+/// so both values are capped while still accepting the documented maxima.
+#[test]
+fn test_upstream_timeout_and_pool_bounds() {
+    for timeout in ["0".to_string(), (MAX_UPSTREAM_TIMEOUT_MS + 1).to_string()] {
+        expect_validation_field(
+            &format!("{TEST_BASE}timeout_ms = {timeout}\n"),
+            "upstream.timeout_ms",
+        );
+    }
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}timeout_ms = {MAX_UPSTREAM_TIMEOUT_MS}\n"
+    ))
+    .expect("the documented timeout maximum must be accepted");
+
+    for pool_size in ["0".to_string(), (MAX_UPSTREAM_POOL_SIZE + 1).to_string()] {
+        expect_validation_field(
+            &format!("{TEST_BASE}pool_size = {pool_size}\n"),
+            "upstream.pool_size",
+        );
+    }
+    Config::from_toml_str(&format!(
+        "{TEST_BASE}pool_size = {MAX_UPSTREAM_POOL_SIZE}\n"
+    ))
+    .expect("the documented pool maximum must be accepted");
+}
+
+/// WP-2.7: validation and the manager agree on schemes and paths. Uppercase
+/// schemes are accepted (the manager normalizes them), while a path on
+/// `udp://`, `tls://` or a bare target is rejected instead of failing startup.
+#[test]
+fn test_upstream_target_schemes_and_paths() {
+    for target in [
+        "UDP://1.1.1.1",
+        "TLS://1.1.1.1",
+        "HTTPS://cloudflare-dns.com/dns-query",
+        "QUIC://dns.adguard.com",
+    ] {
+        Config::from_toml_str(&format!(
+            "config_version = 2\n[upstream]\nservers = [\"{target}\"]\n"
+        ))
+        .unwrap_or_else(|e| panic!("uppercase target '{target}' must be accepted: {e}"));
+    }
+
+    for target in [
+        "udp://1.1.1.1/dns-query",
+        "UDP://1.1.1.1/dns-query",
+        "tls://dns.quad9.net/dns-query",
+        "1.1.1.1:53/dns-query",
+    ] {
+        expect_cross_section_field(
+            &format!("config_version = 2\n[upstream]\nservers = [\"{target}\"]\n"),
+            "upstream.servers[0]",
+        );
+    }
+}
+
+/// WP-2.7: hostname targets need a bootstrap resolver; IP literals do not.
+#[test]
+fn test_upstream_hostname_target_requires_bootstrap() {
+    expect_validation_field(
+        "config_version = 2\n[upstream]\nservers = [\"dns.quad9.net\"]\nbootstrap = []\n",
+        "upstream.bootstrap",
+    );
+    expect_validation_field(
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\nbootstrap = []\n[[upstream.per_domain]]\ndomains = [\"lan\"]\nservers = [\"dns.internal.example\"]\n",
+        "upstream.bootstrap",
+    );
+    Config::from_toml_str(
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\", \"tls://1.0.0.1\"]\nbootstrap = []\n",
+    )
+    .expect("IP-literal targets must not require a bootstrap resolver");
+
+    expect_validation_field(
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\nbootstrap = []\n[clients]\n[[clients.entries]]\nname = \"phone\"\nuse_global_upstreams = false\nupstreams = [\"dns.quad9.net\"]\n",
+        "upstream.bootstrap",
+    );
+}
+
+/// WP-2.7: `UpstreamConfig::validate` itself rejects bad targets so direct
+/// callers (API DTO handling, restore) cannot bypass the configuration path.
+#[test]
+fn test_upstream_config_validate_checks_targets_directly() {
+    let mut config = UpstreamConfig {
+        servers: vec!["udp://1.1.1.1/dns-query".to_string()],
+        ..UpstreamConfig::default()
+    };
+    assert!(
+        config.validate().is_err(),
+        "a path on a UDP target must be rejected by UpstreamConfig::validate"
+    );
+
+    config.servers = vec!["TLS://1.1.1.1".to_string()];
+    config.validate().expect("uppercase schemes must validate");
+
+    config.servers = vec!["dns.quad9.net".to_string()];
+    config.bootstrap.clear();
+    assert!(
+        config.validate().is_err(),
+        "a hostname target without a bootstrap resolver must be rejected"
+    );
+
+    config.servers = vec!["1.1.1.1".to_string()];
+    config
+        .validate()
+        .expect("an IP literal does not need a bootstrap resolver");
 }
 
 /// 1.9.2 keeps the historical wildcard defaults, so startup must tell the

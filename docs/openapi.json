@@ -5383,7 +5383,9 @@
           },
           "pool_size": {
             "type": "integer",
-            "minimum": 0
+            "description": "Persistent connections per endpoint; bounded to 1..=64 by core\nvalidation (`MAX_UPSTREAM_POOL_SIZE`).",
+            "maximum": 64,
+            "minimum": 1
           },
           "probe_domain": {
             "type": "string"
@@ -5400,7 +5402,9 @@
           "timeout_ms": {
             "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "description": "Overall per-query budget; bounded to 1..=60000 ms by core validation\n(`MAX_UPSTREAM_TIMEOUT_MS`).",
+            "maximum": 60000,
+            "minimum": 1
           }
         }
       },

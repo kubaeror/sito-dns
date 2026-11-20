@@ -518,65 +518,90 @@ async fn create_managed_entry(
     let name = server_str.to_string();
     let bootstrap = bootstrap.clone();
 
-    let upstream: Arc<dyn Upstream> = if let Some(tls_target) = server_str.strip_prefix("tls://") {
-        let (host, port) = split_host_port(tls_target, 853);
-        Arc::new(
-            FailoverUpstream::new(
-                bootstrap,
-                host.clone(),
-                port,
-                timeout_duration,
-                CandidateKind::Dot {
-                    server_name: host,
-                    pool_size,
-                },
+    // Match schemes case-insensitively: validation accepts `TLS://` and the
+    // runtime must build the same transport instead of treating it as a
+    // single-label hostname.
+    let (scheme, target) = split_scheme(server_str);
+
+    let upstream: Arc<dyn Upstream> = match scheme.as_deref() {
+        Some("tls") => {
+            reject_path(server_str, target, "tls://")?;
+            let (host, port) = split_host_port(target, 853);
+            Arc::new(
+                FailoverUpstream::new(
+                    bootstrap,
+                    host.clone(),
+                    port,
+                    timeout_duration,
+                    CandidateKind::Dot {
+                        server_name: host,
+                        pool_size,
+                    },
+                )
+                .await?,
             )
-            .await?,
-        )
-    } else if server_str.starts_with("https://") {
-        let (host, port, path) = parse_scheme_target(server_str, "https", 443)?;
-        Arc::new(
-            FailoverUpstream::new(
-                bootstrap,
-                host.clone(),
-                port,
-                timeout_duration,
-                CandidateKind::Https {
-                    url: build_https_url(&host, port, &path),
-                },
+        }
+        Some("https") => {
+            let (host, port, path) = parse_scheme_target(target, 443)?;
+            Arc::new(
+                FailoverUpstream::new(
+                    bootstrap,
+                    host.clone(),
+                    port,
+                    timeout_duration,
+                    CandidateKind::Https {
+                        url: build_https_url(&host, port, &path),
+                    },
+                )
+                .await?,
             )
-            .await?,
-        )
-    } else if server_str.starts_with("quic://") {
-        let (host, port, _path) = parse_scheme_target(server_str, "quic", 853)?;
-        Arc::new(
-            FailoverUpstream::new(
-                bootstrap,
-                host.clone(),
-                port,
-                timeout_duration,
-                CandidateKind::Quic { server_name: host },
+        }
+        Some("quic") => {
+            let (host, port, _path) = parse_scheme_target(target, 853)?;
+            Arc::new(
+                FailoverUpstream::new(
+                    bootstrap,
+                    host.clone(),
+                    port,
+                    timeout_duration,
+                    CandidateKind::Quic { server_name: host },
+                )
+                .await?,
             )
-            .await?,
-        )
-    } else {
-        let target_str = server_str.strip_prefix("udp://").unwrap_or(server_str);
-        if let Some(scheme) = unsupported_scheme(target_str) {
+        }
+        Some("udp") => {
+            reject_path(server_str, target, "udp://")?;
+            let (host, port) = split_host_port(target, 53);
+            Arc::new(
+                FailoverUpstream::new(
+                    bootstrap,
+                    host,
+                    port,
+                    timeout_duration,
+                    CandidateKind::Plain,
+                )
+                .await?,
+            )
+        }
+        Some(other) => {
             return Err(UpstreamError::BadResponse(format!(
-                "unsupported upstream scheme '{scheme}://' in '{server_str}'; supported schemes are tls://, https://, udp:// and plain host/IP"
+                "unsupported upstream scheme '{other}://' in '{server_str}'; supported schemes are tls://, https://, quic://, udp:// and plain host/IP"
             )));
         }
-        let (host, port) = split_host_port(target_str, 53);
-        Arc::new(
-            FailoverUpstream::new(
-                bootstrap,
-                host,
-                port,
-                timeout_duration,
-                CandidateKind::Plain,
+        None => {
+            reject_path(server_str, server_str, "a plain host:port target")?;
+            let (host, port) = split_host_port(server_str, 53);
+            Arc::new(
+                FailoverUpstream::new(
+                    bootstrap,
+                    host,
+                    port,
+                    timeout_duration,
+                    CandidateKind::Plain,
+                )
+                .await?,
             )
-            .await?,
-        )
+        }
     };
 
     Ok(ManagedEntry {
@@ -586,22 +611,38 @@ async fn create_managed_entry(
     })
 }
 
-/// Parses a `scheme://host[:port][/path]` upstream target.
+/// Splits `scheme://rest` into a lowercased scheme (when present) and `rest`.
+fn split_scheme(target: &str) -> (Option<String>, &str) {
+    match target.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme.to_ascii_lowercase()), rest),
+        None => (None, target),
+    }
+}
+
+/// Rejects a URL path on schemes that do not carry one. Validation rejects
+/// these too; the runtime check keeps direct manager callers in agreement.
+fn reject_path(server_str: &str, target: &str, kind: &str) -> Result<(), UpstreamError> {
+    if target.contains('/') {
+        return Err(UpstreamError::BadResponse(format!(
+            "upstream target '{server_str}' uses {kind} and must not include a URL path"
+        )));
+    }
+    Ok(())
+}
+
+/// Parses `host[:port][/path]` for a scheme that accepts an optional path.
 fn parse_scheme_target(
-    url: &str,
-    scheme: &str,
+    target: &str,
     default_port: u16,
 ) -> Result<(String, u16, String), UpstreamError> {
-    let prefix = format!("{scheme}://");
-    let rest = url.strip_prefix(prefix.as_str()).unwrap_or(url);
-    let (authority, path) = match rest.split_once('/') {
+    let (authority, path) = match target.split_once('/') {
         Some((authority, path)) => (authority, format!("/{path}")),
-        None => (rest, DEFAULT_DOH_PATH.to_string()),
+        None => (target, DEFAULT_DOH_PATH.to_string()),
     };
     let (host, port) = split_host_port(authority, default_port);
     if host.is_empty() {
         return Err(UpstreamError::BadResponse(format!(
-            "invalid upstream URL '{url}': missing host"
+            "invalid upstream URL '{target}': missing host"
         )));
     }
     Ok((host, port, path))
@@ -629,6 +670,7 @@ fn build_https_url(host: &str, port: u16, path: &str) -> String {
 }
 
 /// Returns the scheme of an upstream string if it uses an unsupported `xxx://` prefix.
+#[cfg(test)]
 fn unsupported_scheme(target: &str) -> Option<String> {
     let (scheme, _) = target.split_once("://")?;
     if scheme.is_empty()
@@ -2115,30 +2157,28 @@ mod tests {
     #[test]
     fn test_parse_https_target() {
         assert_eq!(
-            parse_scheme_target("https://dns.quad9.net/dns-query", "https", 443).unwrap(),
+            parse_scheme_target("dns.quad9.net/dns-query", 443).unwrap(),
             ("dns.quad9.net".to_string(), 443, "/dns-query".to_string())
         );
         assert_eq!(
-            parse_scheme_target("https://dns.google:8443/dns-query", "https", 443)
+            parse_scheme_target("dns.google:8443/dns-query", 443)
                 .unwrap()
                 .1,
             8443
         );
         assert_eq!(
-            parse_scheme_target("https://[2606:4700:4700::1111]/dns-query", "https", 443)
+            parse_scheme_target("[2606:4700:4700::1111]/dns-query", 443)
                 .unwrap()
                 .0,
             "2606:4700:4700::1111"
         );
         assert_eq!(
-            parse_scheme_target("https://cloudflare-dns.com", "https", 443)
-                .unwrap()
-                .2,
+            parse_scheme_target("cloudflare-dns.com", 443).unwrap().2,
             "/dns-query"
         );
-        assert!(parse_scheme_target("https:///dns-query", "https", 443).is_err());
+        assert!(parse_scheme_target("/dns-query", 443).is_err());
         assert_eq!(
-            parse_scheme_target("quic://dns.adguard.com", "quic", 853).unwrap(),
+            parse_scheme_target("dns.adguard.com", 853).unwrap(),
             ("dns.adguard.com".to_string(), 853, "/dns-query".to_string())
         );
     }
@@ -2154,6 +2194,38 @@ mod tests {
         assert_eq!(unsupported_scheme("https://dns.quad9.net/dns-query"), None);
         assert_eq!(unsupported_scheme("udp://1.1.1.1"), None);
         assert_eq!(unsupported_scheme("1.1.1.1"), None);
+    }
+
+    /// WP-2.7: the manager accepts the same uppercase schemes as validation and
+    /// rejects the same path-bearing targets instead of failing later at startup.
+    #[tokio::test]
+    async fn test_managed_entry_schemes_and_paths_match_validation() {
+        let bootstrap = BootstrapResolver::new(
+            vec![std::net::Ipv4Addr::LOCALHOST.into()],
+            Duration::from_secs(1),
+        );
+        for target in [
+            "UDP://1.1.1.1:53",
+            "TLS://1.1.1.1:853",
+            "HTTPS://1.1.1.1/dns-query",
+        ] {
+            create_managed_entry(target, &bootstrap, Duration::from_secs(1), 1)
+                .await
+                .unwrap_or_else(|e| panic!("uppercase target '{target}' must build: {e}"));
+        }
+
+        for target in [
+            "UDP://1.1.1.1/dns-query",
+            "TLS://1.1.1.1/dns-query",
+            "1.1.1.1:53/dns-query",
+        ] {
+            assert!(
+                create_managed_entry(target, &bootstrap, Duration::from_secs(1), 1)
+                    .await
+                    .is_err(),
+                "path-bearing target '{target}' must be rejected"
+            );
+        }
     }
 
     /// Spawns a mock bootstrap server returning the given A records in order.
@@ -2182,6 +2254,24 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// WP-2.7: a bootstrap answer with more addresses than the cap keeps only
+    /// the bounded candidate set instead of building one transport per record.
+    #[tokio::test]
+    async fn test_bootstrap_resolution_caps_candidates() {
+        let records: Vec<_> = (1..=20)
+            .map(|last| std::net::Ipv4Addr::new(8, 8, 8, last))
+            .collect();
+        let addr = spawn_bootstrap_records(records).await;
+        let resolver =
+            BootstrapResolver::new(vec![addr.ip()], Duration::from_secs(1)).with_port(addr.port());
+
+        let ips = resolver
+            .resolve_hostname("many-addresses.test")
+            .await
+            .expect("bootstrap lookup must succeed");
+        assert_eq!(ips.len(), crate::bootstrap::MAX_BOOTSTRAP_CANDIDATES);
     }
 
     #[test]

@@ -356,8 +356,14 @@ pub struct UpstreamConfigDto {
     pub servers: Vec<String>,
     pub bootstrap: Vec<String>,
     pub strategy: String,
+    /// Overall per-query budget; bounded to 1..=60000 ms by core validation
+    /// (`MAX_UPSTREAM_TIMEOUT_MS`).
+    #[schema(maximum = 60000, minimum = 1)]
     pub timeout_ms: u64,
     pub probe_domain: String,
+    /// Persistent connections per endpoint; bounded to 1..=64 by core
+    /// validation (`MAX_UPSTREAM_POOL_SIZE`).
+    #[schema(maximum = 64, minimum = 1)]
     pub pool_size: usize,
 }
 

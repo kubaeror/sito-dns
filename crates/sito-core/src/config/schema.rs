@@ -902,6 +902,20 @@ pub struct PerDomainUpstream {
     pub servers: Vec<String>,
 }
 
+/// Largest accepted `upstream.timeout_ms` (60 seconds).
+///
+/// The timeout is the overall budget for one logical resolve. A larger value
+/// lets one stalled upstream hold the query pipeline (and its tasks) for an
+/// unbounded time, so configuration is rejected instead of silently accepting
+/// an effectively disabled timeout.
+pub const MAX_UPSTREAM_TIMEOUT_MS: u64 = 60_000;
+
+/// Largest accepted `upstream.pool_size` (64 connections per endpoint).
+///
+/// Each pooled connection is a live TLS/TCP socket; an unbounded pool would let
+/// a typo exhaust file descriptors and memory on every configured upstream.
+pub const MAX_UPSTREAM_POOL_SIZE: usize = 64;
+
 /// Upstream resolvers and forwarding configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -996,10 +1010,28 @@ impl UpstreamConfig {
                 "timeout_ms must be greater than 0",
             ));
         }
+        if self.timeout_ms > MAX_UPSTREAM_TIMEOUT_MS {
+            return Err(ConfigError::validation(
+                "upstream.timeout_ms",
+                format!(
+                    "timeout_ms must be at most {MAX_UPSTREAM_TIMEOUT_MS} (got {}); a larger budget lets one stalled upstream hold the query pipeline indefinitely",
+                    self.timeout_ms
+                ),
+            ));
+        }
         if self.pool_size == 0 {
             return Err(ConfigError::validation(
                 "upstream.pool_size",
                 "pool_size must be greater than 0",
+            ));
+        }
+        if self.pool_size > MAX_UPSTREAM_POOL_SIZE {
+            return Err(ConfigError::validation(
+                "upstream.pool_size",
+                format!(
+                    "pool_size must be at most {MAX_UPSTREAM_POOL_SIZE} (got {})",
+                    self.pool_size
+                ),
             ));
         }
         let probe_domain = self.probe_domain.trim();
@@ -1021,7 +1053,25 @@ impl UpstreamConfig {
             )
         })?;
 
+        // Target validation lives here (not only in `Config::validate_full`) so
+        // direct callers — the API DTO, restore and tests — get the same rules.
+        let bootstrap_configured = !self.bootstrap.is_empty();
+        for (index, server) in self.servers.iter().enumerate() {
+            Self::validate_target(
+                server,
+                &format!("upstream.servers[{index}]"),
+                bootstrap_configured,
+            )?;
+        }
+
         for (i, rule) in self.per_domain.iter().enumerate() {
+            for (server_index, server) in rule.servers.iter().enumerate() {
+                Self::validate_target(
+                    server,
+                    &format!("upstream.per_domain[{i}].servers[{server_index}]"),
+                    bootstrap_configured,
+                )?;
+            }
             if rule.domains.iter().all(|d| d.trim().is_empty()) {
                 return Err(ConfigError::validation(
                     format!("upstream.per_domain[{i}].domains"),
@@ -1034,6 +1084,32 @@ impl UpstreamConfig {
                     "per-domain rule must list at least one non-empty upstream server",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Validates one configured target and enforces the bootstrap requirement
+    /// for hostname-based upstreams.
+    fn validate_target(
+        server: &str,
+        field: &str,
+        bootstrap_configured: bool,
+    ) -> Result<(), ConfigError> {
+        let host = super::validate::upstream_target_host(server).map_err(|reason| {
+            ConfigError::cross_section(
+                field,
+                format!("invalid upstream target '{server}': {reason}"),
+            )
+        })?;
+        if !bootstrap_configured && host.parse::<IpAddr>().is_err() {
+            return Err(ConfigError::validation(
+                "upstream.bootstrap",
+                format!(
+                    "upstream target '{server}' is a hostname but upstream.bootstrap is empty; \
+                     add at least one bootstrap resolver IP (for example bootstrap = [\"9.9.9.9\"]) \
+                     or use an IP literal"
+                ),
+            ));
         }
         Ok(())
     }
