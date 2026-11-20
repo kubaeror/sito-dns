@@ -89,8 +89,7 @@ allow_plaintext_doh = false
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
 > [!WARNING]
-> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 2.0 has **no DNS client
-> allow-list**. A default-deny DNS client ACL is deferred, not part of Phase 2
+> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 2.0 has no DNS client allow-list: a default-deny DNS client ACL is deferred, not part of Phase 2
 > core hardening. `rate_limit_per_ip` only limits rate; it does not authorize
 > clients. A wildcard bind therefore accepts recursive queries from any source
 > that can reach the host. Restrict the DNS ports to your LAN with a host
