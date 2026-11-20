@@ -929,50 +929,6 @@ fn rewrites_from_config(cfg: &Config) -> Result<sito_rewrites::RewritesConfig, P
     }
 }
 
-<<<<<<< HEAD
-/// Queues a background blocklist refresh for the given filtering config and
-/// returns its join handle. Used by the wizard so the HTTP request does not
-/// download lists synchronously; the caller can await the handle to know when
-/// the filter engine is ready.
-pub fn queue_filter_refresh(
-    ctx: &ServerContext,
-    filtering: sito_core::config::FilteringConfig,
-) -> tokio::task::JoinHandle<()> {
-    let engine = ctx.filter.clone();
-    let metrics = ctx.metrics.clone();
-    let cache = ctx.cache.clone();
-    let runtime = ctx.runtime.clone();
-    tokio::spawn(async move {
-        // Capture the generation the caller's `filtering` value belongs to
-        // before staging. The helper re-checks both the generation and the
-        // filtering config after acquiring the engine guard: an apply that
-        // committed before this task started makes the refresh stale even
-        // though the generation read here is already the new one.
-        let expected = runtime.generation();
-        match apply_filter_refresh(&engine, &runtime, &filtering, expected).await {
-            Ok(_) => {
-                cache.flush();
-                metrics.set_cache_size_bytes(crate::state::cache_size_bytes(&cache));
-                metrics.set_filter_rules(engine.rule_count());
-                tracing::info!("Background blocklist refresh completed");
-            }
-            Err(ApplyError::GenerationConflict { .. }) => {
-                tracing::debug!(
-                    "Discarding a background blocklist refresh compiled for an older configuration"
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Background blocklist refresh failed; the filter engine keeps its previous \
-                     snapshot: {error}"
-                );
-            }
-        }
-    })
-}
-
-=======
->>>>>>> feat/2.0-phase2-wp211
 /// Stages and publishes one filter refresh, tied to `expected` (the config
 /// generation the caller captured together with `filtering`).
 ///
@@ -1140,7 +1096,6 @@ mod tests {
     use sito_core::config::FilterListConfig;
     use std::time::Duration;
 
-<<<<<<< HEAD
     /// The publish report must say "queued", not "delivered", and expose the
     /// connected/queued/coalesced distinction.
     #[test]
@@ -1174,7 +1129,8 @@ mod tests {
         assert_eq!(no_delivery.status, "connected_no_delivery");
         assert_eq!(no_delivery.slaves_connected, Some(2));
         assert_eq!(no_delivery.slaves_queued, Some(0));
-=======
+    }
+
     #[test]
     fn test_filter_apply_for_defers_only_when_filtering_is_unchanged() {
         let previous = Config::default();
@@ -1287,7 +1243,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
->>>>>>> feat/2.0-phase2-wp211
     }
 
     /// Deferred D4b: `retry_at` must reflect the retry loop that was actually
