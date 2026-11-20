@@ -112,8 +112,13 @@ the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
   service stopped (the unit keeps `ProtectSystem=strict`).
 * Statistics retention and rollup privacy (P1-19/P1-23/P1-24) now use keyed
   rollup hashes, rollup retention, clear/vacuum, optional query-log totals,
-  cached dashboard aggregates, and bounded retention chunks. See the
-  [1.9.4 release notes](release-notes-1.9.4.md#stats-privacy-retention-and-polling).
+  bounded retention chunks, and a 30 s cached dashboard aggregate. Query-log
+  anonymization remains forward-only: enabling `privacy.anonymize_querylog`
+  masks new rows but does not rewrite existing detailed rows (a documented
+  residual). See the
+  [1.9.4 release notes](release-notes-1.9.4.md#stats-privacy-retention-and-polling)
+  and the WP-2.12 status in
+  [`docs/audit6-followup-plan.md`](audit6-followup-plan.md#wp-212--stats-retention-pii-and-polling).
 * RouterOS integration is experimental/niche and is not part of the core
   security posture. It now lives in the optional `sito-routeros` crate and is
   absent from the default build. If enabled, only a verified `https://` lease

@@ -385,7 +385,7 @@ This is the explicit cleanup list for the refactor. Each item is either removed,
 | Three CIDR parsers and two suffix matchers | `filter/parser.rs`, `clients/registry.rs`, `rewrites/table.rs`, `parental.rs`, `services.rs` | Shared `IpNetwork`/`DomainSuffix`; WP-1.2. |
 | Two atomic state writers and three secret-strip copies | `ha/coordinator.rs`, `ha/slave/state.rs`, `ha/bundle.rs`, `api/state.rs` | One `AtomicFile`/`SecretSanitizer`; WP-2.9. |
 | Two hook systems | `.pre-commit-config.yaml`, `scripts/git-hooks` | Keep one; WP-1.9. |
-| `stats_watermark` written but never read | `sito-stats/src/db.rs` | Delete or wire to retention; WP-2.12. |
+| `stats_watermark` written but never read | `sito-stats/src/db/retention.rs` | Kept as a progress/diagnostic record and v1.9 compatibility; not read to skip rows because aggregate/delete share a transaction and backdated rows must re-aggregate (documented in the retention module and WP-2.12 status). |
 | `RuntimeState` separate 225-LOC crate | `sito-runtime` | Keep if generation/apply grows; otherwise merge into `sito-core`; WP-1.4. |
 | Six `mock_context` helpers / 22 `"1.2.1"` fixtures | `sito-api` test modules | Consolidate into `test_support`; WP-1.8. |
 | `sito-test` 45 dependencies | `crates/sito-test/Cargo.toml` | Split harness/mocks; remove unused; WP-1.8. |
@@ -1359,17 +1359,43 @@ cancelled losers may not get an attempt entry.
 **Addresses:** P1-19, P1-23, P1-24, P2-55..P2-63.
 **Files:** `sito-stats/src/{db,writer,metrics,anonymize,lib}.rs`, `sito-api/src/ui/handlers.rs`.
 **Steps:**
-- [ ] Write a failing test: after retention, `stats_hourly` contains no raw client IP/client name and old rollups are deleted per `rollup_retention_days`.
-- [ ] Write a failing test: “clear query log” empties both `query_log` and `stats_hourly` by default; `--keep-aggregates` keeps rollups.
-- [ ] Write a failing test: a 90-day retention sweep completes in bounded chunks without holding a write lock long enough to drop a concurrent insert.
-- [ ] Write a failing test: live query-log refresh does not execute a `COUNT(*)`; dashboard polling is served from cache within 30s.
-- [ ] Incremental retention with bounded chunks/commits, startup catch-up, metrics.
-- [ ] Rollup PII policy: keyed hash IPs, optional client names/domains, rollup retention, clear/vacuum.
-- [ ] `include_total=false` for live UI; cache dashboard aggregates; rate-limit stats.
-- [ ] Fix error definition, failover attribution, ignore_stats, mapped IPv6.
-- [ ] Remove per-verdict mutex or document/shard it.
+- [x] Write a failing test: after retention, `stats_hourly` contains no raw client IP/client name and old rollups are deleted per `rollup_retention_days`.
+- [x] Write a failing test: “clear query log” empties both `query_log` and `stats_hourly` by default; `--keep-aggregates` keeps rollups.
+- [x] Write a failing test: a 90-day retention sweep completes in bounded chunks without holding a write lock long enough to drop a concurrent insert.
+- [x] Write a failing test: live query-log refresh does not execute a `COUNT(*)`; dashboard polling is served from cache within 30s.
+- [x] Incremental retention with bounded chunks/commits, startup catch-up, metrics.
+- [x] Rollup PII policy: keyed hash IPs, optional client names/domains, rollup retention, clear/vacuum.
+- [x] `include_total=false` for live UI; cache dashboard aggregates; rate-limit stats.
+- [x] Fix error definition, failover attribution, ignore_stats, mapped IPv6.
+- [x] Remove per-verdict mutex or document/shard it.
 - **Acceptance:** retention scale/PII/polling/metrics tests pass; no dropped batches on normal sweep.
 **Estimate:** L.
+
+**Status (2026-11-20): complete; residuals documented.** Evidence is in the
+WP-2.12 section of [`docs/audit6-test-matrix.md`](audit6-test-matrix.md#phase-2--stats-retention-pii-and-polling-wp-212)
+and the three WP commits (`a385e76`, `7d7d6ec`, `dfd7b7e`) on
+`feat/2.0-phase2-wp212`. Residual decisions:
+
+- **P2-59 (forward-only anonymization):** enabling `privacy.anonymize_querylog`
+  affects new writes only; existing `query_log` rows are not rewritten. Safe
+  retroactive anonymization needs a bounded, crash-resumable rewrite and is
+  deferred (documented in `sito-stats/src/anonymize.rs` and the config
+  reference).
+- **P2-61 (keep-aggregates clear):** the operator-requested
+  `keep_aggregates=true` clear is deliberately one whole-range transaction and
+  loads all affected hours' top lists in memory; normal retention remains
+  hour-bounded with per-hour temp tables. The whole-range cost is a documented
+  residual.
+- **90-day / 1M scale:** a 72-hour multi-day retention test covers the
+  hour-chunked algorithm; a 1M-row/90-day soak remains a capacity-testing
+  residual (sweep cost is linear in expired rows; each transaction is
+  row-bounded).
+- **`stats_watermark`:** still written for progress diagnostics and v1.9
+  compatibility but intentionally not read to skip rows; aggregate/delete share
+  a transaction and backdated rows must be re-aggregated.
+- **P2-62 (histogram contention):** retained the per-verdict/per-upstream
+  mutex and documented the bounded critical section, read-mostly maps and hot
+  `allowed` benchmark rather than sharding.
 
 ### WP-2.13 — Ops, Docker, systemd, installer, release
 
