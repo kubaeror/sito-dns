@@ -151,7 +151,7 @@ impl StatsDb {
         &self,
         keep_aggregates: bool,
     ) -> Result<u64, StatsError> {
-        self.delete_query_logs_with_policy(keep_aggregates, self.rollup_client_names)
+        self.delete_query_logs_with_policy(keep_aggregates, self.rollup_client_names_enabled())
             .await
     }
 
@@ -732,7 +732,7 @@ impl StatsDb {
             r"
             SELECT upstream,
                    COUNT(*) as total,
-                   SUM(CASE WHEN rcode IS NOT NULL AND rcode != 0 THEN 1 ELSE 0 END) as errors,
+                   SUM(CASE WHEN rcode IS NOT NULL AND rcode NOT IN (0, 3) THEN 1 ELSE 0 END) as errors,
                    SUM(COALESCE(elapsed_us, 0)) as elapsed_sum
             FROM query_log
             WHERE ts >= ? AND upstream IS NOT NULL

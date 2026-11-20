@@ -1245,6 +1245,83 @@ mod tests {
         }));
     }
 
+    /// P2-55: NXDOMAIN (rcode 3) is a normal negative answer, not an upstream
+    /// error. The live aggregate and the archived rollup must agree, so the
+    /// live and archived windows are exercised separately.
+    #[tokio::test]
+    async fn test_upstream_error_queries_excludes_nxdomain() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let live_upstream = "1.1.1.1:53";
+        let archived_upstream = "9.9.9.9:53";
+        let entry = |ts: i64, qname: &str, rcode: u8, upstream: &str| {
+            let mut entry = retention_entry(ts, qname, "allowed", None);
+            entry.rcode = Some(rcode);
+            entry.upstream = Some(upstream.to_string());
+            entry.elapsed_us = Some(1_000);
+            entry
+        };
+
+        db.insert_batch(&[
+            entry(now, "noerror.example", 0, live_upstream),
+            entry(now + 1, "nxdomain.example", 3, live_upstream),
+            entry(now + 2, "servfail.example", 2, live_upstream),
+            entry(now + 3, "nxdomain-two.example", 3, live_upstream),
+        ])
+        .await
+        .unwrap();
+
+        let live = db.get_upstream_stats(86_400_000).await.unwrap();
+        let live = live
+            .iter()
+            .find(|stats| stats.upstream == live_upstream)
+            .expect("live upstream must be reported");
+        assert_eq!(live.total_queries, 4);
+        assert_eq!(
+            live.error_queries, 1,
+            "only SERVFAIL counts as an upstream error, not NXDOMAIN"
+        );
+
+        // Archive a second upstream so the archived (rollup) SQL is the only
+        // source for it.
+        let archived_ts = now - 100 * 86_400_000;
+        db.insert_batch(&[
+            entry(archived_ts, "old-noerror.example", 0, archived_upstream),
+            entry(
+                archived_ts + 1,
+                "old-nxdomain.example",
+                3,
+                archived_upstream,
+            ),
+            entry(
+                archived_ts + 2,
+                "old-servfail.example",
+                2,
+                archived_upstream,
+            ),
+            entry(
+                archived_ts + 3,
+                "old-nxdomain-two.example",
+                3,
+                archived_upstream,
+            ),
+        ])
+        .await
+        .unwrap();
+        db.cleanup_detailed_retention(90).await.unwrap();
+
+        let archived = db.get_upstream_stats(200 * 86_400_000).await.unwrap();
+        let archived = archived
+            .iter()
+            .find(|stats| stats.upstream == archived_upstream)
+            .expect("archived upstream must be merged from stats_hourly");
+        assert_eq!(archived.total_queries, 4);
+        assert_eq!(
+            archived.error_queries, 1,
+            "the rollup error count must exclude NXDOMAIN too"
+        );
+    }
+
     /// WP-7.2/7.3: blocked domains are ranked independently of the total-query
     /// ranking, so a heavily blocked domain outside the total top-N is still
     /// reported.
@@ -1987,6 +2064,71 @@ mod tests {
 
         drop(db);
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// P1-19: a live config apply re-applies the policy without reopening the
+    /// database, scrubbing already-written rollup names immediately.
+    #[tokio::test]
+    async fn test_set_rollup_client_names_scrubs_live_rollups() {
+        let db = StatsDb::in_memory_with_rollup_client_names(true)
+            .await
+            .unwrap();
+        let old_ts = chrono::Utc::now().timestamp_millis() - 100 * 86_400_000;
+        let mut entry = retention_entry(old_ts, "live-scrub.example", "allowed", None);
+        entry.client_ip = "10.7.7.9".into();
+        entry.client_name = Some("live-named-device".into());
+        db.insert_batch(&[entry]).await.unwrap();
+        db.cleanup_detailed_retention(90).await.unwrap();
+
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(payload.contains("live-named-device"));
+
+        db.set_rollup_client_names(false).await.unwrap();
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(!payload.contains("live-named-device"));
+        assert!(!payload.contains("10.7.7.9"));
+        assert!(
+            payload.contains("blake3:"),
+            "the scrub must hash the raw IP while removing the name"
+        );
+    }
+
+    /// P2-58: an IPv4-mapped IPv6 client and its native IPv4 spelling are one
+    /// host, so the rollup must not count them as two clients.
+    #[tokio::test]
+    async fn test_rollup_hash_canonicalizes_ipv4_mapped_client() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let old_ts = chrono::Utc::now().timestamp_millis() - 100 * 86_400_000;
+        let mut mapped = retention_entry(old_ts, "mapped.example", "allowed", None);
+        mapped.client_ip = "::ffff:10.7.7.7".into();
+        let mut native = retention_entry(old_ts + 1, "native.example", "allowed", None);
+        native.client_ip = "10.7.7.7".into();
+        db.insert_batch(&[mapped, native]).await.unwrap();
+        db.cleanup_detailed_retention(90).await.unwrap();
+
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let clients: Vec<(String, Option<String>, i64, i64, i64)> =
+            serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            clients.len(),
+            1,
+            "mapped and native IPv4 must canonicalize to one rollup client"
+        );
+        assert_eq!(clients[0].2, 2);
+        assert!(clients[0].0.starts_with("blake3:"));
+        assert!(
+            !clients[0].0.contains("::ffff"),
+            "the canonical identifier must not keep the mapped spelling"
+        );
     }
 
     /// P1-19: names are preserved by a legacy backfill when explicitly enabled.

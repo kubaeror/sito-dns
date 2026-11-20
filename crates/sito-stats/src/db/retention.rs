@@ -26,7 +26,7 @@ impl StatsDb {
         &self,
         retention_days: u32,
     ) -> Result<RetentionReport, StatsError> {
-        self.cleanup_retention_inner(retention_days, None, self.rollup_client_names)
+        self.cleanup_retention_inner(retention_days, None, self.rollup_client_names_enabled())
             .await
     }
 
@@ -50,7 +50,7 @@ impl StatsDb {
         self.cleanup_retention_with_policy(
             retention_days,
             rollup_retention_days,
-            self.rollup_client_names,
+            self.rollup_client_names_enabled(),
         )
         .await
     }
@@ -617,7 +617,7 @@ impl StatsDb {
             r"
             INSERT INTO retention_upstream_counts (hour, upstream, total, errors, elapsed_sum)
             SELECT ?, upstream, COUNT(*),
-                   SUM(CASE WHEN rcode IS NOT NULL AND rcode != 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN rcode IS NOT NULL AND rcode NOT IN (0, 3) THEN 1 ELSE 0 END),
                    SUM(COALESCE(elapsed_us, 0))
             FROM query_log INDEXED BY idx_ql_ts_id
             WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)

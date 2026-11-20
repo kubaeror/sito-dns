@@ -179,7 +179,7 @@ guidance and residual risks.
   client names are opt-in; rollups expire after `rollup_retention_days`;
   clearing the log deletes rollups by default (`keep_aggregates` opts out);
   large clears vacuum and `secure_delete=ON`; stats files are repaired to 0600.
-- **P1-23:** `include_total=false` for live query-log refresh; 45 s dashboard
+- **P1-23:** `include_total=false` for live query-log refresh; 30 s dashboard
   cache with invalidation; stats endpoints rate-limited with `Retry-After: 1`
   on `429`.
 - **P1-24:** retention runs in bounded hour chunks, startup catch-up with

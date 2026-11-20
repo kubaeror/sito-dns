@@ -28,7 +28,7 @@ impl StatsDb {
             pool,
             db_path: None,
             salt: Arc::new(random_salt()),
-            rollup_client_names,
+            rollup_client_names: Arc::new(AtomicBool::new(rollup_client_names)),
             cache: Arc::new(StatsCache::default()),
         };
         db.run_migrations().await?;
@@ -77,7 +77,7 @@ impl StatsDb {
             pool,
             db_path: Some(path),
             salt: Arc::new(salt),
-            rollup_client_names,
+            rollup_client_names: Arc::new(AtomicBool::new(rollup_client_names)),
             cache: Arc::new(StatsCache::default()),
         };
         db.run_migrations().await?;
@@ -182,7 +182,7 @@ impl StatsDb {
                         .map(|(client_ip, client_name, total, blocked, last_seen)| {
                             (
                                 self.hash_client_ip(&client_ip),
-                                if self.rollup_client_names {
+                                if self.rollup_client_names_enabled() {
                                     client_name
                                 } else {
                                     None
@@ -226,7 +226,7 @@ impl StatsDb {
             "INSERT INTO stats_meta (key, value) VALUES ('rollup_client_names_policy', ?) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
-        .bind(if self.rollup_client_names {
+        .bind(if self.rollup_client_names_enabled() {
             "true"
         } else {
             "false"
@@ -235,6 +235,16 @@ impl StatsDb {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Re-applies a new `rollup_client_names` policy to the live database.
+    ///
+    /// Config apply calls this when the setting changes so the new policy takes
+    /// effect without a restart. Turning names off scrubs every existing
+    /// rollup (irreversible); turning them on only affects future rollups.
+    pub async fn set_rollup_client_names(&self, enabled: bool) -> Result<(), StatsError> {
+        self.rollup_client_names.store(enabled, Ordering::Relaxed);
+        self.sync_rollup_name_policy().await
     }
 
     /// Enforces the current `rollup_client_names` policy on existing rollups.
@@ -249,13 +259,13 @@ impl StatsDb {
         )
         .fetch_optional(&self.pool)
         .await?;
-        let current = if self.rollup_client_names {
+        let current = if self.rollup_client_names_enabled() {
             "true"
         } else {
             "false"
         };
 
-        if !self.rollup_client_names && stored.as_deref() != Some("false") {
+        if !self.rollup_client_names_enabled() && stored.as_deref() != Some("false") {
             self.scrub_rollup_client_names().await?;
         }
 
