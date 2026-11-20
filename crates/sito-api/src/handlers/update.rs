@@ -71,6 +71,7 @@ pub async fn check_update(
     responses(
         (status = 200, description = "Update applied successfully", body = ApplyUpdateResponse),
         (status = 400, description = "Invalid request or running in Docker", body = ProblemDetails),
+        (status = 409, description = "Another update is running, the version comparison is unknown, or the service is managed by systemd", body = ProblemDetails),
         (status = 500, description = "Update process failed", body = ProblemDetails)
     )
 )]
@@ -104,6 +105,26 @@ pub async fn apply_update(
             "Docker Environment Cannot Self-Update",
             msg,
         )),
+        Err(updater::UpdateError::SystemdEnvironment(msg)) => Err(ProblemDetails::new(
+            StatusCode::CONFLICT,
+            "Systemd Service Cannot Self-Update",
+            msg,
+        )),
+        Err(updater::UpdateError::UpdateInProgress) => Err(ProblemDetails::new(
+            StatusCode::CONFLICT,
+            "Update Already In Progress",
+            "Another in-app update is already running. Wait for it to finish and retry.",
+        )),
+        Err(updater::UpdateError::VersionComparisonUnknown { current, latest }) => {
+            Err(ProblemDetails::new(
+                StatusCode::CONFLICT,
+                "Update Availability Unknown",
+                format!(
+                    "Cannot order v{current} against the latest tag 'v{latest}' because it is not \
+                     strict semver. Retry with force=true to reinstall."
+                ),
+            ))
+        }
         Err(e) => Err(ProblemDetails::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Update Application Failed",

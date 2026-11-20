@@ -31,6 +31,14 @@ pub enum UpdateError {
     Parse(String),
     #[error("In-app update is disabled inside Docker containers: {0}")]
     DockerEnvironment(String),
+    #[error("In-app update is disabled while running as a systemd service: {0}")]
+    SystemdEnvironment(String),
+    #[error("Another in-app update is already in progress")]
+    UpdateInProgress,
+    #[error(
+        "Cannot order the current version and latest tag (current {current}, latest {latest}); re-run with force to reinstall"
+    )]
+    VersionComparisonUnknown { current: String, latest: String },
     #[error("No compatible release asset found for architecture {0}")]
     NoCompatibleAsset(String),
     #[error("Checksum verification failed: expected {expected}, got {actual}")]
@@ -43,6 +51,8 @@ pub enum UpdateError {
     SignatureInvalid(String),
     #[error("Release signature is required but no verifier is available: {0}")]
     SignatureVerifierUnavailable(String),
+    #[error("Release ships an incomplete signature pair: {0}")]
+    SignatureIncomplete(String),
     #[error("I/O error during update: {0}")]
     Io(#[from] std::io::Error),
     #[error("Archive extraction error: {0}")]
@@ -76,7 +86,13 @@ pub struct UpdateInfo {
     pub published_at: Option<String>,
     /// Whether the server is running inside a Docker/OCI container.
     pub is_docker: bool,
-    /// Environment-specific upgrade instructions (e.g. docker compose command).
+    /// Whether the server is running as a systemd service.
+    pub is_systemd: bool,
+    /// True when this deployment must not replace its own binary in place.
+    /// `--check` and the CLI after `systemctl stop` still work.
+    pub in_app_update_disabled: bool,
+    /// Environment-specific upgrade instructions (e.g. docker compose or
+    /// systemctl commands).
     pub instructions: Option<String>,
     /// True when the version comparison could not be performed because one of
     /// the version strings is not valid semver. Callers must not interpret
@@ -105,6 +121,48 @@ fn is_running_in_docker() -> bool {
     }
 
     false
+}
+
+/// True when systemd sets one of its service-scoped environment variables.
+/// Kept pure so tests do not mutate the process environment.
+fn systemd_service_env(
+    invocation_id: Option<&std::ffi::OsStr>,
+    journal_stream: Option<&std::ffi::OsStr>,
+) -> bool {
+    invocation_id.is_some() || journal_stream.is_some()
+}
+
+/// Detects a process started by a systemd unit. The unit hardening
+/// (`ProtectSystem=strict`) makes the installed binary read-only, so in-app
+/// replacement cannot work even though `sito update --check` can.
+fn is_running_under_systemd() -> bool {
+    systemd_service_env(
+        std::env::var_os("INVOCATION_ID").as_deref(),
+        std::env::var_os("JOURNAL_STREAM").as_deref(),
+    )
+}
+
+/// Operator guidance for environments that cannot replace their own binary.
+fn update_instructions(is_docker: bool, is_systemd: bool) -> Option<String> {
+    if is_docker {
+        return Some(
+            "Running inside a Docker container. In-app binary replacement is disabled.\n\
+             Upgrade by pulling the latest image on your Docker host:\n\
+             docker compose pull && docker compose up -d"
+                .to_string(),
+        );
+    }
+    if is_systemd {
+        return Some(
+            "Running as a systemd service. In-app binary replacement is disabled.\n\
+             Upgrade from a shell after stopping the service:\n\
+             sudo systemctl stop sito\n\
+             sudo sito update\n\
+             sudo systemctl start sito"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Maps the current host CPU architecture to the release target triple.
@@ -173,6 +231,7 @@ pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateEr
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // No releases published yet
         let is_docker = is_running_in_docker();
+        let is_systemd = is_running_under_systemd();
         return Ok(UpdateInfo {
             current_version: current_version.clone(),
             latest_version: current_version,
@@ -181,7 +240,9 @@ pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateEr
             release_notes: "No releases found on GitHub.".to_string(),
             published_at: None,
             is_docker,
-            instructions: None,
+            is_systemd,
+            in_app_update_disabled: is_docker || is_systemd,
+            instructions: update_instructions(is_docker, is_systemd),
             version_comparison_unknown: false,
         });
     }
@@ -208,6 +269,7 @@ pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateEr
     let published_at = release["published_at"].as_str().map(ToString::to_string);
 
     let is_docker = is_running_in_docker();
+    let is_systemd = is_running_under_systemd();
     let version_comparison_unknown = !versions_comparable(&latest_version, &current_version);
     if version_comparison_unknown {
         tracing::warn!(
@@ -218,17 +280,6 @@ pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateEr
     }
     let update_available = is_version_newer(&latest_version, &current_version);
 
-    let instructions = if is_docker {
-        Some(
-            "Running inside a Docker container. In-app binary replacement is disabled.\n\
-             Upgrade by pulling the latest image on your Docker host:\n\
-             docker compose pull && docker compose up -d"
-                .to_string(),
-        )
-    } else {
-        None
-    };
-
     Ok(UpdateInfo {
         current_version,
         latest_version,
@@ -237,7 +288,9 @@ pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateEr
         release_notes,
         published_at,
         is_docker,
-        instructions,
+        is_systemd,
+        in_app_update_disabled: is_docker || is_systemd,
+        instructions: update_instructions(is_docker, is_systemd),
         version_comparison_unknown,
     })
 }
@@ -352,8 +405,8 @@ const MAX_EXTRACTED_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 pub enum SignatureOutcome {
     /// A signature was present and verified successfully.
     Verified,
-    /// No signature was present (or no verifier is installed) and the policy
-    /// does not require one; checksum verification still applies.
+    /// No signature assets were present and the policy does not require one;
+    /// SHA-256 checksum verification still applies.
     UnsignedAllowed,
 }
 
@@ -473,9 +526,10 @@ fn find_signature_assets(
 
 /// Applies the release signature policy.
 ///
-/// * A signature that is present must verify, regardless of `required`.
-/// * If no signature is present (or no verifier is installed), verification is
-///   only skipped when `required` is false; otherwise an error is returned.
+/// * A signature that is present must verify, regardless of `required`; a
+///   present signature without an installed verifier is an error.
+/// * Only when no signature assets are present may `required = false` skip
+///   verification (SHA-256 checksum verification still applies).
 async fn verify_release_signature(
     artifact: &Path,
     signature: Option<&Path>,
@@ -485,15 +539,12 @@ async fn verify_release_signature(
 ) -> Result<SignatureOutcome, UpdateError> {
     if let (Some(sig), Some(cert)) = (signature, certificate) {
         if !verifier.is_available() {
-            if required {
-                return Err(UpdateError::SignatureVerifierUnavailable(format!(
-                    "release ships a signature but no verifier is installed; {COSIGN_MISSING_GUIDANCE}"
-                )));
-            }
-            tracing::warn!(
-                "Release ships a signature but no verifier is available; relying on SHA-256 checksum only"
-            );
-            return Ok(SignatureOutcome::UnsignedAllowed);
+            // A present signature is never silently ignored, even when the
+            // policy does not require signatures: that would let an attacker
+            // downgrade verification by shipping unverifiable assets.
+            return Err(UpdateError::SignatureVerifierUnavailable(format!(
+                "release ships a signature but no verifier is installed; {COSIGN_MISSING_GUIDANCE}"
+            )));
         }
         verifier.verify(artifact, sig, cert).await?;
         tracing::info!("Release signature verified successfully");
@@ -571,7 +622,13 @@ async fn write_capped_stream(
     dest: &Path,
     cap: u64,
 ) -> Result<(), UpdateError> {
-    let mut file = tokio::fs::File::create(dest).await?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(dest).await?;
     let mut stream = response.bytes_stream();
     let mut total: u64 = 0;
 
@@ -592,6 +649,17 @@ async fn write_capped_stream(
     Ok(())
 }
 
+/// Creates a private scratch directory for downloaded signature assets.
+async fn create_private_dir(path: &Path) -> Result<(), UpdateError> {
+    tokio::fs::create_dir_all(path).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    Ok(())
+}
+
 /// Downloads release signature assets (when present) and applies the configured
 /// signature policy to the archive on disk.
 #[allow(clippy::too_many_arguments)]
@@ -606,8 +674,23 @@ async fn apply_signature_policy(
 ) -> Result<SignatureOutcome, UpdateError> {
     let verifier = CosignVerifier::new(repo_name);
 
-    let (Some(sig), Some(cert)) = (sig_asset, cert_asset) else {
-        return verify_release_signature(archive_path, None, None, required, &verifier).await;
+    let (sig, cert) = match (sig_asset, cert_asset) {
+        (None, None) => {
+            return verify_release_signature(archive_path, None, None, required, &verifier).await;
+        }
+        (Some(sig), Some(cert)) => (sig, cert),
+        (Some(sig), None) => {
+            return Err(UpdateError::SignatureIncomplete(format!(
+                "release ships '{}' without the matching .pem certificate",
+                sig.name
+            )));
+        }
+        (None, Some(cert)) => {
+            return Err(UpdateError::SignatureIncomplete(format!(
+                "release ships '{}' without the matching .sig signature",
+                cert.name
+            )));
+        }
     };
 
     for asset in [sig, cert] {
@@ -629,7 +712,7 @@ async fn apply_signature_policy(
     let temp_dir =
         std::env::temp_dir().join(format!("sito-update-verify-{}", rand::random::<u64>()));
     let _temp_guard = TempFileGuard::new(temp_dir.clone());
-    tokio::fs::create_dir_all(&temp_dir).await?;
+    create_private_dir(&temp_dir).await?;
     let sig_path = temp_dir.join(format!("{}.sig", archive.name));
     let cert_path = temp_dir.join(format!("{}.pem", archive.name));
 
@@ -727,8 +810,94 @@ async fn extract_binary_from_file(archive_path: &Path) -> Result<Vec<u8>, Update
     .map_err(|e| UpdateError::Other(format!("Archive extraction task failed: {e}")))?
 }
 
-/// Writes the extracted binary next to the running executable and renames it
-/// into place, removing the temporary file on any failure.
+/// Writes an executable with a private initial mode, then makes it executable.
+async fn write_private_executable(path: &Path, content: &[u8]) -> Result<(), UpdateError> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).await?;
+    file.write_all(content).await?;
+    file.flush().await?;
+    file.sync_all().await?;
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).await?;
+    }
+    Ok(())
+}
+
+/// Runs the staged binary once to prove it is executable before replacing the
+/// running server binary.
+async fn verify_executable_version(path: &Path) -> Result<(), UpdateError> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new(path).arg("--version").output(),
+    )
+    .await
+    .map_err(|_| {
+        UpdateError::Other(
+            "The downloaded executable did not respond to --version within 10 seconds".to_string(),
+        )
+    })?
+    .map_err(|e| {
+        UpdateError::Other(format!(
+            "The downloaded executable could not be run for verification: {e}"
+        ))
+    })?;
+    if !output.status.success() {
+        return Err(UpdateError::Other(format!(
+            "The downloaded executable failed --version verification with status {}",
+            output.status
+        )));
+    }
+    Ok(())
+}
+
+/// Replaces `current_exe` with `new_exe`, keeping a backup until the rename
+/// succeeds. A failed rename restores the backup.
+async fn replace_with_backup(new_exe: &Path, current_exe: &Path) -> Result<(), UpdateError> {
+    let parent_dir = current_exe.parent().ok_or_else(|| {
+        UpdateError::Other("Could not resolve parent directory of executable".to_string())
+    })?;
+    let backup = parent_dir.join(format!(".sito_backup_{}", rand::random::<u32>()));
+    let _backup_guard = TempFileGuard::new(backup.clone());
+
+    tokio::fs::copy(current_exe, &backup).await?;
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(current_exe) {
+        let _ = tokio::fs::set_permissions(&backup, metadata.permissions()).await;
+    }
+
+    match tokio::fs::rename(new_exe, current_exe).await {
+        Ok(()) => {
+            let _ = tokio::fs::remove_file(&backup).await;
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(restore_error) = tokio::fs::rename(&backup, current_exe).await {
+                tracing::error!(
+                    %error,
+                    %restore_error,
+                    "Failed to install the new executable and could not restore the backup"
+                );
+                return Err(UpdateError::Other(format!(
+                    "Failed to install the new executable ({error}); restoring the backup also failed ({restore_error})"
+                )));
+            }
+            Err(UpdateError::Io(error))
+        }
+    }
+}
+
+/// Writes the extracted binary next to the running executable, verifies it
+/// with `--version`, then atomically replaces the old binary while keeping a
+/// backup for rollback.
 async fn install_binary_atomically(
     binary_content: &[u8],
     current_exe: &Path,
@@ -740,17 +909,46 @@ async fn install_binary_atomically(
     let temp_exe = parent_dir.join(format!(".sito_update_{}", rand::random::<u32>()));
     let _temp_guard = TempFileGuard::new(temp_exe.clone());
 
-    tokio::fs::write(&temp_exe, binary_content).await?;
+    write_private_executable(&temp_exe, binary_content).await?;
+    verify_executable_version(&temp_exe).await?;
+    replace_with_backup(&temp_exe, current_exe).await
+}
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        tokio::fs::set_permissions(&temp_exe, perms).await?;
+/// The in-process update lock prevents two admin requests (or an admin and a
+/// CLI invocation in the same process) from replacing the binary concurrently.
+fn update_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn try_acquire_update_lock() -> Result<tokio::sync::MutexGuard<'static, ()>, UpdateError> {
+    update_lock()
+        .try_lock()
+        .map_err(|_| UpdateError::UpdateInProgress)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateDecision {
+    Install,
+    UpToDate,
+}
+
+/// Decides whether an explicit apply may proceed.
+///
+/// `update_available = false` is only "up to date" when both versions parsed.
+/// An unknown comparison requires `force`, so a non-semver tag can never make
+/// the updater claim the server is current when it is not.
+fn update_decision(info: &UpdateInfo, force: bool) -> Result<UpdateDecision, UpdateError> {
+    if info.version_comparison_unknown && !force {
+        return Err(UpdateError::VersionComparisonUnknown {
+            current: info.current_version.clone(),
+            latest: info.latest_version.clone(),
+        });
     }
-
-    tokio::fs::rename(&temp_exe, current_exe).await?;
-    Ok(())
+    if !info.update_available && !force {
+        return Ok(UpdateDecision::UpToDate);
+    }
+    Ok(UpdateDecision::Install)
 }
 
 /// Downloads the latest release archive, verifies the release signature (when
@@ -761,9 +959,20 @@ pub async fn apply_update(
     force: bool,
     require_signature: bool,
 ) -> Result<String, UpdateError> {
+    // Acquire before any network work so a second request fails fast with a
+    // conflict instead of racing the download/verification/replace sequence.
+    let _update_guard = try_acquire_update_lock()?;
+
     if is_running_in_docker() {
         return Err(UpdateError::DockerEnvironment(
             "In-app binary update is disabled inside Docker. Use container image management."
+                .to_string(),
+        ));
+    }
+    if is_running_under_systemd() {
+        return Err(UpdateError::SystemdEnvironment(
+            "In-app binary update is disabled for a systemd service. Stop the service and run \
+             'sudo sito update', then start it again."
                 .to_string(),
         ));
     }
@@ -776,7 +985,7 @@ pub async fn apply_update(
     }
     let update_info = check_for_update(Some(repo_name)).await?;
 
-    if !update_info.update_available && !force {
+    if update_decision(&update_info, force)? == UpdateDecision::UpToDate {
         return Ok(format!(
             "sito is already on the latest version (v{}). Use force to reinstall.",
             update_info.current_version
@@ -905,6 +1114,26 @@ pub async fn apply_update(
 mod tests {
     use super::*;
 
+    fn update_info(unknown: bool) -> UpdateInfo {
+        UpdateInfo {
+            current_version: "2.0.0-alpha.1".to_string(),
+            latest_version: if unknown {
+                "nightly".to_string()
+            } else {
+                "2.0.0".to_string()
+            },
+            update_available: !unknown,
+            release_url: "https://github.com/kubaeror/sito-dns/releases".to_string(),
+            release_notes: String::new(),
+            published_at: None,
+            is_docker: false,
+            is_systemd: false,
+            in_app_update_disabled: false,
+            instructions: None,
+            version_comparison_unknown: unknown,
+        }
+    }
+
     #[test]
     fn test_is_version_newer() {
         assert!(is_version_newer("1.2.0", "1.1.1"));
@@ -920,6 +1149,57 @@ mod tests {
         assert!(!is_version_newer("1.0", "0.9"));
         assert!(versions_comparable("1.6.0", "1.5.0"));
         assert!(!versions_comparable("nightly", "1.5.0"));
+    }
+
+    #[test]
+    fn test_systemd_service_detection() {
+        let id = std::ffi::OsStr::new("abc");
+        let journal = std::ffi::OsStr::new("1:2");
+        assert!(!systemd_service_env(None, None));
+        assert!(systemd_service_env(Some(id), None));
+        assert!(systemd_service_env(None, Some(journal)));
+        assert!(systemd_service_env(Some(id), Some(journal)));
+    }
+
+    #[test]
+    fn test_unknown_version_requires_force_never_up_to_date() {
+        let unknown = update_info(true);
+        let err = update_decision(&unknown, false).unwrap_err();
+        assert!(matches!(err, UpdateError::VersionComparisonUnknown { .. }));
+        assert_eq!(
+            update_decision(&unknown, true).unwrap(),
+            UpdateDecision::Install,
+            "force must allow an explicit reinstall"
+        );
+
+        let known = update_info(false);
+        // Make the known release look older so it is genuinely up to date.
+        let mut up_to_date = known.clone();
+        up_to_date.update_available = false;
+        up_to_date.latest_version = up_to_date.current_version.clone();
+        assert_eq!(
+            update_decision(&up_to_date, false).unwrap(),
+            UpdateDecision::UpToDate
+        );
+        assert_eq!(
+            update_decision(&up_to_date, true).unwrap(),
+            UpdateDecision::Install
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_lock_serializes_applies() {
+        let first = match try_acquire_update_lock() {
+            Ok(guard) => guard,
+            Err(e) => panic!("first lock acquisition failed: {e}"),
+        };
+        match try_acquire_update_lock() {
+            Ok(_) => panic!("a concurrent update must not acquire the lock"),
+            Err(UpdateError::UpdateInProgress) => {}
+            Err(e) => panic!("unexpected lock error: {e}"),
+        }
+        drop(first);
+        assert!(try_acquire_update_lock().is_ok());
     }
 
     #[test]
@@ -1174,6 +1454,58 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
     }
 
     #[tokio::test]
+    async fn test_signature_policy_present_without_verifier_optional_fails() {
+        let verifier = MockVerifier {
+            available: false,
+            result: Ok(()),
+        };
+        let err = verify_release_signature(
+            Path::new("archive.tar.gz"),
+            Some(Path::new("archive.tar.gz.sig")),
+            Some(Path::new("archive.tar.gz.pem")),
+            false, // optional policy must not silently skip present assets
+            &verifier,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, UpdateError::SignatureVerifierUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn test_signature_policy_incomplete_pair_fails() {
+        let archive = asset("sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz");
+        let sig = asset("sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz.sig");
+        let client = reqwest::Client::new();
+
+        let err = apply_signature_policy(
+            &client,
+            "kubaeror/sito-dns",
+            &archive,
+            Path::new("/nonexistent/archive.tar.gz"),
+            Some(&sig),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, UpdateError::SignatureIncomplete(_)));
+
+        let cert = asset("sito-v1.4.0-x86_64-unknown-linux-gnu.tar.gz.pem");
+        let err = apply_signature_policy(
+            &client,
+            "kubaeror/sito-dns",
+            &archive,
+            Path::new("/nonexistent/archive.tar.gz"),
+            None,
+            Some(&cert),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, UpdateError::SignatureIncomplete(_)));
+    }
+
+    #[tokio::test]
     async fn test_signature_policy_required_without_verifier_fails() {
         let verifier = MockVerifier {
             available: false,
@@ -1319,6 +1651,12 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         server.await.unwrap();
 
         assert_eq!(std::fs::read(&dest).unwrap(), archive);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "downloaded update assets must be 0600");
+        }
 
         let archive_name = "sito-v1.9.0-x86_64-unknown-linux-gnu.tar.gz";
         let valid_hash =
@@ -1342,24 +1680,92 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
     }
 
     #[tokio::test]
-    async fn test_temp_exe_removed_when_rename_fails() {
-        let dir = test_scratch_dir("rename");
-        // Renaming a file over an existing directory fails, exercising the
-        // cleanup path after the temp executable was already written.
-        let target = dir.join("sito");
-        std::fs::create_dir(&target).unwrap();
+    async fn test_private_signature_dir_is_0700() {
+        let dir = test_scratch_dir("sig-dir");
+        let path = dir.join("nested").join("signatures");
+        create_private_dir(&path).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "signature scratch dir must be 0700");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        let err = install_binary_atomically(b"new-binary", &target)
+    fn no_leaked_files(dir: &Path, prefixes: &[&str]) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_install_verifies_new_binary_and_keeps_backup_only_on_success() {
+        let dir = test_scratch_dir("install-ok");
+        let target = dir.join("sito");
+        std::fs::write(&target, b"#!/bin/sh\nexit 1\n").unwrap();
+
+        let new_binary = b"#!/bin/sh\necho 'sito 9.9.9'\n";
+        install_binary_atomically(new_binary, &target)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), new_binary);
+        let leaked = no_leaked_files(&dir, &[".sito_update_", ".sito_backup_"]);
+        assert!(
+            leaked.is_empty(),
+            "temporary update files leaked: {leaked:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_install_rejects_unverified_binary_and_leaves_current_in_place() {
+        let dir = test_scratch_dir("install-invalid");
+        let target = dir.join("sito");
+        let original = b"#!/bin/sh\necho old\n";
+        std::fs::write(&target, original).unwrap();
+
+        let err = install_binary_atomically(b"not an executable", &target)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UpdateError::Other(_)), "got {err:?}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            original,
+            "a binary that fails --version must not replace the running executable"
+        );
+        let leaked = no_leaked_files(&dir, &[".sito_update_", ".sito_backup_"]);
+        assert!(
+            leaked.is_empty(),
+            "temporary update files leaked: {leaked:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_replace_restores_backup_when_rename_fails() {
+        let dir = test_scratch_dir("install-rollback");
+        let target = dir.join("sito");
+        let original = b"old-binary";
+        std::fs::write(&target, original).unwrap();
+        let missing_new = dir.join("missing-new-binary");
+
+        let err = replace_with_backup(&missing_new, &target)
             .await
             .unwrap_err();
         assert!(matches!(err, UpdateError::Io(_)), "got {err:?}");
-
-        let leaked: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".sito_update_"))
-            .collect();
-        assert!(leaked.is_empty(), "temp executable leaked: {leaked:?}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            original,
+            "the backup must be restored when replacement fails"
+        );
+        let leaked = no_leaked_files(&dir, &[".sito_update_", ".sito_backup_"]);
+        assert!(leaked.is_empty(), "backup/temp files leaked: {leaked:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1139,6 +1139,17 @@ fn update_preflight(config_path: &Path, cosign_available: bool) -> Result<bool, 
     Ok(require_signature)
 }
 
+/// Message shown when the release tag and the running version cannot be
+/// ordered. It must never claim the server is up to date.
+fn unknown_version_message(info: &sito_api::updater::UpdateInfo) -> String {
+    format!(
+        "\nVersion comparison unknown: current v{} and latest tag v{} cannot be ordered because a \
+         version is not strict semver.\nCannot determine whether this server is current. \
+         Re-run 'sito update --force' to reinstall.",
+        info.current_version, info.latest_version
+    )
+}
+
 /// Executes the `update` subcommand.
 pub async fn run_update(
     check: bool,
@@ -1168,6 +1179,11 @@ pub async fn run_update(
     // means `sudo sito update` works from any cwd after the service is stopped.
     let config_path = resolve_update_config_path(config_path)?;
     let require_signature = update_preflight(&config_path, sito_api::updater::cosign_available())?;
+
+    if info.version_comparison_unknown && !force {
+        println!("{}", unknown_version_message(&info));
+        return Ok(());
+    }
 
     if !info.update_available && !force {
         println!("\nsito is up to date.");
@@ -1809,6 +1825,30 @@ mod tests {
         assert!(!update_preflight(&cfg, false).unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unknown_version_message_never_claims_up_to_date() {
+        let info = sito_api::updater::UpdateInfo {
+            current_version: "2.0.0-alpha.1".to_string(),
+            latest_version: "nightly".to_string(),
+            update_available: false,
+            release_url: "https://github.com/kubaeror/sito-dns/releases".to_string(),
+            release_notes: String::new(),
+            published_at: None,
+            is_docker: false,
+            is_systemd: false,
+            in_app_update_disabled: false,
+            instructions: None,
+            version_comparison_unknown: true,
+        };
+        let message = unknown_version_message(&info);
+        assert!(
+            !message.to_ascii_lowercase().contains("up to date"),
+            "unknown comparison must not claim up to date: {message}"
+        );
+        assert!(message.contains("--force"), "{message}");
+        assert!(message.contains("Cannot determine"), "{message}");
     }
 
     #[test]

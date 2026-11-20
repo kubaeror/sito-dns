@@ -21,6 +21,8 @@ fn test_update_install_form_carries_csrf_token_and_uses_htmx() {
         release_notes: "notes".to_string(),
         published_at: None,
         is_docker: false,
+        is_systemd: false,
+        in_app_update_disabled: false,
         instructions: None,
         version_comparison_unknown: false,
     };
@@ -51,11 +53,38 @@ fn test_update_install_form_carries_csrf_token_and_uses_htmx() {
 
     let docker = crate::updater::UpdateInfo {
         is_docker: true,
-        ..info
+        in_app_update_disabled: true,
+        ..info.clone()
     };
     let docker_html = update_action_html(&docker, "csrf-token-123");
     assert!(!docker_html.contains("<form"), "{docker_html}");
     assert!(docker_html.contains("docker compose pull"), "{docker_html}");
+
+    let unknown = crate::updater::UpdateInfo {
+        version_comparison_unknown: true,
+        update_available: false,
+        ..info.clone()
+    };
+    let unknown_html = update_check_html(&unknown, "csrf-token-123");
+    assert!(
+        !unknown_html.to_ascii_lowercase().contains("up to date"),
+        "unknown comparison must not render an up-to-date badge: {unknown_html}"
+    );
+    assert!(unknown_html.contains("Version comparison unknown"));
+    assert!(unknown_html.contains("--force"));
+
+    let systemd = crate::updater::UpdateInfo {
+        is_systemd: true,
+        in_app_update_disabled: true,
+        ..info
+    };
+    let systemd_html = update_action_html(&systemd, "csrf-token-123");
+    assert!(!systemd_html.contains("<form"), "{systemd_html}");
+    assert!(
+        systemd_html.contains("systemctl stop sito"),
+        "{systemd_html}"
+    );
+    assert!(systemd_html.contains("sito update"), "{systemd_html}");
 }
 
 async fn mock_context(temp_dir: &std::path::Path) -> ServerContext {

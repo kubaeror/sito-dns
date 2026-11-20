@@ -3189,6 +3189,16 @@
               }
             }
           },
+          "409": {
+            "description": "Another update is running, the version comparison is unknown, or the service is managed by systemd",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Update process failed",
             "content": {
@@ -5353,23 +5363,33 @@
           "update_available",
           "release_url",
           "release_notes",
-          "is_docker"
+          "is_docker",
+          "is_systemd",
+          "in_app_update_disabled"
         ],
         "properties": {
           "current_version": {
             "type": "string",
             "description": "Currently running version of sito."
           },
+          "in_app_update_disabled": {
+            "type": "boolean",
+            "description": "True when this deployment must not replace its own binary in place.\n`--check` and the CLI after `systemctl stop` still work."
+          },
           "instructions": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Environment-specific upgrade instructions (e.g. docker compose command)."
+            "description": "Environment-specific upgrade instructions (e.g. docker compose or\nsystemctl commands)."
           },
           "is_docker": {
             "type": "boolean",
             "description": "Whether the server is running inside a Docker/OCI container."
+          },
+          "is_systemd": {
+            "type": "boolean",
+            "description": "Whether the server is running as a systemd service."
           },
           "latest_version": {
             "type": "string",
