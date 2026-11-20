@@ -327,6 +327,10 @@ async fn commit_staged(
         }
     }
     ctx.querylog_sender.set_anonymize(anonymize);
+    // An apply that changes filter rules or the DNSSEC policy flushes the
+    // response cache inside the runtime publish; refresh the footprint gauge
+    // so it cannot keep reporting reclaimed entries.
+    ctx.publish_cache_size();
     // P1-19: switching `stats.rollup_client_names` off must scrub names from
     // already-written rollups now, not only on the next restart.
     let previous_names = previous.get_stats_config().rollup_client_names;
@@ -882,6 +886,7 @@ pub fn queue_filter_refresh(
         match apply_filter_refresh(&engine, &runtime, &filtering, expected).await {
             Ok(_) => {
                 cache.flush();
+                metrics.set_cache_size_bytes(crate::state::cache_size_bytes(&cache));
                 metrics.set_filter_rules(engine.rule_count());
                 tracing::info!("Background blocklist refresh completed");
             }
@@ -1175,6 +1180,7 @@ mod tests {
                     .is_some(),
                 "cache seed for {change} must succeed"
             );
+            ctx.metrics.set_cache_size_bytes(4_096);
 
             let mut candidate = (**ctx.config.load()).clone();
             match change {
@@ -1197,6 +1203,12 @@ mod tests {
                     .await
                     .is_none(),
                 "changing dnssec {change} must flush cached validation decisions"
+            );
+            assert!(
+                ctx.metrics
+                    .render_prometheus()
+                    .contains("sito_cache_size_bytes 0"),
+                "a flushing apply must publish the reclaimed cache size"
             );
         }
 

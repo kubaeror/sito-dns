@@ -170,15 +170,25 @@ pub async fn run_server_with_lease(
     // the runtime snapshot (and therefore the query path) on the new rules.
     {
         let refresh_runtime = Arc::clone(&runtime);
+        let refresh_cache = Arc::clone(&cache);
+        let refresh_metrics = metrics.clone();
         filter_engine.set_snapshot_observer(Arc::new(move |snapshot, groups| {
             // Called while the filter engine holds its reload guard, so the
             // config generation cannot change between the read and publish.
             let expected = refresh_runtime.generation();
-            if let Err(error) = refresh_runtime.publish_filter(Some(snapshot), groups, expected) {
-                tracing::debug!(
+            match refresh_runtime.publish_filter(Some(snapshot), groups, expected) {
+                Ok(_) => {
+                    // A successful filter publish flushes entries tagged with
+                    // the old filter epoch; keep the size gauge truthful for
+                    // scheduled refreshes as well as API-triggered ones.
+                    refresh_metrics.set_cache_size_bytes(
+                        i64::try_from(refresh_cache.weighted_size()).unwrap_or(i64::MAX),
+                    );
+                }
+                Err(error) => tracing::debug!(
                     error = %error,
                     "Discarding a scheduled blocklist refresh that raced a config apply"
-                );
+                ),
             }
         }));
     }

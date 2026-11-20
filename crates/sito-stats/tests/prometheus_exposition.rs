@@ -39,6 +39,7 @@ fn populated_registry() -> MetricsRegistry {
     registry.set_filter_rules(10_000);
     registry.set_filter_status(FilterStatusMetrics {
         state: 2,
+        rule_count: None,
         loaded_lists: 3,
         failed_lists: 0,
         degraded_groups: 0,

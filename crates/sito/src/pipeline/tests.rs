@@ -2057,6 +2057,226 @@ async fn test_pipeline_records_per_attempt_upstream_metrics() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// P2-57: every per-query metric family honours the client's `ignore_stats`
+/// policy, not just the query counters. The test renders the exposition after
+/// driving one ignored and one normal client through the same cache, upstream,
+/// stale, anti-DoH and identification paths.
+#[tokio::test]
+async fn test_ignore_stats_gates_all_per_query_metric_families() {
+    use sito_clients::{ClientEntryConfig, ClientsConfig};
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut config = Config::default();
+    config.filtering.enabled = true;
+    config.filtering.custom_rules = vec!["||never-match.invalid^".to_string()];
+    config.filtering.anti_doh_bypass = "block_all".to_string();
+    config.dns.dnssec.validate = false;
+    config.dns.cache.enabled = true;
+    config.dns.cache.min_ttl = 1;
+    config.dns.cache.max_ttl = 1;
+    config.dns.cache.negative_ttl_max = 1;
+    config.dns.cache.serve_stale_hours = 1;
+    config.upstream.timeout_ms = 300;
+
+    let fail = std::sync::Arc::new(AtomicBool::new(false));
+    let (mock_addr, _calls) = spawn_mock_upstream(Some(std::sync::Arc::clone(&fail))).await;
+    let server = mock_addr.to_string();
+    config.upstream.servers = vec![server.clone()];
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+
+    let clients = ClientsConfig {
+        entries: vec![
+            ClientEntryConfig {
+                name: "ignored-client".to_string(),
+                ids: vec!["10.0.0.1".to_string()],
+                group: "default".to_string(),
+                ignore_query_log: false,
+                ignore_stats: true,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            },
+            ClientEntryConfig {
+                name: "normal-client".to_string(),
+                ids: vec!["10.0.0.2".to_string()],
+                group: "default".to_string(),
+                ignore_query_log: false,
+                ignore_stats: false,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            },
+        ],
+        ..Default::default()
+    };
+    let validator = DnssecValidator::from_config(&config.dns.dnssec);
+    let (pipeline, temp_dir) =
+        build_test_pipeline_with_clients(config, upstream, validator, clients).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let ignored = ClientContext::new("10.0.0.1".parse().unwrap());
+    let normal = ClientContext::new("10.0.0.2".parse().unwrap());
+
+    // Miss -> hit for the normal client; the ignored client's miss and
+    // upstream success must not be counted.
+    pipeline
+        .handle(
+            rewrite_query("ignored-ok.example.", RecordType::A),
+            ignored.clone(),
+        )
+        .await
+        .unwrap();
+    pipeline
+        .handle(
+            rewrite_query("normal-ok.example.", RecordType::A),
+            normal.clone(),
+        )
+        .await
+        .unwrap();
+    pipeline
+        .handle(
+            rewrite_query("normal-ok.example.", RecordType::A),
+            normal.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Failure attribution: only the normal client's failure is observable.
+    fail.store(true, Ordering::SeqCst);
+    let ignored_failure = pipeline
+        .handle(
+            rewrite_query("ignored-fail.example.", RecordType::A),
+            ignored.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ignored_failure.metadata.response_code,
+        ResponseCode::ServFail
+    );
+    let normal_failure = pipeline
+        .handle(
+            rewrite_query("normal-fail.example.", RecordType::A),
+            normal.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        normal_failure.metadata.response_code,
+        ResponseCode::ServFail
+    );
+
+    // Seed one stale entry per client and leave the fresh window.
+    for (id, name) in [
+        (21u16, "ignored-stale.example."),
+        (22, "normal-stale.example."),
+    ] {
+        let query = rewrite_query(name, RecordType::A);
+        let mut cached = Message::response(id, OpCode::Query);
+        cached.queries = query.queries.clone();
+        cached.answers.push(Record::from_rdata(
+            Name::from_str(name).unwrap(),
+            1,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, id as u8))),
+        ));
+        pipeline
+            .cache
+            .insert_with_status(&query, &cached, ValidationStatus::Unchecked)
+            .await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    pipeline
+        .handle(
+            rewrite_query("ignored-stale.example.", RecordType::A),
+            ignored.clone(),
+        )
+        .await
+        .unwrap();
+    let stale = pipeline
+        .handle(
+            rewrite_query("normal-stale.example.", RecordType::A),
+            normal.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.metadata.response_code, ResponseCode::NoError);
+
+    // Anti-DoH bypass is blocked before the cache/upstream path for both
+    // clients; only the normal client's counter may move.
+    pipeline
+        .handle(rewrite_query("dns.google.", RecordType::A), ignored)
+        .await
+        .unwrap();
+    pipeline
+        .handle(rewrite_query("dns.google.", RecordType::A), normal)
+        .await
+        .unwrap();
+
+    let rendered = metrics.render_prometheus();
+    let series = |needle: &str| -> u64 {
+        rendered
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(' ')?;
+                (name == needle).then(|| value.parse::<u64>().unwrap())
+            })
+            .unwrap_or_else(|| panic!("missing {needle} in:\n{rendered}"))
+    };
+
+    assert_eq!(
+        metrics.get_queries_and_blocked().0,
+        5,
+        "only the normal client's five queries are counted: {rendered}"
+    );
+    assert_eq!(
+        series(r#"sito_clients_identified_total{method="identified"}"#),
+        5,
+        "identification must be gated: {rendered}"
+    );
+    assert_eq!(
+        series("sito_cache_misses_total"),
+        3,
+        "normal misses: success, failure and stale lookup: {rendered}"
+    );
+    assert_eq!(
+        series("sito_cache_hits_total"),
+        2,
+        "the normal client's repeat and stale serve are the only cache hits: {rendered}"
+    );
+    assert_eq!(
+        series("sito_cache_stale_served_total"),
+        1,
+        "the ignored client's stale serve must not be counted: {rendered}"
+    );
+    assert_eq!(
+        series("sito_doh_bypass_blocked_total"),
+        1,
+        "the ignored client's anti-DoH block must not be counted: {rendered}"
+    );
+    assert_eq!(
+        series(&format!(
+            r#"sito_upstream_rtt_seconds_count{{upstream="{server}"}}"#
+        )),
+        3,
+        "one RTT per normal success/failure/stale attempt: {rendered}"
+    );
+    assert_eq!(
+        series(&format!(
+            r#"sito_upstream_errors_total{{upstream="{server}",kind="bad_response"}}"#
+        )),
+        2,
+        "the normal failure and stale lookup are the only attributed errors: {rendered}"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 /// D-12: failures that cannot be attributed to one configured server use
 /// the constant `unattributed` label and must not write a health gauge.
 #[tokio::test]
@@ -2379,6 +2599,7 @@ async fn test_stale_indeterminate_entry_is_not_served_under_validation() {
 async fn test_pipeline_with_bogus_signed_upstream(
     mut config: Config,
     mode: DnssecMode,
+    clients: sito_clients::ClientsConfig,
 ) -> (
     DnsPipeline,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -2470,8 +2691,78 @@ async fn test_pipeline_with_bogus_signed_upstream(
     anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
     let validator = DnssecValidator::new(mode, Vec::new()).with_trust_anchors(anchors);
     let (pipeline, temp_dir) =
-        build_test_pipeline_with_validator(config, upstream, validator).await;
+        build_test_pipeline_with_clients(config, upstream, validator, clients).await;
     (pipeline, calls, temp_dir, qname)
+}
+
+/// P2-57: the per-upstream `sito_dnssec_bogus_total` series honours
+/// `ignore_stats`. The validator's cumulative outcome counters are node-wide
+/// and intentionally still include both validations.
+#[tokio::test]
+async fn test_ignore_stats_gates_dnssec_bogus_per_upstream() {
+    use sito_clients::{ClientEntryConfig, ClientsConfig};
+
+    let clients = ClientsConfig {
+        entries: vec![
+            ClientEntryConfig {
+                name: "ignored-client".to_string(),
+                ids: vec!["10.0.0.1".to_string()],
+                group: "default".to_string(),
+                ignore_query_log: false,
+                ignore_stats: true,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            },
+            ClientEntryConfig {
+                name: "normal-client".to_string(),
+                ids: vec!["10.0.0.2".to_string()],
+                group: "default".to_string(),
+                ignore_query_log: false,
+                ignore_stats: false,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            },
+        ],
+        ..Default::default()
+    };
+    let (pipeline, _calls, temp_dir, qname) =
+        test_pipeline_with_bogus_signed_upstream(Config::default(), DnssecMode::LogOnly, clients)
+            .await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let ignored = ClientContext::new("10.0.0.1".parse().unwrap());
+    let normal = ClientContext::new("10.0.0.2".parse().unwrap());
+
+    // LogOnly keeps the answer and caches it as Indeterminate, which is not
+    // servable to a validating query; both clients reach the validator.
+    let query = do_query(31, &qname);
+    let ignored_resp = pipeline.handle(query.clone(), ignored).await.unwrap();
+    assert_eq!(ignored_resp.metadata.response_code, ResponseCode::NoError);
+    let normal_resp = pipeline.handle(query, normal).await.unwrap();
+    assert_eq!(normal_resp.metadata.response_code, ResponseCode::NoError);
+
+    let rendered = metrics.render_prometheus();
+    let bogus_series: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with("sito_dnssec_bogus_total{"))
+        .collect();
+    assert_eq!(
+        bogus_series.len(),
+        1,
+        "only the normal client may create a per-upstream bogus series: {rendered}"
+    );
+    assert!(
+        bogus_series[0].ends_with(" 1"),
+        "the normal client's bogus answer must be counted once: {}",
+        bogus_series[0]
+    );
+    assert!(
+        rendered.contains(r#"sito_dnssec_validations_total{result="bogus"} 2"#),
+        "the node-wide validator counters are shared state: {rendered}"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
 /// A strict-mode Bogus result is a fail-closed SERVFAIL. It is cached as
@@ -2481,8 +2772,12 @@ async fn test_pipeline_with_bogus_signed_upstream(
 async fn test_strict_bogus_servfail_is_cached_and_served_without_upstream() {
     use std::sync::atomic::Ordering;
 
-    let (pipeline, calls, temp_dir, qname) =
-        test_pipeline_with_bogus_signed_upstream(Config::default(), DnssecMode::Validate).await;
+    let (pipeline, calls, temp_dir, qname) = test_pipeline_with_bogus_signed_upstream(
+        Config::default(),
+        DnssecMode::Validate,
+        sito_clients::ClientsConfig::default(),
+    )
+    .await;
     let client = ClientContext::new("127.0.0.1".parse().unwrap());
 
     let first_query = do_query(20, &qname);
@@ -2569,8 +2864,12 @@ async fn test_prefetch_strict_bogus_is_cached_as_fail_closed_servfail() {
     // the background refresh to replace it.
     config.dns.cache.min_ttl = 10;
     config.dns.cache.max_ttl = 10;
-    let (pipeline, calls, temp_dir, qname) =
-        test_pipeline_with_bogus_signed_upstream(config, DnssecMode::Validate).await;
+    let (pipeline, calls, temp_dir, qname) = test_pipeline_with_bogus_signed_upstream(
+        config,
+        DnssecMode::Validate,
+        sito_clients::ClientsConfig::default(),
+    )
+    .await;
     let client = ClientContext::new("127.0.0.1".parse().unwrap());
 
     // Seed a servable, near-expiry entry so cache hits trigger the background
@@ -2666,8 +2965,12 @@ async fn test_prefetch_log_only_bogus_is_cached_as_indeterminate() {
     config.dns.cache.prefetch = true;
     config.dns.cache.min_ttl = 10;
     config.dns.cache.max_ttl = 10;
-    let (pipeline, calls, temp_dir, qname) =
-        test_pipeline_with_bogus_signed_upstream(config, DnssecMode::LogOnly).await;
+    let (pipeline, calls, temp_dir, qname) = test_pipeline_with_bogus_signed_upstream(
+        config,
+        DnssecMode::LogOnly,
+        sito_clients::ClientsConfig::default(),
+    )
+    .await;
     let client = ClientContext::new("127.0.0.1".parse().unwrap());
 
     let seed_query = do_query(40, &qname);
@@ -2733,8 +3036,12 @@ async fn test_prefetch_log_only_bogus_is_cached_as_indeterminate() {
 async fn test_log_only_bogus_is_cached_as_indeterminate_and_not_served() {
     use std::sync::atomic::Ordering;
 
-    let (pipeline, calls, temp_dir, qname) =
-        test_pipeline_with_bogus_signed_upstream(Config::default(), DnssecMode::LogOnly).await;
+    let (pipeline, calls, temp_dir, qname) = test_pipeline_with_bogus_signed_upstream(
+        Config::default(),
+        DnssecMode::LogOnly,
+        sito_clients::ClientsConfig::default(),
+    )
+    .await;
     let client = ClientContext::new("127.0.0.1".parse().unwrap());
 
     let first_query = do_query(22, &qname);

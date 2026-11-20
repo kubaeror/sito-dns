@@ -442,6 +442,7 @@ pub async fn refresh_filtering(
         .map_err(|e| ProblemDetails::internal_error(format!("Refresh failed: {e}")))?;
     ctx.metrics.set_filter_rules(count);
     ctx.cache.flush();
+    ctx.publish_cache_size();
     Ok(Json(GenericMessageResponse {
         message: format!("Successfully refreshed filter lists ({count} active rules compiled)"),
     }))

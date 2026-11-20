@@ -406,5 +406,6 @@ pub async fn filtering_update_all_handler(
     }
     ctx.metrics.set_filter_rules(ctx.filter.rule_count());
     ctx.cache.flush();
+    ctx.publish_cache_size();
     Redirect::to("/filtering").into_response()
 }
