@@ -5,10 +5,27 @@
 //! Hot-path metrics inter their label values (`proto`, `verdict`, `upstream`,
 //! `method`, ...) into dense integer ids once and keep the counters in
 //! `RwLock` maps of atomics, so a per-query observation performs no `String`
-//! allocation and never takes a global exclusive lock. Rendering is the only
+//! allocation and never takes a *global* exclusive lock. Rendering is the only
 //! place that materializes label strings and it sorts them, keeping the
 //! exposition output byte-for-byte equivalent to the previous `BTreeMap`
 //! implementation.
+//!
+//! Latency histograms are the one exception to lock-free updates: each
+//! interned label (verdict for `sito_query_duration_seconds`, upstream for
+//! `sito_upstream_rtt_seconds`) owns a small [`HistogramState`] behind its own
+//! mutex (P2-62). The hot `allowed` path therefore serializes only with other
+//! queries that share that verdict, not with cache/upstream/filter metrics or
+//! other labels. The critical section is a fixed 14-bucket compare-and-add loop
+//! and is never held across I/O, formatting or rendering. Both histogram maps
+//! are read-mostly `RwLock`s: the write lock is taken only when a label is
+//! first observed, and the label sets are bounded (verdicts are a closed set;
+//! upstream labels pass through the same bounded interner as the other metric
+//! families). Sharding by label would add memory/indirection without removing
+//! the per-label serialization that the exposition requires, so the per-label
+//! mutex is kept deliberately. `metrics_bench` measures the contended
+//! `observe_query_duration("allowed", ...)` path, and
+//! `test_histogram_concurrent_updates_are_not_lost` pins the correctness
+//! invariant.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -276,6 +293,11 @@ where
 }
 
 /// Observes `value` in the histogram for interned label id `id`.
+///
+/// The map lookup takes a shared lock on the hot path; the per-label mutex is
+/// then held only for [`HistogramState::observe`]'s fixed bucket loop. See the
+/// module documentation for why per-verdict/per-upstream serialization is
+/// bounded and preferable to sharding this small state.
 fn observe_histogram(map: &HistogramMap, id: u32, value: f64) {
     let histogram = {
         if let Ok(guard) = map.read()
@@ -1660,6 +1682,45 @@ mod tests {
         }
         assert_line("sito_dnssec_fetch_failures_total{kind=\"budget\"} 5");
         assert_line("sito_dnssec_fetch_failures_total{kind=\"deadline\"} 4");
+    }
+
+    /// P2-62 rationale test: the per-verdict histogram mutex may serialize
+    /// same-verdict observations, but it must not lose any of them. Distinct
+    /// verdicts use distinct mutexes and remain independent.
+    #[test]
+    fn test_histogram_concurrent_updates_are_not_lost() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 1_000;
+
+        let reg = std::sync::Arc::new(MetricsRegistry::new("1.0.0", "test"));
+        let mut handles = Vec::new();
+        for thread in 0..THREADS {
+            let reg = std::sync::Arc::clone(&reg);
+            handles.push(std::thread::spawn(move || {
+                let verdict = if thread % 2 == 0 {
+                    "allowed"
+                } else {
+                    "blocked"
+                };
+                for _ in 0..PER_THREAD {
+                    reg.observe_query_duration(verdict, 0.001);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("histogram writer thread");
+        }
+
+        let rendered = reg.render_prometheus();
+        for verdict in ["allowed", "blocked"] {
+            assert!(
+                rendered.contains(&format!(
+                    "sito_query_duration_seconds_count{{verdict=\"{verdict}\"}} {}",
+                    THREADS / 2 * PER_THREAD
+                )),
+                "every observation for {verdict} must be retained: {rendered}"
+            );
+        }
     }
 
     #[test]

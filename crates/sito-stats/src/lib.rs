@@ -277,6 +277,87 @@ mod tests {
         assert_eq!(remaining.entries[0].qname, "recent.com");
     }
 
+    /// Representative multi-day retention sweep: 72 consecutive expired hours
+    /// are aggregated in one call, one hour at a time, with no double counting
+    /// and no rows left in the detailed log. This covers the 90-day-scale
+    /// algorithm without a CI-hostile 1M-row soak (see the retention module
+    /// docs for that documented residual).
+    #[tokio::test]
+    async fn test_retention_handles_multiple_hours_across_days() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        // Align to an hour boundary and stay well outside the 90-day cutoff.
+        let base = ((now - 100 * 86_400_000) / 3_600_000) * 3_600_000;
+        let hours = 72i64;
+        let per_hour = 5i64;
+
+        let mut entries = Vec::new();
+        for hour in 0..hours {
+            for index in 0..per_hour {
+                let ts = base + hour * 3_600_000 + index * 1_000;
+                let qname = format!("day{}-hour{}-{index}.example", hour / 24, hour % 24);
+                let mut entry = retention_entry(
+                    ts,
+                    &qname,
+                    if index == 0 { "blocked" } else { "allowed" },
+                    None,
+                );
+                entry.client_ip = format!("10.0.{}.{}", hour % 256, index + 1);
+                entry.upstream = Some(
+                    if index % 2 == 0 {
+                        "1.1.1.1:53"
+                    } else {
+                        "9.9.9.9:53"
+                    }
+                    .to_string(),
+                );
+                entry.elapsed_us = Some(1_000 + index);
+                entries.push(entry);
+            }
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
+        assert_eq!(
+            report.aggregated_hours,
+            usize::try_from(hours).unwrap(),
+            "every expired hour must be aggregated exactly once"
+        );
+        assert_eq!(
+            report.deleted_records,
+            u64::try_from(hours * per_hour).unwrap()
+        );
+
+        let rollup_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_hourly")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rollup_rows, hours);
+        let total: i64 = sqlx::query_scalar("SELECT SUM(queries) FROM stats_hourly")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(total, hours * per_hour);
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0, "the sweep must delete every expired row");
+
+        let (queries, blocked, top_domains): (i64, i64, String) =
+            sqlx::query_as("SELECT queries, blocked, top_domains FROM stats_hourly WHERE hour = ?")
+                .bind(base)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(queries, per_hour);
+        assert_eq!(blocked, 1);
+        assert!(
+            top_domains.contains("day0-hour0-0.example"),
+            "the first hour's top list must be retained: {top_domains}"
+        );
+    }
+
     #[tokio::test]
     async fn test_persistence_restart() {
         let temp_dir = std::env::temp_dir().join(format!(

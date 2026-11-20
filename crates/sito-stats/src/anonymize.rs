@@ -1,6 +1,19 @@
 //! IP anonymization utilities per section 14.3.
 //!
 //! When enabled, masks IPv4 addresses to /24 and IPv6 addresses to /56.
+//!
+//! # Forward-only policy (P2-59, deferred)
+//!
+//! The setting is applied by the query-log writer before a new row is stored,
+//! so it affects writes made after the setting becomes live. Existing
+//! `query_log` rows are **not** rewritten when the operator enables it, and
+//! this crate does not provide a retroactive bounded rewrite. Rollup client
+//! identifiers are separately hashed by the one-time rollup backfill, but the
+//! raw IPs/names in old detailed rows remain until retention or an explicit
+//! clear removes them. Retroactive anonymization is tracked as a deferred
+//! residual; implementing it safely needs a bounded, crash-resumable rewrite
+//! that respects retention and the live writer rather than a blocking
+//! `UPDATE` over the whole table.
 
 use std::net::IpAddr;
 

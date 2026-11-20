@@ -569,6 +569,23 @@ key before any retention task starts.
 > inside the chunk transaction and can be expensive for a pathological hour
 > with very many distinct domains/clients.
 
+**Retention and clear capacity notes.** Normal retention is hour-bounded and
+commits each hour separately, so a backlog is pruned without holding the
+writer lock for the whole sweep; the per-connection temp tables hold at most
+one hour of distinct domains, clients and upstreams and are cleared after each
+hour. The `keep_aggregates=true` clear is the exception: it folds the whole
+query-log range into rollups in one immediate transaction and loads every
+affected hour's top lists into memory before deleting, so a very large first
+clear can be slow and memory-heavy (documented residual, P2-61). A 1M-row,
+90-day soak is likewise a documented capacity-testing residual rather than a
+unit-test guarantee; the row-bounded chunks keep each transaction bounded but
+the sweep is still linear in the number of expired rows. `stats_watermark` is
+still written for progress diagnostics/backward compatibility but is not read
+to skip rows: aggregation and deletion share a transaction, and backdated rows
+must be re-aggregated. Enabling `privacy.anonymize_querylog` is forward-only;
+old detailed rows are not rewritten (retroactive anonymization is deferred,
+P2-59).
+
 > Query logging is always enabled when `[stats]` is present. Prometheus metrics
 > are exposed at `/metrics` and require a Viewer-or-higher bearer token or
 > session when `web.metrics_auth = true` (the default); set

@@ -1,4 +1,53 @@
 //! Hour-chunked retention, rollups, and PII-safe aggregate maintenance.
+//!
+//! # Bounded normal retention
+//!
+//! [`StatsDb::cleanup_detailed_retention`] and
+//! [`StatsDb::cleanup_retention_with_policy`] process one expired hour at a
+//! time in row-bounded `(ts, id)` chunks, each in its own short
+//! `BEGIN IMMEDIATE` transaction. Exact per-hour domain/client/upstream counts
+//! accumulate in per-connection SQLite temp tables
+//! ([`StatsDb::ensure_retention_temp_tables`]). Those tables are cleared at
+//! sweep start and after each hour, so their memory is bounded to roughly one
+//! hour of distinct domains/clients/upstreams rather than the whole retention
+//! range. The rows can transiently contain raw client IPs during a sweep; they
+//! are never persisted to another table.
+//!
+//! # Keep-aggregates clear (documented residual)
+//!
+//! The `keep_aggregates` clear path
+//! ([`StatsDb::rollup_and_delete_range`]) is intentionally different: an
+//! operator requested a full clear while preserving rollups, so it runs one
+//! `BEGIN IMMEDIATE` transaction over the whole range, performs one
+//! `GROUP BY hour` scan, loads every affected hour's top lists into a
+//! `HashMap` before writing, and only then deletes the rows. A very large
+//! first clear can therefore hold the writer lock for a long time and consume
+//! memory proportional to the number of affected hours/distinct values. This
+//! whole-range shape is deliberately not split into the normal hour-bounded
+//! sweep: doing so would make the clear non-atomic with respect to the
+//! preserved rollups. It is documented as a residual risk (P2-61).
+//!
+//! # Scale residual (90 days / 1M rows)
+//!
+//! `test_retention_handles_multiple_hours_across_days` covers a multi-day,
+//! multi-hour sweep. A true 1M-row/90-day soak is not part of the unit suite
+//! (it would dominate CI); the chunking keeps each write transaction bounded
+//! and the total sweep remains O(rows) with scheduled startup catch-up. Use
+//! `benches/stats_bench.rs` or a production-sized database for capacity
+//! testing. This is a documented residual rather than an untested claim.
+//!
+//! # `stats_watermark`
+//!
+//! The table is still written on every aggregated chunk, but it is **not read
+//! to decide which rows to aggregate**. That is deliberate: the aggregate read,
+//! rollup upsert, watermark update and delete share one transaction, so a row
+//! can never be deleted without being aggregated, and re-inserted/backdated
+//! rows must be re-aggregated rather than skipped by an `id > watermark`
+//! predicate. The writes are retained as a bounded progress/diagnostic record
+//! and for compatibility with the v1.9 schema (and its tests); removing them is
+//! a schema/behavior change deferred to a later cleanup. See
+//! `test_retention_watermark_prevents_double_counting` and
+//! `test_retention_aggregates_backdated_rows_after_watermark`.
 
 #[allow(clippy::wildcard_imports, unused_imports)]
 use super::*;
@@ -406,6 +455,12 @@ impl StatsDb {
     /// exactly those rows in one transaction. Used by the explicit
     /// `keep_aggregates` clear path (which is not row-bounded because the
     /// operator requested a full clear).
+    ///
+    /// This is the documented whole-range residual: one `BEGIN IMMEDIATE`
+    /// transaction, one `GROUP BY hour` scan, and in-memory top-list storage
+    /// for every affected hour before any write. A very large clear can hold
+    /// the writer lock and use memory proportional to the range. Normal
+    /// retention uses the hour-bounded `rollup_and_delete_chunk` path instead.
     pub(super) async fn rollup_and_delete_range(
         &self,
         start: i64,

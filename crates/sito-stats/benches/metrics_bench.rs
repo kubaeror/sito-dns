@@ -36,6 +36,9 @@ fn bench_metrics(c: &mut Criterion) {
     group.bench_function("inc_queries", |b| {
         b.iter(|| registry.inc_queries("udp", 1, "allowed"));
     });
+    // P2-62: this is the contended per-verdict histogram path. Every query
+    // that shares the hot `allowed` verdict serializes on one small mutex
+    // around the fixed bucket loop; the benchmark records that cost.
     group.bench_function("observe_query_duration", |b| {
         b.iter(|| registry.observe_query_duration(black_box("allowed"), black_box(0.000_3)));
     });
