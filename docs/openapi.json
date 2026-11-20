@@ -4228,9 +4228,33 @@
             ],
             "description": "RFC3339 timestamp of the first background retry, when one is scheduled."
           },
+          "slaves_coalesced": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Slaves scheduled for coalesced/deferred delivery.",
+            "minimum": 0
+          },
+          "slaves_connected": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Connected slaves observed during the publish (including closed channels).",
+            "minimum": 0
+          },
+          "slaves_queued": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Slaves with a direct channel enqueue.",
+            "minimum": 0
+          },
           "status": {
             "type": "string",
-            "description": "`published`, `no_slaves` or `failed`."
+            "description": "`queued`, `no_slaves` or `failed`. `queued` is a queue outcome, not\nproof of delivery; delivery is confirmed by the slave ACK."
           }
         }
       },

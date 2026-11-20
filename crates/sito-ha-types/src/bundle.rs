@@ -155,13 +155,14 @@ pub struct AppliedWatermark {
     pub forked: bool,
     /// Version at which the fork was detected.
     pub forked_at_version: u64,
-    /// BLAKE3 digest of the exact `config.toml` document this node persisted
-    /// when it applied the bundle.
+    /// BLAKE3 digest of the shared projection of the configuration document
+    /// this node persisted when it applied the bundle.
     ///
-    /// On restart the digest is compared with the on-disk document. A mismatch
-    /// means a local edit/revert changed the configuration while the process
-    /// was stopped (or the file watcher applied one while running) and the
-    /// slave must re-apply the master's bundle instead of early-ACKing
+    /// On restart the digest is compared with the shared projection of the
+    /// on-disk document. Node-local fields (identity, `[ha]`, listener/TLS,
+    /// web bind settings, credentials and per-client secrets) are excluded; an
+    /// edit to a shared field means the file was changed outside replication
+    /// and the slave must re-apply the master's bundle instead of early-ACKing
     /// `Synced`. Always present when a digest was recorded.
     pub applied_config_digest: Option<String>,
 }

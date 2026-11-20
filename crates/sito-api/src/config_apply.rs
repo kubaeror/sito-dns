@@ -122,27 +122,49 @@ pub struct AppliedReport {
 /// Client-visible summary of an HA publication attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HaPublishReport {
-    /// `published`, `no_slaves` or `failed`.
+    /// `queued`, `no_slaves` or `failed`.
+    ///
+    /// `queued` means the bundle was persisted and queued for delivery (a
+    /// direct channel enqueue or a coalesced fallback); delivery is proven only
+    /// by the slave's ACK. `slaves_queued`/`slaves_coalesced` make that
+    /// distinction explicit.
     pub status: String,
     /// Failure detail, never containing secret material.
     pub error: Option<String>,
     /// RFC3339 timestamp of the first scheduled retry.
     pub retry_at: Option<String>,
+    /// Connected slaves observed during the publish (including closed channels).
+    pub slaves_connected: Option<usize>,
+    /// Slaves with a direct channel enqueue.
+    pub slaves_queued: Option<usize>,
+    /// Slaves scheduled for coalesced/deferred delivery.
+    pub slaves_coalesced: Option<usize>,
 }
 
 impl HaPublishReport {
     #[must_use]
     pub fn from_outcome(outcome: PublishOutcome) -> Self {
         match outcome {
-            PublishOutcome::Published { .. } => Self {
-                status: "published".to_string(),
+            PublishOutcome::Published {
+                slaves_connected,
+                slaves_queued,
+                slaves_coalesced,
+                ..
+            } => Self {
+                status: "queued".to_string(),
                 error: None,
                 retry_at: None,
+                slaves_connected: Some(slaves_connected),
+                slaves_queued: Some(slaves_queued),
+                slaves_coalesced: Some(slaves_coalesced),
             },
             PublishOutcome::NoSlaves => Self {
                 status: "no_slaves".to_string(),
                 error: None,
                 retry_at: None,
+                slaves_connected: Some(0),
+                slaves_queued: Some(0),
+                slaves_coalesced: Some(0),
             },
             // Callers normally treat this as an apply error before building a
             // report; keep a faithful representation for completeness.
@@ -152,6 +174,9 @@ impl HaPublishReport {
                     "configuration bundle is {bytes} bytes, above the {limit}-byte replication limit"
                 )),
                 retry_at: None,
+                slaves_connected: None,
+                slaves_queued: None,
+                slaves_coalesced: None,
             },
         }
     }
@@ -188,6 +213,9 @@ impl HaPublishReport {
             status: "failed".to_string(),
             error: Some(error.into()),
             retry_at,
+            slaves_connected: None,
+            slaves_queued: None,
+            slaves_coalesced: None,
         }
     }
 }
@@ -1069,6 +1097,28 @@ pub fn restart_required_field_names() -> Vec<&'static str> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// The publish report must say "queued", not "delivered", and expose the
+    /// connected/queued/coalesced distinction.
+    #[test]
+    fn test_ha_publish_report_distinguishes_queued_from_connected() {
+        let report = HaPublishReport::from_outcome(PublishOutcome::Published {
+            version: 7,
+            term: 1,
+            slaves_connected: 3,
+            slaves_queued: 1,
+            slaves_coalesced: 1,
+        });
+        assert_eq!(report.status, "queued");
+        assert_eq!(report.slaves_connected, Some(3));
+        assert_eq!(report.slaves_queued, Some(1));
+        assert_eq!(report.slaves_coalesced, Some(1));
+        assert!(report.error.is_none());
+
+        let no_slaves = HaPublishReport::from_outcome(PublishOutcome::NoSlaves);
+        assert_eq!(no_slaves.status, "no_slaves");
+        assert_eq!(no_slaves.slaves_connected, Some(0));
+    }
 
     /// Deferred D4b: `retry_at` must reflect the retry loop that was actually
     /// scheduled, and must be absent when no new loop was started.

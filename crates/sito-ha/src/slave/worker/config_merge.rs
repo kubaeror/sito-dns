@@ -6,7 +6,7 @@ use tracing::warn;
 
 use sito_core::config::Config;
 
-use crate::bundle::ConfigBundle;
+use crate::bundle::{ConfigBundle, NODE_LOCAL_WEB_KEYS};
 use crate::error::HaError;
 
 /// Builds the TOML document that is persisted after a successful push.
@@ -166,19 +166,6 @@ fn ensure_section<'a>(
             reason: format!("Pushed [{key}] section is not a table"),
         })
 }
-
-/// `[web]` keys whose values describe this node. The master's copies must
-/// never replace them: the admin listener is bound per host, and the proxy,
-/// metrics-auth and public-URL settings describe how this node is reached.
-const NODE_LOCAL_WEB_KEYS: [&str; 7] = [
-    "enabled",
-    "bind",
-    "port",
-    "trusted_proxies",
-    "metrics_auth",
-    "public_url",
-    "tls_terminated_by_proxy",
-];
 
 /// Restores the node-local listener, TLS and ACME identity into `pushed`.
 ///

@@ -46,10 +46,13 @@ pub use sito_ha_types::status::{PublishOutcome, ResyncOutcome};
 pub const MAX_PUBLISH_HISTORY: usize = 64;
 
 /// Maximum bytes queued for one slave before the master falls back to
-/// coalesced delivery.
+/// coalesced delivery (4 MiB, i.e. four maximum-size 1 MiB messages).
 ///
 /// The channel capacity alone bounds the number of queued pushes, not their
 /// size: with 1 MiB bundles a slow peer could otherwise pin tens of MiB.
+/// A send that cannot fit this budget is deferred through the coalesced
+/// fallback, which delivers only the latest active bundle when the channel has
+/// room.
 pub const MAX_SLAVE_QUEUE_BYTES: usize = MAX_WS_MESSAGE_SIZE * 4;
 
 /// Maximum concurrently unauthenticated/active handshake slots per source IP.

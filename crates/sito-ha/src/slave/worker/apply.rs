@@ -9,7 +9,8 @@ use sito_core::config::{Config, FilterListConfig};
 use sito_rewrites::RewritesConfig;
 
 use crate::bundle::{
-    config_digest, push_payload_hash, substitute_secrets, verify_and_unpack_push_with_watermark,
+    push_payload_hash, shared_config_digest, substitute_secrets,
+    verify_and_unpack_push_with_watermark,
 };
 use crate::error::HaError;
 use crate::protocol::HaMessage;
@@ -249,11 +250,12 @@ pub async fn apply_config_push(
         return Err(HaError::Rollback(reason));
     }
 
-    // Persist the applied-version watermark and the digest of the exact
-    // document that was applied before acknowledging: a crash between apply
-    // and ACK must still leave a restart able to reject replays and detect a
-    // local edit to the shared configuration.
-    let applied_config_digest = config_digest(&document);
+    // Persist the applied-version watermark and the digest of the shared
+    // projection of the document that was applied before acknowledging: a
+    // crash between apply and ACK must still leave a restart able to reject
+    // replays and detect a shared-field edit, while node-local edits (identity,
+    // listener/TLS, secrets) do not force a spurious full apply.
+    let applied_config_digest = shared_config_digest(&document);
     if let Err(e) = tracker.persist_watermark_with_identity(
         bundle.version,
         bundle.term,

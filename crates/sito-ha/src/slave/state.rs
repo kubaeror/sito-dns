@@ -254,8 +254,14 @@ impl SlaveStatusTracker {
         Ok(())
     }
 
-    /// Compares `document` with the digest persisted for the last applied
-    /// bundle.
+    /// Compares `document`'s shared projection with the digest persisted for
+    /// the last applied bundle.
+    ///
+    /// Node-local fields (identity, `[ha]`, listener/TLS/ACME, web bind
+    /// settings, MikroTik credentials and per-client secrets) are excluded:
+    /// editing only those must not force a full re-apply. A shared-field edit
+    /// (upstreams, filtering, shared runtime policy) changes the projection and
+    /// forces a full apply.
     ///
     /// Returns `true` when drift was detected (and marks the tracker
     /// `Degraded`/not-ready). A node with no watermark, or a watermark written
@@ -268,7 +274,7 @@ impl SlaveStatusTracker {
         else {
             return Ok(false);
         };
-        let actual = crate::bundle::config_digest(document);
+        let actual = crate::bundle::shared_config_digest(document);
         if actual == expected {
             self.local_config_drift
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -520,6 +526,55 @@ mod tests {
         assert_eq!(watermark.term, 0);
         assert_eq!(watermark.payload_hash, "abc123");
         assert!(watermark.timestamp > 0);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_node_local_edits_do_not_force_full_apply_but_shared_edits_do() {
+        let path = temp_path("shared-projection");
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        let applied = r#"config_version = 2
+[server]
+role = "slave"
+instance_name = "slave-1"
+
+[ha]
+master_url = "wss://master:8953"
+
+[upstream]
+servers = ["9.9.9.9"]
+"#;
+        tracker
+            .persist_watermark_with_config_digest(
+                5,
+                0,
+                "payload",
+                Some(&crate::bundle::shared_config_digest(applied)),
+            )
+            .unwrap();
+
+        let node_local = applied
+            .replace("slave-1", "slave-renamed")
+            .replace("wss://master:8953", "wss://other:8953");
+        assert!(
+            !tracker
+                .verify_applied_config(&node_local)
+                .expect("digest check"),
+            "node-local edits must not force a full apply"
+        );
+        assert!(!tracker.requires_full_apply());
+
+        let shared = applied.replace("9.9.9.9", "1.1.1.1");
+        assert!(
+            tracker
+                .verify_applied_config(&shared)
+                .expect("digest check"),
+            "a shared-field edit must be detected as drift"
+        );
+        assert!(tracker.requires_full_apply());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

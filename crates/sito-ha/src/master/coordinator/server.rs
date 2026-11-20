@@ -4,7 +4,9 @@
 use super::*;
 
 /// Maximum concurrently accepted slave connections (handshake + session).
-const MAX_SLAVE_CONNECTIONS: usize = 64;
+/// Maximum simultaneously admitted/handshaking HA connections across all peers
+/// (listener-level semaphore). Slots are released when the session ends.
+pub(super) const MAX_SLAVE_CONNECTIONS: usize = 64;
 /// Upper bound on the TLS handshake and WebSocket upgrade of a slave
 /// connection; a slowloris peer must not pin a task or socket indefinitely.
 const MASTER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

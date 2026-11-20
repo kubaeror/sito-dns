@@ -278,6 +278,9 @@ fn ha_publish_status(
         status: report.status,
         error: report.error,
         retry_at: report.retry_at,
+        slaves_connected: report.slaves_connected,
+        slaves_queued: report.slaves_queued,
+        slaves_coalesced: report.slaves_coalesced,
     })
 }
 

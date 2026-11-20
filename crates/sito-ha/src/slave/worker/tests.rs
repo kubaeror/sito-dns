@@ -8,7 +8,10 @@ use super::session::{
 };
 use super::stats::build_stats_report;
 use super::{SlaveAppHandles, SlaveConfigApplier, spawn_slave_worker};
-use crate::bundle::{ConfigBundle, build_and_sign_push, push_payload_hash};
+use crate::bundle::{
+    ConfigBundle, build_and_sign_push, push_payload_hash, shared_config_digest,
+    signing_key_fingerprint,
+};
 use crate::config::HaConfig;
 use crate::error::HaError;
 use crate::protocol::{AckConflict, HaMessage};
@@ -1703,6 +1706,97 @@ async fn test_stale_master_push_is_rejected_without_overwriting() {
         5,
         "the stale push must not advance the watermark"
     );
+
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+/// An unmodified restart must take the same-version early-ACK path: the
+/// watermark proves the shared configuration already matches, so no full apply
+/// may run.
+#[tokio::test]
+async fn test_unmodified_restart_early_acks_without_full_apply() {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_ha_early_ack_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let watermark_path = dir.join("ha_watermark.toml");
+    let applied_doc = "config_version = 2\n[server]\nrole = \"slave\"\n";
+    let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+    let push = build_and_sign_push(&test_bundle(5, applied_doc, None, None), &signing_key).unwrap();
+    let payload_hash = push_payload_hash(&push).unwrap();
+
+    let original = SlaveStatusTracker::new("slave-restart".to_string(), 0, None)
+        .with_watermark_path(watermark_path.clone())
+        .unwrap();
+    original
+        .persist_watermark_with_identity(
+            5,
+            0,
+            &payload_hash,
+            Some(&shared_config_digest(applied_doc)),
+            Some(&signing_key_fingerprint(&signing_key.public_key())),
+        )
+        .unwrap();
+
+    // Restart restores the watermark; nothing changed on disk.
+    let restarted = SlaveStatusTracker::new("slave-restart".to_string(), 0, None)
+        .with_watermark_path(watermark_path.clone())
+        .unwrap();
+    assert!(
+        !restarted.requires_full_apply(),
+        "an unmodified restart must be eligible for the early-ACK path"
+    );
+
+    let mut handles = test_handles(None).await;
+    let observation = Arc::new(std::sync::Mutex::new(None));
+    handles.applier = Arc::new(RecordingApplier {
+        observation: observation.clone(),
+        tracker: restarted.clone(),
+    });
+
+    let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        slave_socket,
+        Role::Client,
+        Some(ws_config()),
+    )
+    .await;
+    let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        peer_socket,
+        Role::Server,
+        Some(ws_config()),
+    )
+    .await;
+
+    restarted.set_state(SlaveState::HelloSent);
+    handle_master_message(
+        &push.to_json().unwrap(),
+        &mut ws,
+        &restarted,
+        &handles,
+        Some(&signing_key.public_key()),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        observation.lock().unwrap().is_none(),
+        "an unmodified restart must not run the full apply path"
+    );
+    assert_eq!(restarted.get_state(), SlaveState::Synced);
+    let ack = read_ack(&mut peer).await;
+    assert!(matches!(
+        ack,
+        HaMessage::Ack {
+            version: 5,
+            applied: true,
+            ..
+        }
+    ));
 
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }

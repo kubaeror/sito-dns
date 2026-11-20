@@ -3,6 +3,18 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Counts returned by a broadcast attempt.
+///
+/// `queued` counts direct channel enqueues, `coalesced` counts deferred
+/// fallback tasks, and `connected` is the number of tracked slave entries.
+/// Delivery is acknowledged separately by the slave's ACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BroadcastOutcome {
+    pub connected: usize,
+    pub queued: usize,
+    pub coalesced: usize,
+}
+
 impl MasterCoordinator {
     /// Records a divergence for one instance, keeping the most severe kind and
     /// version that instance reported.
@@ -246,20 +258,25 @@ impl MasterCoordinator {
     /// This is the variant API/config callers use: a `TooLarge` outcome is not
     /// a transport error, it is a configuration that cannot be replicated and
     /// must be treated as an apply error by the caller. Publication failures
-    /// are also recorded in HA readiness.
+    /// are also recorded in HA readiness. `TooLarge` is deliberately not
+    /// retried in the background: retrying the same document cannot shrink it,
+    /// so the caller must change the configuration.
     pub async fn publish_bundle_async(
         &self,
         bundle: ConfigBundle,
     ) -> Result<PublishOutcome, HaError> {
         match self.update_bundle_async_inner(bundle).await {
-            Ok((version, notified)) => {
+            Ok((version, broadcast)) => {
                 self.set_publish_error(None);
-                if notified == 0 {
+                if broadcast.connected == 0 {
                     Ok(PublishOutcome::NoSlaves)
                 } else {
                     Ok(PublishOutcome::Published {
                         version,
                         term: self.get_current_term(),
+                        slaves_connected: broadcast.connected,
+                        slaves_queued: broadcast.queued,
+                        slaves_coalesced: broadcast.coalesced,
                     })
                 }
             }
@@ -279,7 +296,7 @@ impl MasterCoordinator {
     pub(super) async fn update_bundle_async_inner(
         &self,
         bundle: ConfigBundle,
-    ) -> Result<(u64, usize), HaError> {
+    ) -> Result<(u64, BroadcastOutcome), HaError> {
         let _persist_guard = self.persist_lock.lock().await;
 
         let (bundle, version, push_msg, previous_version) = {
@@ -330,30 +347,48 @@ impl MasterCoordinator {
 
         self.record_published_version(version);
 
-        // Broadcast to all active slaves
-        let notified = self.broadcast(&push_msg);
+        // Broadcast to all active slaves. Keep connected/queued/coalesced
+        // counts distinct: a connected slave with a closed channel must not
+        // turn the outcome into NoSlaves.
+        let broadcast = self.broadcast_with_counts(&push_msg);
 
         info!(
             version,
+            connected = broadcast.connected,
+            queued = broadcast.queued,
+            coalesced = broadcast.coalesced,
             "Master updated configuration bundle and broadcasted push to connected slaves"
         );
 
-        Ok((version, notified))
+        Ok((version, broadcast))
     }
 
     /// Broadcasts a message to all connected slaves.
     ///
     /// Returns the number of slaves for which delivery was queued (a full
-    /// queue with a coalesced fallback task counts as queued).
+    /// queue with a coalesced fallback task counts as queued). This is a queue
+    /// count, not delivery confirmation.
     pub fn broadcast(&self, msg: &HaMessage) -> usize {
+        let outcome = self.broadcast_with_counts(msg);
+        outcome.queued + outcome.coalesced
+    }
+
+    /// Broadcasts a message and reports connected/queued/coalesced counts.
+    ///
+    /// A connected slave whose channel is already closed is counted in
+    /// `connected` only: it must not disappear from the publish outcome (that
+    /// would turn "all channels closed" into a misleading `NoSlaves`).
+    pub(super) fn broadcast_with_counts(&self, msg: &HaMessage) -> BroadcastOutcome {
         let message_bytes = wire_size(msg);
-        let mut notified = 0;
+        let mut queued = 0;
+        let mut coalesced = 0;
         let slaves = sito_core::sync::lock_or_recover(&self.slaves);
-        let mut queued = sito_core::sync::lock_or_recover(&self.queued_bytes);
+        let connected = slaves.len();
+        let mut queued_bytes = sito_core::sync::lock_or_recover(&self.queued_bytes);
         for slave in slaves.values() {
             let instance = &slave.instance;
             let session = (instance.clone(), slave.connection_id);
-            let current = queued.get(&session).copied().unwrap_or(0);
+            let current = queued_bytes.get(&session).copied().unwrap_or(0);
             if message_bytes > 0 && current.saturating_add(message_bytes) > MAX_SLAVE_QUEUE_BYTES {
                 // The per-slave byte budget is exhausted even though the
                 // message-count channel may still have room: coalesce instead
@@ -366,15 +401,15 @@ impl MasterCoordinator {
                     "HA push byte budget exhausted; scheduling coalesced delivery"
                 );
                 self.schedule_coalesced_delivery(instance, slave.connection_id, &slave.sender, msg);
-                notified += 1;
+                coalesced += 1;
                 continue;
             }
             match slave.sender.try_send(msg.clone()) {
                 Ok(()) => {
                     if message_bytes > 0 {
-                        *queued.entry(session).or_insert(0) += message_bytes;
+                        *queued_bytes.entry(session).or_insert(0) += message_bytes;
                     }
-                    notified += 1;
+                    queued += 1;
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // Queue is full: do not silently drop the update. Coalesce
@@ -389,14 +424,18 @@ impl MasterCoordinator {
                     );
                     // The push will be delivered by the coalesced fallback
                     // task (either this one or one already pending).
-                    notified += 1;
+                    coalesced += 1;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     debug!(instance = %slave.instance, "HA push channel closed");
                 }
             }
         }
-        notified
+        BroadcastOutcome {
+            connected,
+            queued,
+            coalesced,
+        }
     }
 
     /// Queues `msg` for one slave session and records its wire size in the

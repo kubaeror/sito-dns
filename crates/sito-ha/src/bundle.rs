@@ -275,6 +275,73 @@ pub fn seal_bundle_identity(bundle: &mut ConfigBundle, master_pubkey: &[u8]) {
     bundle.signing_key_fingerprint = signing_key_fingerprint(master_pubkey);
 }
 
+/// `[web]` keys that describe this node rather than cluster-shared state.
+///
+/// Kept here (next to the shared-projection digest) and reused by the merge
+/// code so the digest and the merge cannot disagree about which fields are
+/// node-local.
+pub(crate) const NODE_LOCAL_WEB_KEYS: [&str; 7] = [
+    "enabled",
+    "bind",
+    "port",
+    "trusted_proxies",
+    "metrics_auth",
+    "public_url",
+    "tls_terminated_by_proxy",
+];
+
+/// Computes the digest of the *shared* projection of a persisted document.
+///
+/// The applied document contains node-local settings merged back from this
+/// node (`[ha]`, identity/data_dir, listener/TLS/ACME identity, web bind
+/// settings, MikroTik credentials and per-client secrets). A local edit to
+/// those fields must not force a full re-apply; a change to shared state
+/// (upstreams, filtering, shared runtime policy) must. The watermark stores
+/// this projection digest instead of the raw document digest.
+///
+/// An unparseable document falls back to the raw digest so a corrupt file still
+/// compares as drifted (and then fails validation on re-apply rather than being
+/// silently accepted).
+#[must_use]
+pub fn shared_config_digest(document: &str) -> String {
+    let Ok(mut table) = document.parse::<toml::Table>() else {
+        return config_digest(document);
+    };
+
+    table.remove("ha");
+    table.remove("tls");
+    table.remove("acme");
+
+    if let Some(server) = table.get_mut("server").and_then(toml::Value::as_table_mut) {
+        server.remove("instance_name");
+        server.remove("data_dir");
+    }
+    if let Some(dns) = table.get_mut("dns").and_then(toml::Value::as_table_mut) {
+        dns.remove("bind");
+        dns.remove("tls");
+    }
+    if let Some(web) = table.get_mut("web").and_then(toml::Value::as_table_mut) {
+        for key in NODE_LOCAL_WEB_KEYS {
+            web.remove(key);
+        }
+    }
+    let empty_integrations = table
+        .get_mut("integrations")
+        .and_then(toml::Value::as_table_mut)
+        .is_some_and(|integrations| {
+            integrations.remove("mikrotik");
+            integrations.is_empty()
+        });
+    if empty_integrations {
+        table.remove("integrations");
+    }
+    if let Some(clients) = table.get_mut("clients").and_then(toml::Value::as_table_mut) {
+        clients.remove("client_id_secrets");
+    }
+
+    toml::to_string(&table).map_or_else(|_| config_digest(document), |s| config_digest(&s))
+}
+
 /// Extracts the signed payload hash from a `ConfigPush` envelope.
 pub fn push_payload_hash(push: &HaMessage) -> Result<String, HaError> {
     match push {
@@ -830,6 +897,71 @@ password = "mikrotik_secret_password"
         let wrong_key = Ed25519SigningKey::generate().unwrap();
         let sig_err = verify_and_unpack_push(&push_msg, 9, &wrong_key.public_key());
         assert!(sig_err.is_err());
+    }
+
+    #[test]
+    fn test_shared_config_digest_ignores_node_local_edits() {
+        let base = r#"config_version = 2
+[server]
+role = "slave"
+instance_name = "slave-a"
+data_dir = "/var/lib/sito"
+
+[ha]
+master_url = "wss://master:8953"
+
+[upstream]
+servers = ["9.9.9.9"]
+
+[dns]
+bind = ["0.0.0.0:53"]
+
+[dns.tls]
+cert = "/node/local.crt"
+
+[web]
+bind = "127.0.0.1"
+port = 8080
+
+[clients.client_id_secrets]
+laptop = "node-secret"
+
+[integrations.mikrotik]
+host = "192.168.88.1"
+token = "node-token"
+"#;
+        let digest = shared_config_digest(base);
+
+        // Node-local edits: identity, [ha], listener/TLS, web bind, MikroTik
+        // credentials and per-client secrets.
+        let node_local = base
+            .replace("slave-a", "slave-renamed")
+            .replace("/var/lib/sito", "/srv/sito")
+            .replace("wss://master:8953", "wss://other-master:8953")
+            .replace("0.0.0.0:53", "127.0.0.1:5353")
+            .replace("/node/local.crt", "/etc/other.crt")
+            .replace("127.0.0.1", "0.0.0.0")
+            .replace("8080", "9090")
+            .replace("node-secret", "rotated-secret")
+            .replace("node-token", "rotated-token");
+        assert_eq!(
+            shared_config_digest(&node_local),
+            digest,
+            "node-local edits must not force a full apply"
+        );
+
+        // Shared-field edits must change the projection digest.
+        for shared_edit in [
+            base.replace("9.9.9.9", "1.1.1.1"),
+            base.replace("role = \"slave\"", "role = \"master\""),
+            format!("{base}\n[filtering]\ncustom_rules = [\"||blocked.example^\"]\n"),
+        ] {
+            assert_ne!(
+                shared_config_digest(&shared_edit),
+                digest,
+                "a shared-field edit must be detected as drift"
+            );
+        }
     }
 
     #[test]

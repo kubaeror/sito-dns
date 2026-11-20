@@ -25,7 +25,7 @@ use sito_filter::HostsFilterEngine;
 use sito_ha::{
     ConfigBundle, Ed25519SigningKey, FilterListMetadata, HaConfig, HaMessage, MasterCoordinator,
     PublishOutcome, SlaveAppHandles, SlaveConfigApplier, SlaveState, SlaveStatusTracker,
-    build_and_sign_push, config_digest, push_payload_hash, spawn_slave_worker,
+    build_and_sign_push, push_payload_hash, shared_config_digest, spawn_slave_worker,
 };
 use sito_rewrites::RewriteTable;
 use sito_stats::{MetricsRegistry, QueryLogWriter, StatsDb};
@@ -227,7 +227,7 @@ servers = ["9.9.9.9"]
             5,
             0,
             &payload_hash,
-            Some(&config_digest(applied_doc)),
+            Some(&shared_config_digest(applied_doc)),
         )
         .unwrap();
 

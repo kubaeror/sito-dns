@@ -416,7 +416,8 @@ pub struct ConfigUpdateResponse {
 /// Outcome of publishing a configuration to HA replica slaves.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct HaPublishStatus {
-    /// `published`, `no_slaves` or `failed`.
+    /// `queued`, `no_slaves` or `failed`. `queued` is a queue outcome, not
+    /// proof of delivery; delivery is confirmed by the slave ACK.
     pub status: String,
     /// Human-readable failure reason. Never contains secret material.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -424,6 +425,15 @@ pub struct HaPublishStatus {
     /// RFC3339 timestamp of the first background retry, when one is scheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_at: Option<String>,
+    /// Connected slaves observed during the publish (including closed channels).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slaves_connected: Option<usize>,
+    /// Slaves with a direct channel enqueue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slaves_queued: Option<usize>,
+    /// Slaves scheduled for coalesced/deferred delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slaves_coalesced: Option<usize>,
 }
 
 /// Full configuration response with secrets masked.
