@@ -3,6 +3,20 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+/// Trim a rejection reason to the WebSocket close-frame payload limit.
+fn close_reason(reason: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    if reason.chars().count() <= MAX_CHARS {
+        return reason.to_string();
+    }
+    let mut truncated: String = reason.chars().take(MAX_CHARS - 3).collect();
+    truncated.push_str("...");
+    truncated
+}
+
 /// Reads and parses the opening Hello frame within the handshake deadline.
 async fn read_hello<S>(
     ws_stream: &mut tokio_tungstenite::WebSocketStream<S>,
@@ -84,8 +98,21 @@ impl MasterCoordinator {
         let Some(hello) = read_hello(&mut ws_stream, peer_addr).await else {
             return;
         };
-        let Some(session) = SessionMachine::admit(self, peer_addr, hello) else {
-            return;
+        let session = match SessionMachine::admit(self, peer_addr, hello) {
+            Ok(session) => session,
+            Err(reason) => {
+                // A bad peer must never fail the listener or the coordinator's
+                // own readiness. Close this connection with the actionable
+                // reason (WebSocket close payloads are capped at 123 bytes) and
+                // keep accepting other slaves.
+                warn!(peer = %peer_addr, "{reason}");
+                let frame = WsMessage::Close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: close_reason(&reason).into(),
+                }));
+                let _ = send_frame(&mut ws_stream, frame, "master", "rejection close").await;
+                return;
+            }
         };
         let mut rx = session.register();
 

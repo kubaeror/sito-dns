@@ -32,7 +32,7 @@ use crate::error::HaError;
 use crate::master::tracker::{ActiveSlave, SlaveStatsSummary, SlaveSummary};
 use crate::protocol::{AckConflict, HaMessage};
 use crate::readiness::{HaReadiness, HaReadinessState};
-use crate::session::{frame_text, send_ha_message, wire_size};
+use crate::session::{frame_text, send_frame, send_ha_message, wire_size};
 use crate::transport::{MAX_WS_MESSAGE_SIZE, build_server_tls_config, ws_config};
 
 pub use sito_ha_types::status::{PublishOutcome, ResyncOutcome};
@@ -75,14 +75,15 @@ struct PublishedEnvelope {
     payload_hash: String,
 }
 
-/// On-disk master state.
+/// On-disk master state for HA protocol v2.
 ///
-/// `ConfigBundle` is flattened so files written by 1.9.3 (a bare bundle JSON
-/// document) still deserialize. New writes add the signing-key identity; an
-/// older reader ignores the unknown top-level field.
+/// The bundle is nested instead of flattened so a v1 binary (which expects a
+/// bare `ConfigBundle` at the top level) fails with missing fields instead of
+/// silently reading v2 state. `protocol_version` is required and checked on
+/// restore; v1 files are rejected with an actionable `protocol_mismatch`.
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedMasterState {
-    #[serde(flatten)]
+    protocol_version: u32,
     bundle: ConfigBundle,
     /// Hex Ed25519 public key that signed the persisted bundle/state.
     #[serde(default, skip_serializing_if = "Option::is_none")]

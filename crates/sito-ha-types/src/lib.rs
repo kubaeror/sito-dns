@@ -78,6 +78,7 @@ mod tests {
         );
 
         let bundle = ConfigBundle {
+            protocol_version: PROTOCOL_VERSION,
             version: 1,
             term: 2,
             timestamp: 3,
@@ -119,7 +120,48 @@ mod tests {
 
         assert_eq!(SlaveState::Synced.to_string(), "synced");
         assert!(HaReadiness::ready().ready);
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn protocol_v2_state_and_bundle_reject_v1_shapes() {
+        let default_bundle = ConfigBundle::default();
+        assert_eq!(default_bundle.protocol_version, PROTOCOL_VERSION);
+
+        // v1 signed payloads have no protocol_version and must not deserialize
+        // as a v2 bundle.
+        let legacy_bundle = r#"{"version":7,"timestamp":1,"config_toml":"config_version = 2\n","custom_rules":[],"lists":[]}"#;
+        assert!(ConfigBundle::from_json(legacy_bundle).is_err());
+
+        let watermark = AppliedWatermark {
+            protocol_version: PROTOCOL_VERSION,
+            version: 7,
+            term: 1,
+            payload_hash: "abc".to_string(),
+            timestamp: 1,
+            forked: false,
+            forked_at_version: 0,
+            applied_config_digest: None,
+        };
+        let json = serde_json::to_string(&watermark).expect("serialize watermark");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse json");
+        assert_eq!(value["protocol_version"], 2);
+        assert_eq!(
+            value["watermark"]["version"], 7,
+            "v2 watermarks are wrapped so v1 binaries fail instead of silently reading them"
+        );
+        assert_eq!(
+            serde_json::from_str::<AppliedWatermark>(&json).expect("roundtrip"),
+            watermark
+        );
+
+        // A v1 flat watermark (or a future protocol version) is rejected.
+        let legacy_watermark = r#"{"version":7,"payload_hash":"abc","timestamp":1}"#;
+        assert!(serde_json::from_str::<AppliedWatermark>(legacy_watermark).is_err());
+        let other_version = json.replace(r#""protocol_version":2"#, r#""protocol_version":3"#);
+        let err = serde_json::from_str::<AppliedWatermark>(&other_version)
+            .expect_err("a mismatched watermark protocol version must be rejected");
+        assert!(err.to_string().contains("protocol_mismatch"));
     }
 
     #[test]

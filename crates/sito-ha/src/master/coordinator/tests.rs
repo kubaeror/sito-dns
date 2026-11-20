@@ -16,6 +16,7 @@ fn test_coordinator() -> MasterCoordinator {
 
 fn test_bundle(version: u64) -> ConfigBundle {
     ConfigBundle {
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
         version,
         term: 0,
         timestamp: 1,
@@ -145,7 +146,7 @@ fn test_state_persists_and_restores_across_restart() {
 }
 
 #[test]
-fn test_restore_preserves_term_and_legacy_state_defaults_to_zero() {
+fn test_restore_preserves_term_and_rejects_v1_state() {
     let dir = std::env::temp_dir().join(format!(
         "sito_ha_term_state_{}_{}",
         std::process::id(),
@@ -157,7 +158,12 @@ fn test_restore_preserves_term_and_legacy_state_defaults_to_zero() {
 
     let mut promoted = test_bundle(5);
     promoted.term = 2;
-    std::fs::write(&state_path, serde_json::to_vec(&promoted).unwrap()).unwrap();
+    let persisted = PersistedMasterState {
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
+        bundle: promoted,
+        signing_key_pubkey: None,
+    };
+    std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
     let restored = MasterCoordinator::new(
         "test-master".to_string(),
         0,
@@ -168,8 +174,9 @@ fn test_restore_preserves_term_and_legacy_state_defaults_to_zero() {
     assert_eq!(restored.restore_state().unwrap(), Some(5));
     assert_eq!(restored.get_current_term(), 2);
 
-    // State written before terms existed has no `term` field and must load
-    // as epoch 0.
+    // State written by v1 is intentionally incompatible: it must be rejected
+    // with an actionable protocol_mismatch instead of silently restarting at
+    // version 0 or interpreting v1 fields with v2 semantics.
     let legacy = r#"{"version":6,"timestamp":1,"config_toml":"config_version = 2\n[server]\nrole = \"slave\"\n","custom_rules":[],"lists":[]}"#;
     std::fs::write(&state_path, legacy).unwrap();
     let legacy_restored = MasterCoordinator::new(
@@ -179,8 +186,13 @@ fn test_restore_preserves_term_and_legacy_state_defaults_to_zero() {
         sito_stats::MetricsRegistry::new("test", "test"),
     )
     .with_state_path(state_path.clone());
-    assert_eq!(legacy_restored.restore_state().unwrap(), Some(6));
-    assert_eq!(legacy_restored.get_current_term(), 0);
+    let err = legacy_restored
+        .restore_state()
+        .expect_err("v1 master state must not be read by a v2 binary");
+    assert!(
+        matches!(err, HaError::Validation { ref field, ref reason } if field == "ha_protocol_version" && reason.contains("protocol_mismatch")),
+        "unexpected error: {err:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -433,10 +445,10 @@ async fn test_conflict_restore_persists_active_bundle() {
         .clone()
         .expect("active bundle");
     assert_eq!(active.version, 3);
-    let persisted: ConfigBundle =
+    let persisted: PersistedMasterState =
         serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
     assert_eq!(
-        persisted, active,
+        persisted.bundle, active,
         "the restored state file must contain the active bundle"
     );
 
@@ -2137,6 +2149,88 @@ fn test_slave_summary_flags_diverged_slave() {
 }
 
 #[tokio::test]
+async fn test_master_rejects_v1_slave_and_keeps_listening() {
+    let port = sito_test_support::reserve_port_number().unwrap();
+    let coordinator = test_coordinator();
+    let master_cfg = HaConfig {
+        replication_port: port,
+        listen_addr: "127.0.0.1".to_string(),
+        allow_insecure_ws: true,
+        ..Default::default()
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let _server = spawn_master_server(master_cfg, coordinator.clone(), shutdown_rx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A v1 slave omits `protocol_version`: it must be rejected with an
+    // actionable close frame instead of being admitted with v2 semantics.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("connect to master");
+    let v1_hello = r#"{"type":"hello","instance":"v1-slave","have_version":0,"capabilities":[],"role":"slave"}"#;
+    ws.send(WsMessage::Text(v1_hello.into())).await.unwrap();
+
+    let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("master must close a v1 slave")
+        .expect("close frame")
+        .expect("valid frame");
+    match frame {
+        WsMessage::Close(Some(frame)) => assert!(
+            frame.reason.to_string().contains("protocol_mismatch"),
+            "close reason must be actionable: {}",
+            frame.reason
+        ),
+        other => panic!("expected a protocol_mismatch close frame, got {other:?}"),
+    }
+    assert_eq!(coordinator.connected_slave_count(), 0);
+    assert!(
+        coordinator.readiness().ready,
+        "a bad peer must not make the master itself unready"
+    );
+    let rendered = coordinator.metrics.render_prometheus();
+    assert!(
+        rendered.contains(
+            r#"sito_ha_protocol_rejections_total{role="master",reason="version_mismatch"} 1"#
+        ),
+        "the rejection must be observable: {rendered}"
+    );
+
+    // The listener must keep serving: a v2 slave that connects next is
+    // admitted normally.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("listener must stay alive after a rejection");
+    let hello = HaMessage::Hello {
+        instance: "v2-slave".to_string(),
+        have_version: 0,
+        have_term: 0,
+        capabilities: vec![],
+        token: None,
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+    };
+    ws2.send(WsMessage::Text(hello.to_json().unwrap().into()))
+        .await
+        .unwrap();
+    let admitted = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if coordinator.connected_slave_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        admitted.is_ok(),
+        "a subsequent valid connection must not be frozen out"
+    );
+
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
 async fn test_master_rejects_oversized_websocket_hello() {
     let port = sito_test_support::reserve_port_number().unwrap();
     let coordinator = test_coordinator().with_token(Some("tok".to_string()));
@@ -2222,11 +2316,12 @@ fn test_restore_rejects_u64_max_state_instead_of_freezing() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let state_path = dir.join("ha_state.toml");
-    std::fs::write(
-        &state_path,
-        serde_json::to_vec(&test_bundle(u64::MAX)).unwrap(),
-    )
-    .unwrap();
+    let persisted = PersistedMasterState {
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
+        bundle: test_bundle(u64::MAX),
+        signing_key_pubkey: None,
+    };
+    std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
 
     let coordinator = test_coordinator().with_state_path(state_path);
     let err = coordinator

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::crypto::{Ed25519SigningKey, verify_ed25519_signature};
 use crate::error::HaError;
-use crate::protocol::HaMessage;
+use crate::protocol::{HaMessage, PROTOCOL_VERSION};
 
 pub use sito_ha_types::bundle::{AppliedWatermark, ConfigBundle, FilterListMetadata};
 
@@ -114,6 +114,7 @@ pub fn build_config_bundle(
 
     #[allow(clippy::cast_sign_loss)]
     let mut bundle = ConfigBundle {
+        protocol_version: PROTOCOL_VERSION,
         version,
         term,
         timestamp: chrono::Utc::now().timestamp_millis() as u64,
@@ -285,6 +286,7 @@ pub fn build_and_sign_push(
 
     Ok(HaMessage::ConfigPush {
         version: bundle.version,
+        protocol_version: bundle.protocol_version,
         term: bundle.term,
         hash_blake3: hash_hex.clone(),
         signature_ed25519: sig_hex,
@@ -299,29 +301,51 @@ fn verify_and_unpack_push_inner(
     push: &HaMessage,
     master_pubkey: &[u8],
 ) -> Result<(ConfigBundle, String), HaError> {
-    let (version, term, signature_ed25519, payload_b64, payload_hash_blake3, envelope_hash) =
-        match push {
-            HaMessage::ConfigPush {
-                version,
-                term,
-                signature_ed25519,
-                payload_b64,
-                payload_hash_blake3,
-                hash_blake3,
-            } => (
-                *version,
-                *term,
-                signature_ed25519,
-                payload_b64,
-                payload_hash_blake3,
-                hash_blake3,
-            ),
-            other => {
-                return Err(HaError::Protocol(format!(
-                    "Expected ConfigPush message, got: {other:?}"
-                )));
-            }
+    let (
+        version,
+        protocol_version,
+        term,
+        signature_ed25519,
+        payload_b64,
+        payload_hash_blake3,
+        envelope_hash,
+    ) = match push {
+        HaMessage::ConfigPush {
+            version,
+            protocol_version,
+            term,
+            signature_ed25519,
+            payload_b64,
+            payload_hash_blake3,
+            hash_blake3,
+        } => (
+            *version,
+            *protocol_version,
+            *term,
+            signature_ed25519,
+            payload_b64,
+            payload_hash_blake3,
+            hash_blake3,
+        ),
+        other => {
+            return Err(HaError::Protocol(format!(
+                "Expected ConfigPush message, got: {other:?}"
+            )));
+        }
+    };
+
+    // Refuse to interpret a v1 (or future) envelope with v2 semantics before
+    // decoding its payload or touching local state.
+    if protocol_version != PROTOCOL_VERSION {
+        let peer_version = if protocol_version == 0 {
+            1
+        } else {
+            protocol_version
         };
+        return Err(HaError::Protocol(format!(
+            "protocol_mismatch: config push speaks HA protocol v{peer_version} but this node requires v{PROTOCOL_VERSION}; upgrade the master or this slave"
+        )));
+    }
 
     if version == u64::MAX {
         return Err(HaError::Validation {
@@ -374,6 +398,21 @@ fn verify_and_unpack_push_inner(
         .map_err(|e| HaError::Serialization(format!("Bundle payload is not valid UTF-8: {e}")))?;
 
     let bundle = ConfigBundle::from_json(bundle_str)?;
+
+    // A v1 signed payload has no `protocol_version` and fails above; this also
+    // catches a payload that explicitly claims another protocol version.
+    if bundle.protocol_version != PROTOCOL_VERSION {
+        return Err(HaError::Protocol(format!(
+            "protocol_mismatch: signed bundle carries HA protocol v{} but this node requires v{PROTOCOL_VERSION}",
+            bundle.protocol_version
+        )));
+    }
+    if bundle.protocol_version != protocol_version {
+        return Err(HaError::Protocol(format!(
+            "protocol_mismatch: envelope protocol v{protocol_version} does not match signed bundle protocol v{} (tampering rejected)",
+            bundle.protocol_version
+        )));
+    }
 
     // 5. Envelope/payload version binding: the version the monotonicity guard
     // checked must be the same one actually carried inside the signed payload,
@@ -524,15 +563,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_legacy_bundle_without_term_verifies_as_term_zero() {
+    fn test_v1_bundle_is_rejected_by_protocol_v2() {
         let signing_key = Ed25519SigningKey::generate().unwrap();
-        // A payload produced by a pre-term master: no `term` field.
+        // A payload produced by a v1 master: no `protocol_version` field.
         let payload = r#"{"version":7,"timestamp":1,"config_toml":"config_version = 2\n[server]\nrole = \"slave\"\n","custom_rules":[],"lists":[]}"#;
         let hash = blake3::hash(payload.as_bytes());
         let hash_hex = hash.to_hex().to_string();
         let sig = signing_key.sign(hash.as_bytes());
         let push = HaMessage::ConfigPush {
             version: 7,
+            protocol_version: 1,
             term: 0,
             hash_blake3: hash_hex.clone(),
             signature_ed25519: hex::encode(sig),
@@ -540,13 +580,18 @@ mod tests {
             payload_hash_blake3: hash_hex,
         };
 
-        let bundle = verify_and_unpack_push(&push, 6, &signing_key.public_key())
-            .expect("a legacy term-less bundle must remain verifiable");
-        assert_eq!(bundle.term, 0, "missing term must default to epoch 0");
+        let err = verify_and_unpack_push(&push, 6, &signing_key.public_key())
+            .expect_err("a v1 signed bundle must not be interpreted with v2 semantics");
+        assert!(
+            matches!(err, HaError::Protocol(ref reason) if reason.contains("protocol_mismatch")),
+            "unexpected error: {err:?}"
+        );
 
-        let bundle =
-            verify_and_unpack_push_with_watermark(&push, None, &signing_key.public_key()).unwrap();
-        assert_eq!(bundle.term, 0);
+        let err = verify_and_unpack_push_with_watermark(&push, None, &signing_key.public_key())
+            .expect_err("v1 bundles are rejected with or without a watermark");
+        assert!(
+            matches!(err, HaError::Protocol(ref reason) if reason.contains("protocol_mismatch"))
+        );
     }
 
     #[test]
@@ -637,6 +682,7 @@ password = "mikrotik_secret_password"
         );
 
         let bundle = ConfigBundle {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version: 7,
             term: 0,
             timestamp: 123,
@@ -676,6 +722,7 @@ password = "mikrotik_secret_password"
         let signing_key = Ed25519SigningKey::generate().unwrap();
 
         let bundle = ConfigBundle {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version: 10,
             term: 0,
             timestamp: 123_456_789,
@@ -712,6 +759,7 @@ password = "mikrotik_secret_password"
         let signing_key = Ed25519SigningKey::generate().unwrap();
 
         let bundle = ConfigBundle {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version: 10,
             term: 0,
             timestamp: 123_456_789,
@@ -734,6 +782,7 @@ password = "mikrotik_secret_password"
                 payload_hash_blake3,
                 ..
             } => HaMessage::ConfigPush {
+                protocol_version: crate::protocol::PROTOCOL_VERSION,
                 version: 11,
                 term: 0,
                 hash_blake3,

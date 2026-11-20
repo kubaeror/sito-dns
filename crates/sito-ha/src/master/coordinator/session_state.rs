@@ -61,11 +61,16 @@ pub(super) struct SessionMachine<'a> {
 impl<'a> SessionMachine<'a> {
     /// Validates a Hello (protocol, role, token, version continuity) and
     /// returns a machine only when the peer may be admitted.
+    ///
+    /// Returns `Err(reason)` for a peer that must be closed. The reason is an
+    /// operator-facing, actionable `protocol_mismatch: ...` explanation where
+    /// applicable. A rejected peer is never registered and never affects the
+    /// coordinator's own readiness; the listener keeps serving other slaves.
     pub(super) fn admit(
         coordinator: &'a MasterCoordinator,
         peer_addr: SocketAddr,
         hello: HelloFields,
-    ) -> Option<Self> {
+    ) -> Result<Self, String> {
         let HelloFields {
             instance: slave_instance,
             have_version,
@@ -76,31 +81,34 @@ impl<'a> SessionMachine<'a> {
             protocol_version,
         } = hello;
 
-        // Protocol version negotiation
-        if let Some(version) = protocol_version
-            && version != crate::protocol::PROTOCOL_VERSION
-        {
-            warn!(
+        // Protocol version negotiation: a Hello without the field comes from a
+        // v1 slave, which is not compatible with v2 semantics.
+        let peer_version = protocol_version.unwrap_or(1);
+        if peer_version != crate::protocol::PROTOCOL_VERSION {
+            let reason = format!(
+                "protocol_mismatch: slave '{slave_instance}' speaks HA protocol v{peer_version} but this master requires v{}. Upgrade the slave (or this master) so both run the same HA protocol",
+                crate::protocol::PROTOCOL_VERSION
+            );
+            coordinator
+                .metrics
+                .inc_ha_protocol_rejection("master", "version_mismatch");
+            error!(
                 instance = %slave_instance,
                 peer = %peer_addr,
-                version,
+                version = peer_version,
                 expected = crate::protocol::PROTOCOL_VERSION,
-                "Rejecting slave with incompatible HA protocol version"
+                "{reason}"
             );
-            return None;
+            return Err(reason);
         }
 
         // Role validation: only replica slaves may connect.
         match role.as_deref() {
             Some("slave") => {}
             Some(other) => {
-                warn!(
-                    instance = %slave_instance,
-                    peer = %peer_addr,
-                    role = %other,
-                    "Rejecting HA connection with non-slave role"
-                );
-                return None;
+                return Err(format!(
+                    "invalid_role: instance '{slave_instance}' announced role '{other}'; only role \"slave\" may connect to a master"
+                ));
             }
             None => {
                 warn!(
@@ -117,12 +125,9 @@ impl<'a> SessionMachine<'a> {
             let tokens_match = provided.len() == required_token.len()
                 && bool::from(provided.as_bytes().ct_eq(required_token.as_bytes()));
             if !tokens_match {
-                warn!(
-                    instance = %slave_instance,
-                    peer = %peer_addr,
-                    "Slave authentication failed: invalid or missing token"
-                );
-                return None;
+                return Err(format!(
+                    "authentication_failed: slave '{slave_instance}' presented an invalid or missing token; check the shared [ha] slave_token"
+                ));
             }
         }
 
@@ -147,7 +152,9 @@ impl<'a> SessionMachine<'a> {
                 max_lead = MAX_PEER_VERSION_LEAD,
                 "Rejecting Hello with an implausible have_version"
             );
-            return None;
+            return Err(format!(
+                "implausible_version: slave '{slave_instance}' reported have_version {have_version}, more than {MAX_PEER_VERSION_LEAD} above this master's {current}; fix the slave's ha_state/watermark"
+            ));
         }
 
         // Term/version continuity is checked, never repaired automatically from
@@ -204,7 +211,7 @@ impl<'a> SessionMachine<'a> {
             capabilities,
             have_version,
         );
-        Some(Self {
+        Ok(Self {
             coordinator,
             state,
             ping_secs,

@@ -353,6 +353,9 @@ pub struct MetricsRegistry {
     ha_diverged: Arc<Mutex<BTreeMap<String, bool>>>,
     /// HA startup paths that left replication inactive, keyed by (role, reason).
     ha_startup_noop: Arc<Mutex<BTreeMap<(String, String), u64>>>,
+    /// HA peers rejected for an incompatible protocol version, keyed by
+    /// (role, reason code).
+    ha_protocol_rejections: Arc<Mutex<BTreeMap<(String, String), u64>>>,
     querylog_dropped: Arc<AtomicU64>,
     stats_retention_last_success_seconds: Arc<AtomicU64>,
     stats_retention_last_failure_seconds: Arc<AtomicU64>,
@@ -428,6 +431,7 @@ impl MetricsRegistry {
             ha_config_version: Arc::new(Mutex::new(BTreeMap::new())),
             ha_diverged: Arc::new(Mutex::new(BTreeMap::new())),
             ha_startup_noop: Arc::new(Mutex::new(BTreeMap::new())),
+            ha_protocol_rejections: Arc::new(Mutex::new(BTreeMap::new())),
             querylog_dropped: Arc::new(AtomicU64::new(0)),
             stats_retention_last_success_seconds: Arc::new(AtomicU64::new(0)),
             stats_retention_last_failure_seconds: Arc::new(AtomicU64::new(0)),
@@ -642,6 +646,17 @@ impl MetricsRegistry {
     /// `tls_init_failed`, `bind_failed`).
     pub fn inc_ha_startup_noop(&self, role: &str, reason: &str) {
         let mut map = sito_core::sync::lock_or_recover(&self.ha_startup_noop);
+        *map.entry((role.to_string(), reason.to_string()))
+            .or_insert(0) += 1;
+    }
+
+    /// Counts an HA peer rejected for an incompatible protocol version.
+    ///
+    /// `role` is the local side (`master`/`slave`) and `reason` is a fixed,
+    /// low-cardinality identifier (`version_mismatch`); the detailed,
+    /// operator-facing explanation is logged and sent in the close frame.
+    pub fn inc_ha_protocol_rejection(&self, role: &str, reason: &str) {
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_protocol_rejections);
         *map.entry((role.to_string(), reason.to_string()))
             .or_insert(0) += 1;
     }
@@ -1407,6 +1422,25 @@ impl MetricsRegistry {
             }
         }
 
+        // 17b. sito_ha_protocol_rejections_total
+        {
+            let map = sito_core::sync::lock_or_recover(&self.ha_protocol_rejections);
+            if !map.is_empty() {
+                out.push_str(
+                    "# HELP sito_ha_protocol_rejections_total HA peers rejected for an incompatible protocol version\n",
+                );
+                out.push_str("# TYPE sito_ha_protocol_rejections_total counter\n");
+                for ((role, reason), count) in map.iter() {
+                    let _ = writeln!(
+                        out,
+                        "sito_ha_protocol_rejections_total{{role=\"{}\",reason=\"{}\"}} {count}",
+                        escape_label_value(role),
+                        escape_label_value(reason)
+                    );
+                }
+            }
+        }
+
         // 18. sito_querylog_dropped_total
         out.push_str("# HELP sito_querylog_dropped_total Total query log entries dropped due to buffer overflow\n");
         out.push_str("# TYPE sito_querylog_dropped_total counter\n");
@@ -2022,6 +2056,27 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         reg.remove_ha_config_version(hostile);
         let rendered_after = reg.render_prometheus();
         assert!(!rendered_after.contains("evil"));
+    }
+
+    #[test]
+    fn test_ha_protocol_rejection_counter_renders_only_when_used() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        assert!(
+            !reg.render_prometheus()
+                .contains("sito_ha_protocol_rejections_total"),
+            "an unused rejection counter must not churn the scrape output"
+        );
+
+        reg.inc_ha_protocol_rejection("master", "version_mismatch");
+        reg.inc_ha_protocol_rejection("master", "version_mismatch");
+        reg.inc_ha_protocol_rejection("slave", "version_mismatch");
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains(
+            r#"sito_ha_protocol_rejections_total{role="master",reason="version_mismatch"} 2"#
+        ));
+        assert!(rendered.contains(
+            r#"sito_ha_protocol_rejections_total{role="slave",reason="version_mismatch"} 1"#
+        ));
     }
 
     #[test]

@@ -242,6 +242,7 @@ mod tests {
 
     fn test_bundle(version: u64) -> sito_ha::ConfigBundle {
         sito_ha::ConfigBundle {
+            protocol_version: sito_ha::PROTOCOL_VERSION,
             version,
             term: 0,
             timestamp: 1,

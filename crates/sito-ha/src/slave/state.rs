@@ -128,6 +128,7 @@ impl SlaveStatusTracker {
         #[allow(clippy::cast_sign_loss)]
         let timestamp = Utc::now().timestamp_millis() as u64;
         let mut watermark = self.get_watermark().unwrap_or(AppliedWatermark {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version,
             term,
             payload_hash: String::new(),
@@ -204,6 +205,7 @@ impl SlaveStatusTracker {
         #[allow(clippy::cast_sign_loss)]
         let timestamp = Utc::now().timestamp_millis() as u64;
         let watermark = AppliedWatermark {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version,
             term,
             payload_hash: payload_hash.trim_start_matches("blake3:").to_string(),
@@ -414,6 +416,7 @@ mod tests {
 
     fn bundle(version: u64) -> ConfigBundle {
         ConfigBundle {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version,
             term: 0,
             timestamp: 1,
@@ -651,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_watermark_without_term_loads_as_term_zero() {
+    fn test_v1_watermark_is_rejected_by_protocol_v2() {
         let path = temp_path("legacy");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -660,12 +663,13 @@ mod tests {
         )
         .unwrap();
 
-        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+        let err = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
             .with_watermark_path(path.clone())
-            .expect("a pre-term watermark must remain loadable");
-        assert_eq!(tracker.get_version(), 5);
-        assert_eq!(tracker.get_term(), 0);
-        assert_eq!(tracker.get_watermark().unwrap().term, 0);
+            .expect_err("a v1 watermark must not be read by a v2 binary");
+        assert!(
+            matches!(err, HaError::Validation { ref field, ref reason } if field == "ha_watermark" && reason.contains("protocol_version")),
+            "unexpected error: {err:?}"
+        );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

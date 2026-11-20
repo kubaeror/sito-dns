@@ -195,6 +195,7 @@ fn test_bundle(
     rewrites: Option<toml::Value>,
 ) -> ConfigBundle {
     ConfigBundle {
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
         version,
         term: 0,
         timestamp: 1,
@@ -1689,6 +1690,104 @@ async fn test_stale_master_push_is_rejected_without_overwriting() {
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 
+/// A v1 master must be rejected before its first push is applied, and the
+/// rejection must not latch: the next valid v2 push on a later session applies.
+#[tokio::test]
+async fn test_slave_rejects_v1_master_and_accepts_next_valid_push() {
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+    let tracker = SlaveStatusTracker::new("slave-v1-master".to_string(), 4, None);
+    let handles = test_handles(None).await;
+
+    let (slave_socket, peer_socket) = tokio::io::duplex(64 * 1024);
+    let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        slave_socket,
+        Role::Client,
+        Some(ws_config()),
+    )
+    .await;
+    let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        peer_socket,
+        Role::Server,
+        Some(ws_config()),
+    )
+    .await;
+
+    // A v1 master's ConfigPush has no protocol_version (deserialized as 0).
+    let v1_text = r#"{"type":"config_push","version":5,"term":0,"hash_blake3":"h","signature_ed25519":"s","payload_b64":"p","payload_hash_blake3":"h"}"#;
+    tracker.set_state(SlaveState::HelloSent);
+    let err = handle_master_message(v1_text, &mut ws, &tracker, &handles, None)
+        .await
+        .expect_err("a v1 master must be rejected before applying its push");
+    assert!(
+        err.to_string().contains("protocol_mismatch"),
+        "rejection must be actionable: {err}"
+    );
+    assert_eq!(
+        tracker.get_version(),
+        4,
+        "a rejected v1 push must not advance the applied version"
+    );
+    assert_ne!(
+        tracker.get_state(),
+        SlaveState::Synced,
+        "a rejected master must not leave the slave synced"
+    );
+    let readiness = tracker.readiness();
+    assert!(!readiness.ready);
+    assert!(
+        readiness
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("protocol_mismatch"),
+        "readiness must expose the protocol mismatch: {readiness:?}"
+    );
+    assert!(matches!(
+        read_ack(&mut peer).await,
+        HaMessage::Ack {
+            applied: false,
+            error: Some(ref error),
+            ..
+        } if error.contains("protocol_mismatch")
+    ));
+
+    // A later v2 connection (represented here by the next push on the same
+    // socket) is still accepted: the rejection is per-peer, not sticky.
+    let push = build_and_sign_push(
+        &test_bundle(
+            5,
+            "config_version = 2\n[server]\nrole = \"slave\"\n",
+            None,
+            None,
+        ),
+        &signing_key,
+    )
+    .unwrap();
+    tracker.set_state(SlaveState::HelloSent);
+    handle_master_message(
+        &push.to_json().unwrap(),
+        &mut ws,
+        &tracker,
+        &handles,
+        Some(&signing_key.public_key()),
+    )
+    .await
+    .expect("a subsequent v2 push must be accepted");
+    assert_eq!(tracker.get_version(), 5);
+    assert_eq!(tracker.get_state(), SlaveState::Synced);
+    assert!(tracker.readiness().ready);
+    assert!(matches!(
+        read_ack(&mut peer).await,
+        HaMessage::Ack {
+            version: 5,
+            applied: true,
+            ..
+        }
+    ));
+}
+
 /// The early-ACK path must reach `Synced`, but it must never clear a
 /// `Degraded` state without a successful apply.
 #[tokio::test]
@@ -1713,6 +1812,7 @@ async fn test_early_ack_marks_synced_but_keeps_degraded() {
     let tracker = SlaveStatusTracker::new("slave-early".to_string(), 5, None);
     let handles = test_handles(None).await;
     let push = HaMessage::ConfigPush {
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
         version: 5,
         term: 0,
         hash_blake3: "hash".to_string(),
@@ -1913,6 +2013,7 @@ async fn test_slave_rejects_oversized_push() {
         // Read the Hello, then send a valid but oversized push.
         let _ = ws.next().await;
         let big = HaMessage::ConfigPush {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version: 99,
             term: 0,
             hash_blake3: "h".to_string(),

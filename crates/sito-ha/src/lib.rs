@@ -138,6 +138,7 @@ mod tests {
 
         // Update bundle on master
         let bundle = ConfigBundle {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             version: 2,
             term: 0,
             timestamp: 12345,
@@ -447,6 +448,7 @@ mod tests {
         );
         coordinator
             .update_bundle(ConfigBundle {
+                protocol_version: crate::protocol::PROTOCOL_VERSION,
                 version: 2,
                 term: 0,
                 timestamp: 1,
@@ -526,6 +528,7 @@ mod tests {
         );
         coordinator
             .update_bundle(ConfigBundle {
+                protocol_version: crate::protocol::PROTOCOL_VERSION,
                 version: 2,
                 term: 0,
                 timestamp: 1,
@@ -605,6 +608,7 @@ mod tests {
         .with_token(Some("tok".to_string()));
         coordinator
             .update_bundle(ConfigBundle {
+                protocol_version: crate::protocol::PROTOCOL_VERSION,
                 version: 2,
                 term: 0,
                 timestamp: 1,
@@ -679,6 +683,7 @@ mod tests {
 
         coordinator
             .update_bundle(ConfigBundle {
+                protocol_version: crate::protocol::PROTOCOL_VERSION,
                 version: 2,
                 term: 0,
                 timestamp: 1,

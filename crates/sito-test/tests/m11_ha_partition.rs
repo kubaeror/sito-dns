@@ -105,6 +105,7 @@ fn signed_push(
 ) -> HaMessage {
     build_and_sign_push(
         &ConfigBundle {
+            protocol_version: sito_ha::PROTOCOL_VERSION,
             version,
             term,
             timestamp: 1,
@@ -320,11 +321,12 @@ servers = ["9.9.9.9"]
     std::fs::write(&config_path, applied_doc).unwrap();
     let push = signed_push(5, 0, applied_doc, vec![], &key);
     let payload_hash = push_payload_hash(&push).unwrap();
-    // A 1.9.3 watermark: no `applied_config_digest`.
+    // A pre-digest v2 watermark: wrapped with protocol_version but no
+    // `applied_config_digest`.
     std::fs::write(
         &watermark_path,
         format!(
-            r#"{{"version":5,"term":0,"payload_hash":"{payload_hash}","timestamp":1,"forked":false,"forked_at_version":0}}"#
+            r#"{{"protocol_version":2,"watermark":{{"version":5,"term":0,"payload_hash":"{payload_hash}","timestamp":1,"forked":false,"forked_at_version":0}}}}"#
         ),
     )
     .unwrap();
@@ -503,6 +505,7 @@ async fn test_delayed_same_version_fork_ack_after_newer_publish_is_divergence() 
 
 fn bundle(version: u64) -> ConfigBundle {
     ConfigBundle {
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version,
         term: 0,
         timestamp: 1,
@@ -575,6 +578,7 @@ async fn test_publish_bundle_propagates_sanitize_failure_and_rejects_oversize() 
     .with_state_path(state_path.clone());
 
     let oversized = ConfigBundle {
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version: 1,
         term: 0,
         timestamp: 1,

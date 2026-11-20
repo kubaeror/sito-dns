@@ -1,8 +1,10 @@
 //! Configuration bundle types shared by master and slave.
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::HaError;
+use crate::protocol::PROTOCOL_VERSION;
 
 /// Metadata for a filter list subscription included in the bundle.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -20,6 +22,12 @@ pub struct FilterListMetadata {
 /// and with all secrets redacted with `${SECRET:name}` placeholders.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigBundle {
+    /// HA protocol version that produced this bundle.
+    ///
+    /// Required: a v1 signed payload (which has no such field) fails to
+    /// deserialize instead of being interpreted with v2 semantics. The field is
+    /// signed as part of the bundle JSON.
+    pub protocol_version: u32,
     pub version: u64,
     /// Cluster epoch/term that produced this bundle.
     ///
@@ -39,6 +47,22 @@ pub struct ConfigBundle {
     pub clients: Option<toml::Value>,
     #[serde(default)]
     pub lists: Vec<FilterListMetadata>,
+}
+
+impl Default for ConfigBundle {
+    fn default() -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            version: 0,
+            term: 0,
+            timestamp: 0,
+            config_toml: String::new(),
+            custom_rules: Vec::new(),
+            rewrites: None,
+            clients: None,
+            lists: Vec::new(),
+        }
+    }
 }
 
 impl ConfigBundle {
@@ -89,13 +113,18 @@ fn strip_client_id_secrets(clients: &mut toml::Value) {
 /// configuration persisted, before the slave acknowledges it. On startup the
 /// slave restores this record so a restart cannot replay an older signed
 /// bundle or overwrite the applied configuration with stale content.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedWatermark {
+    /// HA protocol version that wrote this watermark.
+    ///
+    /// Required and checked on load. The on-disk shape is wrapped under
+    /// `{"protocol_version": 2, "watermark": { ... }}` so a v1 binary cannot
+    /// silently deserialize v2 state: v1 expects the fields at the top level
+    /// and fails with a missing-field error instead.
+    pub protocol_version: u32,
     /// Configuration version of the last successfully applied bundle.
     pub version: u64,
-    /// Cluster epoch/term of that bundle. Missing in watermark files written
-    /// before terms existed, which are interpreted as term 0.
-    #[serde(default)]
+    /// Cluster epoch/term of that bundle. Always present in v2 watermarks.
     pub term: u64,
     /// BLAKE3 hash of the signed bundle payload that produced `version`.
     pub payload_hash: String,
@@ -104,10 +133,8 @@ pub struct AppliedWatermark {
     /// Set when a same-version payload-hash mismatch proved that this node and
     /// its master are on different forks. All same-term pushes are rejected
     /// until an explicit higher-term promotion arrives.
-    #[serde(default)]
     pub forked: bool,
     /// Version at which the fork was detected.
-    #[serde(default)]
     pub forked_at_version: u64,
     /// BLAKE3 digest of the exact `config.toml` document this node persisted
     /// when it applied the bundle.
@@ -116,9 +143,89 @@ pub struct AppliedWatermark {
     /// means a local edit/revert changed the configuration while the process
     /// was stopped (or the file watcher applied one while running) and the
     /// slave must re-apply the master's bundle instead of early-ACKing
-    /// `Synced`. Missing in watermarks written before this field existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `Synced`. Always present when a digest was recorded.
     pub applied_config_digest: Option<String>,
+}
+
+impl Serialize for AppliedWatermark {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            version: u64,
+            term: u64,
+            payload_hash: &'a str,
+            timestamp: u64,
+            forked: bool,
+            forked_at_version: u64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            applied_config_digest: Option<&'a str>,
+        }
+
+        let mut state = serializer.serialize_struct("AppliedWatermark", 2)?;
+        state.serialize_field("protocol_version", &self.protocol_version)?;
+        state.serialize_field(
+            "watermark",
+            &Body {
+                version: self.version,
+                term: self.term,
+                payload_hash: &self.payload_hash,
+                timestamp: self.timestamp,
+                forked: self.forked,
+                forked_at_version: self.forked_at_version,
+                applied_config_digest: self.applied_config_digest.as_deref(),
+            },
+        )?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AppliedWatermark {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Envelope {
+            protocol_version: u32,
+            watermark: Body,
+        }
+
+        #[derive(Deserialize)]
+        struct Body {
+            version: u64,
+            #[serde(default)]
+            term: u64,
+            payload_hash: String,
+            timestamp: u64,
+            #[serde(default)]
+            forked: bool,
+            #[serde(default)]
+            forked_at_version: u64,
+            #[serde(default)]
+            applied_config_digest: Option<String>,
+        }
+
+        let envelope = Envelope::deserialize(deserializer)?;
+        if envelope.protocol_version != PROTOCOL_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "protocol_mismatch: watermark was written by HA protocol v{} but this node requires v{}; restore a v2 watermark/backup or delete it to force a full resync",
+                envelope.protocol_version, PROTOCOL_VERSION
+            )));
+        }
+        Ok(Self {
+            protocol_version: envelope.protocol_version,
+            version: envelope.watermark.version,
+            term: envelope.watermark.term,
+            payload_hash: envelope.watermark.payload_hash,
+            timestamp: envelope.watermark.timestamp,
+            forked: envelope.watermark.forked,
+            forked_at_version: envelope.watermark.forked_at_version,
+            applied_config_digest: envelope.watermark.applied_config_digest,
+        })
+    }
 }
 
 impl AppliedWatermark {

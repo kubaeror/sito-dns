@@ -417,6 +417,7 @@ key = "/etc/sito/certs/master.key"
     assert!(!sanitized.contains("secret_auth_token_xyz"));
 
     let clean_bundle = ConfigBundle {
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version: 1,
         term: 0,
         timestamp: 1000,
@@ -460,6 +461,7 @@ fn test_m8_monotonicity_guard_rejects_replay() {
     let pubkey = signing_key.public_key();
 
     let bundle = ConfigBundle {
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version: 5,
         term: 0,
         timestamp: 2000,
@@ -495,6 +497,7 @@ fn test_m8_monotonicity_guard_rejects_replay() {
     } = &push_msg
     {
         let fake_push = HaMessage::ConfigPush {
+            protocol_version: sito_ha::PROTOCOL_VERSION,
             version: *version,
             term: 0,
             hash_blake3: hash_blake3.clone(),
@@ -559,6 +562,7 @@ async fn test_m8_slave_rollback_on_invalid_bundle() {
 
     // Construct a corrupted bundle with invalid TOML syntax
     let corrupted_bundle = ConfigBundle {
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version: 2,
         term: 0,
         timestamp: 12345,
@@ -1322,6 +1326,7 @@ async fn test_m8_list_change_applied_to_two_slaves_fast() {
 
     // Now update bundle on master: add a new custom rule
     let bundle = ConfigBundle {
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version: 2,
         term: 0,
         timestamp: 12345,
@@ -1478,6 +1483,7 @@ nta = ["pushed.internal"]
 "#;
     let push = build_and_sign_push(
         &ConfigBundle {
+            protocol_version: sito_ha::PROTOCOL_VERSION,
             version: 2,
             term: 0,
             timestamp: 1,
@@ -1635,6 +1641,7 @@ servers = ["9.9.9.9"]
 "#;
     let push = build_and_sign_push(
         &ConfigBundle {
+            protocol_version: sito_ha::PROTOCOL_VERSION,
             version: 2,
             term: 0,
             timestamp: 1,
@@ -1739,6 +1746,7 @@ servers = ["9.9.9.9"]
 "#;
     let push = build_and_sign_push(
         &ConfigBundle {
+            protocol_version: sito_ha::PROTOCOL_VERSION,
             version: 2,
             term: 0,
             timestamp: 1,
@@ -1767,6 +1775,7 @@ servers = ["9.9.9.9"]
         default_auth_toml.replace("session_ttl_hours = 24", "session_ttl_hours = 1");
     let push = build_and_sign_push(
         &ConfigBundle {
+            protocol_version: sito_ha::PROTOCOL_VERSION,
             version: 3,
             term: 0,
             timestamp: 2,
@@ -1838,6 +1847,7 @@ async fn test_m8_push_before_listeners_fails_and_retries_after_ready() {
 
     let push = build_and_sign_push(
         &ConfigBundle {
+            protocol_version: sito_ha::PROTOCOL_VERSION,
             version: 2,
             term: 0,
             timestamp: 1,
@@ -1979,6 +1989,7 @@ async fn test_m8_chaos_master_mid_push_kill() {
 
     // Publish a bundle and kill the master while the push is in flight.
     let bundle = ConfigBundle {
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version: 2,
         term: 0,
         timestamp: 424_242,
@@ -2053,6 +2064,7 @@ async fn test_m8_slave_to_master_promotion_procedure() {
 
     // d. Promoted master creates and signs new bundle (version 3, term 1)
     let new_bundle = ConfigBundle {
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version: 3,
         term: 1,
         timestamp: 99999,
@@ -2067,6 +2079,7 @@ async fn test_m8_slave_to_master_promotion_procedure() {
 
     // A promoted master must never publish a stale/equal version again.
     let stale_bundle = ConfigBundle {
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version: 3,
         term: 1,
         timestamp: 100_000,
@@ -2084,6 +2097,7 @@ async fn test_m8_slave_to_master_promotion_procedure() {
     // A stale term-0 master cannot publish a higher version over the promoted
     // epoch.
     let stale_epoch_bundle = ConfigBundle {
+        protocol_version: sito_ha::PROTOCOL_VERSION,
         version: 4,
         term: 0,
         timestamp: 100_001,

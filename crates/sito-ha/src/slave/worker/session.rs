@@ -14,7 +14,7 @@ use crate::bundle::watermark_covers;
 use crate::config::HaConfig;
 use crate::crypto::parse_public_key;
 use crate::error::HaError;
-use crate::protocol::{AckConflict, HaMessage};
+use crate::protocol::{AckConflict, HaMessage, PROTOCOL_VERSION};
 use crate::session::{frame_text, send_frame, send_ha_message};
 use crate::slave::state::{SlaveState, SlaveStatusTracker};
 use crate::transport::{
@@ -479,12 +479,41 @@ where
         }
         HaMessage::ConfigPush {
             ref version,
+            protocol_version,
             ref term,
             ref payload_hash_blake3,
             ..
         } => {
             let target_version = *version;
             let push_term = *term;
+
+            // Verify the master's protocol before applying the first (or any)
+            // config push. A v1 master omits the field (deserialized as 0) and
+            // must never have its bundle interpreted with v2 semantics.
+            let master_version = if protocol_version == 0 {
+                1
+            } else {
+                protocol_version
+            };
+            if master_version != PROTOCOL_VERSION {
+                let reason = format!(
+                    "protocol_mismatch: master speaks HA protocol v{master_version} but this slave requires v{PROTOCOL_VERSION}; upgrade the master or this slave so both run the same HA protocol"
+                );
+                tracker.set_connection_error(Some(reason.clone()));
+                handles
+                    .metrics
+                    .inc_ha_protocol_rejection("slave", "version_mismatch");
+                warn!(instance = %tracker.instance_name, "{reason}");
+                let ack = HaMessage::Ack {
+                    version: tracker.get_version(),
+                    term: tracker.get_term(),
+                    applied: false,
+                    conflict: None,
+                    error: Some(reason.clone()),
+                };
+                send_ack!(ack);
+                return Err(HaError::Protocol(reason));
+            }
 
             // A push from an older epoch is a stale master and must never
             // overwrite newer configuration, even when its version counter is
