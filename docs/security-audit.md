@@ -39,7 +39,7 @@ implementation of record.
 | **Secrets** | HA bundles strip TLS/web keys, auth hashes/tokens, RouterOS credentials and per-client shared secrets (`${SECRET:*}` placeholders where applicable; node-local values are restored on the slave). Config/users/tokens/sessions and ACME keys are written 0600 atomically. Headers and cookies are never logged. | `sito-ha::bundle`, `sito-api::config_writer`, `sito-transport::acme` |
 | **TLS/ACME readiness** | rustls-only, TLS 1.2/1.3, AEAD cipher suites, RPK/SNI certificate support, atomic certificate reload, native ACME (TLS-ALPN-01 with a bound TCP 443 listener, otherwise HTTP-01). Bootstrap certificates are 7-day self-signed placeholders and are not served unless `acme.allow_bootstrap_cert = true`; invalid, expired, or mismatched configured TLS material is a startup error. A successful issuance reloads DoT, DoH, DoQ, and DoH3. Readiness distinguishes current-with-renewal-failure (`acme_renewal_failed`, degraded), expiring within 30 days (`acme_cert_expiring`/`tls_cert_expiring`, degraded), and expired/unparseable (`acme_cert_expired`/`tls_cert_expired`, not ready); there is no self-signed fallback for an expired ACME certificate. | `sito-transport::tls`, `::acme`, `sito-api::readiness` |
 | **DNSSEC** | Fail-closed validation with trust-anchor chains, DS/DNSKEY walking, NSEC/NSEC3 denial proofs (including wildcard denial and delegation-boundary checks), algorithm/digest policy, key-cache bounds, a 5-second per-query validation deadline, CD/DO semantics and AD only for validated answers. | `sito-dnssec` |
-| **Supply chain** | `cargo deny` (advisories/bans/licenses/sources) in CI, SHA-pinned GitHub Actions, digest-pinned container bases, signed (cosign) release archives. The **installer** requires signatures by default (`SITO_REQUIRE_SIGNATURE=1`, explicit `=0` opt-out); the **self-updater** uses `server.update_require_signature = true` by default (explicit `false` opt-out). When verification runs, a signature that is present is always checked. With `required = false` and no verifier configured, the updater logs a warning and proceeds without verification; this is an explicit operator opt-out, not a silent downgrade. Release tags are gated on the required branch plus green CI/security checks, and container images are scanned and cosign-signed. | `deny.toml`, `.github/workflows`, `contrib/install.sh`, `sito-api::updater` |
+| **Supply chain** | `cargo deny` (advisories/bans/licenses/sources) in CI, SHA-pinned GitHub Actions, digest-pinned container bases, signed (cosign) release archives. The **installer** requires signatures by default (`SITO_REQUIRE_SIGNATURE=1`, explicit `=0` opt-out); the **self-updater** uses `server.update_require_signature = true` by default (explicit `false` opt-out). When verification runs, a signature that is present is always checked. With `required = false` and no verifier configured, the updater logs a warning and proceeds without verification; this is an explicit operator opt-out, not a silent downgrade. Release tags are gated on the required branch plus green CI/security checks, and container images are scanned and cosign-signed. The installer records an installer-owned cosign with a marker so `--uninstall` removes only that copy, and the self-updater preserves the existing executable's mode and xattrs (including `security.capability`). | `deny.toml`, `.github/workflows`, `contrib/install.sh`, `sito-api::updater` |
 | **API integrity** | Config writes run the same deep typed-section validation as startup, invalid configs are rejected before persisting, restart-only writes return 409 and persist nothing, restore archives are decompression-capped, unknown keys are rejected everywhere except the explicit migration flag, tokens expire by default (90 days), deleting a user revokes sessions. `/metrics` requires a Viewer-or-higher token or session by default (`web.metrics_auth = true`). | `sito-api::config_validation`, `config_apply`, `handlers::config`, `auth::manager`, `handlers::metrics` |
 | **Health/status split** | `/health` is generic (`200`/`503` only) and leaks no setup state, component names, reasons, paths or configuration values. Authenticated `GET /api/v1/status` carries `ready`/`reasons[]`; `GET /api/v1/ha/status` carries the detailed HA reason. A stats outage is advisory and never makes DNS unhealthy. | `sito-api::readiness`, `handlers::status`, `handlers::ha` |
 
@@ -57,16 +57,20 @@ implementation of record.
 * **Compromised client identity claims:** DoH path segments and DoT/DoQ SNI
   only identify a client when they match a configured shared secret; filter
   `$client=` matching uses only registry-resolved identity.
-* **First-boot exposure:** the web UI binds `0.0.0.0:8080` during setup but no
-  DNS listener is bound and the wizard is token-gated. Operators exposing the
-  setup endpoint beyond a trusted network should treat the printed token as
-  the only credential until setup completes.
+* **First-boot exposure:** during setup no DNS listener is bound and the wizard
+  is token-gated. The 1.9.5 line binds the setup panel on `0.0.0.0:8080`; the
+  2.0 config-v2 safe default is `web.bind = "127.0.0.1"`. The shipped Compose
+  file publishes the admin port only on loopback either way. Operators
+  exposing the setup endpoint beyond a trusted network should treat the printed
+  token as the only credential until setup completes.
 * **Container isolation:** images run as nonroot (uid/gid 65532) with
-  `NET_BIND_SERVICE` required for ports < 1024; `/var/lib/sito` and `/etc/sito`
-  are owned by that uid so fresh named volumes are writable. Docker's `ports`
-  mapping controls host exposure; keep `web.bind = "0.0.0.0"` inside the
-  container and publish the admin port only on loopback
-  (`-p 127.0.0.1:8080:8080`).
+  `NET_BIND_SERVICE` required for ports < 1024. Compose adds
+  `no-new-privileges`, a read-only root filesystem and a small `/tmp` tmpfs;
+  `/etc/sito` is the named `sito-config` volume and `/var/lib/sito` the named
+  data volume, both initialised with uid/gid 65532. HA bind mounts still need
+  `chown 65532:65532` on config and certificate directories, with keys `0600`.
+  Docker's `ports` mapping controls host exposure; publish the admin port only
+  on loopback (`127.0.0.1:8080:8080`).
 
 ---
 
@@ -109,7 +113,13 @@ the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
   proofs are incomplete are treated as `Bogus` (fail closed) rather than
   downgraded to `Insecure`.
 * Self-update under systemd requires running `sito update` as root with the
-  service stopped (the unit keeps `ProtectSystem=strict`).
+  service stopped (the unit keeps `ProtectSystem=strict`). The updater writes a
+  temporary executable next to the target, copies the existing mode and xattrs
+  (including `security.capability`), then renames; a missing attribute or
+  failed rename aborts and removes the temp file. The installer backs up the
+  config only after stopping the service and restores it with temp-file +
+  rename. `setcap`/`getcap` problems are printed as warnings rather than
+  swallowed.
 * Statistics retention and rollup privacy (P1-19/P1-23/P1-24) now use keyed
   rollup hashes, rollup retention, clear/vacuum, optional query-log totals,
   bounded retention chunks, and a 30 s cached dashboard aggregate. Query-log

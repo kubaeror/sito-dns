@@ -545,3 +545,30 @@ every focused command must include `--features ha` or it runs zero tests.
 | H-21: v1 `ha_state.toml`/`ha_watermark.toml` are refused with migration instructions instead of being read or reset; moving them aside after backup starts a clean sequence | `test_restore_preserves_term_and_rejects_v1_state`, `test_v1_watermark_is_rejected_by_protocol_v2`, `protocol_v2_state_and_bundle_reject_v1_shapes` | `cargo test -p sito-ha test_restore_preserves_term_and_rejects_v1_state`; `cargo test -p sito-ha test_v1_watermark_is_rejected_by_protocol_v2`; `cargo test -p sito-ha-types protocol_v2_state_and_bundle_reject_v1_shapes` |
 | H-22: rejection is observable through the log, `protocol_mismatch` close reason, the slave readiness reason and `sito_ha_protocol_rejections_total` | `test_master_rejects_v1_slave_and_keeps_listening`, `test_slave_rejects_v1_master_and_accepts_next_valid_push`, `test_ha_protocol_rejection_counter_renders_only_when_used` | `cargo test -p sito-ha test_slave_rejects_v1_master_and_accepts_next_valid_push`; `cargo test -p sito-stats test_ha_protocol_rejection_counter_renders_only_when_used` |
 | H-23: limits are explicit in code/docs: 1 MiB message/frame, 4 MiB per-slave queue, 10 s send and handshake deadlines, 64 global/8 per-IP concurrent session budgets | `MAX_WS_MESSAGE_SIZE`, `MAX_SLAVE_QUEUE_BYTES`, `WS_SEND_TIMEOUT`, `MAX_SLAVE_CONNECTIONS`, `MAX_HANDSHAKES_PER_IP`; see `docs/runbook-ha.md#7-ha-protocol-v2-upgrade-and-downgrade` | `cargo test -p sito-ha test_broadcast_respects_per_slave_queue_byte_budget`; `cargo test -p sito-ha test_listener_global_connection_limit_and_release` |
+
+## Phase 2 — ops, Docker, systemd, installer, release (WP-2.13)
+
+WP-2.13 secures the shipped deployment defaults and makes the installer and
+self-updater preserve the service's ability to bind privileged DNS ports. The
+static compose/systemd checks are shipped alongside the files; the installer E2E
+runs unprivileged against a temporary sandbox. Release-image vulnerability
+scanning remains linux/amd64-only, the real release image is smoke-tested with
+`--version`/`check-config` rather than a live DNS query, and the root-gated HA
+ownership test remains a manual/weekly operator step; those three residuals are
+tracked for WP-3.1.
+
+| Finding / acceptance | Named test / check | Focused command |
+|---|---|---|
+| P2-67: single-node Compose binds the admin UI to loopback, keeps `/etc/sito` in the named `sito-config` volume, and ships a pinned non-local image | `scripts/test-compose-defaults.sh` (loopback/volume/image assertions) | `bash scripts/test-compose-defaults.sh` |
+| P2-68: HA Compose uses valid even-length DHCP Option 6 hex, parameterizes IP/subnet/gateway/parent with `SITO_HA_*`, and keeps the chown/key-mode requirements explicit | `scripts/test-compose-defaults.sh` (DHCP hex and topology assertions) | `bash scripts/test-compose-defaults.sh` |
+| P2-69: the installer has a behavioral fresh/upgrade/rollback/uninstall E2E, not just shellcheck | `contrib/tests/test-installer.sh`; CI `contrib` job | `bash contrib/tests/test-installer.sh` |
+| P2-70: release images are scanned for HIGH/CRITICAL and cosign-signed; scan coverage is linux/amd64 only (residual, WP-3.1) | `scripts/test-release-workflow.sh`, `scripts/test-release-attestation-gate.sh`, release workflow `docker-build-push` | `bash scripts/test-release-workflow.sh`; `bash scripts/test-release-attestation-gate.sh` |
+| P2-82: systemd unit and installer fallback read `EnvironmentFile=-/etc/sito/sito.env` and apply `UMask=0077`, `PrivateTmp`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictSUIDSGID`, `LockPersonality`, `SystemCallArchitectures=native` | `scripts/test-systemd-hardening.sh`; `test_m9_release_configuration_and_systemd` | `bash scripts/test-systemd-hardening.sh`; `cargo test -p sito-test --test m9_acceptance test_m9_release_configuration_and_systemd` |
+| P2-83: `sito update` preserves the existing executable mode and extended attributes (including `security.capability`); 0755 is only the absent-target fallback | `test_install_preserves_existing_mode_and_xattrs`, `test_install_preserves_security_capability_when_root`, `test_install_uses_0755_when_target_is_absent`, `test_temp_exe_removed_when_rename_fails` | `cargo test -p sito-api --lib updater` |
+| P3-20: uninstall removes installer-managed cosign (marker), keeps a pre-existing user cosign, warns without systemd, removes the unit unconditionally, and makes setcap/getcap outcomes visible | `contrib/tests/test-installer.sh` capability/no-systemd/cosign cases | `bash contrib/tests/test-installer.sh` |
+| P3-21: root-gated HA certificate ownership test exists and documents the manual `sudo` run; CI wiring is deferred to WP-3.1 | `scripts/test-ha-ownership-root.sh`; see the WP-2.13 status in `docs/audit6-followup-plan.md` | `sudo bash scripts/test-ha-ownership-root.sh` |
+| P3-22: build contexts exclude root and nested Cargo targets, including `fuzz/target` | `.dockerignore`; `scripts/test-compose-defaults.sh` | `bash scripts/test-compose-defaults.sh` |
+| P3-23: packaged unit, installer fallback and docs snippet cannot drift on the hardening directives | `scripts/test-systemd-hardening.sh`; m9 acceptance test | `bash scripts/test-systemd-hardening.sh` |
+| P3-24: `.dockerignore` explicitly excludes `fuzz/target/` and `**/target/` | `scripts/test-compose-defaults.sh` | `bash scripts/test-compose-defaults.sh` |
+| P3-25: HA Compose no longer hardcodes the LAN topology; master/slave/slave-2 IPs, subnet, gateway and parent are `SITO_HA_*` variables with documented defaults | `scripts/test-compose-defaults.sh` | `bash scripts/test-compose-defaults.sh` |
+| P3-26: release archives are built from real binaries, contain `contrib/install.sh` and `contrib/systemd/sito.service`, and the release image runs `--version`/`check-config`; a live start/healthcheck/DNS smoke is deferred to WP-3.1 | `.github/workflows/artifact-e2e.yml` archive assertions; `.github/workflows/release.yml` image smoke | `bash scripts/test-release-workflow.sh`; artifact E2E workflow |

@@ -176,6 +176,25 @@ jobs:
             archive="sito-${TAG}-${triple}.tar.gz"
             dir="${archive%.tar.gz}"
             tar -xzf "${archive}"
+            # The archive must keep the installer and unit in the layout the
+            # installer searches, so `bash contrib/install.sh` works from the
+            # extracted directory. Executing the archived installer is WP-3.1.
+            [ -x "${dir}/contrib/install.sh" ] || {
+              echo "::error::${archive} is missing executable contrib/install.sh"
+              exit 1
+            }
+            [ -f "${dir}/contrib/systemd/sito.service" ] || {
+              echo "::error::${archive} is missing contrib/systemd/sito.service"
+              exit 1
+            }
+            cmp "${dir}/contrib/install.sh" ../contrib/install.sh || {
+              echo "::error::${archive} install.sh differs from the tagged source"
+              exit 1
+            }
+            cmp "${dir}/contrib/systemd/sito.service" ../contrib/systemd/sito.service || {
+              echo "::error::${archive} systemd unit differs from the tagged source"
+              exit 1
+            }
             docker run --rm --platform "${platform}" \
               --entrypoint "/assets/${dir}/sito" \
               -v "${PWD}:/assets:ro" \

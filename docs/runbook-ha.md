@@ -70,6 +70,23 @@ file is written and a failed transfer aborts generation, so a root-owned key
 cannot be mistaken for a working HA setup. Certificates (`*.crt`) may be
 world-readable; the private keys (`*.key`) must stay `0600`.
 
+The shipped `docker-compose.ha.yml` keeps those bind mounts explicit and
+parameterizes the LAN topology instead of hardcoding it. Set these in the shell
+or a `.env` file next to the compose file:
+
+| Variable | Default |
+|---|---|
+| `SITO_HA_PARENT` | `eth0` |
+| `SITO_HA_SUBNET` | `192.168.1.0/24` |
+| `SITO_HA_GATEWAY` | `192.168.1.1` |
+| `SITO_HA_MASTER_IP` | `192.168.1.10` |
+| `SITO_HA_SLAVE_IP` | `192.168.1.11` |
+| `SITO_HA_SLAVE2_IP` | `192.168.1.12` |
+
+The RouterOS DHCP Option 6 example is `0xc0a8010ac0a8010b` for
+`192.168.1.10,192.168.1.11`; regenerate the even-length hex value if you change
+either DNS IP.
+
 A key that the runtime cannot read fails closed: the master listener logs
 `Failed to initialize mTLS for master HA replication server: ... Permission
 denied`, `GET /api/v1/ha/status` reports `ready: false` with a
@@ -365,7 +382,9 @@ slave they are resolved from the process environment only:
 There is no on-disk local secret store. A bundle referencing a secret the
 slave cannot resolve is rejected as a whole (the slave stays `Degraded` and
 keeps its previous configuration), so provision the variables in the service
-environment (e.g. an `EnvironmentFile` for systemd) before pushing the config.
+environment before pushing the config. The packaged systemd unit reads
+`EnvironmentFile=-/etc/sito/sito.env` (mode `0600`, created by the installer
+when absent); put the `DNSD_SECRET_*` lines there and restart the service.
 Node-local secret material (`[clients] client_id_secrets`, RouterOS
 credentials) is stripped from bundles and is never replicated; keep those
 values in each node's own `config.toml`.

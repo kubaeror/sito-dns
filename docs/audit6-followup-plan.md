@@ -1467,13 +1467,37 @@ and the three WP commits (`a385e76`, `7d7d6ec`, `dfd7b7e`) on
 **Addresses:** P1-17, P1-21, P2-67..P2-83, P3-20..P3-26.
 **Files:** `contrib/install.sh`, `contrib/systemd/sito.service`, Dockerfiles/compose, workflows, docs.
 **Steps:**
-- [ ] Atomic install/rollback, stop/start service, preserve capabilities.
-- [ ] Compose defaults loopback admin; named volume/init for config; valid DHCP hex.
-- [ ] Systemd `EnvironmentFile`, hardening directives, `UMask`.
-- [ ] Installer E2E, image scan/sign, release gate on tested main.
-- [ ] Pin `latest`/digest; verify install commands.
+- [x] Atomic install/rollback, stop/start service, preserve capabilities.
+- [x] Compose defaults loopback admin; named volume/init for config; valid DHCP hex.
+- [x] Systemd `EnvironmentFile`, hardening directives, `UMask`.
+- [x] Installer E2E, image scan/sign, release gate on tested main.
+- [x] Pin `latest`/digest; verify install commands.
 - **Acceptance:** fresh install/upgrade/rollback/uninstall E2E passes; image scan clean; docs commands work.
 **Estimate:** L.
+
+**Status (2026-11-20): complete; residuals documented.** Evidence is in the
+WP-2.13 section of [`docs/audit6-test-matrix.md`](audit6-test-matrix.md#phase-2--ops-docker-systemd-installer-release-wp-213)
+and the WP commits (`e26e342`, `7e380f4`, and this docs/evidence commit) on
+`feat/2.0-phase2-wp213`. The compose files keep the admin UI on loopback and use
+a named config volume; HA uses valid `0xc0a8010ac0a8010b` DHCP hex and
+`SITO_HA_*` topology variables; the systemd unit, installer fallback and docs
+share the hardening directives and `/etc/sito/sito.env`; the updater preserves
+mode/xattrs; and the installer E2E covers stop-before-backup, atomic config
+restore, setcap/getcap, no-systemd, cosign ownership and uninstall. Residual
+decisions:
+
+- **WP-3.1 full Docker/image E2E:** release vulnerability scanning uses
+  `--platform linux/amd64` only, and the published-image smoke is
+  `--version`/`check-config` rather than start/healthcheck/DNS. Extending the
+  scan to arm64/armv7 and running a live release-image DNS query is deferred to
+  WP-3.1 (documented in the release workflow and matrix P2-70/P3-26).
+- **Root HA lane:** `scripts/test-ha-ownership-root.sh` remains a root-gated
+  manual/weekly operator step; wiring it into a root-capable CI runner is
+  deferred to WP-3.1 (P3-21).
+- **Digest-pin docs:** the shipped examples use pinned release tags and explain
+  digest pinning, but do not hardcode a per-release digest. Operators should
+  resolve and record the published digest at deploy time; a generated
+  digest-pinned example remains a WP-3.1 documentation follow-up.
 
 ### WP-2.14 — Documentation, migration, and final truth pass
 

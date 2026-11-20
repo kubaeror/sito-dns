@@ -494,6 +494,18 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 > Publishing `8080:8080` exposes the plain-HTTP admin UI on every host
 > interface. Pin the image tag (`1.9.5`) instead of `latest` in production.
 
+For reproducible deploys, pin the published digest as well as the tag:
+
+```bash
+docker buildx imagetools inspect ghcr.io/kubaeror/sito-dns:1.9.5 \
+  --format '{{.Manifest.Digest}}'
+# then set:
+#   image: ghcr.io/kubaeror/sito-dns:1.9.5@sha256:<digest>
+```
+
+A digest cannot be moved by retagging, so upgrades become an explicit edit. The
+same rule applies to the HA services in `docker-compose.ha.yml`.
+
 ### 4.2 High-Availability Master/Slave on LAN (`macvlan`)
 Run redundant master and slave instances on separate dedicated LAN IPs on a single server:
 
