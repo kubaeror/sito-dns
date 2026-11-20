@@ -1254,12 +1254,19 @@ curated data section in `docs/audit6-test-matrix.md` and §19 of
 
 **Addresses:** P1-10..P1-14, P2-15..P2-21.
 **Files:** `sito-transport/src/{udp,tcp,dot,doh,doh3,doq,tls,acme,limiter,handler}.rs`, `sito/src/server.rs`.
+**Status (2026-11-20): complete.** `AdmissionController` publishes the
+connection/per-source/request permits and prefix `RateKey`; TCP/DoT admit on
+the length prefix before allocating a body; DoQ/DoH3 connections are bounded
+by a 300 s lifetime; configured DoQ/DoH3 bind failures abort startup and DoH
+only advertises Alt-Svc after a successful DoH3 bind. Evidence: Phase 2 —
+transport admission and TLS (WP-2.6) in `docs/audit6-test-matrix.md` and §20 of
+`docs/2.0-public-api-diff.md`.
 **Steps:**
-- [ ] Implement `AdmissionController` permits before handshake/body; per-prefix rate keys.
-- [ ] Set QUIC windows/stream caps; total request/connection deadlines.
-- [ ] Reject QR=1/multi-question; enforce 65,535-byte responses.
-- [ ] Validate cert/key pair and ALPN; one `TlsManagerSet` reloads all protocols.
-- [ ] Add accept-error backoff, slowloris caps, ACME HTTP-01 limits.
+- [x] Implement `AdmissionController` permits before handshake/body; per-prefix rate keys.
+- [x] Set QUIC windows/stream caps; total request/connection deadlines.
+- [x] Reject QR=1/multi-question; enforce 65,535-byte responses.
+- [x] Validate cert/key pair and ALPN; one `TlsManagerSet` reloads all protocols.
+- [x] Add accept-error backoff, slowloris caps, ACME HTTP-01 limits.
 - **Acceptance:** DoS/slowloris/EDNS/TLS tests pass; no listener silently disappears.
 **Estimate:** L.
 

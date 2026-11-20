@@ -85,7 +85,7 @@ allow_plaintext_doh = false
 | `tls` | table | `None` | Top-level `[tls]` is the canonical config v2 table. `[dns.tls]` is a deprecated v1 alias that still takes precedence when both are present (v1 behavior); migration moves it to `[tls]`. Changing either table requires a restart. |
 | `edns_udp_size` | integer | `1232` | Maximum EDNS0 UDP buffer size (1232 bytes prevents IPv6 fragmentation). |
 | `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual source prefix (`0` disables rate limiting; maximum `1000000`). IPv4 budgets are keyed per `/24` and IPv6 per `/64`. |
-| `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, and DoH client connections. |
+| `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, DoH, DoQ, and DoH3 client connections. Each source address is additionally capped at 16 concurrent connections, and long-lived connections are closed after a 300-second lifetime (DoT also honours its query/idle caps). |
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
 > [!WARNING]
