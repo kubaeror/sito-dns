@@ -2237,6 +2237,87 @@ mod tests {
         );
     }
 
+    /// Important review fix: the scrub's `BEGIN IMMEDIATE` transaction must
+    /// wait for an in-flight rollup writer, then include its newly committed
+    /// row in the scan. Before the fix the scrub selected in autocommit (did
+    /// not see the uncommitted row) and only blocked later at the marker
+    /// write, leaving the name-bearing row behind with a `"false"` marker.
+    #[tokio::test]
+    async fn test_name_scrub_waits_for_in_flight_rollup_writer() {
+        use sqlx::Connection;
+        use sqlx::sqlite::SqliteConnectOptions;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-name-scrub-race-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open_with_rollup_client_names(&db_path, true)
+            .await
+            .unwrap();
+        let hour = 1_000_000_000_000i64;
+
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(30));
+        let mut writer = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO stats_hourly \
+             (hour, queries, blocked, cached, top_domains, top_clients, top_upstreams) \
+             VALUES (?, 1, 0, 0, '[]', ?, '[]')",
+        )
+        .bind(hour)
+        .bind(r#"[["10.7.7.12","in-flight-name",1,0,1000]]"#)
+        .execute(&mut writer)
+        .await
+        .unwrap();
+
+        let scrub_db = db.clone();
+        let scrub = tokio::spawn(async move { scrub_db.set_rollup_client_names(false).await });
+        // Give the scrub task time to reach its blocking BEGIN IMMEDIATE. The
+        // writer still holds the lock, so the task cannot have completed.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !scrub.is_finished(),
+            "the scrub must wait for the in-flight rollup writer"
+        );
+
+        sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
+        scrub
+            .await
+            .expect("scrub task must not panic")
+            .expect("scrub must succeed after the writer commits");
+
+        let payload: String =
+            sqlx::query_scalar("SELECT top_clients FROM stats_hourly WHERE hour = ?")
+                .bind(hour)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            !payload.contains("in-flight-name"),
+            "the scrub must include the row committed by the waited-for writer: {payload}"
+        );
+        assert!(!payload.contains("10.7.7.12"));
+        assert!(payload.contains("blake3:"));
+        let marker: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM stats_meta WHERE key = 'rollup_client_names_policy'",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(marker.as_deref(), Some("false"));
+
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     /// P2-58: an IPv4-mapped IPv6 client and its native IPv4 spelling are one
     /// host, so the rollup must not count them as two clients.
     #[tokio::test]

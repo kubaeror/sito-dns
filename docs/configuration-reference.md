@@ -552,7 +552,10 @@ key before any retention task starts.
 > SQLite runs with `secure_delete=ON`. Rollup client IPs are keyed BLAKE3
 > hashes using `<data_dir>/stats-salt` (0600); client names are omitted unless
 > `rollup_client_names = true`. Switching `rollup_client_names` from `true` to
-> `false` scrubs names from existing rollups on the next startup. Archived
+> `false` scrubs names from existing rollups immediately on a live config
+> apply (the scrub runs in one `BEGIN IMMEDIATE` transaction, so it waits for
+> an in-flight retention/clear writer and later writers see the `false` policy).
+> Startup re-runs the same sync if the marker did not commit. Archived
 > per-client rows therefore show the keyed hash (`blake3:…`) instead of a raw
 > address for data older than the detailed query-log retention. Symlinked
 > `stats.db` or `stats-salt` paths are refused. Hashes written by the

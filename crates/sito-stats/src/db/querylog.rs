@@ -164,6 +164,10 @@ impl StatsDb {
     /// whole-range memory/lock residual (P2-61). The default
     /// `keep_aggregates = false` deletes both tables atomically without
     /// aggregating.
+    ///
+    /// `rollup_client_names` is the caller's captured policy, not an override:
+    /// a live `false` from [`StatsDb::set_rollup_client_names`] is
+    /// authoritative and strips client names in this path too.
     pub async fn delete_query_logs_with_policy(
         &self,
         keep_aggregates: bool,

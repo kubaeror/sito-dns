@@ -110,6 +110,11 @@ impl StatsDb {
     /// its own short `BEGIN IMMEDIATE` transaction. Expired `stats_hourly`
     /// rows (and therefore their domains and hashed client identifiers) are
     /// removed separately according to `rollup_retention_days`.
+    ///
+    /// `rollup_client_names` is the caller's captured policy. The live
+    /// [`Self::set_rollup_client_names`] policy is authoritative: a live
+    /// `false` overrides a captured `true` at merge/write time, so this
+    /// argument cannot re-insert names after a live scrub.
     pub async fn cleanup_retention_with_policy(
         &self,
         retention_days: u32,
@@ -167,7 +172,10 @@ impl StatsDb {
             // Snapshot the pre-sweep top lists once. Each chunk writes
             // `pre_sweep + cumulative temp counts` (replacing the previous
             // chunk's value), so writing every chunk is crash-safe without
-            // double counting.
+            // double counting. A scrub may land between this read and the
+            // chunk transaction; `merge_hour_rollup` re-reads the live policy
+            // inside the transaction and strips names, so the stale snapshot
+            // cannot resurrect them.
             let existing_rollups = load_existing_rollups(&mut conn, &[hour]).await?;
             let existing_tops = existing_rollups.get(&hour).cloned().unwrap_or_default();
 
