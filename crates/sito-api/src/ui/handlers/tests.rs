@@ -898,6 +898,72 @@ async fn test_wizard_invalid_ports_and_ips() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// P2-41/viewer: the filtering page shows only scheme+host to Viewers while
+/// Operators keep the full subscription URL.
+#[tokio::test]
+async fn test_filtering_page_redacts_subscription_urls_below_operator() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_filter_urls_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let mut config = (**ctx.config.load()).clone();
+    config.filtering.lists = vec![sito_core::config::FilterListConfig {
+        name: "Private".to_string(),
+        url: "https://lists.example.net/subscriptions/private-token.txt".to_string(),
+        enabled: false,
+        refresh_hours: None,
+    }];
+    ctx.set_config(config);
+
+    ctx.auth_mgr
+        .create_user("view_user", "pass", Role::Viewer)
+        .await;
+    ctx.auth_mgr
+        .create_user("oper_user", "pass", Role::Operator)
+        .await;
+
+    let render = |session: crate::auth::session::Session| {
+        let ctx = ctx.clone();
+        async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
+            let response = filtering_page(State(ctx), headers).await;
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        }
+    };
+
+    let LoginResult::Success(viewer_session) =
+        ctx.auth_mgr.login("view_user", "pass", "127.0.0.1").await
+    else {
+        panic!("viewer login failed");
+    };
+    let viewer_html = String::from_utf8(render(viewer_session).await.to_vec()).unwrap();
+    assert!(
+        viewer_html.contains("https://lists.example.net"),
+        "a Viewer may see the source host"
+    );
+    assert!(
+        !viewer_html.contains("private-token"),
+        "a Viewer must not see the full subscription URL: {viewer_html}"
+    );
+
+    let LoginResult::Success(oper_session) =
+        ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1").await
+    else {
+        panic!("operator login failed");
+    };
+    let operator_html = String::from_utf8(render(oper_session).await.to_vec()).unwrap();
+    assert!(
+        operator_html.contains("https://lists.example.net/subscriptions/private-token.txt"),
+        "an Operator must see the full subscription URL"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 #[tokio::test]
 async fn test_ui_handlers_persist_failure_returns_500_and_preserves_in_memory_state() {
     let temp_dir =

@@ -1,9 +1,10 @@
 //! Query log endpoints and WebSocket streaming per section 12.1.
 
-use crate::auth::client_ip::resolve_client_ip;
+use crate::auth::client_ip::{admin_scheme_config, resolve_client_ip};
 use crate::auth::{MaybeConnectInfo, RequireOperator, RequireViewer};
 use crate::error::ProblemDetails;
 use crate::models::GenericMessageResponse;
+use crate::security::validate_websocket_origin;
 use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -192,12 +193,33 @@ pub async fn delete_querylog(
 }
 
 /// WebSocket live tail endpoint streaming query log entries in real-time.
+///
+/// The Origin header is validated before the upgrade: `null` and cross-origin
+/// handshakes are rejected, and a session-authenticated browser request must
+/// send a same-origin `Origin`. Token clients (Bearer or deprecated
+/// `?token=`) are not browser-ambient and may omit it.
 pub async fn stream_querylog(
     ws: WebSocketUpgrade,
-    _viewer: RequireViewer,
+    RequireViewer(viewer): RequireViewer,
     State(ctx): State<ServerContext>,
-) -> Response {
-    ws.on_upgrade(move |socket| handle_live_tail(socket, ctx))
+    MaybeConnectInfo(peer): MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Result<Response, ProblemDetails> {
+    let config = ctx.config.load();
+    let trusted_proxies = config.get_web_config().trusted_proxies.clone();
+    let scheme = admin_scheme_config(config.web.as_ref());
+    drop(config);
+
+    validate_websocket_origin(
+        &headers,
+        peer,
+        &trusted_proxies,
+        &scheme,
+        viewer.token_id.is_some(),
+    )
+    .map_err(ProblemDetails::forbidden)?;
+
+    Ok(ws.on_upgrade(move |socket| handle_live_tail(socket, ctx)))
 }
 
 async fn handle_live_tail(mut socket: WebSocket, ctx: ServerContext) {

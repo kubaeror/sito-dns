@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::ServiceExt;
 use utoipa::OpenApi;
 
@@ -559,7 +560,12 @@ async fn test_acceptance_m5_websocket_livetail() {
     });
 
     let ws_url = format!("ws://{addr}/api/v1/querylog/stream?token={view_tok}");
-    let (ws_stream, _) = connect_async(&ws_url)
+    let mut ws_request = ws_url.into_client_request().expect("valid WebSocket URL");
+    ws_request.headers_mut().insert(
+        header::ORIGIN,
+        format!("http://{addr}").parse().expect("valid Origin"),
+    );
+    let (ws_stream, _) = connect_async(ws_request)
         .await
         .expect("WebSocket handshake failed");
     let (_, mut rx) = ws_stream.split();

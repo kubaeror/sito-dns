@@ -88,6 +88,15 @@ fn warn_query_token_deprecation(token: &str) {
     }
 }
 
+/// True only for the query-log live-tail endpoint.
+///
+/// Axum strips the `/api/v1` prefix for routes nested under that router, so
+/// extractors see `/querylog/stream` at runtime while direct unit tests may
+/// pass the full path. Both spellings name the same single route.
+fn is_querylog_stream_path(path: &str) -> bool {
+    path == "/api/v1/querylog/stream" || path == "/querylog/stream"
+}
+
 /// Helper to authenticate from request parts against AuthManager.
 pub fn authenticate_request(
     parts: &Parts,
@@ -126,10 +135,12 @@ pub fn authenticate_request(
         ));
     }
 
-    // 3. Legacy `?token=` query parameter: only for WebSocket upgrades without
-    //    an Authorization header. Deprecated, warned and slated for removal in
-    //    2.0. Every other endpoint must use the header or a session cookie.
+    // 3. Legacy `?token=` query parameter: only for the query-log live-tail
+    //    WebSocket upgrade without an Authorization header. No other Upgrade
+    //    path may authenticate from the URL, because query strings leak into
+    //    logs, browser history and proxy access logs.
     if is_websocket_upgrade(parts)
+        && is_querylog_stream_path(parts.uri.path())
         && let Some(query) = parts.uri.query()
     {
         for param in query.split('&') {
@@ -255,5 +266,36 @@ mod tests {
         let (parts, ()) = req.into_parts();
         let err = authenticate_request(&parts, &mgr).unwrap_err();
         assert!(err.detail.contains("Authentication required"));
+    }
+
+    /// P2-41/WS: `?token=` is accepted only on the query-log live-tail path,
+    /// never on another Upgrade endpoint.
+    #[tokio::test]
+    async fn test_query_token_ignored_for_non_querylog_upgrade() {
+        let mgr = AuthManager::new();
+        let (_, resp) = mgr
+            .create_token("ws", Role::Viewer, None)
+            .await
+            .expect("token");
+
+        let other = Request::builder()
+            .uri(format!("/api/v1/other/stream?token={}", resp.token))
+            .header(UPGRADE, "websocket")
+            .header(CONNECTION, "Upgrade")
+            .body(())
+            .unwrap();
+        let (parts, ()) = other.into_parts();
+        let err = authenticate_request(&parts, &mgr).unwrap_err();
+        assert!(err.detail.contains("Authentication required"));
+
+        let allowed = Request::builder()
+            .uri(format!("/api/v1/querylog/stream?token={}", resp.token))
+            .header(UPGRADE, "websocket")
+            .header(CONNECTION, "Upgrade")
+            .body(())
+            .unwrap();
+        let (parts, ()) = allowed.into_parts();
+        let user = authenticate_request(&parts, &mgr).expect("querylog stream token");
+        assert_eq!(user.role, Role::Viewer);
     }
 }

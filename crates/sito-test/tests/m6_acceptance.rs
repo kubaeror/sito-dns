@@ -941,28 +941,45 @@ async fn test_sensitive_responses_have_no_store_and_vary_cookie() {
     let (ctx, temp_dir) = create_test_context().await;
     let app = create_router(ctx);
 
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/clients")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        resp.headers()
-            .get(header::CACHE_CONTROL)
-            .and_then(|v| v.to_str().ok()),
-        Some("no-store")
-    );
-    assert_eq!(
-        resp.headers()
-            .get(header::VARY)
-            .and_then(|v| v.to_str().ok()),
-        Some("Cookie")
-    );
+    // Every authenticated surface (including the newer filtering,
+    // integrations, upstream, rewrites, cache and status routes) and /metrics
+    // must be uncacheable. Methods differ where the route only supports POST.
+    for (method, path) in [
+        ("GET", "/api/v1/clients"),
+        ("GET", "/api/v1/filtering/lists"),
+        ("GET", "/api/v1/integrations/lists"),
+        ("GET", "/api/v1/upstream"),
+        ("GET", "/api/v1/rewrites"),
+        ("POST", "/api/v1/cache/flush"),
+        ("GET", "/api/v1/status"),
+        ("GET", "/metrics"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "{path} must be no-store"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("Cookie"),
+            "{path} must vary on Cookie"
+        );
+    }
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

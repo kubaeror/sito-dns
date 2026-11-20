@@ -88,11 +88,28 @@ pub(crate) fn bundled_list_views(
     bundled_lists
 }
 
+/// Reduces a subscription URL to its scheme and host for roles that may see
+/// that a source exists but not its full (often tokenised) URL.
+pub(crate) fn redact_subscription_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "***".to_string();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    if scheme.is_empty() || host.is_empty() {
+        "***".to_string()
+    } else {
+        format!("{scheme}://{host}")
+    }
+}
+
 pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
     };
     let csrf = get_csrf_token(&ctx, &headers);
+    let can_view_urls = user.role >= Role::Operator;
 
     let cfg = ctx.config.load();
     let snapshot = ctx.filter.snapshot();
@@ -113,7 +130,11 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
             FilterListDto {
                 id: list.name.clone(),
                 name: list.name.clone(),
-                url: list.url.clone(),
+                url: if can_view_urls {
+                    list.url.clone()
+                } else {
+                    redact_subscription_url(&list.url)
+                },
                 enabled: list.enabled,
                 refresh_hours: list.refresh_hours.unwrap_or(24) as u32,
                 rule_count: count,

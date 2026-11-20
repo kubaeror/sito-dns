@@ -33,14 +33,13 @@ fn peer_addr(request: &Request) -> Option<SocketAddr> {
 /// Returns true for responses that must never be cached (auth/config/session
 /// state, authenticated API surfaces and any response that sets a cookie).
 fn is_sensitive_path(path: &str) -> bool {
-    path.starts_with("/api/v1/auth")
-        || path.starts_with("/api/v1/config")
-        || path.starts_with("/api/v1/system")
-        || path.starts_with("/api/v1/clients")
-        || path.starts_with("/api/v1/querylog")
-        || path.starts_with("/api/v1/stats")
-        || path.starts_with("/api/v1/ha")
+    // Every authenticated API route and UI page can carry caller-specific
+    // state (sessions, tokens, query history, config, URLs), so the whole
+    // surface must stay out of shared caches.
+    path.starts_with("/api/v1/")
+        || path == "/api/v1"
         || path.starts_with("/ui/")
+        || path == "/metrics"
         || matches!(
             path,
             "/" | "/login"
@@ -198,7 +197,7 @@ fn normalize_authority(authority: &str, scheme: &str) -> String {
 
 /// True when `value` (Origin or Referer URL) refers to the same origin as the
 /// request, using only proxy headers supplied by configured trusted proxies.
-fn same_origin(
+pub(crate) fn same_origin(
     value: &str,
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
@@ -220,6 +219,36 @@ fn same_origin(
         return false;
     };
     normalize_authority(authority, scheme_url) == normalize_authority(&expected, expected_scheme)
+}
+
+/// Validates the `Origin` header of a WebSocket upgrade before the handshake.
+///
+/// * A present `Origin` must be same-origin; `Origin: null` is always rejected.
+/// * A missing `Origin` is accepted only for token-authenticated clients
+///   (Bearer or the deprecated query token), which are not browser-ambient.
+///   Session-authenticated upgrades are browser requests and must carry it.
+pub(crate) fn validate_websocket_origin(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    trusted_proxies: &[IpAddr],
+    scheme: &AdminSchemeConfig,
+    token_authenticated: bool,
+) -> Result<(), &'static str> {
+    let origin = headers
+        .get(ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    match origin {
+        Some(origin) if origin.eq_ignore_ascii_case("null") => {
+            Err("Cross-origin WebSocket request rejected (Origin: null)")
+        }
+        Some(origin) if !same_origin(origin, headers, peer, trusted_proxies, scheme) => {
+            Err("Cross-origin WebSocket request rejected")
+        }
+        Some(_) => Ok(()),
+        None if token_authenticated => Ok(()),
+        None => Err("Missing Origin on a browser WebSocket request"),
+    }
 }
 
 /// Decodes a `application/x-www-form-urlencoded` field (percent-decoding and
@@ -556,6 +585,37 @@ mod tests {
     }
 
     #[test]
+    fn test_websocket_origin_validation() {
+        let plain = AdminSchemeConfig::default();
+        let headers = headers_with_host("example.com:8080");
+
+        let mut same = headers.clone();
+        same.insert(ORIGIN, HeaderValue::from_static("http://example.com:8080"));
+        assert!(validate_websocket_origin(&same, None, &[], &plain, false).is_ok());
+
+        let mut cross = headers.clone();
+        cross.insert(ORIGIN, HeaderValue::from_static("http://evil.example"));
+        assert!(
+            validate_websocket_origin(&cross, None, &[], &plain, true).is_err(),
+            "a cross-origin token request must still be rejected"
+        );
+
+        let mut null = headers.clone();
+        null.insert(ORIGIN, HeaderValue::from_static("null"));
+        assert!(validate_websocket_origin(&null, None, &[], &plain, true).is_err());
+
+        let missing = headers.clone();
+        assert!(
+            validate_websocket_origin(&missing, None, &[], &plain, false).is_err(),
+            "a session/browser upgrade must carry Origin"
+        );
+        assert!(
+            validate_websocket_origin(&missing, None, &[], &plain, true).is_ok(),
+            "a token client may omit Origin"
+        );
+    }
+
+    #[test]
     fn test_form_field_extraction() {
         let body = b"address=1.1.1.1&csrf_token=deadbeef&x=1";
         assert_eq!(form_field(body, "csrf_token"), Some("deadbeef".to_string()));
@@ -596,20 +656,38 @@ mod tests {
 
     #[test]
     fn test_sensitive_paths() {
-        assert!(is_sensitive_path("/api/v1/auth/login"));
-        assert!(is_sensitive_path("/api/v1/config"));
-        assert!(is_sensitive_path("/api/v1/clients"));
-        assert!(is_sensitive_path("/api/v1/querylog"));
-        assert!(is_sensitive_path("/api/v1/stats"));
-        assert!(is_sensitive_path("/ui/login"));
-        assert!(is_sensitive_path("/wizard"));
-        assert!(is_sensitive_path("/dashboard"));
-        assert!(is_sensitive_path("/querylog"));
-        assert!(is_sensitive_path("/users"));
-        assert!(is_sensitive_path("/account"));
+        for path in [
+            "/api/v1",
+            "/api/v1/auth/login",
+            "/api/v1/config",
+            "/api/v1/config/restart-required",
+            "/api/v1/clients",
+            "/api/v1/querylog",
+            "/api/v1/querylog/stream",
+            "/api/v1/stats",
+            "/api/v1/filtering/status",
+            "/api/v1/integrations/lists",
+            "/api/v1/upstream",
+            "/api/v1/rewrites",
+            "/api/v1/cache/flush",
+            "/api/v1/status",
+            "/api/v1/ha/status",
+            "/metrics",
+            "/ui/login",
+            "/ui/partials/dashboard-stats",
+            "/wizard",
+            "/dashboard",
+            "/querylog",
+            "/users",
+            "/account",
+        ] {
+            assert!(is_sensitive_path(path), "{path} must be no-store");
+        }
         assert!(!is_sensitive_path("/static/app.js"));
         assert!(!is_sensitive_path("/assets/app.js"));
         assert!(!is_sensitive_path("/health"));
+        assert!(!is_sensitive_path("/api/docs"));
+        assert!(!is_sensitive_path("/metrics-extra"));
     }
 
     #[test]
