@@ -242,7 +242,10 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
                     rustls::CertificateError::ApplicationVerificationFailure,
                 ));
             }
-        } else if !self.allow_unpinned {
+        } else if self.webpki.is_none() && !self.allow_unpinned {
+            // No pin, no CA, and no explicit opt-out: refuse. A configured CA
+            // is a complete trust anchor and must not require the insecure
+            // opt-out flag.
             return Err(RustlsError::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
             ));
@@ -459,8 +462,9 @@ mod tests {
         let name = server_name("127.0.0.1");
         let now = UnixTime::now();
 
-        // CA-only is a valid trust mode: no pin, but the chain/SAN must verify.
-        let verifier = PinnedServerCertVerifier::new(None, true)
+        // CA-only is a valid trust mode without the insecure opt-out: the
+        // verifier must validate the chain/SAN, not reject before checking it.
+        let verifier = PinnedServerCertVerifier::new(None, false)
             .with_ca(&certs.ca_cert_path)
             .unwrap();
         assert!(

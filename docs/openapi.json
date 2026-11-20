@@ -4254,7 +4254,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`queued`, `no_slaves` or `failed`. `queued` is a queue outcome, not\nproof of delivery; delivery is confirmed by the slave ACK."
+            "description": "`queued`, `connected_no_delivery`, `no_slaves` or `failed`. Neither\n`queued` nor `connected_no_delivery` is delivery proof; delivery is\nconfirmed by the slave ACK."
           }
         }
       },

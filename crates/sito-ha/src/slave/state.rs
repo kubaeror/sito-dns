@@ -176,14 +176,21 @@ impl SlaveStatusTracker {
         self.persist_watermark_with_config_digest(version, term, payload_hash, None)
     }
 
-    /// Persists the applied watermark together with the BLAKE3 digest of the
-    /// exact configuration document that was persisted for this bundle.
+    /// Persists the applied watermark together with a BLAKE3 digest of the
+    /// shared projection of the configuration document persisted for this
+    /// bundle.
     ///
     /// The digest is what makes restart-time drift detection possible: a local
     /// edit to a shared field (or a local revert) no longer matches and forces
-    /// a re-apply instead of an early `Synced` ACK. Passing `None` preserves
-    /// legacy callers and clears the drift flag because the caller explicitly
-    /// says it has no document to verify.
+    /// a re-apply instead of an early `Synced` ACK. Node-local fields are
+    /// excluded by [`crate::bundle::shared_config_digest`]. Passing `None`
+    /// preserves legacy callers and clears the drift flag because the caller
+    /// explicitly says it has no document to verify.
+    ///
+    /// Prefer [`Self::persist_watermark_with_identity`] on apply paths. This
+    /// wrapper preserves any existing signing-key fingerprint instead of
+    /// clearing it: an unrelated watermark refresh must not erase the identity
+    /// needed to detect a same-term key change.
     pub fn persist_watermark_with_config_digest(
         &self,
         version: u64,
@@ -191,7 +198,16 @@ impl SlaveStatusTracker {
         payload_hash: &str,
         config_digest: Option<&str>,
     ) -> Result<(), HaError> {
-        self.persist_watermark_with_identity(version, term, payload_hash, config_digest, None)
+        let existing_fingerprint = self
+            .get_watermark()
+            .and_then(|watermark| watermark.signing_key_fingerprint);
+        self.persist_watermark_with_identity(
+            version,
+            term,
+            payload_hash,
+            config_digest,
+            existing_fingerprint.as_deref(),
+        )
     }
 
     /// Persists the applied watermark including the signing-key fingerprint of
@@ -602,6 +618,21 @@ servers = ["9.9.9.9"]
             Some(fingerprint)
         );
 
+        // The compatibility wrapper must preserve the recorded identity rather
+        // than clearing it.
+        tracker
+            .persist_watermark_with_config_digest(6, 0, "payload2", None)
+            .unwrap();
+        assert_eq!(
+            tracker
+                .get_watermark()
+                .unwrap()
+                .signing_key_fingerprint
+                .as_deref(),
+            Some(fingerprint),
+            "a config-digest-only refresh must not erase the signing-key fingerprint"
+        );
+
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -781,6 +812,18 @@ servers = ["9.9.9.9"]
             matches!(err, HaError::Validation { ref field, ref reason } if field == "ha_watermark" && reason.contains("protocol_version")),
             "unexpected error: {err:?}"
         );
+
+        // Documented recovery: move the v1 watermark aside after backup; the
+        // next start begins at version 0 with no local replay guard and must
+        // take a full resync.
+        let backup = path.with_extension("v1.bak");
+        std::fs::rename(&path, &backup).unwrap();
+        assert!(backup.exists());
+        let clean = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .expect("a missing watermark is a clean start");
+        assert_eq!(clean.get_version(), 0);
+        assert!(clean.get_watermark().is_none());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

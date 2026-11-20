@@ -122,12 +122,12 @@ pub struct AppliedReport {
 /// Client-visible summary of an HA publication attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HaPublishReport {
-    /// `queued`, `no_slaves` or `failed`.
+    /// `queued`, `connected_no_delivery`, `no_slaves` or `failed`.
     ///
-    /// `queued` means the bundle was persisted and queued for delivery (a
-    /// direct channel enqueue or a coalesced fallback); delivery is proven only
-    /// by the slave's ACK. `slaves_queued`/`slaves_coalesced` make that
-    /// distinction explicit.
+    /// `queued` means the bundle was persisted and at least one slave was
+    /// directly enqueued or coalesced; `connected_no_delivery` means slaves are
+    /// connected but every channel was closed, so nothing was queued. Neither
+    /// is delivery proof: delivery is confirmed by the slave ACK.
     pub status: String,
     /// Failure detail, never containing secret material.
     pub error: Option<String>,
@@ -151,7 +151,14 @@ impl HaPublishReport {
                 slaves_coalesced,
                 ..
             } => Self {
-                status: "queued".to_string(),
+                // "queued" only when something was actually enqueued. A
+                // connected-but-closed peer is `connected_no_delivery`, not a
+                // delivery claim and not `no_slaves`.
+                status: if slaves_queued + slaves_coalesced > 0 {
+                    "queued".to_string()
+                } else {
+                    "connected_no_delivery".to_string()
+                },
                 error: None,
                 retry_at: None,
                 slaves_connected: Some(slaves_connected),
@@ -1118,6 +1125,19 @@ mod tests {
         let no_slaves = HaPublishReport::from_outcome(PublishOutcome::NoSlaves);
         assert_eq!(no_slaves.status, "no_slaves");
         assert_eq!(no_slaves.slaves_connected, Some(0));
+
+        // Connected peers whose channels are all closed are not a queue claim
+        // and not "no slaves": report the honest no-delivery status.
+        let no_delivery = HaPublishReport::from_outcome(PublishOutcome::Published {
+            version: 8,
+            term: 1,
+            slaves_connected: 2,
+            slaves_queued: 0,
+            slaves_coalesced: 0,
+        });
+        assert_eq!(no_delivery.status, "connected_no_delivery");
+        assert_eq!(no_delivery.slaves_connected, Some(2));
+        assert_eq!(no_delivery.slaves_queued, Some(0));
     }
 
     /// Deferred D4b: `retry_at` must reflect the retry loop that was actually

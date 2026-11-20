@@ -306,7 +306,7 @@ servers = ["9.9.9.9"]
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_legacy_watermark_without_digest_forces_full_apply() {
+async fn test_watermark_without_digest_forces_full_apply() {
     let dir = temp_dir("legacy-digest");
     let config_path = dir.join("config.toml");
     let watermark_path = dir.join("ha_watermark.toml");

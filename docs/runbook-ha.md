@@ -8,7 +8,7 @@ This runbook provides step-by-step operational procedures for managing, maintain
 
 `sito` implements an active-passive master/slave replication architecture governed by [ADR-0002](adr/0002-ha-master-slave-push.md):
 - **Master Node**: Accepts administrative REST API mutations and Web UI configurations, generates monotonic configuration bundles, signs them using an Ed25519 private key (`data_dir/ha_signing.key`, permissions `0600`), and pushes updates to connected slaves in real-time over WebSocket with mutual TLS (mTLS) on port `8953`. The active bundle and its version are persisted to `data_dir/ha_state.toml` (mode `0600`) on every publish. On startup the master compares the sanitized current `config.toml` with the persisted bundle and republishes at `N + 1` when the configuration changed, so a restart can never leave slaves on stale settings.
-- **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce the cluster epoch (a bundle from an older term is rejected even when its version is higher) and strict monotonic version ordering within a term, and apply configuration snapshots atomically. The last applied term, version, signed payload hash, digest of the exact applied `config.toml`, and timestamp are persisted to `data_dir/ha_watermark.toml` (atomic, mode `0600`) before the push is acknowledged, so a restart cannot replay an older bundle, accept same-version content with a different hash, or early-ACK a locally edited configuration. A watermark written by 1.9.3 or earlier has no digest and forces one full apply before any early ACK. A slave that receives no frame for `3 × ping_interval_secs` leaves `Synced` and reports not-ready. A corrupt watermark fails startup; delete the file only to force a full resync.
+- **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce the cluster epoch (a bundle from an older term is rejected even when its version is higher) and strict monotonic version ordering within a term, and apply configuration snapshots atomically. The last applied term, version, signed payload hash, digest of the **shared projection** of the applied `config.toml`, signing-key fingerprint and timestamp are persisted to `data_dir/ha_watermark.toml` (atomic, mode `0600`) before the push is acknowledged, so a restart cannot replay an older bundle, accept same-version content with a different hash, or early-ACK a locally edited shared configuration. Protocol v2 refuses a v1 watermark; back it up and move it aside before the first v2 start (see §7). A slave that receives no frame for `3 × ping_interval_secs` leaves `Synced` and reports not-ready. A corrupt or v1 watermark fails startup; delete it only after backup to force a full resync.
 - **Admission limits**: the replication listener accepts at most 64 concurrent slave sessions and at most 8 concurrent sessions per source IP; a 10 s timeout bounds TLS/WebSocket handshakes and one WebSocket write. A NAT deployment with more than eight simultaneous HA peers from one address must be split across source addresses.
 - **Continuous Resolution**: Slaves serve DNS queries continuously without downtime. If an invalid or unparsable configuration bundle is received, the slave performs an automatic rollback to its last known good snapshot and enters a `Degraded` state.
 - **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master.
@@ -565,7 +565,7 @@ When a slave node fails or must be reprovisioned from bare metal:
 | `Incoming version <= have_version` | Out of order or replayed bundle | Normal during network blips; the master will send the latest monotonic version. After a promotion, an older-term master is rejected even with a higher version; promote the master explicitly (section 2). |
 | Master reports `"diverged": true` | A slave is ahead in the same term, reports a newer term (stale/partitioned master, lost/corrupt `ha_state.toml`, or forked master), or reported a same-version payload fork | Read `diverged_reason`. Divergence is **sticky per slave**: it is not cleared by another slave applying the current version, nor by `POST /api/v1/ha/resync`. It clears when that specific slave acknowledges the master's current term/version or disconnects. A same-version fork marks that slave unsynced and visible but does **not** stop publishing to healthy replicas. Isolate the stale master, resolve the fork, restore its state file or perform the explicit promotion in section 2 (raise both `term` and `version`), then restart it. |
 | Slave stays `Synced` but its master is gone / stale config | The TCP session is blackholed (no frames, no close) | The slave now treats any frame as liveness proof and requires one within `3 × ping_interval_secs` (default 45 s). On timeout it leaves `Synced`, sets `readiness_reason`, and `/health` reports not ready while DNS keeps serving the last applied configuration. Check the network path/port 8953 and the master process. |
-| Slave reports `"Degraded"` with `Local configuration drift` | `config.toml` was edited or reverted locally after the last applied bundle | The persisted `ha_watermark.toml` stores the digest of the exact applied document. Wait for the master to push the current bundle (the slave forces a full apply even for the same version) or issue a resync. If the master is unreachable the node stays degraded and `/health` false until it reconnects. |
+| Slave reports `"Degraded"` with `Local configuration drift` | A shared field in `config.toml` was edited or reverted locally after the last applied bundle | The persisted `ha_watermark.toml` stores the digest of the shared projection of the applied document. Wait for the master to push the current bundle (the slave forces a full apply even for the same version) or issue a resync. If the master is unreachable the node stays degraded and `/health` false until it reconnects. |
 | Slave reports a same-version payload fork | The master and slave hold different signed content for the same term and version (split brain) | The slave persists a fork latch in `ha_watermark.toml`, degrades, and rejects all same-term pushes; the master records divergence and stops showing the slave as synced. Do not retry the same version. Isolate the forked master and perform an explicit promotion with a strictly higher `term` **and** `version` (section 2); the promoted bundle clears the latch. |
 | Master `/health` stays false after an external `config.toml` edit, log says the HA bundle exceeds the replication limit | The file watcher rolled the live configuration back, but the oversized external file is left on disk; publication re-reads it on every attempt | Correct or replace `config.toml` with a document under the replication limit (or restore the previous file). Until then each republish/retry re-reads the oversized document and `/health` cannot recover. The `PUT /api/v1/config` path rolls the persisted document back and is not affected. |
 | API returns `409 Conflict` | Mutation attempted directly on a slave node | Perform configuration edits on the master node indicated in the `X-Dnsd-Master` header. |
@@ -658,10 +658,11 @@ export TOKEN='sito_...'   # Admin token: all /api/v1/ha/* endpoints require Admi
 The HA replication channel synchronizes entire server configuration bundles, custom rules, DNS rewrites, and client definitions between nodes. Protecting this transport against interception, tampering, and unauthorized slave connections is critical.
 
 ### 1. Certificate Pinning & Transport Encryption
-- **Pinned TLS (Default & Recommended)**: Slave nodes connecting to `wss://` require `master_fingerprint = "blake3:..."` matching the master's certificate. This prevents man-in-the-middle (MITM) attacks even if a rogue CA is trusted in the system certificate store.
-- **Unpinned TLS (`allow_unpinned_tls = true`)**:
+- **Pinned TLS (Recommended)**: Slave nodes connecting to `wss://` can require `master_fingerprint = "blake3:..."` matching the master's certificate. This prevents man-in-the-middle (MITM) attacks even if a rogue CA is trusted in the system certificate store.
+- **CA-only TLS**: With `ca` configured and no `master_fingerprint`, the slave validates the master chain, validity and SAN/hostname against that CA. This is a supported trust mode and does **not** require `allow_unpinned_tls`. If both a pin and a CA are configured, both are enforced.
+- **Explicit no-verification (`allow_unpinned_tls = true`)**:
   > [!WARNING]
-  > Setting `allow_unpinned_tls = true` allows the slave to trust any server certificate issued by the configured CA without fingerprint pinning. This is discouraged in production because any compromised certificate issued by that CA could intercept or alter the cluster configuration bundle.
+  > This flag only has an effect when **neither** `master_fingerprint` nor `ca` is configured. It then trusts any server certificate: there is no pin and no chain validation. This is discouraged in production. A configured CA is still checked even when this flag is set.
 - **Plaintext WebSocket (`allow_insecure_ws = true`)**:
   > [!CAUTION]
   > Plaintext `ws://` connections are refused by default. Setting `allow_insecure_ws = true` transmits replication data without TLS encryption. Do NOT enable `allow_insecure_ws` across untrusted or public networks, as configuration details, network topology, and client tokens will be exposed in cleartext. Only use for local loopback debugging.
@@ -708,19 +709,33 @@ backups described in the [migration guide](2.0-migration.md#8-ha).
    `ha_watermark.toml`; keep the previous binary/container image.
 2. **Install the v2 binary on every node first**, without starting it. Mixed
    v1/v2 replication is refused by design.
-3. **Start the master first.** It serves v2 and rejects any v1 slave with
+3. **Retire the v1 state/watermark files.** A v2 binary refuses v1 files, so
+   after the backup move them aside or remove them:
+   - on the master: `data_dir/ha_state.toml` (for example
+     `mv /var/lib/sito/ha_state.toml /var/lib/sito/ha_state.toml.v1.bak`);
+   - on every slave: `data_dir/ha_watermark.toml`
+     (`mv /var/lib/sito/ha_watermark.toml /var/lib/sito/ha_watermark.toml.v1.bak`).
+
+   There is no in-place state migration command. The consequences are
+   intentional: the master starts a **new local sequence** (version/term reset
+   to the configured initial values), every slave performs a **full resync/full
+   apply**, and each slave's local replay guard is reset. Every slave must
+   apply the master's current bundle before reporting `Synced`. Keep the v1
+   files for downgrade; never hand them to a v2 node.
+4. **Start the master first.** It serves v2 and rejects any v1 slave with
    `protocol_mismatch`. DNS keeps answering from each node's last applied
    configuration; replication is intentionally degraded during this window.
-4. **Start slaves one at a time.** A v2 slave also rejects a v1 master, so
+5. **Start slaves one at a time.** A v2 slave also rejects a v1 master, so
    start slaves only after the master is v2. Watch each slave reach `Synced`
-   with the master's current term/version.
-5. **Verify convergence.** Read `ready`, `readiness_reason` and
+   with the master's current term/version after the full apply.
+6. **Verify convergence.** Read `ready`, `readiness_reason` and
    `diverged_reason` from `GET /api/v1/ha/status`, and per-slave
    `synced_version`/`lag` from `GET /api/v1/ha/slaves`. `/health` stays generic;
    a `protocol_mismatch` reason means a node still runs v1.
-6. **Expect a one-time state migration.** The first v2 start rewrites the
-   master state and each slave watermark in the v2 shape. Do not copy those
-   files back to a v1 node.
+7. **Publish/verify the current bundle.** Because the master sequence and the
+   slave replay guards were reset, confirm the active bundle was republished
+   (or trigger `POST /api/v1/ha/resync`) and that every slave's applied version
+   matches the master.
 
 The rolling order above intentionally accepts a short replication gap. For a
 strict no-gap window, stop the whole cluster, start the master, then the
@@ -747,12 +762,12 @@ not a supported downgrade.
 ### 7.4 Publish status, limits and trust policy
 
 - `POST /api/v1/config`/reload responses report `ha_publish.status = "queued"`
-  when the bundle was persisted and queued. This is **not** delivery proof:
-  `slaves_connected`, `slaves_queued` and `slaves_coalesced` are separate
-  counts, and delivery is confirmed by the slave ACK shown in
-  `GET /api/v1/ha/slaves`. `no_slaves` means no slave is connected; a connected
-  slave with a closed channel is still counted as connected and the publish is
-  `queued` with a zero queue count.
+  when at least one slave was enqueued (directly or coalesced). This is **not**
+  delivery proof: `slaves_connected`, `slaves_queued` and `slaves_coalesced` are
+  separate counts, and delivery is confirmed by the slave ACK shown in
+  `GET /api/v1/ha/slaves`. `no_slaves` means no slave is connected. When
+  slaves are connected but every channel is closed, nothing was queued and the
+  status is `connected_no_delivery` (never `no_slaves` and never `queued`).
 - `TooLarge` is a configuration error, not a transport error. The envelope is
   not persisted or broadcast, and it is **not retried** because retrying the
   same document cannot shrink it. Reduce the shared configuration (rules,
@@ -760,7 +775,8 @@ not a supported downgrade.
 - Limits: 1 MiB maximum WebSocket message/frame, 4 MiB per-slave queued bytes
   (500 ms/1 s writes coalesce the latest bundle), 10 s send deadline, 10 s
   handshake/connect deadline, 64 global and 8 per-source-IP concurrent
-  handshakes. Slow or silent peers are disconnected instead of pinning memory.
+  **sessions** (the per-IP permit is held for the whole session, not only the
+  handshake). Slow or silent peers are disconnected instead of pinning memory.
 - Master URL: bracketed IPv6 literals are supported, for example
   `master_url = "wss://[2001:db8::10]:8953"` or
   `master_url = "wss://[::1]:8953"`. Do not omit the brackets.

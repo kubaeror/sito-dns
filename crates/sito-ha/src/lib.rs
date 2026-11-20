@@ -336,6 +336,124 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// CA-only TLS must complete a real mTLS handshake and sync without a
+    /// certificate pin and without `allow_unpinned_tls`.
+    #[tokio::test]
+    async fn test_ha_ca_only_tls_end_to_end() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ha_ca_only_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let certs = generate_ha_certs(&temp_dir, true, true).unwrap();
+        let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let coordinator = MasterCoordinator::new(
+            "master-ca-only".to_string(),
+            1,
+            signing_key.clone(),
+            sito_stats::MetricsRegistry::new("0.1.0", "test"),
+        );
+
+        let replication_port = sito_test_support::reserve_port_number().unwrap();
+        let master_ha_cfg = HaConfig {
+            replication_port,
+            listen_addr: "127.0.0.1".to_string(),
+            cert: certs.master_cert_path.clone(),
+            key: certs.master_key_path.clone(),
+            // No pins: the client chain is authenticated by the CA.
+            ca: Some(certs.ca_cert_path.clone()),
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let _server = spawn_master_server(master_ha_cfg, coordinator.clone(), shutdown_rx);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let master_url = format!("wss://127.0.0.1:{replication_port}");
+        let slave_tracker =
+            SlaveStatusTracker::new("slave-ca-only".to_string(), 0, Some(master_url.clone()));
+        let base_config = sito_core::config::Config::default();
+        let config_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(base_config.clone())));
+        let filter_engine = Arc::new(
+            sito_filter::HostsFilterEngine::init(base_config.filtering.clone(), temp_dir.clone())
+                .await,
+        );
+        let rewrites_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            sito_rewrites::RewriteTable::new(Default::default()),
+        )));
+        let clients_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            sito_clients::ClientRegistry::new(Default::default()),
+        )));
+        let runtime = Arc::new(sito_runtime::RuntimeState::new(
+            config_arc,
+            clients_arc,
+            rewrites_arc,
+        ));
+        let applier = Arc::new(crate::slave::worker::test_support::TestApplier::new(
+            runtime.clone(),
+            filter_engine.clone(),
+            None,
+        ));
+        let handles = SlaveAppHandles {
+            runtime,
+            filter: filter_engine,
+            metrics: sito_stats::MetricsRegistry::new("0.1.0", "slave-ca-only"),
+            config_path: None,
+            applier,
+        };
+
+        let slave_ha_cfg = HaConfig {
+            master_url: Some(master_url),
+            master_fingerprint: None,
+            allow_unpinned_tls: false,
+            master_pubkey: Some(signing_key.public_key_hex()),
+            cert: certs.slave_cert_path.clone(),
+            key: certs.slave_key_path.clone(),
+            ca: Some(certs.ca_cert_path.clone()),
+            stats_interval_secs: 1,
+            ..Default::default()
+        };
+        assert!(
+            slave_ha_cfg.validate("slave").is_ok(),
+            "CA-only TLS must pass slave config validation"
+        );
+
+        let bundle = ConfigBundle {
+            version: 2,
+            timestamp: 1,
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
+            custom_rules: vec!["||ca-only-sync.example^".to_string()],
+            ..ConfigBundle::default()
+        };
+        coordinator.update_bundle(bundle).unwrap();
+
+        let (_resync_tx, resync_rx) = tokio::sync::mpsc::channel(1);
+        let _worker = spawn_slave_worker(
+            slave_ha_cfg,
+            slave_tracker.clone(),
+            handles,
+            resync_rx,
+            shutdown_tx.subscribe(),
+        );
+
+        let mut synced = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if slave_tracker.get_version() == 2 && slave_tracker.get_state() == SlaveState::Synced {
+                synced = true;
+                break;
+            }
+        }
+        assert!(
+            synced,
+            "CA-only slave must synchronize (state {:?}, reason {:?})",
+            slave_tracker.get_state(),
+            slave_tracker.readiness().reason
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[test]
     fn test_unpinned_tls_rejected_by_default() {
         let mut cfg = HaConfig {

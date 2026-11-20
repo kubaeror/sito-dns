@@ -416,8 +416,9 @@ pub struct ConfigUpdateResponse {
 /// Outcome of publishing a configuration to HA replica slaves.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct HaPublishStatus {
-    /// `queued`, `no_slaves` or `failed`. `queued` is a queue outcome, not
-    /// proof of delivery; delivery is confirmed by the slave ACK.
+    /// `queued`, `connected_no_delivery`, `no_slaves` or `failed`. Neither
+    /// `queued` nor `connected_no_delivery` is delivery proof; delivery is
+    /// confirmed by the slave ACK.
     pub status: String,
     /// Human-readable failure reason. Never contains secret material.
     #[serde(default, skip_serializing_if = "Option::is_none")]

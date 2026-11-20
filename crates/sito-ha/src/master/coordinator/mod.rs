@@ -55,7 +55,12 @@ pub const MAX_PUBLISH_HISTORY: usize = 64;
 /// room.
 pub const MAX_SLAVE_QUEUE_BYTES: usize = MAX_WS_MESSAGE_SIZE * 4;
 
-/// Maximum concurrently unauthenticated/active handshake slots per source IP.
+/// Maximum concurrently admitted/handshaking HA sessions per source IP.
+///
+/// The permit is held for the whole WebSocket session (not only the handshake
+/// upgrade), so one source cannot consume the global 64-session budget with
+/// idle authenticated sessions. A rejected peer's slot is released when its
+/// connection closes.
 const MAX_HANDSHAKES_PER_IP: usize = 8;
 
 /// Identifies one slave session for queue accounting.
@@ -133,8 +138,9 @@ struct Divergence {
 /// Per-IP accounting for accepted HA connections.
 ///
 /// The global connection semaphore bounds total slots, but a single source
-/// could still consume all of them before authenticating. This budget makes
-/// the unauthenticated handshake/session surface per-IP as well.
+/// could still consume all of them before authenticating. This budget bounds
+/// concurrent sessions per IP; the permit is held for the whole session, so it
+/// limits authenticated idle sessions too, not only the handshake window.
 #[derive(Debug, Default)]
 struct HandshakeBudget {
     active: Mutex<HashMap<IpAddr, usize>>,

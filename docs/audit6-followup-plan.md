@@ -482,9 +482,10 @@ Startup, check-config, API writes, restore, and HA apply all reject unknown keys
 ### D7 — HA protocol v2 upgrade/downgrade
 
 - Upgrade order: **master first**, then slaves. A v2 master rejects v1 slaves with `protocol_mismatch` and a readiness reason; a v2 slave rejects a v1 master the same way. The cluster is upgraded one node at a time with replication intentionally degraded during the window.
+- Before the first v2 start, back up and move aside `ha_state.toml` on the master and `ha_watermark.toml` on every slave. There is no in-place state-migration command; the master sequence resets, each slave replay guard resets, and a full resync/full apply is required. Keep the v1 files for downgrade.
 - Downgrade is **not supported in place**. Restore the pre-upgrade backup of `config.toml`, `ha_state.toml`, `ha_watermark.toml`, and certificates, then run 1.9.3.
 - `ha_state.toml`/`ha_watermark.toml` carry `protocol_version = 2`; v1 files are refused with migration instructions rather than guessed at.
-- Shared config fields on a slave are read-only. A local edit to a shared field marks the slave `Degraded` and requires a full resync; node-local fields remain editable.
+- A local edit to a shared field is detected as drift after the write, marks the slave `Degraded`, and requires a full resync; node-local fields remain editable. Edit-time read-only enforcement is future work.
 
 ### D8 — HA publish failure semantics
 
@@ -827,9 +828,9 @@ UI/live refresh sets `include_total=false`; retention processes bounded hour chu
 - Bind bundle `term`, `version`, `config_digest`, `signing_key_fingerprint` into the signed payload.
 - Require local config digest match on restart.
 - Add heartbeat/pong deadline and per-slave ACK history.
-- Require CA or pin+CA semantics; no “unpinned without CA” unless an explicit `allow_no_verification` flag is set.
-- Upgrade order: master first, then slaves; downgrade is not supported in place. Restore config/HA state/certs backups to return to 1.9.3.
-- Shared config fields are read-only on slaves; local shared-field edits mark `Degraded` and require resync.
+- Require CA or pin+CA semantics; no “unpinned without CA” unless the explicit `allow_unpinned_tls` opt-out is set. A configured CA is always enforced.
+- Upgrade order: master first, then slaves; before the first v2 start, back up and move aside v1 `ha_state.toml`/`ha_watermark.toml` (no in-place state migration; master sequence and slave replay guards reset, full resync required). Downgrade is not supported in place; restore config/HA state/certs backups to return to 1.9.3.
+- A local shared-field edit is detected as post-edit drift, marks the slave `Degraded`, and requires resync; edit-time read-only enforcement is future work.
 - Coordinated cluster upgrade documented in `docs/runbook-ha.md`.
 
 ## 12. Fail-Closed Policy
@@ -1359,18 +1360,23 @@ and v1 state/watermark files are rejected with `protocol_mismatch`, the signed
 bundle binds `protocol_version`, `config_digest` and
 `signing_key_fingerprint`, and the watermark persists the key fingerprint.
 The pong watchdog, bounded 64-envelope publish history, honest
-`PublishOutcome` counts (`queued` vs connected/coalesced), 64/8 listener
-admission limits, 10 s send/handshake deadlines, 1 MiB message and 4 MiB
-per-slave queue budgets, IPv6 URLs, CA/SAN/pin policy, `ca.key` repair and
-fixed 1 s clean-close reconnect are covered by tests. Evidence:
+`PublishOutcome` counts (`queued`/`connected_no_delivery` vs
+connected/queued/coalesced), 64/8 listener session limits, 10 s send/handshake
+deadlines, 1 MiB message and 4 MiB per-slave queue budgets, IPv6 URLs,
+CA/SAN/pin policy, `ca.key` repair and fixed 1 s clean-close reconnect are
+covered by tests. Evidence:
 [`docs/audit6-test-matrix.md`](audit6-test-matrix.md#phase-2--ha-protocol-v2-and-failover-wp-29),
 [`docs/runbook-ha.md`](runbook-ha.md#7-ha-protocol-v2-upgrade-and-downgrade),
 [`docs/2.0-migration.md`](2.0-migration.md#82-ha-protocol-v2-upgrade) and the
 [API diff](2.0-public-api-diff.md#25-phase-2--ha-protocol-v2-and-failover-wp-29).
 Residuals: edit-time read-only enforcement for shared fields on slaves remains
-post-edit drift detection; the published API status is `queued` (delivery is
-confirmed only by the slave ACK), and downgrade requires restoring pre-upgrade
-state/watermark and certificate backups rather than an in-place rollback.
+post-edit drift detection; the published API status is `queued` only when a
+slave was enqueued and `connected_no_delivery` when connected channels were
+closed (delivery is confirmed only by the slave ACK), and downgrade requires
+restoring pre-upgrade state/watermark and certificate backups rather than an
+in-place rollback. The first v2 start requires moving v1 state/watermark files
+aside after backup (no in-place state migration), which resets the master
+sequence and slave replay guards and forces a full resync.
 
 ### WP-2.10 — Auth, RBAC, and self-service 2FA
 

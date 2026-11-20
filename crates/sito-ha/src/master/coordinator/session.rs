@@ -7,12 +7,21 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 /// Trim a rejection reason to the WebSocket close-frame payload limit.
-fn close_reason(reason: &str) -> String {
-    const MAX_CHARS: usize = 120;
-    if reason.chars().count() <= MAX_CHARS {
+///
+/// RFC 6455 allows at most 125 bytes of control-frame payload; the two-byte
+/// close code leaves 123 bytes for the UTF-8 reason. Truncation must happen on
+/// a character boundary so a multibyte instance name cannot panic or produce an
+/// invalid frame.
+pub(super) fn close_reason(reason: &str) -> String {
+    const MAX_BYTES: usize = 123;
+    if reason.len() <= MAX_BYTES {
         return reason.to_string();
     }
-    let mut truncated: String = reason.chars().take(MAX_CHARS - 3).collect();
+    let mut end = MAX_BYTES - 3;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = reason[..end].to_string();
     truncated.push_str("...");
     truncated
 }

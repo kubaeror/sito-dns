@@ -63,14 +63,14 @@ pub struct SlaveStatsSummary {
 /// Outcome of publishing a configuration bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishOutcome {
-    /// The bundle was persisted and queued for at least one connected slave.
+    /// The bundle was persisted and at least one connected slave was observed.
     ///
-    /// This is a *queue* outcome, not delivery confirmation: `slaves_queued`
+    /// This is a *queue outcome*, not delivery confirmation: `slaves_queued`
     /// counts direct channel enqueues, `slaves_coalesced` counts deferred
     /// fallback deliveries (slow/full queue), and `slaves_connected` is the
-    /// number of connected slaves observed during the publish. A slave that is
-    /// connected but whose channel is already closed counts in
-    /// `slaves_connected` but in neither queue counter.
+    /// number of connected slaves observed during the publish. Both queue
+    /// counters may be zero when every connected channel was already closed;
+    /// such a publish must not be reported as `NoSlaves` or as delivered.
     Published {
         version: u64,
         term: u64,

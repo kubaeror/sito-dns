@@ -196,6 +196,21 @@ fn test_restore_preserves_term_and_rejects_v1_state() {
         "unexpected error: {err:?}"
     );
 
+    // Documented recovery: move the v1 file aside after backup; the next start
+    // is a clean sequence (full resync/replay-guard reset).
+    let backup = state_path.with_extension("v1.bak");
+    std::fs::rename(&state_path, &backup).unwrap();
+    assert!(backup.exists());
+    let clean = MasterCoordinator::new(
+        "test-master".to_string(),
+        0,
+        Arc::new(Ed25519SigningKey::generate().unwrap()),
+        sito_stats::MetricsRegistry::new("test", "test"),
+    )
+    .with_state_path(state_path.clone());
+    assert_eq!(clean.restore_state().unwrap(), None);
+    assert_eq!(clean.get_current_version(), 0);
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1248,6 +1263,25 @@ async fn test_pending_coalesced_task_does_not_charge_reconnected_session() {
         new_rx.try_recv().is_err(),
         "the superseded task must not deliver to the replacement session"
     );
+}
+
+#[test]
+fn test_close_reason_truncates_multibyte_on_utf8_boundary() {
+    // A multibyte instance name must not push the close-frame reason past the
+    // 123-byte payload limit or split a UTF-8 code point.
+    let reason = format!(
+        "protocol_mismatch: slave '{}' speaks HA protocol v1 but this master requires v2",
+        "réplica-λ".repeat(50)
+    );
+    assert!(reason.len() > 123);
+    let truncated = super::session::close_reason(&reason);
+    assert!(
+        truncated.len() <= 123,
+        "close reason is {} bytes: {truncated}",
+        truncated.len()
+    );
+    assert!(truncated.ends_with("..."));
+    assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
 }
 
 #[tokio::test]

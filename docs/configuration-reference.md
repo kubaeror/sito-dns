@@ -649,13 +649,16 @@ pre-upgrade state/watermark and certificate backups. See the
 Runtime limits are fixed: 1 MiB maximum WebSocket message/frame, 4 MiB of
 queued bundles per slave (older pushes coalesce to the latest active bundle),
 10 s send and handshake deadlines, and 64 global/8 per-source-IP concurrent
-handshakes. A publish response with `ha_publish.status = "queued"` means the
-bundle is persisted and queued, not delivered; inspect
+sessions (the per-IP permit covers the whole session, not only the handshake).
+A publish response with `ha_publish.status = "queued"` means at least one slave
+was enqueued (directly or coalesced), not delivered; inspect
 `slaves_connected`/`slaves_queued`/`slaves_coalesced` and the slave ACKs in
-`GET /api/v1/ha/slaves`. An oversized bundle returns `TooLarge`, is not
-persisted/broadcast, and is not retried: reduce the shared configuration.
-Private keys (`cert`/`key`, `ca.key`, and the Ed25519 signing key) are `0600`;
-reusing an existing CA repairs `ca.key` to `0600` without rewriting it.
+`GET /api/v1/ha/slaves`. If slaves are connected but every channel is closed,
+nothing was queued and the status is `connected_no_delivery`. An oversized
+bundle returns `TooLarge`, is not persisted/broadcast, and is not retried:
+reduce the shared configuration. Private keys (`cert`/`key`, `ca.key`, and the
+Ed25519 signing key) are `0600`; reusing an existing CA repairs `ca.key` to
+`0600` without rewriting it.
 
 The slave stores a **single** `master_fingerprint`; the master stores a list of
 accepted `pinned_slave_fingerprints`. During certificate rotation, the master
@@ -693,15 +696,20 @@ A slave must receive a frame (push, ping/pong, stats or close) within
 `3 × ping_interval_secs` (default 45 s); otherwise it leaves `Synced`, records a
 `readiness_reason`, and `/health` reports not ready while DNS keeps serving the
 last applied configuration. The watermark also records a BLAKE3 digest of the
-exact applied `config.toml`; a local edit or revert marks the node `Degraded`
-and forces a full apply before it can report `Synced` again. A watermark written
-by 1.9.3 or earlier has no digest and forces one full apply after upgrade.
-Master publish failures are reported through `ha_publish` on config writes and
-make HA readiness false. `POST /api/v1/ha/resync` returns `200` when the request
-was accepted (including a master with no connected slaves and no active bundle,
-which reports `slaves_notified: 0`). It returns `503` when replication is
-inactive, the slave worker is stopped, or a master has connected slaves and an
-active bundle but the push could not be queued for any of them.
+**shared projection** of the applied `config.toml` and the master signing-key
+fingerprint; a local edit to a shared field marks the node `Degraded` and forces
+a full apply before it can report `Synced` again, while node-local edits do not.
+Protocol v2 refuses v1 `ha_state.toml`/`ha_watermark.toml`; before the first v2
+start, back them up and move them aside on the master and every slave (see the
+[HA runbook §7.2](runbook-ha.md#72-upgrade-v1-cluster--v2)). This intentionally
+resets the master sequence and each slave's local replay guard and requires a
+full resync; keep the v1 files for downgrade. Master publish failures are
+reported through `ha_publish` on config writes and make HA readiness false.
+`POST /api/v1/ha/resync` returns `200` when the request was accepted (including
+a master with no connected slaves and no active bundle, which reports
+`slaves_notified: 0`). It returns `503` when replication is inactive, the slave
+worker is stopped, or a master has connected slaves and an active bundle but the
+push could not be queued for any of them.
 
 Replication preserves node-local identity. The master does not overwrite a
 slave's `dns.bind`, `[dns.tls]`/`[tls]` certificate paths, `[acme]` account and
