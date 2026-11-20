@@ -1306,14 +1306,39 @@ cancelled losers may not get an attempt entry.
 ### WP-2.8 — Cache and response shaping
 
 **Addresses:** P1-13, P1-14, P1-18, P2-22, P2-23, P2-84.
-**Files:** `sito-cache/src/*`, `sito-proto/src/wire.rs`, `sito/src/pipeline.rs`.
+**Files:** `crates/sito-cache/src/*`, `crates/sito-proto/src/{wire,shaping}.rs`,
+`crates/sito/src/pipeline/*`, `crates/sito-api/src/handlers/cache.rs`,
+`crates/sito-transport/src/{udp,tcp,dot,doh,doh3,doq}.rs`.
 **Steps:**
-- [ ] Enable moka invalidation closures; add non-root test.
-- [ ] Rebuild question/flags/OPT per client; strip upstream EDNS options.
-- [ ] Add policy epoch and TTL re-clamp; sanitize public helpers.
-- [ ] Enforce response size on DoH/DoH3/TCP/DoT.
+- [x] Enable moka invalidation closures; add non-root test.
+- [x] Rebuild question/flags/OPT per client; strip upstream EDNS options.
+- [x] Add policy epoch and TTL re-clamp; sanitize public helpers.
+- [x] Enforce response size on DoH/DoH3/TCP/DoT.
 - **Acceptance:** cache invalidation/shaping/size tests pass.
 **Estimate:** M.
+
+**Status (2026-11-20): complete.** Non-root invalidation is exercised for the
+exact name, subdomains, IDN/punycode, every key variant (plain, EDNS/DO, CD=1,
+ECS, Secure) and after a cache resize, plus the REST seed/invalidate path.
+Every result path uses the shared shaper; the multi-question FORMERR path is
+shaped with `dns.edns_udp_size` and echoes no client options. Cache inserts now
+store `AD=1` only for `Secure` decisions without mutating the caller, the
+status-less fresh/stale getters hide `Bogus`/`Indeterminate`, and the
+status-aware getters remain the raw inspection form. TTL-only runtime applies
+invalidate old entries by epoch (documented and tested) while direct
+`update_config` re-clamps TTL, negative and stale windows; stale responses use
+`min(30 s, max_ttl)`. CD=1-triggered prefetches refresh the triggering key
+instead of writing the CD=0 key. UDP, TCP, DoT, DoH, DoH3 and DoQ all enforce
+the 65,535-byte framing fallback, with direct `truncate_for_framing` over/under/
+undecodable tests. Evidence is in the Phase 2 — cache and response shaping
+(WP-2.8) section of `docs/audit6-test-matrix.md` and §23 of
+`docs/2.0-public-api-diff.md`.
+
+**Residuals (later work):** runtime cache-policy applies remain
+epoch-invalidating rather than warm-entry re-clamping, so a TTL-only apply
+drops warm entries by design; the over-limit `truncate_for_framing` test pads a
+decodable wire buffer because Hickory's encoder itself caps output at 65,535
+bytes.
 
 ### WP-2.9 — HA protocol v2 and failover
 
