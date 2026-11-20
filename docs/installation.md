@@ -3,9 +3,11 @@
 This guide covers deploying **sito** on Linux hosts using the automated one-line installer, manual systemd service configuration, Docker, or Docker Compose.
 
 > **Development status:** the `main` line is currently **2.0.0-alpha.1**
-> (Phase 1 refactor foundations). The published stable release remains
-> **1.9.5**, and the pinned examples below intentionally target it. Alpha
-> builds are not published as stable artifacts.
+> (Phase 2 core hardening; WP-2.1 through WP-2.13 are delivered). The published
+> stable release remains **1.9.5**, and the pinned examples below intentionally
+> target it. Alpha builds are not published as stable artifacts. Phase 3
+> verification/release and the deferred items listed in the
+> [2.0 claim matrix](2.0-claim-matrix.md) remain outstanding.
 
 ---
 
@@ -91,10 +93,10 @@ safe choice is the default; a bind-mounted `./config` needs an explicit chown.
 
 > [!NOTE]
 > The loopback admin default is already in the **2.0** config v2 schema. A
-> default-deny DNS client ACL is not part of Phase 1 and remains future work;
-> the startup warning and this firewall guidance are the mitigation on both
-> lines. 1.9.5 keeps its historical `0.0.0.0` admin default so existing
-> configurations continue to work. See the
+> default-deny DNS client ACL is not part of Phase 2 core hardening and remains
+> deferred work; the startup warning and this firewall guidance are the
+> mitigation on both lines. 1.9.5 keeps its historical `0.0.0.0` admin default
+> so existing configurations continue to work. See the
 > [2.0 migration guide](2.0-migration.md) before moving an existing install.
 
 ---
@@ -121,9 +123,10 @@ The installer automatically:
 4. Grants `CAP_NET_BIND_SERVICE` capability to bind ports 53 and 443 without root.
 5. Deploys the hardened systemd unit, enables, and starts the service.
 6. Runs post-install health verification (`systemctl is-active` and HTTP check).
-7. Prompts you to complete setup via the web wizard at `http://<server-ip>:8080`
-   and prints LAN-only firewall guidance. The advice allows SSH first, does not
-   open 8080, and points at the SSH tunnel or a temporary LAN-scoped rule for
+7. Prompts you to complete setup via the web wizard. The **1.9.5** installer
+   prints `http://<server-ip>:8080`; a **2.0 config-v2** install binds the admin
+   UI to `127.0.0.1`, so use the SSH tunnel. The advice allows SSH first, does
+   not open 8080, and points at the tunnel or a temporary LAN-scoped rule for
    first-time setup.
 
 ### 1.1 The 2.0 alpha line
@@ -257,7 +260,9 @@ bind = "127.0.0.1"
 ```
 
 ### 2.5 Install Systemd Unit
-Copy `contrib/systemd/sito.service` to `/etc/systemd/system/sito.service`:
+The canonical unit is [`contrib/systemd/sito.service`](../contrib/systemd/sito.service);
+the installer copies that file (or its embedded fallback with the same hardening
+directives). Copy it to `/etc/systemd/system/sito.service`:
 ```ini
 [Unit]
 Description=sito high-performance filtering DNS server
@@ -371,9 +376,10 @@ The CLI updater downloads assets with `0600` permissions, verifies the staged
 binary with `--version`, keeps a backup of the current executable and restores
 it if replacement fails, then renames the verified binary into place. It also
 refuses to report “up to date” when the release tag cannot be compared as
-semver; use `sito update --force` for an explicit reinstall. The updater does
-not preserve file capabilities; if you installed the binary manually with
-`setcap`, re-apply
+semver; use `sito update --force` for an explicit reinstall. The updater copies
+the existing executable's mode and extended attributes, including
+`security.capability`; a missing attribute or failed rename aborts and removes
+the temporary file. If you replace the binary manually, re-apply
 `sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito` after the update.
 The installer restores capabilities itself.
 
@@ -446,6 +452,8 @@ accepts the admin web interface while the API reports first-boot setup pending
 ## 4. Docker Compose Deployment
 
 ### 4.1 Single Node (`docker-compose.yml`)
+The shipped [`docker-compose.yml`](../docker-compose.yml) is the canonical
+single-node file; this block mirrors its ports, named volumes and hardening.
 ```yaml
 services:
   sito:
@@ -492,6 +500,24 @@ a broken DNS listener still turns the container unhealthy.
 initialises with uid/gid `65532` ownership. To keep configuration on the host,
 replace it with `./config:/etc/sito` and hand the directory to the container
 user once: `sudo chown -R 65532:65532 ./config`.
+
+> **Migrating an older bind-mounted deployment.** Existing deployments that
+> mount `./config:/etc/sito` are not converted automatically. Either keep the
+> bind mount and `chown` it to `65532:65532`, or create the named volume and
+> copy the files before starting the new Compose definition:
+>
+> ```bash
+> docker volume create <project>_sito-config
+> docker run --rm \
+>   -v "$PWD/config:/from:ro" \
+>   -v "<project>_sito-config:/to" \
+>   busybox sh -c 'cp -a /from/. /to/ && chown -R 65532:65532 /to'
+> ```
+>
+> Use `docker compose config --volumes` to confirm the project-prefixed volume
+> name. `sito.env`, `config.toml`, `users.toml`, ACME state and HA key material
+> must move together; a config volume without its data volume is not a complete
+> backup.
 
 To build and run the working tree instead of the pinned release image, layer
 the build override:

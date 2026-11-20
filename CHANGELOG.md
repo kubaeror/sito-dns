@@ -7,10 +7,51 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [2.0.0-alpha.1] - Unreleased
 
-Phase 1 refactor foundations. This is **not a published release**: the
-workspace version advances so the 2.0 line can be built, tested and released
-as a prerelease. Phase 1 work packages land as separate commits on
-`feat/2.0-phase1-foundations`.
+Phase 2 core hardening. This is **not a published release**: the workspace
+version advances so the 2.0 line can be built, tested and released as a
+prerelease. Phase 1 foundations and the Phase 2 work packages (WP-2.1 through
+WP-2.13) are delivered on `feat/2.0-phase2-core-hardening`; the final
+documentation/migration pass and legacy WebSocket query-token removal are
+WP-2.14. Phase 3 verification/release (WP-3.1 through WP-3.4) remains pending.
+
+### Phase 2 core hardening (WP-2.1 through WP-2.13)
+- WP-2.1/2.2: DNSSEC chain state machine, delegation-boundary checks, negative
+  cache/policy integration and a per-query validation/fetch deadline.
+- WP-2.3/2.4: filter parser/compiler streaming budgets, precedence/groups, and
+  validated local rewrites with explicit TXT chunking and NODATA outcomes.
+- WP-2.5: strict client MAC IDs, ARP snapshot invalidation, schedules, safe
+  search, curated-list status/refresh APIs and bundled-data provenance.
+- WP-2.6: one pre-body transport admission controller, prefix rate keys, QUIC
+  connection lifetimes, TLS manager sets and visible encrypted-listener bind
+  failures.
+- WP-2.7: upstream bootstrap/probe SSRF and RD correctness, DoH path/proxy and
+  DoQ reconnect fixes, validation bounds and per-attempt RTT/error metrics with
+  stale-series pruning.
+- WP-2.8: client-neutral response shaping, cache key/status sanitization,
+  non-root invalidation, TTL re-clamping and per-transport oversize truncation.
+- WP-2.9: HA protocol v2 with signed config digest/fingerprint, v1 rejection,
+  truthful publish outcomes, bounded queues/history and the IPv6/CA/SAN/key
+  policy.
+- WP-2.10: self-service password changes and 2FA, session-bound re-auth for
+  sensitive Admin mutations, bounded Argon2 work and truthful create statuses.
+- WP-2.11: OpenAPI security/tag/path coverage, fail-closed config apply,
+  reference/rewrite validation, `no-store` responses, querylog Origin checks,
+  Viewer URL redaction and updater version/systemd/lock/rollback/signature
+  hardening.
+- WP-2.12: rollup PII hashing, bounded retention chunks, clear/vacuum policy,
+  live-tail clone gating and a cached dashboard aggregate.
+- WP-2.13: loopback-admin Compose with named config volume, hardened systemd
+  unit with `EnvironmentFile`/`UMask`, atomic installer rollback and capability
+  preservation, release scan/sign gates and installer E2E.
+
+### Deferred
+- `/api/v2` and the API v1 compatibility facade; `/api/v1` is canonical.
+- SQLite schema/PII migration (`sito db migrate`, `SITO_DB_AUTO_MIGRATE`) and
+  installer/Docker config auto-migration.
+- Default-deny DNS client ACL, weighted upstream balancing, a second proof for
+  user/token deletion and edit-time read-only HA enforcement.
+- Optional external parental/service data and the Phase 3 regression, fuzz,
+  benchmark, Docker/installer E2E and release-candidate work.
 
 ### Changed
 - Workspace version is now `2.0.0-alpha.1`. The stable `1.9.5` release remains
@@ -48,6 +89,13 @@ as a prerelease. Phase 1 work packages land as separate commits on
   backs up/restores the old binary, enforces `0600`/`0700` temp modes and
   always verifies a present signature pair. See §26 of
   `docs/2.0-public-api-diff.md`.
+- WP-2.14 (docs/migration): the 2.0 guide now records BC-8 (legacy WebSocket
+  `?token=` removal) and BC-9 (systemd/Docker update path plus stricter MAC,
+  rewrite and upstream/filter validation), fixes the section map and stale HA
+  protocol/watermark claims, and adds the current
+  [2.0 claim matrix](docs/2.0-claim-matrix.md). BC-8's code removal is the
+  companion change; until it lands, the deprecated query parameter is the only
+  remaining exception.
 
 ## [1.9.5] - 2026-11-10
 
@@ -246,7 +294,10 @@ guidance and residual risks.
   `filtering.allow_empty_list = true`; otherwise the response is rejected and
   the previous snapshot is retained.
 - TOTP automation must call `/api/v1/auth/reauth` and send `X-Reauth-Token`.
-- A 1.9.3 HA watermark without a digest forces one full apply after upgrade.
+- A 1.9.3 HA watermark without a digest forces one full apply after a 1.9.x
+  upgrade. This note is **1.9.x-only**: 2.0 HA protocol v2 refuses a v1
+  watermark instead of reading it, so before the first v2 start back up and move
+  `ha_state.toml`/`ha_watermark.toml` aside (see the 2.0 migration guide §8.2).
 - No data migration is required. Existing configs, SQLite databases,
   sessions/tokens, and HA state files load.
 

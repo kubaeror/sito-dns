@@ -15,9 +15,18 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 `sito` is designed as a modern, rock-solid alternative to AdGuard Home and Pi-hole. Engineered in Rust (edition 2024), it combines sub-millisecond p99 latency, comprehensive ad/tracker/malware blocking (using AdGuard/ABP rule syntax), multi-protocol encryption (DoT, DoH H2, DoQ, DoH3), and automated master/slave high availability.
 
 > **Development status:** the `main` line is currently **2.0.0-alpha.1**
-> (Phase 1 refactor foundations). The latest stable release remains **1.9.5**;
-> the quickstart below intentionally pins the published stable installer and
-> container image. Alpha builds are not published as stable artifacts.
+> (Phase 2 core hardening; WP-2.1 through WP-2.13 are delivered on this tree).
+> The latest stable release remains **1.9.5**; the quickstart below
+> intentionally pins the published stable installer and container image. Alpha
+> builds are not published as stable artifacts.
+>
+> Phase 3 verification and release (WP-3.1 through WP-3.4) is still pending.
+> Deferred work includes `/api/v2` and the API v1 compatibility facade, the
+> SQLite schema/PII migration (`sito db migrate`), installer/Docker
+> auto-migration, a default-deny DNS client ACL, weighted upstream balancing, a
+> second proof for user/token deletion, edit-time read-only HA enforcement, and
+> the optional external parental/service data. The current evidence matrix is
+> [`docs/2.0-claim-matrix.md`](docs/2.0-claim-matrix.md).
 
 ---
 
@@ -57,7 +66,7 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 - **Zero-Node.js Embedded Web Console:** Lightweight, reactive admin panel powered by Axum, Askama compile-time templates, HTMX, and Alpine.js embedded directly into the standalone binary via `rust-embed` (zero npm/Node.js build or runtime dependencies, <1 MB footprint).
 - **AdGuard / ABP Syntax Compatibility:** High-throughput `SuffixTrie` with string interning, Aho-Corasick substring matching, and backtracking-free regex DFAs.
 - **Modern Encryption:** Native support for plain UDP/TCP, DNS-over-TLS (DoT/853), DNS-over-HTTPS (DoH/443, H2), DNS-over-QUIC (DoQ/853), and DNS-over-HTTP/3 (DoH3/443).
-- **Zero-Consensus High Availability:** Real-time master/slave push replication over mTLS WebSockets with Ed25519 cryptographic signatures, certificate pinning by default (`allow_unpinned_tls` is an explicit insecure opt-out), shared token authentication, master-loss heartbeat detection, and instant mutation push.
+- **Zero-Consensus High Availability:** Real-time master/slave push replication over mTLS WebSockets with Ed25519 cryptographic signatures, a required certificate pin or CA validation (`allow_unpinned_tls` is the explicit no-verification opt-out when neither is configured), shared token authentication, master-loss heartbeat detection, and instant mutation push.
 - **Hardened Security & RBAC:** Audited security posture including setup wizard credential validation, default-authenticated Prometheus `/metrics` (`metrics_auth = true`), trusted proxy X-Forwarded-For verification, Argon2id passwords with BLAKE3-hashed TOTP backup codes and bounded auth maps with active background pruners, cosign-verified self-updates (`update_require_signature = true` by default; SHA-256 archives are still checked), constant-time authentication via `subtle`, parameterized SQL query builders, SSRF protection, ReDoS protection via dense DFA compilation bounds, and systemd sandbox directives.
 - **Robust Telemetry:** Non-blocking query logging to SQLite in WAL mode with real upstream identification and querylog privacy anonymization, Prometheus metrics exposition ([ADR-003](docs/adr/0003-log-store-sqlite-wal.md)), and Grafana dashboard.
 - **Unix & Linux Platform Support:** Engineered for Unix-based operating systems (Linux kernel 5.4+ strongly recommended for production; macOS supported for development) utilizing `SO_REUSEPORT`, `IP_PKTINFO`, and raw POSIX socket file descriptors. Windows is not supported natively.
@@ -252,8 +261,9 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 * **[User Management & Authentication](docs/user-management.md):** Accounts, roles/RBAC, password changes, API tokens, TOTP 2FA, last-admin protection, and recovery — including the Admin **Users** page (`/users`), the per-user **Account** page (`/account`), and the Operator-only unidentified-clients table in the web panel.
 * **[Migrating from AdGuard Home](docs/migration-adguard.md):** Migration instructions and automated converter script (`contrib/adguard_to_sito.py`).
 * **[High-Availability Runbook](docs/runbook-ha.md):** Deployment architectures, mTLS certificates, failover, and slave promotion.
+* **[Current 2.0 Claim Matrix](docs/2.0-claim-matrix.md):** Phase 2 claims mapped to the implementation, named tests and current documentation.
 * **[1.9.5 Release Notes](docs/release-notes-1.9.5.md):** Release-engineering patch: multi-platform artifact E2E and container image publication. See the [1.9.4 release notes](docs/release-notes-1.9.4.md#known-issues) for known issues.
-* **[Changelog](CHANGELOG.md):** Release notes for v1.9.5 and complete history of phases M0 through M9.
+* **[Changelog](CHANGELOG.md):** Release notes for v1.9.5, the 2.0 alpha line, and complete history of phases M0 through M9.
 * **[Historical documentation index](docs/history/README.md):** Which audits/plans are historical leads versus current evidence.
 
 ---

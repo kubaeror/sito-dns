@@ -1401,11 +1401,12 @@ explicit disable, and the unimplemented upstream weight control is removed.
 `create_client`, `add_client_group`, `add_filter_list` and `add_rewrite` return
 `201`; the TOTP challenge remains `202`, duplicate groups remain `409`, and
 `update_user` reports the real TOTP state. Evidence: Phase 2 — auth, RBAC and
-self-service 2FA section in `docs/audit6-test-matrix.md` and §20 of
+self-service 2FA section in `docs/audit6-test-matrix.md` and §22 of
 `docs/2.0-public-api-diff.md`. Deferred residuals: second proof for
-`delete_user`/`delete_token` and real weighted upstream balancing are WP-2.11+.
+`delete_user`/`delete_token` and real weighted upstream balancing remain
+unimplemented beyond Phase 2 (they were not delivered by WP-2.11).
 
-### WP-2.11 — API v2, OpenAPI, config apply, updater
+### WP-2.11 — API hardening, OpenAPI, config apply, updater
 
 **Addresses:** P2-38..P2-55, P2-44.
 **Files:** `sito-api/src/{router,openapi,handlers/*,config_apply,updater}.rs`, `docs/openapi.json`.
@@ -1432,9 +1433,10 @@ path. The updater detects systemd/Docker, refuses in-app apply with CLI
 instructions, never claims an unknown version is current, serializes applies,
 verifies the staged binary, backs up/restores the old binary, and enforces
 0600/0700 temp modes plus strict signature-pair policy. Viewer subscription
-URLs are redacted. Evidence: Phase 2 — API v2, OpenAPI, config apply, updater
-section in `docs/audit6-test-matrix.md` and §26 of
-`docs/2.0-public-api-diff.md`. Residuals: systemd unit/installer E2E and
+URLs are redacted. Evidence: Phase 2 — API hardening, OpenAPI, config apply,
+updater section in `docs/audit6-test-matrix.md` and §26 of
+`docs/2.0-public-api-diff.md`. Residuals: `/api/v2` and the API v1
+compatibility facade are absent and deferred; systemd unit/installer E2E and
 atomic installer rollback are WP-2.13; the update lock is process-wide (no
 cross-process file lock); legacy `?token=` WebSocket authentication removal is
 WP-2.14; weighted upstream balancing remains unimplemented.
@@ -1631,7 +1633,7 @@ No deadline is assumed. Phase 0 is shippable as **1.9.4** (with P1-19/P1-23/P1-2
 2. Baseline commands pass; fuzz targets run 24h clean; benchmarks pass the stored baseline.
 3. ACME staging issues/renews/reloads all transports; DNSSEC hostile-chain and real signed-zone tests pass; HA partition/fork/drift/promotion tests pass; `/health` false on a dead master.
 4. Installer fresh/upgrade/rollback/uninstall and Docker health/DNS tests pass.
-5. Config v1→v2, SQLite migration, API v2, and HA protocol v2 migration/rollback tests pass on a copy of a real 1.9.4 data dir.
+5. Config v1→v2 and HA protocol v2 migration/rollback tests pass on a copy of a real 1.9.4 data dir. SQLite migration and API v2 remain deferred; `/api/v1` is canonical.
 6. OpenAPI has security schemes and route coverage; docs commands execute; historical audits are marked.
 7. Threat model/security review signed off.
 

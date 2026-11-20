@@ -1,5 +1,11 @@
 # sito 1.9.1 — release notes
 
+> **Historical release notes (1.9.x line).** This records the 1.9.1 tag, not the
+> current 2.0 tree. Current 2.0 behavior differs: config v2 is required, the
+> admin UI defaults to loopback, `/api/v1` is canonical and HA protocol v2
+> refuses v1 peers/state. Use the [2.0 migration guide](2.0-migration.md) and the
+> [current 2.0 claim matrix](2.0-claim-matrix.md) for operator decisions.
+
 Target release: **1.9.1** on 2026-11-04. This is a patch release for residual
 correctness, concurrency, and UI issues found after 1.9.0. The tag and
 publication are handled separately; this page summarizes the user-visible

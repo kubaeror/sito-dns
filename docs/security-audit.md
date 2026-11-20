@@ -1,17 +1,20 @@
 # Security Review and Threat Model (current)
 
 This document summarizes the **implemented** security controls and known
-limitations of the current development tree (**2.0.0-alpha.1**, Phase 1
-foundations) and calls out where the published stable **1.9.5** line differs.
-It replaces an earlier v1.0.0/v1.2.1 audit record whose claims had drifted from
-the code. Point-in-time audits with file/line evidence and remediation status
-live in the [historical documentation index](history/README.md); they are
-leads, not current evidence.
+limitations of the current development tree (**2.0.0-alpha.1**, Phase 2 core
+hardening; WP-2.1 through WP-2.13 are delivered) and calls out where the
+published stable **1.9.5** line differs. It replaces an earlier v1.0.0/v1.2.1
+audit record whose claims had drifted from the code. Point-in-time audits with
+file/line evidence and remediation status live in the
+[historical documentation index](history/README.md); they are leads, not
+current evidence.
 
 Current contracts:
 
-* [`docs/2.0-migration.md`](2.0-migration.md) — breaking changes and the Phase
-  1/Phase 2 boundary.
+* [`docs/2.0-migration.md`](2.0-migration.md) — breaking changes, the Phase 2
+  delivered set and the deferred Phase 3 work.
+* [`docs/2.0-claim-matrix.md`](2.0-claim-matrix.md) — current Phase 2 claims
+  mapped to code, tests and documentation.
 * [`docs/config-v2.md`](config-v2.md) — config v2 validation, unknown-key policy
   and restart-only matrix.
 * [`docs/runbook-ha.md`](runbook-ha.md#health-and-status-endpoint-semantics-wp-17)
@@ -98,8 +101,8 @@ the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
 
 * The deprecated `?token=` query parameter is accepted **only** on the
   WebSocket upgrade when no `Authorization` header is present, logs a warning,
-  and is scheduled for removal in 2.0. Use `Authorization` headers or
-  `__Host-` session cookies.
+  and is removed by WP-2.14 (BC-8) in the 2.0 line. Use `Authorization` headers
+  or `__Host-` session cookies.
 * Rate-limiting budgets are enforced per network prefix (IPv4 `/24`, IPv6
   `/64`), not per authenticated account.
 * The account lockout map is bounded at 10,000 entries. If every entry is an

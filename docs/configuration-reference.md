@@ -89,12 +89,13 @@ allow_plaintext_doh = false
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
 > [!WARNING]
-> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 2.0 has **no DNS client allow-list**.
-> `rate_limit_per_ip` only limits rate; it does not authorize clients. A wildcard bind therefore accepts recursive queries from any source
+> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 2.0 has **no DNS client
+> allow-list**. A default-deny DNS client ACL is deferred, not part of Phase 2
+> core hardening. `rate_limit_per_ip` only limits rate; it does not authorize
+> clients. A wildcard bind therefore accepts recursive queries from any source
 > that can reach the host. Restrict the DNS ports to your LAN with a host
 > firewall, or bind specific LAN addresses. The server emits a startup warning
-> when a wildcard DNS bind is combined with an enabled DNS port. A
-> default-deny DNS client ACL is not part of the Phase 1 config work package.
+> when a wildcard DNS bind is combined with an enabled DNS port.
 
 ---
 
@@ -138,7 +139,7 @@ ntp = ["local.internal"]
 | `validate` | boolean | `true` | Enable DNSSEC processing. Validation walks DS/DNSKEY links present in the response and, when the chain is incomplete, resolves the missing DNSKEY/DS records through the configured upstreams (bounded per-query fetch budget). Cryptographic verification is bounded per response (256 RRSIG checks, at most 8 candidate keys per signature). NSEC/NSEC3 denial proofs are enumerated; NSEC3 records above 150 iterations are ignored (RFC 9276) and opt-out NXDOMAIN answers are treated as insecure. |
 | `ntp` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). Alias retained for compatibility; `nta` is the preferred key. |
 | `nta` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). |
-| `trust_anchors` | array of strings | `[]` | Trust anchors used as the top of the DS/DNSKEY chain (DS or DNSKEY records in zone-file/hex form). Empty uses validation of RRSIGs against configured anchors only. |
+| `trust_anchors` | array of strings | `[]` | Additional trust anchors used as the top of the DS/DNSKEY chain (DS or DNSKEY records in zone-file/hex form). The built-in root anchors are always present; an empty list means no *configured* anchors are added. Entries extend the built-in set rather than replacing it. |
 
 ---
 
@@ -682,15 +683,18 @@ readiness is reported by the admin web listener, keep `[web] enabled = true`
 fails closed rather than assuming replication is healthy.
 
 Slaves persist the last successfully applied bundle identity to
-`<data_dir>/ha_watermark.toml` (JSON, mode `0600`, written atomically) after
-the configuration is applied and before the push is acknowledged. The file
-records the term, version, signed payload hash and application timestamp. It is
-restored at startup: pushes from an older term are rejected, pushes below the
-recorded version within the same term are rejected, and a push at the same
-version is only accepted when the signed payload hash matches. A corrupt or
-unreadable watermark fails startup rather than resetting to version 0; delete
-it only when you intend to force a full resync from the master. The watermark
-is node-local and must not be copied between slaves.
+`<data_dir>/ha_watermark.toml` (JSON, mode `0600`, written atomically, wrapped
+v2 shape with a required `protocol_version`) after the configuration is applied
+and before the push is acknowledged. The file records the term, version, signed
+payload hash, application timestamp, signing-key fingerprint and a BLAKE3 digest
+of the **shared projection** of the applied `config.toml` (not the exact
+per-node document). It is restored at startup: pushes from an older term are
+rejected, pushes below the recorded version within the same term are rejected,
+and a push at the same version is only accepted when the signed payload hash and
+shared-projection digest match. A v1 or corrupt/unreadable watermark fails
+startup rather than being guessed at or reset to version 0; back it up and move
+it aside only as part of the coordinated v2 upgrade. The watermark is node-local
+and must not be copied between slaves.
 
 A slave must receive a frame (push, ping/pong, stats or close) within
 `3 × ping_interval_secs` (default 45 s); otherwise it leaves `Synced`, records a
