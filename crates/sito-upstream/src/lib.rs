@@ -111,6 +111,14 @@ mod tests {
         ipv4: Option<std::net::Ipv4Addr>,
         ipv6: Option<std::net::Ipv6Addr>,
     ) -> (SocketAddr, Arc<AtomicU32>) {
+        spawn_bootstrap_answers(ipv4.into_iter().collect(), ipv6.into_iter().collect())
+    }
+
+    /// Spawns a mock bootstrap server returning every supplied A/AAAA record.
+    fn spawn_bootstrap_answers(
+        ipv4s: Vec<std::net::Ipv4Addr>,
+        ipv6s: Vec<std::net::Ipv6Addr>,
+    ) -> (SocketAddr, Arc<AtomicU32>) {
         let query_count = Arc::new(AtomicU32::new(0));
         let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -133,21 +141,68 @@ mod tests {
                 let qname = query.queries[0].name().clone();
                 match query.queries[0].query_type() {
                     RecordType::A => {
-                        if let Some(v4) = ipv4 {
-                            resp.answers
-                                .push(Record::from_rdata(qname, 300, RData::A(A(v4))));
+                        for v4 in &ipv4s {
+                            resp.answers.push(Record::from_rdata(
+                                qname.clone(),
+                                300,
+                                RData::A(A(*v4)),
+                            ));
                         }
                     }
                     RecordType::AAAA => {
-                        if let Some(v6) = ipv6 {
+                        for v6 in &ipv6s {
                             resp.answers.push(Record::from_rdata(
-                                qname,
+                                qname.clone(),
                                 300,
-                                RData::AAAA(AAAA(v6)),
+                                RData::AAAA(AAAA(*v6)),
                             ));
                         }
                     }
                     _ => {}
+                }
+                if let Ok(encoded) = encode_message(&resp) {
+                    let _ = socket.send_to(&encoded, peer).await;
+                }
+            }
+        });
+        (addr, query_count)
+    }
+
+    /// Spawns a mock bootstrap server whose A answers rotate from `first` to
+    /// `second` after the first lookup. Used to prove denied answers are not
+    /// cached and forced refreshes bypass the cache.
+    fn spawn_rotating_bootstrap(
+        first: std::net::Ipv4Addr,
+        second: std::net::Ipv4Addr,
+    ) -> (SocketAddr, Arc<AtomicU32>) {
+        let query_count = Arc::new(AtomicU32::new(0));
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let socket = tokio::net::UdpSocket::from_std(listener).unwrap();
+        let count = Arc::clone(&query_count);
+        tokio::spawn(async move {
+            let mut a_index = 0u32;
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let Ok(query) = decode_message(&buf[..len]) else {
+                    continue;
+                };
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                resp.metadata.response_code = ResponseCode::NoError;
+                if query.queries[0].query_type() == RecordType::A {
+                    let ip = if a_index == 0 { first } else { second };
+                    a_index += 1;
+                    resp.answers.push(Record::from_rdata(
+                        query.queries[0].name().clone(),
+                        300,
+                        RData::A(A(ip)),
+                    ));
                 }
                 if let Ok(encoded) = encode_message(&resp) {
                     let _ = socket.send_to(&encoded, peer).await;
@@ -268,6 +323,135 @@ mod tests {
             result.is_err(),
             "NAT64-embedded private targets must be rejected: {result:?}"
         );
+    }
+
+    /// Mixed answers keep the public candidates and silently drop private ones;
+    /// a single denied record must not poison the whole resolution.
+    #[tokio::test]
+    async fn test_bootstrap_mixed_answers_keep_only_public_candidates() {
+        let public_v4 = std::net::Ipv4Addr::new(8, 8, 8, 8);
+        let public_v6 = std::net::Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let (mock_addr, _) = spawn_bootstrap_answers(
+            vec![std::net::Ipv4Addr::new(10, 0, 0, 1), public_v4],
+            vec![
+                std::net::Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1),
+                public_v6,
+            ],
+        );
+        let bootstrap = BootstrapResolver::new(vec![mock_addr.ip()], Duration::from_millis(1000))
+            .with_port(mock_addr.port());
+
+        let ips = bootstrap
+            .resolve_hostname("mixed.example.com")
+            .await
+            .expect("public candidates must survive a mixed answer");
+        assert_eq!(
+            ips,
+            vec![
+                std::net::IpAddr::V4(public_v4),
+                std::net::IpAddr::V6(public_v6)
+            ],
+            "private candidates must be dropped and no fallback may use them"
+        );
+    }
+
+    /// IPv4-mapped, 6to4 and Teredo answers that embed a private IPv4 target
+    /// must be rejected by the bootstrap layer, not only by the shared helper.
+    #[tokio::test]
+    async fn test_bootstrap_rejects_ipv4_embedded_private_answers() {
+        for embedded in [
+            // ::ffff:10.0.0.1
+            std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001),
+            // 6to4 2002:0a00:0001::/48 -> 10.0.0.1
+            std::net::Ipv6Addr::new(0x2002, 0x0a00, 0x0001, 0, 0, 0, 0, 0),
+            // Teredo 2001:0::/32 -> 10.0.0.1 (bitwise inverted)
+            std::net::Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0xf5ff, 0xfffe),
+        ] {
+            let (mock_addr, _) = spawn_bootstrap_server(None, Some(embedded));
+            let bootstrap =
+                BootstrapResolver::new(vec![mock_addr.ip()], Duration::from_millis(1000))
+                    .with_port(mock_addr.port());
+
+            let result = bootstrap.resolve_hostname("embedded.example.com").await;
+            assert!(
+                result.is_err(),
+                "embedded private target {embedded} must be rejected: {result:?}"
+            );
+        }
+    }
+
+    /// A denied-only answer must not enter the cache: the next lookup has to
+    /// query the bootstrap again and can pick up a corrected public answer.
+    #[tokio::test]
+    async fn test_bootstrap_denied_answer_is_not_cached() {
+        let private = std::net::Ipv4Addr::new(10, 0, 0, 1);
+        let public = std::net::Ipv4Addr::new(9, 9, 9, 9);
+        let (mock_addr, query_count) = spawn_rotating_bootstrap(private, public);
+        let bootstrap = BootstrapResolver::new(vec![mock_addr.ip()], Duration::from_millis(1000))
+            .with_port(mock_addr.port());
+
+        let denied = bootstrap.resolve_hostname("uncached.example.com").await;
+        assert!(
+            denied.is_err(),
+            "the first (private-only) answer must be denied: {denied:?}"
+        );
+
+        let ips = bootstrap
+            .resolve_hostname("uncached.example.com")
+            .await
+            .expect("a later lookup must re-resolve instead of reusing a denied result");
+        assert_eq!(ips, vec![std::net::IpAddr::V4(public)]);
+        assert!(
+            query_count.load(Ordering::SeqCst) >= 4,
+            "the denied result must not be cached (A+AAAA queries expected for both lookups)"
+        );
+    }
+
+    /// An explicit IP literal is the intentional allowlist path: it is an
+    /// operator choice and bypasses the bootstrap SSRF denylist.
+    #[tokio::test]
+    async fn test_bootstrap_ip_literal_bypasses_denylist() {
+        let bootstrap = BootstrapResolver::new(
+            vec![std::net::Ipv4Addr::new(9, 9, 9, 9).into()],
+            Duration::from_millis(100),
+        );
+        for literal in ["10.0.0.1", "127.0.0.1", "::1"] {
+            let ips = bootstrap
+                .resolve_hostname(literal)
+                .await
+                .expect("an explicit IP literal must not be denied");
+            assert_eq!(ips, vec![literal.parse::<std::net::IpAddr>().unwrap()]);
+        }
+    }
+
+    /// The manager resolves a hostname through the bootstrap resolver before
+    /// constructing any transport, so the default deny policy rejects a
+    /// private target at that point and the opt-in admits it.
+    #[tokio::test]
+    async fn test_manager_rejects_private_hostname_before_building_transport() {
+        let (mock_addr, _) =
+            spawn_bootstrap_server(Some(std::net::Ipv4Addr::new(10, 0, 0, 1)), None);
+        let mut config = sito_core::config::UpstreamConfig {
+            servers: vec!["tls://private-upstream.example".to_string()],
+            bootstrap: vec![mock_addr.ip()],
+            timeout_ms: 1000,
+            ..Default::default()
+        };
+
+        let denied = BootstrapResolver::from_config(&config).with_port(mock_addr.port());
+        let Err(error) = UpstreamManager::from_config(&config, &denied).await else {
+            panic!("a private hostname target must be rejected by default");
+        };
+        assert!(
+            error.to_string().contains("allow_private_targets"),
+            "the error must point at the opt-in: {error}"
+        );
+
+        config.allow_private_targets = true;
+        let allowed = BootstrapResolver::from_config(&config).with_port(mock_addr.port());
+        UpstreamManager::from_config(&config, &allowed)
+            .await
+            .expect("allow_private_targets must admit the private hostname target");
     }
 
     #[tokio::test]

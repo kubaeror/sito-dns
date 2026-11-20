@@ -251,6 +251,8 @@ struct FailoverUpstream {
     timeout: Duration,
     kind: CandidateKind,
     candidates: RwLock<Vec<Arc<dyn Upstream>>>,
+    #[cfg(test)]
+    candidate_ips: RwLock<Vec<std::net::IpAddr>>,
     last_resolve: Mutex<Instant>,
     last_forced_refresh: Mutex<Option<Instant>>,
     re_resolve_interval: Duration,
@@ -290,6 +292,8 @@ impl FailoverUpstream {
             timeout,
             kind,
             candidates: RwLock::new(Vec::new()),
+            #[cfg(test)]
+            candidate_ips: RwLock::new(Vec::new()),
             last_resolve: Mutex::new(Instant::now()),
             last_forced_refresh: Mutex::new(None),
             re_resolve_interval,
@@ -313,6 +317,11 @@ impl FailoverUpstream {
                 "no IP addresses resolved for '{}'",
                 self.host
             )));
+        }
+
+        #[cfg(test)]
+        {
+            *self.candidate_ips.write().await = ips.clone();
         }
 
         // DoH keeps a single client that carries all resolved addresses.
@@ -343,6 +352,11 @@ impl FailoverUpstream {
             candidates.push(upstream);
         }
         Ok(candidates)
+    }
+
+    #[cfg(test)]
+    async fn candidate_ips(&self) -> Vec<std::net::IpAddr> {
+        self.candidate_ips.read().await.clone()
     }
 
     /// Re-resolve if the interval elapsed and no other task holds the refresh
@@ -2000,6 +2014,89 @@ mod tests {
         );
     }
 
+    /// WP-2.7: forced refresh must also rotate DoT candidates, not only the
+    /// plain UDP path. The live listener counts the connection attempt made to
+    /// the rotated address (the test endpoint cannot complete TLS).
+    #[tokio::test]
+    async fn test_forced_refresh_rotates_dot_candidate() {
+        let blackhole = std::net::Ipv4Addr::new(127, 0, 0, 3);
+        let (live_addr, accepts) = spawn_tcp_accept_counter("127.0.0.2:0").await;
+        let port = live_addr.port();
+        let bootstrap =
+            spawn_rotating_bootstrap(blackhole, std::net::Ipv4Addr::new(127, 0, 0, 2)).await;
+        let resolver = BootstrapResolver::new(vec![bootstrap.ip()], Duration::from_secs(1))
+            .with_port(bootstrap.port())
+            .with_allow_private_targets(true);
+        let upstream = FailoverUpstream::with_interval(
+            resolver,
+            "rotate-dot.test".to_string(),
+            port,
+            Duration::from_millis(400),
+            CandidateKind::Dot {
+                server_name: "rotate-dot.test".to_string(),
+                pool_size: 1,
+            },
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("construct DoT failover upstream");
+
+        assert_eq!(
+            upstream.candidate_ips().await,
+            vec![std::net::IpAddr::V4(blackhole)]
+        );
+        let _ = upstream.resolve(&test_query()).await;
+        assert_eq!(
+            upstream.candidate_ips().await,
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2))],
+            "forced refresh must replace the black-hole DoT candidate"
+        );
+        assert!(
+            accepts.load(Ordering::SeqCst) >= 1,
+            "the rotated DoT candidate must be dialled"
+        );
+    }
+
+    /// WP-2.7: the same forced-refresh rotation for DoH candidates.
+    #[tokio::test]
+    async fn test_forced_refresh_rotates_doh_candidate() {
+        let blackhole = std::net::Ipv4Addr::new(127, 0, 0, 3);
+        let (live_addr, accepts) = spawn_tcp_accept_counter("127.0.0.2:0").await;
+        let port = live_addr.port();
+        let bootstrap =
+            spawn_rotating_bootstrap(blackhole, std::net::Ipv4Addr::new(127, 0, 0, 2)).await;
+        let resolver = BootstrapResolver::new(vec![bootstrap.ip()], Duration::from_secs(1))
+            .with_port(bootstrap.port())
+            .with_allow_private_targets(true);
+        let upstream = FailoverUpstream::with_interval(
+            resolver,
+            "rotate-doh.test".to_string(),
+            port,
+            Duration::from_millis(500),
+            CandidateKind::Https {
+                url: build_https_url("rotate-doh.test", port, "/dns-query"),
+            },
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("construct DoH failover upstream");
+
+        assert_eq!(
+            upstream.candidate_ips().await,
+            vec![std::net::IpAddr::V4(blackhole)]
+        );
+        let _ = upstream.resolve(&test_query()).await;
+        assert_eq!(
+            upstream.candidate_ips().await,
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2))],
+            "forced refresh must replace the black-hole DoH candidate"
+        );
+        assert!(
+            accepts.load(Ordering::SeqCst) >= 1,
+            "the rotated DoH candidate must be dialled"
+        );
+    }
+
     #[tokio::test]
     async fn test_per_domain_routing() {
         let calls_default = Arc::new(AtomicU32::new(0));
@@ -2226,6 +2323,59 @@ mod tests {
                 "path-bearing target '{target}' must be rejected"
             );
         }
+    }
+
+    /// Spawns a mock bootstrap server whose A answer rotates from `first` to
+    /// `second` after the first lookup.
+    async fn spawn_rotating_bootstrap(
+        first: std::net::Ipv4Addr,
+        second: std::net::Ipv4Addr,
+    ) -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut a_index = 0u32;
+            let mut buf = [0u8; 1024];
+            while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+                let Ok(query) = decode_message(&buf[..len]) else {
+                    continue;
+                };
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                if query.queries.first().map(Query::query_type) == Some(RecordType::A) {
+                    let ip = if a_index == 0 { first } else { second };
+                    a_index += 1;
+                    resp.answers.push(Record::from_rdata(
+                        query.queries[0].name().clone(),
+                        300,
+                        RData::A(A(ip)),
+                    ));
+                }
+                if let Ok(encoded) = encode_message(&resp) {
+                    let _ = socket.send_to(&encoded, peer).await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// Binds a TCP listener and counts accepted connections. Used to prove a
+    /// forced refresh actually routes the next attempt at the rotated address
+    /// even when the test endpoint cannot complete a real TLS handshake.
+    async fn spawn_tcp_accept_counter(bind: &str) -> (SocketAddr, Arc<AtomicU32>) {
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (addr, accepts)
     }
 
     /// Spawns a mock bootstrap server returning the given A records in order.
