@@ -600,7 +600,11 @@ impl DnsPipeline {
             // Never propagate a client's CD=1 flag into the background refresh:
             // the shared cache must always be validated when DNSSEC is enabled
             // so a CD=1 query cannot poison cached answers for CD=0 clients.
+            // The *insert* still uses the original triggering key (below) so a
+            // CD=1 hit refreshes the CD=1 entry instead of writing a fresh
+            // CD=0 entry that the triggering client can never see.
             bg_query.metadata.checking_disabled = false;
+            let bg_cache_query = cache_query.clone();
             // Same ordering rule as the query path: read the epoch before the
             // validator so a reload always wins against an in-flight refresh.
             let bg_policy_epoch = Self::cache_epoch_for(runtime_snapshot);
@@ -683,7 +687,7 @@ impl DnsPipeline {
                     // invalid answer in the cache for the rest of its TTL.
                     if !super::shaping::cache_bogus_failure(
                         &bg_cache,
-                        &bg_query,
+                        &bg_cache_query,
                         &mut resp,
                         bg_policy_epoch,
                         bg_filter_epoch,
@@ -706,7 +710,7 @@ impl DnsPipeline {
                 {
                     bg_cache
                         .insert_with_status_at_epochs(
-                            &bg_query,
+                            &bg_cache_query,
                             &resp,
                             bg_status,
                             bg_policy_epoch,

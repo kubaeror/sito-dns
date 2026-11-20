@@ -3183,6 +3183,76 @@ async fn test_prefetch_clears_ad_when_no_validation_ran() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// A prefetch triggered by a CD=1 hit must refresh the CD=1 key that triggered
+/// it. Clearing CD for the upstream/validation request is intentional, but the
+/// insert must not land under the CD=0 key, which the triggering client can
+/// never read.
+#[tokio::test]
+async fn test_prefetch_refreshes_triggering_cd1_key_without_cross_key_insert() {
+    use std::sync::atomic::Ordering;
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.dnssec.mode = "disabled".to_string();
+    config.dns.dnssec.validate = false;
+    config.dns.cache.prefetch = true;
+    config.dns.cache.min_ttl = 10;
+    config.dns.cache.max_ttl = 10;
+    let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    let name = Name::from_str("prefetch-cd1.example.").unwrap();
+
+    let mut cd_query = do_query(30, &name);
+    cd_query.metadata.checking_disabled = true;
+    let plain_query = do_query(31, &name);
+
+    // Seed the CD=1 key with data that differs from the mock upstream, so a
+    // refresh is observable rather than just "an entry still exists".
+    let marker = std::net::Ipv4Addr::new(203, 0, 113, 99);
+    let mut seeded = Message::response(30, OpCode::Query);
+    seeded.queries = cd_query.queries.clone();
+    seeded
+        .answers
+        .push(Record::from_rdata(name.clone(), 10, RData::A(A(marker))));
+    pipeline
+        .cache
+        .insert_with_status(&cd_query, &seeded, ValidationStatus::Unchecked)
+        .await;
+    assert!(
+        pipeline.cache.get_for_query(&plain_query).await.is_none(),
+        "the CD=0 key starts empty"
+    );
+
+    for id in 31..=32 {
+        let mut query = do_query(id, &name);
+        query.metadata.checking_disabled = true;
+        let resp = pipeline.handle(query, client.clone()).await.unwrap();
+        assert_eq!(resp.answers[0].data, RData::A(A(marker)));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        calls.load(Ordering::SeqCst) >= 1,
+        "the prefetch must have re-queried the upstream"
+    );
+
+    let (refreshed, _) = pipeline
+        .cache
+        .get_for_query_with_status(&cd_query)
+        .await
+        .expect("the triggering CD=1 entry must still be present");
+    assert_eq!(
+        refreshed.answers[0].data,
+        RData::A(A(MOCK_UPSTREAM_A)),
+        "the prefetch must replace the triggering CD=1 entry"
+    );
+    assert!(
+        pipeline.cache.get_for_query(&plain_query).await.is_none(),
+        "a CD=1-triggered prefetch must not populate the CD=0 key"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 #[test]
 fn test_strip_dnssec_records_for_do0_clients() {
     use hickory_proto::rr::rdata::NULL;

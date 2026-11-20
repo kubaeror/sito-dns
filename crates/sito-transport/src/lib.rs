@@ -588,7 +588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tcp_large_response_keeps_framing_in_sync() {
+    async fn test_tcp_truncates_oversized_response() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let port = reserve_port_number().unwrap();
 

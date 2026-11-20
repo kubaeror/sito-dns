@@ -1154,7 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_serve_stale_fallback() {
-        let mut config = make_test_config(1, 1, 300);
+        let mut config = make_test_config(1, 3600, 300);
         config.serve_stale_hours = 1;
         let cache = DnsCache::new(config);
 
@@ -2544,6 +2544,105 @@ mod tests {
         assert!(
             cache.get_for_query(&query).await.is_none(),
             "a fully expired entry must not be resurrected by a raised min_ttl"
+        );
+    }
+
+    /// RFC 8767 recommends a 30-second stale TTL, but the configured
+    /// `max_ttl` is still a hard ceiling for data this resolver serves.
+    #[tokio::test]
+    async fn test_stale_serve_ttl_is_capped_by_max_ttl() {
+        for (max_ttl, expected) in [(5u32, 5u32), (3600, 30)] {
+            let mut config = make_test_config(1, max_ttl, 300);
+            config.serve_stale_hours = 1;
+            let cache = DnsCache::new(config);
+
+            let qname = Name::from_str(&format!("stale-ttl-{max_ttl}.example.")).unwrap();
+            let query = query_for(130, &qname);
+            let mut response = answer_response(130, &qname, [192, 0, 2, 130]);
+            response.answers[0].ttl = 1;
+            cache.insert(&query, &response).await;
+            cache
+                .backdate_entry_for_test(&query, Duration::from_secs(2))
+                .await;
+
+            let stale = cache
+                .get_stale(&qname, RecordType::A, DNSClass::IN)
+                .await
+                .expect("entry is still inside the stale window");
+            assert_eq!(
+                stale.answers[0].ttl, expected,
+                "stale TTL must be min(RFC 8767 30s, max_ttl={max_ttl})"
+            );
+        }
+    }
+
+    /// P2-22: lowering `serve_stale_hours` on reload must evict entries that
+    /// are now fully past the new stale window, keep entries still inside it,
+    /// and a later raise must not resurrect what was evicted.
+    #[tokio::test]
+    async fn test_update_config_reclamps_serve_stale_window() {
+        let mut config = make_test_config(1, 1, 300);
+        config.serve_stale_hours = 2;
+        let cache = DnsCache::new(config.clone());
+
+        let expired_name = Name::from_str("stale-window-expired.example.").unwrap();
+        let expired_query = query_for(131, &expired_name);
+        let mut expired_response = answer_response(131, &expired_name, [192, 0, 2, 131]);
+        expired_response.answers[0].ttl = 1;
+        cache.insert(&expired_query, &expired_response).await;
+        cache
+            .backdate_entry_for_test(&expired_query, Duration::from_mins(90))
+            .await;
+
+        let kept_name = Name::from_str("stale-window-kept.example.").unwrap();
+        let kept_query = query_for(132, &kept_name);
+        let mut kept_response = answer_response(132, &kept_name, [192, 0, 2, 132]);
+        kept_response.answers[0].ttl = 1;
+        cache.insert(&kept_query, &kept_response).await;
+        cache
+            .backdate_entry_for_test(&kept_query, Duration::from_mins(30))
+            .await;
+
+        // Both are stale-servable under the original two-hour window.
+        assert!(
+            cache
+                .get_stale(&expired_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_stale(&kept_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_some()
+        );
+
+        config.serve_stale_hours = 1;
+        cache.update_config(config.clone()).await;
+
+        assert!(
+            cache
+                .get_stale(&expired_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "an entry past the lowered stale window must be evicted"
+        );
+        assert!(
+            cache
+                .get_stale(&kept_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_some(),
+            "an entry still inside the new stale window must survive"
+        );
+
+        config.serve_stale_hours = 48;
+        cache.update_config(config).await;
+        assert!(
+            cache
+                .get_stale(&expired_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "raising the stale window must not resurrect an evicted entry"
         );
     }
 

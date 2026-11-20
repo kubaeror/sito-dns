@@ -220,6 +220,13 @@ impl DnsCache {
     /// scan would be pure overhead. Cache-only callers that keep the epoch
     /// (for example a future policy-only reload) must use
     /// [`Self::update_config`] to retain the re-clamp contract.
+    ///
+    /// A runtime apply therefore treats every cache-policy change — including
+    /// a TTL-only change such as `max_ttl` — as an epoch change: old entries
+    /// are unservable immediately and are reclaimed lazily, while new inserts
+    /// are clamped with the newly published config. This trades warm entries
+    /// for an O(1) apply; [`Self::update_config`] is the warm-entry path for
+    /// direct cache users.
     pub async fn update_config_for_generation(&self, config: CacheConfig) {
         let size_changed = self.config.load().size_mb != config.size_mb;
         self.config.store(Arc::new(config.clone()));
@@ -535,7 +542,8 @@ impl DnsCache {
     /// inactive, and the status-aware pipeline gate decides whether it may be
     /// served.
     ///
-    /// TTLs are clamped to 30 seconds as recommended by RFC 8767 section 5.
+    /// TTLs are clamped to 30 seconds as recommended by RFC 8767 section 5,
+    /// and never exceed the configured `max_ttl`.
     pub async fn get_stale(
         &self,
         name: &Name,
@@ -631,14 +639,19 @@ impl DnsCache {
         // Never serve stale data as authenticated (RFC 8767 §5.1 / RFC 6840).
         clear_dnssec_material(&mut response);
 
+        // RFC 8767 §5 recommends a short stale TTL (30 s). The configured
+        // `max_ttl` is still an upper bound for anything this resolver serves:
+        // a policy that caps positive answers below 30 s must not have stale
+        // data handed out with a longer TTL.
+        let stale_ttl = STALE_SERVE_TTL.min(config.max_ttl);
         for record in &mut response.answers {
-            record.ttl = STALE_SERVE_TTL;
+            record.ttl = stale_ttl;
         }
         for record in &mut response.authorities {
-            record.ttl = STALE_SERVE_TTL;
+            record.ttl = stale_ttl;
         }
         for record in &mut response.additionals {
-            record.ttl = STALE_SERVE_TTL;
+            record.ttl = stale_ttl;
         }
 
         debug!(
