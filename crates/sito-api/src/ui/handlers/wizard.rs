@@ -742,7 +742,7 @@ async fn apply_wizard_configuration(
         let report = match apply_and_persist_config_locked(
             ctx,
             &new_cfg,
-            FilterApply::Deferred,
+            FilterApply::DeferredFirstBoot,
             hooks.as_dyn(),
         )
         .await

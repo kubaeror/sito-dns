@@ -27,7 +27,7 @@ use crate::auth::session::{
 use crate::auth::token::Role;
 use crate::config_apply::{
     ApplyHooks, ConfigFileApplyOutcome, FilterApply, apply_and_persist_config_locked,
-    apply_config_document_event,
+    apply_config_document_event, filter_apply_for,
 };
 use crate::error::ProblemDetails;
 use crate::handlers::auth_handlers::{

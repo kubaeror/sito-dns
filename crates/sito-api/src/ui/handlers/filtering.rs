@@ -249,6 +249,17 @@ pub async fn filtering_delete_handler(
     let Some(idx) = find_filter_list_index(&new_cfg, &id) else {
         return error_response(StatusCode::NOT_FOUND, "Filter list not found");
     };
+    let list_name = new_cfg.filtering.lists[idx].name.clone();
+    let groups = crate::handlers::filtering::groups_referencing_filter_list(&new_cfg, &list_name);
+    if !groups.is_empty() {
+        return error_response(
+            StatusCode::CONFLICT,
+            &format!(
+                "Filter list '{list_name}' is referenced by client group(s) {}; update the groups before deleting it",
+                groups.join(", ")
+            ),
+        );
+    }
     new_cfg.filtering.lists.remove(idx);
     if let Err(e) = apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await {
         tracing::error!("Failed to apply filter configuration: {e:?}");

@@ -618,12 +618,13 @@ async fn test_file_watcher_rejects_oversized_bundle_and_rolls_back() {
     let ctx = publish_context(&dir, &config_path).await;
     let original_ttl = ctx.config.load().dns.cache.min_ttl;
 
-    // A real small shared change plus a large *valid* custom rule. Unknown
-    // tables are rejected by config v2 (D5), so the oversized payload must be
-    // a real setting that survives HA sanitization and exceeds the 1 MiB
-    // WebSocket limit.
+    // A real small shared change plus a large *valid* value. Unknown tables
+    // are rejected by config v2 (D5), and a huge filtering payload would now
+    // require a synchronous filter apply; use a client-group note instead,
+    // which survives HA sanitization and exceeds the 1 MiB WebSocket limit
+    // while `[filtering]` stays unchanged.
     let oversized_document = format!(
-        "config_version = 2\n[server]\nrole = \"master\"\n[ha]\nreplication_port = 8953\nallow_insecure_ws = true\nslave_token = \"test-token\"\n[dns.cache]\nmin_ttl = {}\n[filtering]\ncustom_rules = [\"{}\"]\n",
+        "config_version = 2\n[server]\nrole = \"master\"\n[ha]\nreplication_port = 8953\nallow_insecure_ws = true\nslave_token = \"test-token\"\n[dns.cache]\nmin_ttl = {}\n[clients.groups.big]\ndescription = \"{}\"\n",
         original_ttl.saturating_add(7),
         "x".repeat(1_100_000)
     );

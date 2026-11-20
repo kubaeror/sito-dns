@@ -16,7 +16,7 @@ use tar::{Archive, Builder, Header};
 
 use crate::auth::rbac::RequireAdmin;
 use crate::config_apply::{
-    ApplyHooks, FilterApply, apply_and_persist_config, apply_full_config,
+    ApplyHooks, apply_and_persist_config, apply_full_config, filter_apply_for,
     restart_required_field_names,
 };
 use crate::error::ProblemDetails;
@@ -29,6 +29,9 @@ use crate::state::ServerContext;
 /// Placeholder written in place of a secret value. Masked output is valid TOML
 /// and round-trips through [`unmask_sensitive_toml`].
 pub const SECRET_PLACEHOLDER: &str = "***";
+
+/// Backup archive metadata format written by this version.
+pub const BACKUP_METADATA_VERSION: &str = "1.0";
 
 /// Returns true when a TOML key holds a secret value.
 fn is_sensitive_key(key: &str) -> bool {
@@ -194,7 +197,7 @@ pub async fn get_config(
 ) -> Result<Json<ConfigResponse>, ProblemDetails> {
     let raw = tokio::fs::read_to_string(&ctx.config_path)
         .await
-        .unwrap_or_else(|_| toml::to_string_pretty(&*ctx.config.load()).unwrap_or_default());
+        .map_err(|e| ProblemDetails::internal_error(format!("Failed to read config file: {e}")))?;
 
     let masked = mask_sensitive_toml(&raw);
     Ok(Json(ConfigResponse {
@@ -261,7 +264,9 @@ pub async fn update_config(
     let parsed: Config = Config::from_toml_str(&unmasked_toml)
         .map_err(|e| ProblemDetails::bad_request(format!("Configuration error: {e}")))?;
 
-    let report = apply_and_persist_config(&ctx, &parsed, FilterApply::Sync, hooks.as_dyn()).await?;
+    let previous = (**ctx.config.load()).clone();
+    let filter_apply = filter_apply_for(&previous, &parsed);
+    let report = apply_and_persist_config(&ctx, &parsed, filter_apply, hooks.as_dyn()).await?;
 
     Ok(Json(ConfigUpdateResponse {
         message: "Configuration successfully updated".to_string(),
@@ -308,6 +313,72 @@ mod tests {
         let archive = create_backup_archive(bad_config).expect("archive builds");
         let err = extract_backup_archive(&archive).expect_err("must reject typed errors");
         assert!(err.to_string().contains("[clients]"), "got: {err}");
+    }
+
+    /// P2-53: the archive's config member must not be world-readable.
+    #[test]
+    fn test_backup_config_member_is_mode_0600() {
+        let archive =
+            create_backup_archive("config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n")
+                .expect("archive builds");
+        let mut tar = Archive::new(GzDecoder::new(archive.as_slice()));
+        let mut config_mode = None;
+        for entry in tar.entries().unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().unwrap().to_string_lossy() == "config.toml" {
+                config_mode = Some(entry.header().mode().unwrap());
+            }
+        }
+        assert_eq!(config_mode, Some(0o600));
+    }
+
+    /// P2-53: an archive written by an unknown future format must be rejected
+    /// before its config can be restored.
+    #[test]
+    fn test_restore_archive_rejects_unknown_metadata_version() {
+        let config = "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n";
+        let metadata = r#"{"version":"9.9","timestamp":0,"sito_version":"future"}"#;
+
+        let enc = GzEncoder::new(Vec::new(), Compression::default());
+        let mut tar = Builder::new(enc);
+        for (path, body) in [("config.toml", config), ("metadata.json", metadata)] {
+            let mut header = Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            tar.append_data(&mut header, path, body.as_bytes()).unwrap();
+        }
+        let bytes = tar.into_inner().unwrap().finish().unwrap();
+
+        let err = extract_backup_archive(&bytes).expect_err("unknown metadata must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Unsupported backup metadata version"),
+            "got: {err}"
+        );
+    }
+
+    /// P2-53: `GET /config` and the backup download must not fabricate a
+    /// document from in-memory defaults when the real file cannot be read.
+    #[tokio::test]
+    async fn test_get_config_and_backup_fail_when_file_is_unreadable() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_unreadable");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        // `mock_context` does not create the file; a missing path is the
+        // same read failure an unreadable file produces.
+        assert!(!ctx.config_path.exists());
+
+        let err = get_config(admin(), State(ctx.clone()))
+            .await
+            .expect_err("get_config must fail when the file is unreadable");
+        assert_eq!(err.status, 500);
+
+        let err = download_backup(admin(), State(ctx.clone()))
+            .await
+            .expect_err("download_backup must fail when the file is unreadable");
+        assert_eq!(err.status, 500);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -686,7 +757,7 @@ token = "ha-token"
         let err = crate::config_apply::apply_and_persist_config(
             &ctx,
             &candidate,
-            FilterApply::Sync,
+            crate::config_apply::FilterApply::Sync,
             None,
         )
         .await
@@ -728,16 +799,15 @@ pub async fn reload_config(
 
     // Same deep validation and apply routine as every other write path.
     let previous = (**ctx.config.load()).clone();
-    let report = apply_full_config(&ctx, &parsed, FilterApply::Sync, hooks.as_dyn()).await?;
+    let filter_apply = filter_apply_for(&previous, &parsed);
+    let report = apply_full_config(&ctx, &parsed, filter_apply, hooks.as_dyn()).await?;
     let mut report = report;
     let (publish_result, retry_delay) = ctx.publish_bundle_with_retry().await;
     match publish_result {
         Ok(sito_ha_types::PublishOutcome::TooLarge { bytes, limit }) => {
             // The document is already on disk; refuse to serve an
             // unreplicable configuration and roll the live apply back.
-            if let Err(e) =
-                apply_full_config(&ctx, &previous, FilterApply::Sync, hooks.as_dyn()).await
-            {
+            if let Err(e) = apply_full_config(&ctx, &previous, filter_apply, hooks.as_dyn()).await {
                 tracing::error!(
                     error = %e.detail,
                     "Failed to roll back an oversized HA reload"
@@ -789,7 +859,7 @@ pub async fn reload_config(
 /// Create a compressed .tar.gz archive containing config.toml and metadata.json
 pub fn create_backup_archive(config_toml: &str) -> anyhow::Result<Vec<u8>> {
     let metadata = BackupMetadata {
-        version: "1.0".to_string(),
+        version: BACKUP_METADATA_VERSION.to_string(),
         timestamp: chrono::Utc::now().timestamp(),
         sito_version: env!("CARGO_PKG_VERSION").to_string(),
     };
@@ -798,10 +868,11 @@ pub fn create_backup_archive(config_toml: &str) -> anyhow::Result<Vec<u8>> {
     let enc = GzEncoder::new(Vec::new(), Compression::default());
     let mut tar = Builder::new(enc);
 
-    // Add config.toml
+    // Add config.toml. The archive may contain secrets, so the member mode
+    // must not grant group/world read access even if it is extracted as root.
     let mut cfg_header = Header::new_gnu();
     cfg_header.set_size(config_toml.len() as u64);
-    cfg_header.set_mode(0o644);
+    cfg_header.set_mode(0o600);
     cfg_header.set_cksum();
     tar.append_data(&mut cfg_header, "config.toml", config_toml.as_bytes())?;
 
@@ -878,6 +949,12 @@ pub fn extract_backup_archive(archive_bytes: &[u8]) -> anyhow::Result<(String, B
 
     let meta =
         restored_metadata.ok_or_else(|| anyhow::anyhow!("Archive is missing metadata.json"))?;
+    if meta.version != BACKUP_METADATA_VERSION {
+        anyhow::bail!(
+            "Unsupported backup metadata version '{}'; this server supports version '{BACKUP_METADATA_VERSION}'",
+            meta.version
+        );
+    }
     let config_toml = restored_config_toml
         .ok_or_else(|| anyhow::anyhow!("Archive does not contain a valid config.toml"))?;
 
@@ -908,7 +985,7 @@ pub async fn download_backup(
 ) -> Result<Response, ProblemDetails> {
     let config_content = tokio::fs::read_to_string(&ctx.config_path)
         .await
-        .unwrap_or_else(|_| toml::to_string_pretty(&*ctx.config.load()).unwrap_or_default());
+        .map_err(|e| ProblemDetails::internal_error(format!("Failed to read config file: {e}")))?;
 
     let compressed = create_backup_archive(&config_content)
         .map_err(|e| ProblemDetails::internal_error(format!("Backup archiving failed: {e}")))?;
@@ -1030,7 +1107,9 @@ pub async fn confirm_restore(
 
     // Apply first, persist second: a restored config that cannot be applied is
     // rejected without touching the current file.
-    apply_and_persist_config(&ctx, &parsed, FilterApply::Sync, hooks.as_dyn()).await?;
+    let previous = (**ctx.config.load()).clone();
+    let filter_apply = filter_apply_for(&previous, &parsed);
+    apply_and_persist_config(&ctx, &parsed, filter_apply, hooks.as_dyn()).await?;
 
     Ok(Json(GenericMessageResponse {
         message: "Configuration successfully restored from backup".to_string(),
