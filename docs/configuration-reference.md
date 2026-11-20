@@ -552,7 +552,10 @@ key before any retention task starts.
 > SQLite runs with `secure_delete=ON`. Rollup client IPs are keyed BLAKE3
 > hashes using `<data_dir>/stats-salt` (0600); client names are omitted unless
 > `rollup_client_names = true`. Switching `rollup_client_names` from `true` to
-> `false` scrubs names from existing rollups on the next startup. Archived
+> `false` scrubs names from existing rollups immediately on a live config
+> apply (the scrub runs in one `BEGIN IMMEDIATE` transaction, so it waits for
+> an in-flight retention/clear writer and later writers see the `false` policy).
+> Startup re-runs the same sync if the marker did not commit. Archived
 > per-client rows therefore show the keyed hash (`blake3:…`) instead of a raw
 > address for data older than the detailed query-log retention. Symlinked
 > `stats.db` or `stats-salt` paths are refused. Hashes written by the
@@ -568,6 +571,23 @@ key before any retention task starts.
 > the contributions of already-deleted rows. The final per-hour top-N sort runs
 > inside the chunk transaction and can be expensive for a pathological hour
 > with very many distinct domains/clients.
+
+**Retention and clear capacity notes.** Normal retention is hour-bounded and
+commits each hour separately, so a backlog is pruned without holding the
+writer lock for the whole sweep; the per-connection temp tables hold at most
+one hour of distinct domains, clients and upstreams and are cleared after each
+hour. The `keep_aggregates=true` clear is the exception: it folds the whole
+query-log range into rollups in one immediate transaction and loads every
+affected hour's top lists into memory before deleting, so a very large first
+clear can be slow and memory-heavy (documented residual, P2-61). A 1M-row,
+90-day soak is likewise a documented capacity-testing residual rather than a
+unit-test guarantee; the row-bounded chunks keep each transaction bounded but
+the sweep is still linear in the number of expired rows. `stats_watermark` is
+still written for progress diagnostics/backward compatibility but is not read
+to skip rows: aggregation and deletion share a transaction, and backdated rows
+must be re-aggregated. Enabling `privacy.anonymize_querylog` is forward-only;
+old detailed rows are not rewritten (retroactive anonymization is deferred,
+P2-59).
 
 > Query logging is always enabled when `[stats]` is present. Prometheus metrics
 > are exposed at `/metrics` and require a Viewer-or-higher bearer token or
@@ -813,7 +833,8 @@ applies the hot settings and reports the restart-only fields that remain.
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
 | `privacy.anonymize_querylog` | Query-log writer updated. |
-| `stats.retention_days`, `stats.rollup_retention_days`, `stats.rollup_client_names` | Re-read at each retention sweep: a bounded catch-up on startup (within 5 minutes) and every 24 h thereafter. |
+| `stats.retention_days`, `stats.rollup_retention_days` | Re-read at each retention sweep: a bounded catch-up on startup (within 5 minutes) and every 24 h thereafter. |
+| `stats.rollup_client_names` | Applied immediately on a live config apply: existing rollups are scrubbed when switched off, and in-flight retention/merge writes consult the live policy so a captured `true` cannot re-insert names. Forward-only for raw `query_log` rows. |
 
 ### 16.2 Requires a restart
 

@@ -36,7 +36,14 @@ impl PipelineContext<'_> {
         )
         .await;
         if let Some(ref m) = self.pipeline.metrics {
-            if matches!(outcome, sito_dnssec::ValidationOutcome::Bogus { .. }) {
+            // `sito_dnssec_bogus_total` is per-query and honours the client's
+            // `ignore_stats` policy. The validator's cumulative counters below
+            // are node-wide shared state (a single validator is used for every
+            // client), so they cannot be attributed to one client and are
+            // published unconditionally.
+            if !self.policy.ignore_stats
+                && matches!(outcome, sito_dnssec::ValidationOutcome::Bogus { .. })
+            {
                 m.inc_dnssec_bogus(upstream_name);
             }
             m.set_dnssec_key_cache(

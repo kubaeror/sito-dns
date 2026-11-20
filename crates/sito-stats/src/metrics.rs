@@ -5,10 +5,27 @@
 //! Hot-path metrics inter their label values (`proto`, `verdict`, `upstream`,
 //! `method`, ...) into dense integer ids once and keep the counters in
 //! `RwLock` maps of atomics, so a per-query observation performs no `String`
-//! allocation and never takes a global exclusive lock. Rendering is the only
+//! allocation and never takes a *global* exclusive lock. Rendering is the only
 //! place that materializes label strings and it sorts them, keeping the
 //! exposition output byte-for-byte equivalent to the previous `BTreeMap`
 //! implementation.
+//!
+//! Latency histograms are the one exception to lock-free updates: each
+//! interned label (verdict for `sito_query_duration_seconds`, upstream for
+//! `sito_upstream_rtt_seconds`) owns a small [`HistogramState`] behind its own
+//! mutex (P2-62). The hot `allowed` path therefore serializes only with other
+//! queries that share that verdict, not with cache/upstream/filter metrics or
+//! other labels. The critical section is a fixed 14-bucket compare-and-add loop
+//! and is never held across I/O, formatting or rendering. Both histogram maps
+//! are read-mostly `RwLock`s: the write lock is taken only when a label is
+//! first observed, and the label sets are bounded (verdicts are a closed set;
+//! upstream labels pass through the same bounded interner as the other metric
+//! families). Sharding by label would add memory/indirection without removing
+//! the per-label serialization that the exposition requires, so the per-label
+//! mutex is kept deliberately. `metrics_bench` records the single-threaded
+//! per-update cost of `observe_query_duration("allowed", ...)`; the actual
+//! contention evidence is `test_histogram_concurrent_updates_are_not_lost`,
+//! which pins losslessness for same-label writers.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -83,6 +100,16 @@ struct InternerState {
 const MAX_INTERNER_LABELS: usize = 4_096;
 /// Label value used once [`MAX_INTERNER_LABELS`] is reached.
 const INTERNER_OVERFLOW_LABEL: &str = "__other__";
+
+/// Maximum distinct upstream labels in `sito_dnssec_bogus_total`.
+///
+/// Upstream names come from configuration, but a bug or a future dynamically
+/// named upstream source must not be able to grow this standalone map without
+/// bound. New labels beyond the cap are collapsed into
+/// [`DNSSEC_BOGUS_OVERFLOW_LABEL`] so the total observation count is kept.
+const MAX_DNSSEC_BOGUS_UPSTREAMS: usize = 256;
+/// Upstream label used for `sito_dnssec_bogus_total` overflow.
+const DNSSEC_BOGUS_OVERFLOW_LABEL: &str = "__other__";
 
 /// Query types that keep an exact numeric `qtype` label on
 /// `sito_queries_total`. The DNS wire type is a free 16-bit field, so exposing
@@ -266,6 +293,11 @@ where
 }
 
 /// Observes `value` in the histogram for interned label id `id`.
+///
+/// The map lookup takes a shared lock on the hot path; the per-label mutex is
+/// then held only for [`HistogramState::observe`]'s fixed bucket loop. See the
+/// module documentation for why per-verdict/per-upstream serialization is
+/// bounded and preferable to sharding this small state.
 fn observe_histogram(map: &HistogramMap, id: u32, value: f64) {
     let histogram = {
         if let Ok(guard) = map.read()
@@ -346,6 +378,9 @@ pub struct MetricsRegistry {
 pub struct FilterStatusMetrics {
     /// `0 = disabled`, `1 = loading`, `2 = ready`, `3 = failed`.
     pub state: u8,
+    /// Active compiled rules. `None` leaves the existing
+    /// `sito_filter_rules{list="total"}` gauge untouched.
+    pub rule_count: Option<usize>,
     /// Configured lists that loaded successfully.
     pub loaded_lists: u64,
     /// Configured lists that failed.
@@ -441,12 +476,16 @@ impl MetricsRegistry {
     }
 
     /// Removes every per-upstream series for `upstream`: the health gauge, the
-    /// RTT histogram and all error-kind counters.
+    /// RTT histogram, all error-kind counters and the DNSSEC bogus counter.
     ///
     /// Called after a config apply/publish for upstream names that no longer
     /// exist, so removed servers cannot leave stale labels in the exposition
     /// forever. Unknown names are a no-op.
     pub fn remove_upstream_health(&self, upstream: &str) {
+        // `dnssec_bogus` is keyed by the raw upstream string rather than an
+        // interned label, so prune it even when the interner never saw the name.
+        sito_core::sync::lock_or_recover(&self.dnssec_bogus).remove(upstream);
+
         let Some(upstream_id) = self.labels.lookup(upstream) else {
             return;
         };
@@ -489,6 +528,9 @@ impl MetricsRegistry {
     }
 
     /// Publishes DNSSEC validated-key cache hit/miss counters.
+    ///
+    /// Node-wide: the validator and its key cache are shared by all clients,
+    /// so this cannot honour a per-client `ignore_stats`.
     pub fn set_dnssec_key_cache(&self, hits: u64, misses: u64) {
         self.dnssec_key_cache_hits.store(hits, Ordering::Relaxed);
         self.dnssec_key_cache_misses
@@ -500,6 +542,8 @@ impl MetricsRegistry {
     /// This is the outcome view. It is independent of
     /// `sito_dnssec_bogus_total{upstream}`, which counts bogus answers per
     /// upstream; the two families overlap conceptually and must not be summed.
+    /// Node-wide: the validator is shared by all clients, so this cannot
+    /// honour a per-client `ignore_stats`.
     pub fn set_dnssec_validations(
         &self,
         secure: u64,
@@ -519,6 +563,8 @@ impl MetricsRegistry {
 
     /// Publishes the cumulative DNSSEC key-fetch refusal counters,
     /// distinguishing count-budget exhaustion from an expired deadline.
+    ///
+    /// Node-wide like the other validator counters; not per-client.
     pub fn set_dnssec_fetch_failures(&self, budget: u64, deadline: u64) {
         self.dnssec_fetch_budget_failures
             .store(budget, Ordering::Relaxed);
@@ -534,10 +580,20 @@ impl MetricsRegistry {
     ///
     /// This per-upstream view is independent of
     /// `sito_dnssec_validations_total{result="bogus"}`; the two families
-    /// overlap and must not be summed.
+    /// overlap and must not be summed. Labels are capped at
+    /// [`MAX_DNSSEC_BOGUS_UPSTREAMS`]; surplus upstreams are counted under the
+    /// constant `__other__` label.
     pub fn inc_dnssec_bogus(&self, upstream: &str) {
         let mut map = sito_core::sync::lock_or_recover(&self.dnssec_bogus);
-        *map.entry(upstream.to_string()).or_insert(0) += 1;
+        let key = if map.contains_key(upstream)
+            || upstream == DNSSEC_BOGUS_OVERFLOW_LABEL
+            || map.len() < MAX_DNSSEC_BOGUS_UPSTREAMS
+        {
+            upstream
+        } else {
+            DNSSEC_BOGUS_OVERFLOW_LABEL
+        };
+        *map.entry(key.to_string()).or_insert(0) += 1;
     }
 
     pub fn inc_clients_identified(&self, method: &str) {
@@ -656,6 +712,9 @@ impl MetricsRegistry {
     ///
     /// `state` is `0 = disabled`, `1 = loading`, `2 = ready`, `3 = failed`.
     pub fn set_filter_status(&self, status: FilterStatusMetrics) {
+        if let Some(rule_count) = status.rule_count {
+            self.set_filter_rules(rule_count);
+        }
         self.filter_state
             .store(u64::from(status.state), Ordering::Relaxed);
         self.filter_lists_loaded
@@ -1625,6 +1684,45 @@ mod tests {
         assert_line("sito_dnssec_fetch_failures_total{kind=\"deadline\"} 4");
     }
 
+    /// P2-62 rationale test: the per-verdict histogram mutex may serialize
+    /// same-verdict observations, but it must not lose any of them. Distinct
+    /// verdicts use distinct mutexes and remain independent.
+    #[test]
+    fn test_histogram_concurrent_updates_are_not_lost() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 1_000;
+
+        let reg = std::sync::Arc::new(MetricsRegistry::new("1.0.0", "test"));
+        let mut handles = Vec::new();
+        for thread in 0..THREADS {
+            let reg = std::sync::Arc::clone(&reg);
+            handles.push(std::thread::spawn(move || {
+                let verdict = if thread % 2 == 0 {
+                    "allowed"
+                } else {
+                    "blocked"
+                };
+                for _ in 0..PER_THREAD {
+                    reg.observe_query_duration(verdict, 0.001);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("histogram writer thread");
+        }
+
+        let rendered = reg.render_prometheus();
+        for verdict in ["allowed", "blocked"] {
+            assert!(
+                rendered.contains(&format!(
+                    "sito_query_duration_seconds_count{{verdict=\"{verdict}\"}} {}",
+                    THREADS / 2 * PER_THREAD
+                )),
+                "every observation for {verdict} must be retained: {rendered}"
+            );
+        }
+    }
+
     #[test]
     fn test_metrics_registry_contains_table_14_2() {
         let reg = MetricsRegistry::new("0.1.0", "abc1234");
@@ -1712,6 +1810,7 @@ mod tests {
         reg.set_querylog_dropped(1);
         reg.set_filter_status(FilterStatusMetrics {
             state: 2,
+            rule_count: None,
             loaded_lists: 3,
             failed_lists: 1,
             degraded_groups: 1,
@@ -2183,7 +2282,7 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
 
 #[cfg(test)]
 mod allocation_tests {
-    use super::MetricsRegistry;
+    use super::{FilterStatusMetrics, MAX_DNSSEC_BOGUS_UPSTREAMS, MetricsRegistry};
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 
@@ -2287,6 +2386,97 @@ mod allocation_tests {
             reg.stats_retention_last_failure_seconds
                 .load(Ordering::Relaxed)
                 > 0
+        );
+    }
+
+    /// P2-63: removing an upstream from the config must also drop its
+    /// `sito_dnssec_bogus_total` series, which uses its own string-keyed map.
+    #[test]
+    fn test_remove_upstream_health_prunes_dnssec_bogus_series() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.inc_dnssec_bogus("gone.example:53");
+        reg.inc_dnssec_bogus("kept.example:53");
+        reg.set_upstream_health("gone.example:53", 0.0);
+        reg.set_upstream_health("kept.example:53", 1.0);
+
+        reg.remove_upstream_health("gone.example:53");
+
+        let rendered = reg.render_prometheus();
+        assert!(
+            !rendered.contains(r#"sito_dnssec_bogus_total{upstream="gone.example:53"}"#),
+            "a removed upstream must not keep a bogus series: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"sito_upstream_health{upstream="gone.example:53"}"#),
+            "the health gauge is pruned too: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_dnssec_bogus_total{upstream="kept.example:53"} 1"#),
+            "unrelated bogus series must survive: {rendered}"
+        );
+    }
+
+    /// P2-63: the standalone bogus map is capped and overflow is collapsed
+    /// into a constant label without losing observations.
+    #[test]
+    fn test_dnssec_bogus_cardinality_is_capped() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        let overflow = 20usize;
+        for i in 0..(MAX_DNSSEC_BOGUS_UPSTREAMS + overflow) {
+            reg.inc_dnssec_bogus(&format!("bogus-upstream-{i}:53"));
+        }
+
+        let rendered = reg.render_prometheus();
+        let lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("sito_dnssec_bogus_total{"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            MAX_DNSSEC_BOGUS_UPSTREAMS + 1,
+            "the map must keep at most the cap plus the overflow series: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_dnssec_bogus_total{upstream="__other__"} 20"#),
+            "surplus labels must collapse into the constant overflow label: {rendered}"
+        );
+        let total: u64 = lines
+            .iter()
+            .map(|line| line.rsplit_once(' ').unwrap().1.parse::<u64>().unwrap())
+            .sum();
+        assert_eq!(
+            total,
+            (MAX_DNSSEC_BOGUS_UPSTREAMS + overflow) as u64,
+            "collapsing must not lose bogus observations: {rendered}"
+        );
+    }
+
+    /// P2-63: the status observer carries the compiled rule count so a
+    /// scheduled refresh cannot leave `sito_filter_rules` stale.
+    #[test]
+    fn test_filter_status_updates_rule_gauge() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.set_filter_status(FilterStatusMetrics {
+            state: 2,
+            rule_count: Some(42),
+            ..Default::default()
+        });
+        assert!(
+            reg.render_prometheus()
+                .contains(r#"sito_filter_rules{list="total"} 42"#),
+            "the status publication must update the rule gauge"
+        );
+
+        // A status without a rule count must leave the previous value alone.
+        reg.set_filter_status(FilterStatusMetrics {
+            state: 2,
+            rule_count: None,
+            ..Default::default()
+        });
+        assert!(
+            reg.render_prometheus()
+                .contains(r#"sito_filter_rules{list="total"} 42"#),
+            "a partial status must not reset the rule gauge to zero"
         );
     }
 }

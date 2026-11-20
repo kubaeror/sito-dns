@@ -285,7 +285,8 @@ P1-19, P1-23, and P1-24 are closed in this branch:
   rows are not retroactively anonymized.
 - **P1-23 — query-log/dashboard polling cost.** Query-log pages accept
   `include_total` (default `true`; the live 3 s UI refresh sends `false`), and
-  dashboard aggregates are cached for 45 s with invalidation on clear/retention.
+  dashboard aggregates are cached for 45 s with invalidation on clear/retention
+  (2.0 uses a 30 s TTL).
   Stats endpoints are rate-limited per authenticated user, and their `429`
   responses include `Retry-After: 1`. The REST query-log endpoint now returns
   the same `Retry-After: 1` on its `429`.

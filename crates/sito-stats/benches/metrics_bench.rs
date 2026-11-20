@@ -36,6 +36,10 @@ fn bench_metrics(c: &mut Criterion) {
     group.bench_function("inc_queries", |b| {
         b.iter(|| registry.inc_queries("udp", 1, "allowed"));
     });
+    // P2-62: this records the single-threaded per-update cost of the hot
+    // `allowed` histogram (one small mutex around a fixed bucket loop).
+    // Contention losslessness is covered by the concurrent-update test, not
+    // by this criterion loop.
     group.bench_function("observe_query_duration", |b| {
         b.iter(|| registry.observe_query_duration(black_box("allowed"), black_box(0.000_3)));
     });

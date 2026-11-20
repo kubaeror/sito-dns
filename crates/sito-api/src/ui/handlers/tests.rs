@@ -174,6 +174,86 @@ fn test_bundled_list_views_corrupt_manifest_returns_runtime_rows_without_panic()
     );
 }
 
+/// P1-23: the live 3 s paths must stay cheap. The query-log route builds a
+/// filter with `include_total=false`, and the dashboard route serves the cached
+/// aggregate instead of rescanning on every poll.
+#[tokio::test]
+async fn test_live_routes_skip_query_log_total_and_use_cached_dashboard() {
+    use axum::body::to_bytes;
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_live_paths_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    ctx.auth_mgr
+        .create_user("live_admin", "pass", Role::Admin)
+        .await;
+    let LoginResult::Success(session) = ctx.auth_mgr.login("live_admin", "pass", "127.0.0.1").await
+    else {
+        panic!("login failed");
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
+
+    // The route's filter must not request the whole-table COUNT(*).
+    let filter = live_query_log_filter(&QueryLogParams::default());
+    assert_eq!(
+        filter.include_total,
+        Some(false),
+        "the live query-log refresh must not run a filtered COUNT(*)"
+    );
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let entry = sito_stats::QueryLogEntry::new(
+        now,
+        "192.0.2.50",
+        None,
+        "dashboard-cache.example",
+        1,
+        Some(0),
+        "allowed",
+        "udp",
+    );
+    ctx.stats_db.insert_batch(&[entry]).await.unwrap();
+
+    let first = dashboard_stats_partial(State(ctx.clone()), headers.clone()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&first_body).contains(">1</div>"),
+        "the first dashboard render must show the current aggregate"
+    );
+
+    // A write inside the TTL must not be observed: the route used the cached
+    // accessor rather than rescanning query_log.
+    let second_entry = sito_stats::QueryLogEntry::new(
+        now + 1,
+        "192.0.2.50",
+        None,
+        "dashboard-cache.example",
+        1,
+        Some(0),
+        "allowed",
+        "udp",
+    );
+    ctx.stats_db.insert_batch(&[second_entry]).await.unwrap();
+    let second = dashboard_stats_partial(State(ctx.clone()), headers).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+    let second_body = String::from_utf8_lossy(&second_body);
+    assert!(
+        second_body.contains(">1</div>"),
+        "the dashboard must serve the cached aggregate within the TTL"
+    );
+    assert!(
+        !second_body.contains(">2</div>"),
+        "the dashboard route must not bypass the cached accessor"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 #[tokio::test]
 async fn test_ui_rbac_checks() {
     let temp_dir =

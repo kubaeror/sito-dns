@@ -165,6 +165,7 @@ pub(super) fn filter_status_metrics(
             sito_filter::FilterState::Ready => 2,
             sito_filter::FilterState::Failed => 3,
         },
+        rule_count: Some(status.rule_count),
         loaded_lists: u64::try_from(status.loaded_lists).unwrap_or(u64::MAX),
         failed_lists: u64::try_from(status.failed_lists.len()).unwrap_or(u64::MAX),
         degraded_groups: u64::try_from(status.degraded_groups.len()).unwrap_or(u64::MAX),
@@ -211,4 +212,26 @@ pub(super) fn exposure_warnings_for_phase(config: &Config, phase: ExposurePhase)
         ExposurePhase::DnsListeners => config.dns_exposure_warning(),
     };
     warning.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P2-63: the status observer must publish the compiled rule count with
+    /// the lifecycle gauges, otherwise a scheduled refresh leaves
+    /// `sito_filter_rules` reporting the previous snapshot.
+    #[test]
+    fn filter_status_metrics_includes_rule_count() {
+        let status = sito_filter::FilterStatus {
+            state: sito_filter::FilterState::Ready,
+            rule_count: 42,
+            loaded_lists: 2,
+            ..Default::default()
+        };
+        let metrics = filter_status_metrics(&status);
+        assert_eq!(metrics.rule_count, Some(42));
+        assert_eq!(metrics.state, 2);
+        assert_eq!(metrics.loaded_lists, 2);
+    }
 }

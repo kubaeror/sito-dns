@@ -50,7 +50,9 @@ impl QueryHandler for DnsPipeline {
         let now = runtime_snapshot.clients.now();
         let policy = runtime_snapshot.clients.resolve(&mut client, now);
 
-        if let Some(ref m) = self.metrics {
+        if !policy.ignore_stats
+            && let Some(ref m) = self.metrics
+        {
             m.inc_clients_identified(if client.client_name.is_some() {
                 "identified"
             } else {

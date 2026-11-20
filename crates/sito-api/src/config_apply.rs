@@ -327,6 +327,23 @@ async fn commit_staged(
         }
     }
     ctx.querylog_sender.set_anonymize(anonymize);
+    // An apply that changes filter rules or the DNSSEC policy flushes the
+    // response cache inside the runtime publish; refresh the footprint gauge
+    // so it cannot keep reporting reclaimed entries.
+    ctx.publish_cache_size();
+    // P1-19: switching `stats.rollup_client_names` off must scrub names from
+    // already-written rollups now, not only on the next restart.
+    let previous_names = previous.get_stats_config().rollup_client_names;
+    let current_names = candidate.get_stats_config().rollup_client_names;
+    if previous_names != current_names
+        && let Err(e) = ctx.stats_db.set_rollup_client_names(current_names).await
+    {
+        tracing::error!(
+            error = %e,
+            enabled = current_names,
+            "Failed to re-apply stats.rollup_client_names to existing rollups; names may remain until a later scrub or restart"
+        );
+    }
     prune_stale_upstream_metrics(ctx, &previous, candidate);
 
     Ok(AppliedReport {
@@ -869,6 +886,7 @@ pub fn queue_filter_refresh(
         match apply_filter_refresh(&engine, &runtime, &filtering, expected).await {
             Ok(_) => {
                 cache.flush();
+                metrics.set_cache_size_bytes(crate::state::cache_size_bytes(&cache));
                 metrics.set_filter_rules(engine.rule_count());
                 tracing::info!("Background blocklist refresh completed");
             }
@@ -1162,6 +1180,7 @@ mod tests {
                     .is_some(),
                 "cache seed for {change} must succeed"
             );
+            ctx.metrics.set_cache_size_bytes(4_096);
 
             let mut candidate = (**ctx.config.load()).clone();
             match change {
@@ -1184,6 +1203,12 @@ mod tests {
                     .await
                     .is_none(),
                 "changing dnssec {change} must flush cached validation decisions"
+            );
+            assert!(
+                ctx.metrics
+                    .render_prometheus()
+                    .contains("sito_cache_size_bytes 0"),
+                "a flushing apply must publish the reclaimed cache size"
             );
         }
 
@@ -2594,6 +2619,83 @@ acme_enabled = false
                 )
                 .is_blocked(),
             "the new group rule must be enforced immediately"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P1-19: flipping `stats.rollup_client_names` true -> false through the
+    /// live apply pipeline scrubs names from existing rollups without a
+    /// restart.
+    #[tokio::test]
+    async fn test_live_apply_scrubs_rollup_client_names() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_rollup_scrub");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut with_names = (**ctx.config.load()).clone();
+        let mut stats = with_names.get_stats_config();
+        stats.rollup_client_names = true;
+        with_names.stats = Some(toml::Value::try_from(stats).unwrap());
+        apply_and_persist_config(&ctx, &with_names, FilterApply::Deferred, None)
+            .await
+            .unwrap();
+
+        let old_ts = chrono::Utc::now().timestamp_millis() - 100 * 86_400_000;
+        let entry = sito_stats::QueryLogEntry::new(
+            old_ts,
+            "10.7.7.7",
+            Some("live-named-device".to_string()),
+            "live-apply.example",
+            1,
+            Some(0),
+            "allowed",
+            "udp",
+        );
+        ctx.stats_db.insert_batch(&[entry]).await.unwrap();
+        ctx.stats_db.cleanup_detailed_retention(90).await.unwrap();
+
+        let before = ctx
+            .stats_db
+            .get_global_stats(200 * 86_400_000)
+            .await
+            .unwrap();
+        assert!(
+            before
+                .top_clients
+                .iter()
+                .any(|(label, _)| label == "live-named-device"),
+            "the seed rollup must retain the client name: {:?}",
+            before.top_clients
+        );
+
+        let mut scrubbed = with_names.clone();
+        let mut stats = scrubbed.get_stats_config();
+        stats.rollup_client_names = false;
+        scrubbed.stats = Some(toml::Value::try_from(stats).unwrap());
+        apply_and_persist_config(&ctx, &scrubbed, FilterApply::Deferred, None)
+            .await
+            .unwrap();
+
+        let after = ctx
+            .stats_db
+            .get_global_stats(200 * 86_400_000)
+            .await
+            .unwrap();
+        assert!(
+            !after
+                .top_clients
+                .iter()
+                .any(|(label, _)| label == "live-named-device"),
+            "the live apply must scrub the existing name: {:?}",
+            after.top_clients
+        );
+        assert!(
+            after
+                .top_clients
+                .iter()
+                .any(|(label, _)| label.starts_with("blake3:")),
+            "the scrubbed rollup must expose only the hashed identifier: {:?}",
+            after.top_clients
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

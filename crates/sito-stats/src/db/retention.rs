@@ -1,4 +1,53 @@
 //! Hour-chunked retention, rollups, and PII-safe aggregate maintenance.
+//!
+//! # Bounded normal retention
+//!
+//! [`StatsDb::cleanup_detailed_retention`] and
+//! [`StatsDb::cleanup_retention_with_policy`] process one expired hour at a
+//! time in row-bounded `(ts, id)` chunks, each in its own short
+//! `BEGIN IMMEDIATE` transaction. Exact per-hour domain/client/upstream counts
+//! accumulate in per-connection SQLite temp tables
+//! ([`StatsDb::ensure_retention_temp_tables`]). Those tables are cleared at
+//! sweep start and after each hour, so their memory is bounded to roughly one
+//! hour of distinct domains/clients/upstreams rather than the whole retention
+//! range. The rows can transiently contain raw client IPs during a sweep; they
+//! are never persisted to another table.
+//!
+//! # Keep-aggregates clear (documented residual)
+//!
+//! The `keep_aggregates` clear path
+//! ([`StatsDb::rollup_and_delete_range`]) is intentionally different: an
+//! operator requested a full clear while preserving rollups, so it runs one
+//! `BEGIN IMMEDIATE` transaction over the whole range, performs one
+//! `GROUP BY hour` scan, loads every affected hour's top lists into a
+//! `HashMap` before writing, and only then deletes the rows. A very large
+//! first clear can therefore hold the writer lock for a long time and consume
+//! memory proportional to the number of affected hours/distinct values. This
+//! whole-range shape is deliberately not split into the normal hour-bounded
+//! sweep: doing so would make the clear non-atomic with respect to the
+//! preserved rollups. It is documented as a residual risk (P2-61).
+//!
+//! # Scale residual (90 days / 1M rows)
+//!
+//! `test_retention_handles_multiple_hours_across_days` covers a multi-day,
+//! multi-hour sweep. A true 1M-row/90-day soak is not part of the unit suite
+//! (it would dominate CI); the chunking keeps each write transaction bounded
+//! and the total sweep remains O(rows) with scheduled startup catch-up. Use
+//! `benches/stats_bench.rs` or a production-sized database for capacity
+//! testing. This is a documented residual rather than an untested claim.
+//!
+//! # `stats_watermark`
+//!
+//! The table is still written on every aggregated chunk, but it is **not read
+//! to decide which rows to aggregate**. That is deliberate: the aggregate read,
+//! rollup upsert, watermark update and delete share one transaction, so a row
+//! can never be deleted without being aggregated, and re-inserted/backdated
+//! rows must be re-aggregated rather than skipped by an `id > watermark`
+//! predicate. The writes are retained as a bounded progress/diagnostic record
+//! and for compatibility with the v1.9 schema (and its tests); removing them is
+//! a schema/behavior change deferred to a later cleanup. See
+//! `test_retention_watermark_prevents_double_counting` and
+//! `test_retention_aggregates_backdated_rows_after_watermark`.
 
 #[allow(clippy::wildcard_imports, unused_imports)]
 use super::*;
@@ -26,7 +75,7 @@ impl StatsDb {
         &self,
         retention_days: u32,
     ) -> Result<RetentionReport, StatsError> {
-        self.cleanup_retention_inner(retention_days, None, self.rollup_client_names)
+        self.cleanup_retention_inner(retention_days, None, self.rollup_client_names_enabled())
             .await
     }
 
@@ -50,7 +99,7 @@ impl StatsDb {
         self.cleanup_retention_with_policy(
             retention_days,
             rollup_retention_days,
-            self.rollup_client_names,
+            self.rollup_client_names_enabled(),
         )
         .await
     }
@@ -61,6 +110,11 @@ impl StatsDb {
     /// its own short `BEGIN IMMEDIATE` transaction. Expired `stats_hourly`
     /// rows (and therefore their domains and hashed client identifiers) are
     /// removed separately according to `rollup_retention_days`.
+    ///
+    /// `rollup_client_names` is the caller's captured policy. The live
+    /// [`Self::set_rollup_client_names`] policy is authoritative: a live
+    /// `false` overrides a captured `true` at merge/write time, so this
+    /// argument cannot re-insert names after a live scrub.
     pub async fn cleanup_retention_with_policy(
         &self,
         retention_days: u32,
@@ -118,7 +172,10 @@ impl StatsDb {
             // Snapshot the pre-sweep top lists once. Each chunk writes
             // `pre_sweep + cumulative temp counts` (replacing the previous
             // chunk's value), so writing every chunk is crash-safe without
-            // double counting.
+            // double counting. A scrub may land between this read and the
+            // chunk transaction; `merge_hour_rollup` re-reads the live policy
+            // inside the transaction and strips names, so the stale snapshot
+            // cannot resurrect them.
             let existing_rollups = load_existing_rollups(&mut conn, &[hour]).await?;
             let existing_tops = existing_rollups.get(&hour).cloned().unwrap_or_default();
 
@@ -357,9 +414,14 @@ impl StatsDb {
         mut rollup: HourRollup,
         rollup_client_names: bool,
     ) -> HourRollup {
+        // The caller's bool is the policy captured when the sweep was
+        // scheduled. The live atomic is authoritative at write time: a
+        // `set_rollup_client_names(false)` that lands while a sweep is in
+        // flight must not be undone by this chunk re-inserting names.
+        let allow_names = rollup_client_names && self.rollup_client_names_enabled();
         for client in &mut rollup.clients {
             client.0 = self.hash_client_ip(&client.0);
-            if !rollup_client_names {
+            if !allow_names {
                 client.1 = None;
             }
         }
@@ -374,13 +436,19 @@ impl StatsDb {
         rollup: HourRollup,
         rollup_client_names: bool,
     ) -> HourRollup {
-        let mut rollup = self.normalize_hour_rollup(rollup, rollup_client_names);
+        // Read the live policy once at merge time, inside the caller's write
+        // transaction (retention chunks and the keep-aggregates clear both
+        // hold `BEGIN IMMEDIATE`). A concurrent policy flip either happens
+        // before this read (so names are stripped here) or after the commit
+        // (so the scrub that follows the flip sees this row).
+        let allow_names = rollup_client_names && self.rollup_client_names_enabled();
+        let mut rollup = self.normalize_hour_rollup(rollup, allow_names);
         let (existing_domains, existing_clients, existing_upstreams) = existing;
 
         let mut existing_clients: Vec<ClientTop> = decode_tops(existing_clients.as_deref());
         for client in &mut existing_clients {
             client.0 = self.hash_client_ip(&client.0);
-            if !rollup_client_names {
+            if !allow_names {
                 client.1 = None;
             }
         }
@@ -406,6 +474,12 @@ impl StatsDb {
     /// exactly those rows in one transaction. Used by the explicit
     /// `keep_aggregates` clear path (which is not row-bounded because the
     /// operator requested a full clear).
+    ///
+    /// This is the documented whole-range residual: one `BEGIN IMMEDIATE`
+    /// transaction, one `GROUP BY hour` scan, and in-memory top-list storage
+    /// for every affected hour before any write. A very large clear can hold
+    /// the writer lock and use memory proportional to the range. Normal
+    /// retention uses the hour-bounded `rollup_and_delete_chunk` path instead.
     pub(super) async fn rollup_and_delete_range(
         &self,
         start: i64,
@@ -617,7 +691,7 @@ impl StatsDb {
             r"
             INSERT INTO retention_upstream_counts (hour, upstream, total, errors, elapsed_sum)
             SELECT ?, upstream, COUNT(*),
-                   SUM(CASE WHEN rcode IS NOT NULL AND rcode != 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN rcode IS NOT NULL AND rcode NOT IN (0, 3) THEN 1 ELSE 0 END),
                    SUM(COALESCE(elapsed_us, 0))
             FROM query_log INDEXED BY idx_ql_ts_id
             WHERE (ts, id) >= (?, ?) AND (ts, id) < (?, ?)

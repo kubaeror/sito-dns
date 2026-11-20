@@ -5474,7 +5474,8 @@
           },
           "error_queries": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Queries whose response was an upstream error. NXDOMAIN (rcode 3) is a\nnormal negative answer, not an error, and is excluded."
           },
           "share_percentage": {
             "type": "number",

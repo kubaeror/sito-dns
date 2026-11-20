@@ -32,7 +32,9 @@ impl PipelineContext<'_> {
             .await
         {
             Ok((mut upstream_resp, upstream_name, attempts)) => {
-                if let Some(ref m) = pipeline.metrics {
+                if !policy.ignore_stats
+                    && let Some(ref m) = pipeline.metrics
+                {
                     record_resolution_metrics(
                         m,
                         &upstream_name,
@@ -52,6 +54,7 @@ impl PipelineContext<'_> {
                         &domain_str,
                         qtype,
                         "upstream",
+                        policy.ignore_stats,
                     )
                 {
                     return outcome;
@@ -107,7 +110,9 @@ impl PipelineContext<'_> {
                     error = %e,
                     "Upstream resolution failed"
                 );
-                if let Some(ref m) = pipeline.metrics {
+                if !policy.ignore_stats
+                    && let Some(ref m) = pipeline.metrics
+                {
                     record_failure_metrics(m, &e);
                 }
 
@@ -130,6 +135,7 @@ impl PipelineContext<'_> {
                                 &domain_str,
                                 qtype,
                                 "stale_cache",
+                                policy.ignore_stats,
                             )
                         {
                             return outcome;
@@ -161,7 +167,9 @@ impl PipelineContext<'_> {
                             qname = %qname,
                             "Upstream failed, serving stale cached response (RFC 8767)"
                         );
-                        if let Some(ref m) = pipeline.metrics {
+                        if !policy.ignore_stats
+                            && let Some(ref m) = pipeline.metrics
+                        {
                             m.inc_cache_stale_served();
                         }
                         ResponseShaper::shape_with_payload(

@@ -142,6 +142,7 @@ impl DnsPipeline {
         query_id: u16,
         domain_str: &str,
         qtype: RecordType,
+        ignore_stats: bool,
     ) -> Option<QueryOutcome> {
         if !self.anti_bypass.matches_domain(domain_str) {
             return None;
@@ -150,7 +151,7 @@ impl DnsPipeline {
             qname = %domain_str,
             "Query blocked by Anti-DoH bypass rule (resolver domain)"
         );
-        if let Some(ref m) = self.metrics {
+        if !ignore_stats && let Some(ref m) = self.metrics {
             m.inc_doh_bypass_blocked();
         }
         Some(Self::blocked_outcome(
@@ -175,6 +176,7 @@ impl DnsPipeline {
         domain_str: &str,
         qtype: RecordType,
         origin: &'static str,
+        ignore_stats: bool,
     ) -> Option<QueryOutcome> {
         if !answers_contain_bypass_ip(&self.anti_bypass, answers) {
             return None;
@@ -184,7 +186,7 @@ impl DnsPipeline {
             origin,
             "Query blocked by Anti-DoH bypass (resolved IP)"
         );
-        if let Some(ref m) = self.metrics {
+        if !ignore_stats && let Some(ref m) = self.metrics {
             m.inc_doh_bypass_blocked();
         }
         Some(Self::blocked_outcome(
@@ -569,6 +571,7 @@ impl DnsPipeline {
         query_id: u16,
         domain_str: String,
         bypass_check_needed: bool,
+        ignore_stats: bool,
         config: &Config,
         runtime_snapshot: &sito_runtime::RuntimeSnapshot,
         effective_upstream: &Arc<UpstreamManager>,
@@ -582,6 +585,7 @@ impl DnsPipeline {
                 &domain_str,
                 qtype,
                 "cache",
+                ignore_stats,
             )
         {
             return outcome;

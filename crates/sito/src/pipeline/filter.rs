@@ -27,8 +27,14 @@ impl PipelineContext<'_> {
 
         // Anti-DoH bypass: check if domain matches known public resolver
         if self.bypass_check_needed
-            && let Some(outcome) =
-                pipeline.anti_doh_blocked_by_domain(query, config, query_id, domain_str, qtype)
+            && let Some(outcome) = pipeline.anti_doh_blocked_by_domain(
+                query,
+                config,
+                query_id,
+                domain_str,
+                qtype,
+                policy.ignore_stats,
+            )
         {
             return Some(outcome);
         }
