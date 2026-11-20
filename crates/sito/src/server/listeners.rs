@@ -247,6 +247,12 @@ pub(super) async fn start_dns_listeners(
         // configured listener that fails to bind aborts startup: logging and
         // continuing would report ready while the configured endpoint is
         // missing.
+        if config.dns.doq_port > 0 && doq_acceptor_mgr.is_none() {
+            error!(
+                addr = %SocketAddr::new(*bind_ip, config.dns.doq_port),
+                "DoQ port is configured but no TLS certificate/ACME material is available; the DoQ listener is NOT running"
+            );
+        }
         if config.dns.doq_port > 0
             && let Some(ref doq_mgr) = doq_acceptor_mgr
         {
@@ -266,6 +272,12 @@ pub(super) async fn start_dns_listeners(
         // Start DoH3 before DoH: DoH's Alt-Svc is gated on the actual DoH3
         // bind outcome for this address. A configured DoH3 bind failure aborts
         // startup instead of advertising an endpoint that is not serving.
+        if config.dns.doh3_port > 0 && doh3_acceptor_mgr.is_none() {
+            error!(
+                addr = %SocketAddr::new(*bind_ip, config.dns.doh3_port),
+                "DoH3 port is configured but no TLS certificate/ACME material is available; the DoH3 listener is NOT running"
+            );
+        }
         if config.dns.doh3_port > 0
             && let Some(ref doh3_mgr) = doh3_acceptor_mgr
         {

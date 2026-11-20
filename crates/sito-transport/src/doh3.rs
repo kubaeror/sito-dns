@@ -1670,4 +1670,30 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    /// Form-urlencoded `dns` decoding matches the DoH (axum) path: `+` is a
+    /// space, percent-escaped keys/values decode, the last duplicate wins, and
+    /// values containing `=` are not truncated.
+    #[test]
+    fn test_doh3_get_dns_param_decoding_matches_doh() {
+        assert_eq!(decode_dns_query_param("dns=abc"), Some("abc".to_string()));
+        // Percent-encoded '=' (base64 padding) must survive decoding.
+        assert_eq!(
+            decode_dns_query_param("dns=ab%3D%3D"),
+            Some("ab==".to_string())
+        );
+        // Percent-encoded key.
+        assert_eq!(decode_dns_query_param("%64ns=abc"), Some("abc".to_string()));
+        // `+` is a space in form-urlencoded data.
+        assert_eq!(decode_dns_query_param("dns=a+b"), Some("a b".to_string()));
+        // The last occurrence wins, matching the DoH HashMap extractor.
+        assert_eq!(
+            decode_dns_query_param("dns=first&dns=second"),
+            Some("second".to_string())
+        );
+        // A value containing '=' is not truncated.
+        assert_eq!(decode_dns_query_param("dns=a=b"), Some("a=b".to_string()));
+        assert_eq!(decode_dns_query_param("other=abc"), None);
+        assert_eq!(decode_dns_query_param(""), None);
+    }
 }
