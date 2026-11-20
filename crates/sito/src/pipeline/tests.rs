@@ -1989,6 +1989,74 @@ async fn test_pipeline_upstream_metrics_attribution_and_recovery() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// WP-2.7: the pipeline records one RTT and one error/health update per
+/// candidate attempt, so a failed first candidate is visible even though the
+/// second candidate resolves the query.
+#[tokio::test]
+async fn test_pipeline_records_per_attempt_upstream_metrics() {
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.dnssec.validate = false;
+
+    let (live_addr, _live_calls) = spawn_mock_upstream(None).await;
+    // Bound but never read/answered: the first candidate times out.
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let blackhole_addr = blackhole.local_addr().unwrap();
+    config.upstream.servers = vec![blackhole_addr.to_string(), live_addr.to_string()];
+    config.upstream.timeout_ms = 300;
+
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .expect("two IP-literal upstreams must build"),
+    );
+    let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let resp = pipeline
+        .handle(rewrite_query("per-attempt.example.", RecordType::A), client)
+        .await
+        .unwrap();
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+
+    let failed = blackhole_addr.to_string();
+    let winner = live_addr.to_string();
+    let rendered = metrics.render_prometheus();
+    assert!(
+        rendered.contains(&format!(
+            "sito_upstream_errors_total{{upstream=\"{failed}\",kind=\"timeout\"}} 1"
+        )),
+        "the failed attempt must be recorded with its own error kind: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("sito_upstream_health{{upstream=\"{failed}\"}} 0")),
+        "the failed attempt must set its own health to 0: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("sito_upstream_health{{upstream=\"{winner}\"}} 1")),
+        "the winning attempt must set its own health to 1: {rendered}"
+    );
+    for name in [&failed, &winner] {
+        assert!(
+            rendered.contains(&format!(
+                "sito_upstream_rtt_seconds_count{{upstream=\"{name}\"}} 1"
+            )),
+            "each attempt must contribute its own RTT sample: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains(r#"upstream="all""#),
+        "no aggregate/stale label may appear: {rendered}"
+    );
+
+    drop(blackhole);
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 /// D-12: failures that cannot be attributed to one configured server use
 /// the constant `unattributed` label and must not write a health gauge.
 #[tokio::test]

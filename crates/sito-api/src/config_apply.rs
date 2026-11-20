@@ -327,11 +327,38 @@ async fn commit_staged(
         }
     }
     ctx.querylog_sender.set_anonymize(anonymize);
+    prune_stale_upstream_metrics(ctx, &previous, candidate);
 
     Ok(AppliedReport {
         restart_required: restart_required_fields(&previous, candidate),
         ha_publish: None,
     })
+}
+
+/// Drops health/RTT/error series for upstream names that disappeared in a
+/// successful apply. The config is already live here, so these labels cannot
+/// be produced again and would otherwise stay in the exposition forever.
+fn prune_stale_upstream_metrics(ctx: &ServerContext, previous: &Config, candidate: &Config) {
+    let names = |config: &Config| -> std::collections::BTreeSet<String> {
+        config
+            .upstream
+            .servers
+            .iter()
+            .cloned()
+            .chain(
+                config
+                    .upstream
+                    .per_domain
+                    .iter()
+                    .flat_map(|rule| rule.servers.iter().cloned()),
+            )
+            .collect()
+    };
+    let previous_names = names(previous);
+    let current_names = names(candidate);
+    for name in previous_names.difference(&current_names) {
+        ctx.metrics.remove_upstream_health(name);
+    }
 }
 
 /// Applies `candidate` and persists it only after the apply succeeded. A
@@ -1256,6 +1283,46 @@ mod tests {
             ConfigFileApplyOutcome::SelfWriteIgnored => {}
             other => panic!("the runtime-matching document must be suppressed, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-2.7: a successful apply prunes metrics for upstream names that were
+    /// removed, while keeping series for names that still exist.
+    #[tokio::test]
+    async fn test_config_apply_prunes_removed_upstream_series() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_prune_upstream_metrics");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.upstream.servers = vec!["1.1.1.1".to_string()];
+        ctx.config.store(std::sync::Arc::new(previous.clone()));
+
+        for name in ["1.1.1.1", "9.9.9.9"] {
+            ctx.metrics.observe_upstream_rtt(name, 0.010);
+            ctx.metrics.inc_upstream_errors(name, "timeout");
+            ctx.metrics.set_upstream_health(name, 0.0);
+        }
+
+        let mut candidate = previous;
+        candidate.upstream.servers = vec!["9.9.9.9".to_string()];
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, None)
+            .await
+            .expect("the upstream change must apply");
+
+        let rendered = ctx.metrics.render_prometheus();
+        assert!(
+            !rendered.contains(r#"upstream="1.1.1.1""#),
+            "a removed upstream must be pruned from every metric family: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_upstream_health{upstream="9.9.9.9"}"#),
+            "a retained upstream must keep its series: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_upstream_errors_total{upstream="9.9.9.9",kind="timeout"}"#),
+            "a retained upstream must keep its error series: {rendered}"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

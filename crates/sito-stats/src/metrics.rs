@@ -233,6 +233,14 @@ impl LabelInterner {
             .cloned()
             .unwrap_or_else(|| Arc::from(""))
     }
+
+    /// Looks up an existing label id without adding a new interned value.
+    fn lookup(&self, value: &str) -> Option<u32> {
+        sito_core::sync::read_or_recover(&self.state)
+            .ids
+            .get(value)
+            .copied()
+    }
 }
 
 /// Increments the counter for `key`, creating it on first use.
@@ -430,6 +438,23 @@ impl MetricsRegistry {
         let upstream_id = self.labels.intern(upstream);
         let kind_id = self.labels.intern(kind);
         increment_counter(&self.upstream_errors, (upstream_id, kind_id));
+    }
+
+    /// Removes every per-upstream series for `upstream`: the health gauge, the
+    /// RTT histogram and all error-kind counters.
+    ///
+    /// Called after a config apply/publish for upstream names that no longer
+    /// exist, so removed servers cannot leave stale labels in the exposition
+    /// forever. Unknown names are a no-op.
+    pub fn remove_upstream_health(&self, upstream: &str) {
+        let Some(upstream_id) = self.labels.lookup(upstream) else {
+            return;
+        };
+
+        sito_core::sync::write_or_recover(&self.upstream_health).remove(&upstream_id);
+        sito_core::sync::write_or_recover(&self.upstream_rtt).remove(&upstream_id);
+        sito_core::sync::write_or_recover(&self.upstream_errors)
+            .retain(|(label, _kind), _| *label != upstream_id);
     }
 
     pub fn set_upstream_health(&self, upstream: &str, health: f64) {
@@ -2049,6 +2074,42 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         assert!(rendered.contains(r#"qtype="28""#));
         // Raw wire values outside the known set are never exposed.
         assert!(!rendered.contains(r#"qtype="40000""#));
+    }
+
+    /// WP-2.7: removing an upstream prunes its health gauge, RTT histogram and
+    /// every error-kind series, while other upstreams are untouched.
+    #[test]
+    fn test_removed_upstream_health_series_is_pruned() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        for name in ["removed.example", "kept.example"] {
+            reg.observe_upstream_rtt(name, 0.010);
+            reg.inc_upstream_errors(name, "timeout");
+            reg.set_upstream_health(name, 0.0);
+        }
+
+        reg.remove_upstream_health("removed.example");
+        // Removing an unknown name must be a no-op, not a panic or a new label.
+        reg.remove_upstream_health("never-seen.example");
+
+        let rendered = reg.render_prometheus();
+        assert!(
+            !rendered.contains("removed.example"),
+            "all removed upstream series must be pruned: {rendered}"
+        );
+        assert!(
+            !rendered.contains("never-seen.example"),
+            "the removal helper must not intern unknown names: {rendered}"
+        );
+        for family in [
+            "sito_upstream_health{upstream=\"kept.example\"}",
+            "sito_upstream_errors_total{upstream=\"kept.example\",kind=\"timeout\"}",
+            "sito_upstream_rtt_seconds_count{upstream=\"kept.example\"}",
+        ] {
+            assert!(
+                rendered.contains(family),
+                "unrelated upstream series must survive: missing {family}: {rendered}"
+            );
+        }
     }
 
     #[test]

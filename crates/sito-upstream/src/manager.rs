@@ -24,6 +24,51 @@ use crate::upstream::{Upstream, is_edns_failure_code, is_retryable_response};
 pub type NamedUpstream = (String, Arc<dyn Upstream>);
 pub type PerDomainRule = (Vec<String>, Vec<NamedUpstream>);
 
+/// One candidate attempt made while resolving a query.
+///
+/// The manager records each attempt separately so the pipeline can emit
+/// per-attempt RTT/error metrics. The successful attempt's `rtt` measures only
+/// that attempt, not the time already spent on failed candidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamAttempt {
+    /// Configured upstream name (the label used by metrics and health).
+    pub name: String,
+    /// Time spent on this attempt alone.
+    pub rtt: Duration,
+    /// `None` on success; the candidate's error otherwise.
+    pub error: Option<UpstreamError>,
+}
+
+impl UpstreamAttempt {
+    fn success(name: String, rtt: Duration) -> Self {
+        Self {
+            name,
+            rtt,
+            error: None,
+        }
+    }
+
+    fn failure(name: String, rtt: Duration, error: UpstreamError) -> Self {
+        Self {
+            name,
+            rtt,
+            error: Some(error),
+        }
+    }
+
+    /// Whether the candidate produced a usable response.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        self.error.is_none()
+    }
+
+    /// Stable, low-cardinality error kind for metrics labels.
+    #[must_use]
+    pub fn error_kind(&self) -> Option<&'static str> {
+        self.error.as_ref().map(UpstreamError::kind)
+    }
+}
+
 /// Failure returned by [`UpstreamManager::resolve_with_upstream`].
 ///
 /// Carries the name of the upstream that produced the final error so callers
@@ -36,6 +81,8 @@ pub struct UpstreamQueryError {
     pub error: UpstreamError,
     /// Name of the upstream entry that produced `error`, when one was tried.
     pub upstream: Option<String>,
+    /// Every candidate attempt made before the failure.
+    pub attempts: Vec<UpstreamAttempt>,
 }
 
 impl UpstreamQueryError {
@@ -44,6 +91,7 @@ impl UpstreamQueryError {
         Self {
             error,
             upstream: Some(entry.name.clone()),
+            attempts: Vec::new(),
         }
     }
 
@@ -53,6 +101,7 @@ impl UpstreamQueryError {
         Self {
             error,
             upstream: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -932,29 +981,83 @@ impl UpstreamManager {
         &self,
         msg: &Message,
     ) -> Result<(Message, String), UpstreamQueryError> {
+        self.resolve_with_attempts(msg)
+            .await
+            .map(|(response, upstream, _attempts)| (response, upstream))
+    }
+
+    /// Resolve a DNS query and return every candidate attempt alongside the
+    /// response (or failure).
+    ///
+    /// Callers that emit metrics should use this method: each entry in the
+    /// returned attempt list is one candidate, including failures that were
+    /// followed by a successful failover. `resolve_with_upstream` remains the
+    /// compatibility wrapper for callers that only need the winner.
+    pub async fn resolve_with_attempts(
+        &self,
+        msg: &Message,
+    ) -> Result<(Message, String, Vec<UpstreamAttempt>), UpstreamQueryError> {
         let inner = self.inner.load();
-        if let Some(query) = msg.queries.first() {
+        let mut attempts = Vec::new();
+        let result = if let Some(query) = msg.queries.first() {
             // ASCII/punycode form: per-domain rules are normalized to
             // punycode, so a UTS46-decoded IDN would never match them.
             let qname_str = query.name.to_ascii().to_lowercase();
             let qname_clean = qname_str.trim_end_matches('.');
+            let mut routed = None;
             for (domains, group) in &inner.per_domain_rules {
-                for d in domains {
-                    if sito_core::matches_domain_suffix(qname_clean, d) {
-                        debug!(
-                            "Routing query for {} to per-domain upstreams {:?}",
-                            qname_str, domains
-                        );
-                        return self
-                            .resolve_entries(group, msg, inner.strategy, inner.timeout_duration)
-                            .await;
-                    }
+                if domains
+                    .iter()
+                    .any(|d| sito_core::matches_domain_suffix(qname_clean, d))
+                {
+                    debug!(
+                        "Routing query for {} to per-domain upstreams {:?}",
+                        qname_str, domains
+                    );
+                    routed = Some(
+                        self.resolve_entries(
+                            group,
+                            msg,
+                            inner.strategy,
+                            inner.timeout_duration,
+                            &mut attempts,
+                        )
+                        .await,
+                    );
+                    break;
                 }
             }
-        }
-
-        self.resolve_entries(&inner.entries, msg, inner.strategy, inner.timeout_duration)
+            match routed {
+                Some(result) => result,
+                None => {
+                    self.resolve_entries(
+                        &inner.entries,
+                        msg,
+                        inner.strategy,
+                        inner.timeout_duration,
+                        &mut attempts,
+                    )
+                    .await
+                }
+            }
+        } else {
+            self.resolve_entries(
+                &inner.entries,
+                msg,
+                inner.strategy,
+                inner.timeout_duration,
+                &mut attempts,
+            )
             .await
+        };
+
+        match result {
+            Ok((response, upstream)) => Ok((response, upstream, attempts)),
+            Err(mut error) => {
+                error.attempts = attempts;
+                Err(error)
+            }
+        }
     }
 
     /// Runs one resolve across `entries` with the configured `strategy`.
@@ -979,6 +1082,7 @@ impl UpstreamManager {
         msg: &Message,
         strategy: UpstreamStrategy,
         timeout_duration: Duration,
+        attempts: &mut Vec<UpstreamAttempt>,
     ) -> Result<(Message, String), UpstreamQueryError> {
         if entries.is_empty() {
             return Err(UpstreamQueryError::unattributed(UpstreamError::AllDown));
@@ -1004,16 +1108,19 @@ impl UpstreamManager {
         match strategy {
             UpstreamStrategy::Parallel => {
                 let mut futs = Vec::with_capacity(candidates.len());
+                let parallel_attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
                 for entry in candidates {
                     let u = Arc::clone(&entry.upstream);
                     let h = Arc::clone(&entry.health);
                     let m = msg.clone();
                     let name = entry.name.clone();
+                    let attempt_log = Arc::clone(&parallel_attempts);
                     futs.push(Box::pin(async move {
-                        match resolve_with_edns_fallback(u.as_ref(), &m).await {
+                        let started = Instant::now();
+                        let result = match resolve_with_edns_fallback(u.as_ref(), &m).await {
                             Ok(resp) if !is_retryable_response(&resp) => {
                                 h.write().await.record_success();
-                                Ok((resp, name))
+                                Ok((resp, name.clone()))
                             }
                             Ok(resp) => {
                                 let error = retryable_status_error(resp.metadata.response_code);
@@ -1021,7 +1128,8 @@ impl UpstreamManager {
                                 h.write().await.record_error(&error);
                                 Err(UpstreamQueryError {
                                     error,
-                                    upstream: Some(name),
+                                    upstream: Some(name.clone()),
+                                    attempts: Vec::new(),
                                 })
                             }
                             Err(error) => {
@@ -1029,16 +1137,30 @@ impl UpstreamManager {
                                 h.write().await.record_error(&error);
                                 Err(UpstreamQueryError {
                                     error,
-                                    upstream: Some(name),
+                                    upstream: Some(name.clone()),
+                                    attempts: Vec::new(),
                                 })
                             }
+                        };
+                        let rtt = started.elapsed();
+                        let attempt = match &result {
+                            Ok(_) => UpstreamAttempt::success(name, rtt),
+                            Err(error) => UpstreamAttempt::failure(name, rtt, error.error.clone()),
+                        };
+                        if let Ok(mut log) = attempt_log.lock() {
+                            log.push(attempt);
                         }
+                        result
                     }));
                 }
                 // All attempts already run concurrently, so the whole race gets
                 // the full timeout; the deadline only bounds implementations
                 // that ignore their own timeout.
-                match timeout(timeout_duration, futures_util::future::select_ok(futs)).await {
+                let result = timeout(timeout_duration, futures_util::future::select_ok(futs)).await;
+                if let Ok(mut log) = parallel_attempts.lock() {
+                    attempts.append(&mut log);
+                }
+                match result {
                     Ok(Ok((resp, _))) => Ok(resp),
                     Ok(Err(error)) => Err(error),
                     Err(_) => Err(UpstreamQueryError::unattributed(UpstreamError::Timeout)),
@@ -1049,9 +1171,11 @@ impl UpstreamManager {
                 let ordered: Vec<&ManagedEntry> = (0..candidates.len())
                     .map(|i| candidates[(start_idx + i) % candidates.len()])
                     .collect();
-                resolve_sequential(&ordered, msg, deadline).await
+                resolve_sequential(&ordered, msg, deadline, attempts).await
             }
-            UpstreamStrategy::Failover => resolve_sequential(&candidates, msg, deadline).await,
+            UpstreamStrategy::Failover => {
+                resolve_sequential(&candidates, msg, deadline, attempts).await
+            }
         }
     }
 
@@ -1155,6 +1279,7 @@ async fn resolve_sequential(
     ordered: &[&ManagedEntry],
     msg: &Message,
     deadline: Instant,
+    attempts: &mut Vec<UpstreamAttempt>,
 ) -> Result<(Message, String), UpstreamQueryError> {
     let mut last_error = None;
     for (i, entry) in ordered.iter().enumerate() {
@@ -1162,9 +1287,14 @@ async fn resolve_sequential(
             break;
         };
         trace!("Querying upstream {}", entry.name);
+        let started = Instant::now();
         match attempt_entry(entry, msg, budget).await {
             Ok(response) if !is_retryable_response(&response) => {
                 entry.health.write().await.record_success();
+                attempts.push(UpstreamAttempt::success(
+                    entry.name.clone(),
+                    started.elapsed(),
+                ));
                 return Ok((response, entry.name.clone()));
             }
             Ok(response) => {
@@ -1174,11 +1304,21 @@ async fn resolve_sequential(
                     entry.name, error
                 );
                 entry.health.write().await.record_error(&error);
+                attempts.push(UpstreamAttempt::failure(
+                    entry.name.clone(),
+                    started.elapsed(),
+                    error.clone(),
+                ));
                 last_error = Some(UpstreamQueryError::from_entry(entry, error));
             }
             Err(error) => {
                 warn!("Upstream {} failed query: {}", entry.name, error);
                 entry.health.write().await.record_error(&error);
+                attempts.push(UpstreamAttempt::failure(
+                    entry.name.clone(),
+                    started.elapsed(),
+                    error.clone(),
+                ));
                 last_error = Some(UpstreamQueryError::from_entry(entry, error));
             }
         }
@@ -2017,6 +2157,76 @@ mod tests {
     /// WP-2.7: forced refresh must also rotate DoT candidates, not only the
     /// plain UDP path. The live listener counts the connection attempt made to
     /// the rotated address (the test endpoint cannot complete TLS).
+    /// WP-2.7: every candidate attempt is reported with its own RTT and error
+    /// kind. The winner's RTT excludes the time spent on the failed candidate.
+    #[tokio::test]
+    async fn test_failover_reports_per_attempt_rtt_and_error() {
+        let failed_calls = Arc::new(AtomicU32::new(0));
+        let winner_calls = Arc::new(AtomicU32::new(0));
+        let manager = UpstreamManager::with_upstreams(
+            vec![
+                (
+                    "slow-failure".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: false,
+                        delay: Duration::from_millis(80),
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::clone(&failed_calls),
+                    }),
+                ),
+                (
+                    "winner".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(9, 9, 9, 9),
+                        call_count: Arc::clone(&winner_calls),
+                    }),
+                ),
+            ],
+            UpstreamStrategy::Failover,
+            Duration::from_secs(2),
+        );
+
+        let started = Instant::now();
+        let (response, upstream, attempts) = manager
+            .resolve_with_attempts(&test_query())
+            .await
+            .expect("the second candidate must succeed");
+        let total = started.elapsed();
+
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(upstream, "winner");
+        assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(winner_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.len(), 2, "one attempt per candidate: {attempts:?}");
+
+        let failed = &attempts[0];
+        assert_eq!(failed.name, "slow-failure");
+        assert_eq!(failed.error_kind(), Some("timeout"));
+        assert!(!failed.is_success());
+        assert!(
+            failed.rtt >= Duration::from_millis(80),
+            "the failed attempt must report its own elapsed time: {:?}",
+            failed.rtt
+        );
+
+        let winner = &attempts[1];
+        assert_eq!(winner.name, "winner");
+        assert!(winner.is_success());
+        assert_eq!(winner.error_kind(), None);
+        assert!(
+            winner.rtt < failed.rtt,
+            "the winner RTT must exclude the failed attempt: winner={:?} failed={:?}",
+            winner.rtt,
+            failed.rtt
+        );
+        assert!(
+            winner.rtt < total,
+            "the winner RTT must not be the whole failover duration"
+        );
+    }
+
     #[tokio::test]
     async fn test_forced_refresh_rotates_dot_candidate() {
         let blackhole = std::net::Ipv4Addr::new(127, 0, 0, 3);

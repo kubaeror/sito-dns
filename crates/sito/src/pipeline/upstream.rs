@@ -28,13 +28,24 @@ impl PipelineContext<'_> {
         let upstream_start = std::time::Instant::now();
         match self
             .effective_upstream
-            .resolve_with_upstream(&upstream_query)
+            .resolve_with_attempts(&upstream_query)
             .await
         {
-            Ok((mut upstream_resp, upstream_name)) => {
+            Ok((mut upstream_resp, upstream_name, attempts)) => {
                 if let Some(ref m) = pipeline.metrics {
-                    m.observe_upstream_rtt(&upstream_name, upstream_start.elapsed().as_secs_f64());
-                    m.set_upstream_health(&upstream_name, 1.0);
+                    if attempts.is_empty() {
+                        // Compatibility fallback for an implementation that
+                        // cannot report attempts: keep the final winner sample.
+                        m.observe_upstream_rtt(
+                            &upstream_name,
+                            upstream_start.elapsed().as_secs_f64(),
+                        );
+                        m.set_upstream_health(&upstream_name, 1.0);
+                    } else {
+                        for attempt in &attempts {
+                            record_upstream_attempt(m, attempt);
+                        }
+                    }
                 }
                 upstream_resp.metadata.id = query_id;
 
@@ -104,10 +115,16 @@ impl PipelineContext<'_> {
                     "Upstream resolution failed"
                 );
                 if let Some(ref m) = pipeline.metrics {
-                    let label = e.upstream.as_deref().unwrap_or("unattributed");
-                    m.inc_upstream_errors(label, e.kind());
-                    if e.upstream.is_some() {
-                        m.set_upstream_health(label, 0.0);
+                    if e.attempts.is_empty() {
+                        let label = e.upstream.as_deref().unwrap_or("unattributed");
+                        m.inc_upstream_errors(label, e.kind());
+                        if e.upstream.is_some() {
+                            m.set_upstream_health(label, 0.0);
+                        }
+                    } else {
+                        for attempt in &e.attempts {
+                            record_upstream_attempt(m, attempt);
+                        }
                     }
                 }
 
@@ -192,5 +209,22 @@ impl PipelineContext<'_> {
                 QueryOutcome::servfail(query, domain_str, qtype)
             }
         }
+    }
+}
+
+/// Emits one candidate attempt: its own RTT, error kind (if any) and health.
+///
+/// Failed-attempt time is therefore never included in the winner's RTT.
+fn record_upstream_attempt(
+    metrics: &sito_stats::MetricsRegistry,
+    attempt: &sito_upstream::UpstreamAttempt,
+) {
+    metrics.observe_upstream_rtt(&attempt.name, attempt.rtt.as_secs_f64());
+    match attempt.error_kind() {
+        Some(kind) => {
+            metrics.inc_upstream_errors(&attempt.name, kind);
+            metrics.set_upstream_health(&attempt.name, 0.0);
+        }
+        None => metrics.set_upstream_health(&attempt.name, 1.0),
     }
 }

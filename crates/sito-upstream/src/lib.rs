@@ -19,7 +19,7 @@ pub use doq::QuicUpstream;
 pub use dot::DotUpstream;
 pub use health::{HealthStatus, UpstreamHealth};
 pub use key_fetch::UpstreamKeyFetcher;
-pub use manager::{PreparedUpstream, UpstreamManager, UpstreamQueryError};
+pub use manager::{PreparedUpstream, UpstreamAttempt, UpstreamManager, UpstreamQueryError};
 pub use plain::PlainUpstream;
 pub use upstream::Upstream;
 
