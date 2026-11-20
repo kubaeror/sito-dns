@@ -792,13 +792,17 @@ async fn test_wizard_custom_config_and_presets() {
         upstream_strategy: Some("parallel".to_string()),
         bootstrap: Some("1.1.1.1, 8.8.8.8".to_string()),
         timeout_ms: Some("3000".to_string()),
+        cache_enabled_present: Some("1".to_string()),
         cache_enabled: Some("on".to_string()),
         cache_size_mb: Some("128".to_string()),
         dnssec_mode: Some("strict".to_string()),
+        dnssec_validate_present: Some("1".to_string()),
         dnssec_validate: Some("on".to_string()),
+        filtering_enabled_present: Some("1".to_string()),
         filtering_enabled: Some("on".to_string()),
         enable_adblock: None,
         blocking_mode: Some("nxdomain".to_string()),
+        cname_cloaking_present: Some("1".to_string()),
         cname_cloaking: Some("on".to_string()),
         list_oisd_big: Some("on".to_string()),
         list_oisd_small: None,
@@ -3049,4 +3053,94 @@ async fn test_self_service_totp_enrollment_for_all_roles() {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+}
+
+/// WP-2.10: an unchecked wizard checkbox must actively disable a feature
+/// that was already enabled, not leave the old value in place.
+#[tokio::test]
+async fn test_wizard_unchecked_flags_disable_existing_features() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_wizard_unchecked_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let mut cfg = (**ctx.config.load()).clone();
+    cfg.dns.cache.enabled = true;
+    cfg.dns.dnssec.validate = true;
+    cfg.filtering.enabled = true;
+    cfg.filtering.cname_cloaking = true;
+    ctx.set_config(cfg);
+
+    // The hidden sentinels are present while the checkboxes themselves are
+    // absent, exactly as a browser submits an unchecked checkbox.
+    let form = WizardCompleteForm {
+        admin_user: Some("admin".to_string()),
+        admin_password: Some("Str0ngPassword!".to_string()),
+        cache_enabled_present: Some("1".to_string()),
+        filtering_enabled_present: Some("1".to_string()),
+        dnssec_validate_present: Some("1".to_string()),
+        cname_cloaking_present: Some("1".to_string()),
+        ..Default::default()
+    };
+    let resp = wizard_complete_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        crate::auth::MaybeConnectInfo(None),
+        HeaderMap::new(),
+        Form(form),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let cfg = ctx.config.load();
+    assert!(!cfg.dns.cache.enabled, "unchecked cache must disable it");
+    assert!(
+        !cfg.filtering.enabled,
+        "unchecked filtering must disable it"
+    );
+    assert!(
+        !cfg.dns.dnssec.validate,
+        "unchecked DNSSEC validation must disable it"
+    );
+    assert!(
+        !cfg.filtering.cname_cloaking,
+        "unchecked CNAME cloaking must disable it"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// WP-2.10: weighted upstream balancing is not implemented yet (WP-2.11),
+/// so the upstream page must not offer a weight control or column.
+#[tokio::test]
+async fn test_upstreams_page_has_no_unsupported_weight_control() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_upstreams_weight_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+    let body =
+        response_body(upstreams_page(State(ctx.clone()), session_headers(&session)).await).await;
+    assert!(
+        !body.contains("Load Balancing Weight"),
+        "the unimplemented weight input must not be offered: {body}"
+    );
+    assert!(
+        !body.contains("name=\"weight\""),
+        "no weight field may be submitted: {body}"
+    );
+    assert!(
+        !body.contains("id=\"up-weight\""),
+        "the old weight control id must be gone: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }

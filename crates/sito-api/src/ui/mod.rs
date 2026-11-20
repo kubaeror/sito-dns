@@ -174,7 +174,6 @@ mod tests {
                 address: "tls://1.1.1.1:853".to_string(),
                 protocol: "DoT (TLS)".to_string(),
                 is_healthy: true,
-                weight: 100,
                 total_queries: 500,
                 avg_latency_ms: 15.2,
             }],

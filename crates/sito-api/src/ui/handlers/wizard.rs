@@ -84,15 +84,23 @@ pub struct WizardCompleteForm {
     pub timeout_ms: Option<String>,
 
     // 4. Cache & DNSSEC
+    /// Presence sentinels: an unchecked HTML checkbox is omitted from the
+    /// form, so these hidden fields distinguish "unchecked" from "not part of
+    /// this submission". Without them an unchecked box left the previous value
+    /// unchanged instead of disabling the feature.
+    pub cache_enabled_present: Option<String>,
     pub cache_enabled: Option<String>,
     pub cache_size_mb: Option<String>,
     pub dnssec_mode: Option<String>,
+    pub dnssec_validate_present: Option<String>,
     pub dnssec_validate: Option<String>,
 
     // 5. Filtering
+    pub filtering_enabled_present: Option<String>,
     pub filtering_enabled: Option<String>,
     pub enable_adblock: Option<String>,
     pub blocking_mode: Option<String>,
+    pub cname_cloaking_present: Option<String>,
     pub cname_cloaking: Option<String>,
     pub list_oisd_big: Option<String>,
     pub list_oisd_small: Option<String>,
@@ -274,7 +282,7 @@ impl WizardCompleteForm {
     /// Wizard fields for cache, DNSSEC, and filtering presets.
     fn apply_cache_and_filtering(&self, cfg: &mut Config) -> Result<(), String> {
         // 4. Cache & DNSSEC
-        if self.cache_enabled.is_some() {
+        if self.cache_enabled_present.is_some() || self.cache_enabled.is_some() {
             cfg.dns.cache.enabled = Self::is_checkbox_checked(self.cache_enabled.as_deref());
         }
         if let Some(s) = self
@@ -295,12 +303,12 @@ impl WizardCompleteForm {
         {
             cfg.dns.dnssec.mode = s.to_string();
         }
-        if self.dnssec_validate.is_some() {
+        if self.dnssec_validate_present.is_some() || self.dnssec_validate.is_some() {
             cfg.dns.dnssec.validate = Self::is_checkbox_checked(self.dnssec_validate.as_deref());
         }
 
         // 5. Filtering & Protection
-        if self.filtering_enabled.is_some() {
+        if self.filtering_enabled_present.is_some() || self.filtering_enabled.is_some() {
             cfg.filtering.enabled = Self::is_checkbox_checked(self.filtering_enabled.as_deref());
         } else if self.enable_adblock.is_some() {
             cfg.filtering.enabled = Self::is_checkbox_checked(self.enable_adblock.as_deref());
@@ -327,7 +335,7 @@ impl WizardCompleteForm {
             }
         }
 
-        if self.cname_cloaking.is_some() {
+        if self.cname_cloaking_present.is_some() || self.cname_cloaking.is_some() {
             cfg.filtering.cname_cloaking =
                 Self::is_checkbox_checked(self.cname_cloaking.as_deref());
         }

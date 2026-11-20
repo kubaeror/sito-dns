@@ -17,6 +17,7 @@ use crate::models::{
 use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
+use axum::http::StatusCode;
 use serde::Deserialize;
 use sito_clients::{BlockedServiceConfig, ClientEntryConfig, ClientGroupConfig, ClientsConfig};
 
@@ -302,7 +303,7 @@ pub async fn get_unidentified_clients(
     path = "/api/v1/clients",
     request_body = ClientDto,
     responses(
-        (status = 200, description = "Client created", body = ClientDto),
+        (status = 201, description = "Client created", body = ClientDto),
         (status = 400, description = "Bad Request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
@@ -314,7 +315,7 @@ pub async fn create_client(
     State(ctx): State<ServerContext>,
     Extension(hooks): Extension<ApplyHooks>,
     Json(payload): Json<ClientDto>,
-) -> Result<Json<ClientDto>, ProblemDetails> {
+) -> Result<(StatusCode, Json<ClientDto>), ProblemDetails> {
     let _apply_guard = ctx.lock_config_apply().await;
     let mut cfg = load_clients_config(&ctx);
     if cfg.entries.iter().any(|c| c.name == payload.name) {
@@ -346,11 +347,14 @@ pub async fn create_client(
 
     cfg.entries.push(entry.clone());
     save_clients_config_locked(&ctx, &cfg, hooks.as_dyn()).await?;
-    Ok(Json(client_to_dto(
-        &entry,
-        cfg.client_id_secrets.get(&entry.name),
-        false,
-    )))
+    Ok((
+        StatusCode::CREATED,
+        Json(client_to_dto(
+            &entry,
+            cfg.client_id_secrets.get(&entry.name),
+            false,
+        )),
+    ))
 }
 
 #[utoipa::path(
@@ -682,7 +686,7 @@ pub async fn update_client_group(
     path = "/api/v1/clients/groups",
     request_body = ClientGroupDto,
     responses(
-        (status = 200, description = "Client group added", body = ClientGroupDto),
+        (status = 201, description = "Client group added", body = ClientGroupDto),
         (status = 409, description = "Group already exists", body = ProblemDetails),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
@@ -694,7 +698,7 @@ pub async fn add_client_group(
     State(ctx): State<ServerContext>,
     Extension(hooks): Extension<ApplyHooks>,
     Json(payload): Json<ClientGroupDto>,
-) -> Result<Json<ClientGroupDto>, ProblemDetails> {
+) -> Result<(StatusCode, Json<ClientGroupDto>), ProblemDetails> {
     let _apply_guard = ctx.lock_config_apply().await;
     let mut cfg = load_clients_config(&ctx);
     if cfg.groups.contains_key(&payload.name) {
@@ -725,7 +729,10 @@ pub async fn add_client_group(
     };
     cfg.groups.insert(payload.name.clone(), group.clone());
     save_clients_config_locked(&ctx, &cfg, hooks.as_dyn()).await?;
-    Ok(Json(group_to_dto(&payload.name, &group)))
+    Ok((
+        StatusCode::CREATED,
+        Json(group_to_dto(&payload.name, &group)),
+    ))
 }
 
 #[utoipa::path(
@@ -1150,15 +1157,15 @@ mod tests {
         };
 
         // The secret is trimmed, stored in client_id_secrets and never in ids.
-        let created = create_client(
+        let (status, Json(created)) = create_client(
             operator(),
             State(ctx.clone()),
             Extension(ApplyHooks::default()),
             Json(dto("phone", Some("  super-secret  "))),
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
         // The response must not echo the plaintext secret.
         assert_eq!(created.doh_path, None);
         assert!(created.has_secret);
@@ -1376,7 +1383,7 @@ mod tests {
             parental_categories: Vec::new(),
         };
 
-        let _ = add_client_group(
+        let (status, Json(created_group)) = add_client_group(
             operator(),
             State(ctx.clone()),
             Extension(ApplyHooks::default()),
@@ -1384,6 +1391,9 @@ mod tests {
         )
         .await
         .expect("first group creation succeeds");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created_group.name, "kids");
+        assert!(created_group.filtering_enabled);
 
         let err = add_client_group(
             operator(),

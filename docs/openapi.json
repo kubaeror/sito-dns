@@ -1168,7 +1168,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Client created",
             "content": {
               "application/json": {
@@ -1234,7 +1234,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Client group added",
             "content": {
               "application/json": {
@@ -2079,7 +2079,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Filter list added",
             "content": {
               "application/json": {
@@ -2779,7 +2779,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "DNS rewrite created",
             "content": {
               "application/json": {

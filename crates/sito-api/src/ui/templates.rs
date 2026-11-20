@@ -30,7 +30,6 @@ pub struct UpstreamViewItem {
     pub address: String,
     pub protocol: String,
     pub is_healthy: bool,
-    pub weight: u32,
     pub total_queries: u64,
     pub avg_latency_ms: f64,
 }
