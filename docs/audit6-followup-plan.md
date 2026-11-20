@@ -1386,13 +1386,31 @@ self-service 2FA section in `docs/audit6-test-matrix.md` and §20 of
 **Addresses:** P2-38..P2-55, P2-44.
 **Files:** `sito-api/src/{router,openapi,handlers/*,config_apply,updater}.rs`, `docs/openapi.json`.
 **Steps:**
-- [ ] Add OpenAPI security schemes/tags/path coverage; drift validator.
-- [ ] Reject unknown config keys; restart-only changes return 409 with no persistence; invalid references/rewrites rejected.
-- [ ] Deferred filter apply for unrelated settings; apply lock in refresh/update-all.
-- [ ] Cache-Control private/no-store on authenticated GETs; WebSocket Origin.
-- [ ] Updater: disable in-app apply on systemd/Docker, version truth, update lock, rollback, 0600 temp.
+- [x] Add OpenAPI security schemes/tags/path coverage; drift validator.
+- [x] Reject unknown config keys; restart-only changes return 409 with no persistence; invalid references/rewrites rejected.
+- [x] Deferred filter apply for unrelated settings; apply lock in refresh/update-all.
+- [x] Cache-Control private/no-store on authenticated GETs; WebSocket Origin.
+- [x] Updater: disable in-app apply on systemd/Docker, version truth, update lock, rollback, 0600 temp.
 - **Acceptance:** API/OpenAPI/updater tests pass; no false success.
 **Estimate:** L.
+
+**Status (2026-11-20):** Complete. The admin API now returns 409 with
+`restart_required` for restart-only writes, rejects unknown keys and broken
+references/rewrites before persisting, and defers filter work only when
+`[filtering]` is unchanged. OpenAPI declares bearer/cookie security, stable
+tags and the previously missing WebSocket and alias paths, with structural
+drift tests. Authenticated responses are `no-store`/`Vary: Cookie`; the
+querylog WebSocket validates Origin and restricts legacy `?token=` to its own
+path. The updater detects systemd/Docker, refuses in-app apply with CLI
+instructions, never claims an unknown version is current, serializes applies,
+verifies the staged binary, backs up/restores the old binary, and enforces
+0600/0700 temp modes plus strict signature-pair policy. Viewer subscription
+URLs are redacted. Evidence: Phase 2 — API v2, OpenAPI, config apply, updater
+section in `docs/audit6-test-matrix.md` and §26 of
+`docs/2.0-public-api-diff.md`. Residuals: systemd unit/installer E2E and
+atomic installer rollback are WP-2.13; the update lock is process-wide (no
+cross-process file lock); legacy `?token=` WebSocket authentication removal is
+WP-2.14; weighted upstream balancing remains unimplemented.
 
 ### WP-2.12 — Stats retention, PII, and polling
 

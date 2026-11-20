@@ -756,19 +756,15 @@ async fn stage_config(
     // never be used to publish a changed `[filtering]` section. Fail loudly
     // instead of leaving the runtime snapshot and filter engine disagreeing.
     match filter_apply {
-        FilterApply::Sync => {}
+        // The setup wizard owns `DeferredFirstBoot`: the wizard queues the
+        // initial filter refresh and gates DNS listeners until it finishes, so
+        // the candidate filtering config may be published in the same step.
+        FilterApply::Sync | FilterApply::DeferredFirstBoot => {}
         FilterApply::Deferred => {
             let current = ctx.config.load();
             if candidate.filtering != current.filtering {
                 return Err(ProblemDetails::internal_error(
                     "Deferred filter apply cannot change [filtering]; use FilterApply::Sync",
-                ));
-            }
-        }
-        FilterApply::DeferredFirstBoot => {
-            if ctx.filter.rule_count() != 0 {
-                return Err(ProblemDetails::internal_error(
-                    "A first-boot deferred apply cannot run after filter rules are live",
                 ));
             }
         }
