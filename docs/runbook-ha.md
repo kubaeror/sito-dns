@@ -674,38 +674,123 @@ To prevent unauthorized nodes from connecting to the master replication port and
 
 ---
 
-## 7. Planned HA protocol v2 upgrade (Phase 2 — not implemented)
+## 7. HA protocol v2 upgrade and downgrade
 
-> [!IMPORTANT]
-> This section describes the **planned** Phase 2 HA protocol v2 migration. It
-> is **not implemented** on the current 2.0.0-alpha.1 Phase 1 branch. Phase 1
-> does not change the HA wire protocol, `ha_state.toml` or
-> `ha_watermark.toml`. Do not attempt this procedure until the Phase 2 release
-> notes and a `protocol_version` field are present.
+HA protocol **v2** is implemented. It is intentionally incompatible with v1:
+version negotiation, the signed bundle identity and the on-disk state/watermark
+format all changed. Plan a coordinated cluster change and keep the pre-upgrade
+backups described in the [migration guide](2.0-migration.md#8-ha).
 
-The planned protocol adds `protocol_version = 2` to the handshake and to
-`ha_state.toml`/`ha_watermark.toml`. The upgrade is a coordinated cluster
-change:
+### 7.1 What v2 changes
 
-1. **Upgrade the master first.** The master starts on protocol v2 and rejects
-   every v1 slave with `protocol_mismatch` plus a readiness reason. Replication
-   is intentionally degraded during the window; DNS keeps answering on each
-   node from its last applied configuration.
-2. **Upgrade slaves one at a time.** A v2 slave also rejects a v1 master with
-   `protocol_mismatch`. Do not point a v2 slave at a v1 master.
-3. **Verify convergence.** Each slave must reach `Synced` with the master's
-   current term/version. `/health` stays generic; read `ready`,
-   `readiness_reason` and `diverged_reason` from `GET /api/v1/ha/status`.
-4. **Shared fields are read-only on slaves.** A local edit to a shared field
-   marks that slave `Degraded` and requires a full resync; node-local fields
-   (`[web]` identity, `[tls]`/`[acme]` paths, `[ha]`, credentials) remain
-   editable. The current Phase 1 bundle sanitizer already preserves those
-   node-local fields, but the read-only enforcement belongs to Phase 2.
+- `PROTOCOL_VERSION = 2` in the `Hello` handshake and every `ConfigPush`.
+  A `Hello` without a version is treated as v1 and rejected.
+- The signed `ConfigBundle` carries `protocol_version`, a BLAKE3
+  `config_digest` of `config_toml`, and the master's
+  `signing_key_fingerprint` (BLAKE3 of the Ed25519 public key). The slave checks
+  all three against the configured `master_pubkey` before applying anything.
+- `ha_watermark.toml` stores the signing-key fingerprint. A same-term push from
+  a different key requires an explicit higher-term promotion.
+- `ha_state.toml` and `ha_watermark.toml` use a wrapped v2 shape with a
+  required `protocol_version`. A v1 file is refused with `protocol_mismatch`;
+  it is never silently read or reset to version 0.
+- Rejections are observable: the peer receives a WebSocket close whose reason
+  starts with `protocol_mismatch:`, the local log names the action, the slave
+  readiness reason carries the same text, and the master increments
+  `sito_ha_protocol_rejections_total{role="master",reason="version_mismatch"}`
+  (the slave uses `role="slave"`). A bad peer never makes the listener or the
+  master's own readiness fail.
 
-**Downgrade is not supported in place.** To return to 1.9.x, stop every node,
-restore the pre-upgrade backups of `config.toml`, `ha_state.toml`,
-`ha_watermark.toml` and the certificate/key material, then start the old
-binary. A v1 node must not read a v2 state/watermark file; the planned v2
-reader refuses `protocol_version = 1` with migration instructions rather than
-guessing. See the
-[2.0 migration guide](2.0-migration.md#8-ha) for the operator summary.
+### 7.2 Upgrade (v1 cluster → v2)
+
+1. **Back up every node.** Stop the service and archive `config.toml`,
+   `users.toml`, the certificate/key material, `ha_state.toml` and
+   `ha_watermark.toml`; keep the previous binary/container image.
+2. **Install the v2 binary on every node first**, without starting it. Mixed
+   v1/v2 replication is refused by design.
+3. **Start the master first.** It serves v2 and rejects any v1 slave with
+   `protocol_mismatch`. DNS keeps answering from each node's last applied
+   configuration; replication is intentionally degraded during this window.
+4. **Start slaves one at a time.** A v2 slave also rejects a v1 master, so
+   start slaves only after the master is v2. Watch each slave reach `Synced`
+   with the master's current term/version.
+5. **Verify convergence.** Read `ready`, `readiness_reason` and
+   `diverged_reason` from `GET /api/v1/ha/status`, and per-slave
+   `synced_version`/`lag` from `GET /api/v1/ha/slaves`. `/health` stays generic;
+   a `protocol_mismatch` reason means a node still runs v1.
+6. **Expect a one-time state migration.** The first v2 start rewrites the
+   master state and each slave watermark in the v2 shape. Do not copy those
+   files back to a v1 node.
+
+The rolling order above intentionally accepts a short replication gap. For a
+strict no-gap window, stop the whole cluster, start the master, then the
+slaves; DNS availability during that stop is an operational decision.
+
+### 7.3 Downgrade (v2 → v1)
+
+In-place downgrade is **not supported**. A v1 binary cannot read v2 state or
+watermarks and will refuse them (or the operator would be tempted to delete
+them, which loses the replay guard). To return to 1.9.x:
+
+1. Stop every v2 node.
+2. Restore the pre-upgrade backups of `config.toml`, `ha_state.toml`,
+   `ha_watermark.toml` and the certificate/key material on every node.
+3. Start the old binary on the master, then the slaves.
+4. Verify `Synced` and that no `protocol_mismatch` remains in
+   `GET /api/v1/ha/status`.
+
+If the v2 state/watermark cannot be restored, the only safe recovery is a full
+resync from a master whose state you trust, after an explicit version/term
+promotion; deleting the state file alone silently drops the replay guard and is
+not a supported downgrade.
+
+### 7.4 Publish status, limits and trust policy
+
+- `POST /api/v1/config`/reload responses report `ha_publish.status = "queued"`
+  when the bundle was persisted and queued. This is **not** delivery proof:
+  `slaves_connected`, `slaves_queued` and `slaves_coalesced` are separate
+  counts, and delivery is confirmed by the slave ACK shown in
+  `GET /api/v1/ha/slaves`. `no_slaves` means no slave is connected; a connected
+  slave with a closed channel is still counted as connected and the publish is
+  `queued` with a zero queue count.
+- `TooLarge` is a configuration error, not a transport error. The envelope is
+  not persisted or broadcast, and it is **not retried** because retrying the
+  same document cannot shrink it. Reduce the shared configuration (rules,
+  rewrites, lists) and reapply.
+- Limits: 1 MiB maximum WebSocket message/frame, 4 MiB per-slave queued bytes
+  (500 ms/1 s writes coalesce the latest bundle), 10 s send deadline, 10 s
+  handshake/connect deadline, 64 global and 8 per-source-IP concurrent
+  handshakes. Slow or silent peers are disconnected instead of pinning memory.
+- Master URL: bracketed IPv6 literals are supported, for example
+  `master_url = "wss://[2001:db8::10]:8953"` or
+  `master_url = "wss://[::1]:8953"`. Do not omit the brackets.
+- TLS trust policy: a configured `master_fingerprint` is always enforced; a
+  configured `ca` always enforces chain, validity and SAN/hostname checking,
+  even when a pin is also configured. `allow_unpinned_tls = true` selects the
+  explicit no-verification mode only when **neither** a pin nor a CA is
+  configured. CA-only is supported and does not require the opt-out. Keep the
+  certificate SAN aligned with the host/IP used in `master_url`.
+- Key permissions: `sito ha gen-certs` writes private keys `0600`; reusing an
+  existing CA repairs `ca.key` to `0600` without rewriting it. The Ed25519
+  signing key is also owner-only. A key owned by another user fails the mTLS
+  listener even though DNS keeps answering.
+
+### 7.5 Node-local vs shared fields
+
+Slaves persist the pushed document with node-local values merged back in. The
+applied watermark stores a digest of the **shared projection** only, so a local
+edit to one of these fields does not force a full apply:
+
+- `[ha]`;
+- `server.instance_name`, `server.data_dir`;
+- `[dns] bind` and `[dns.tls]`;
+- the complete `[tls]` and `[acme]` sections;
+- `[web] enabled`, `bind`, `port`, `trusted_proxies`, `metrics_auth`,
+  `public_url`, `tls_terminated_by_proxy`;
+- the complete `[integrations.mikrotik]` section;
+- `[clients] client_id_secrets`.
+
+A local edit to any other (shared) field is detected as drift on the next
+watcher/restart check, marks the node `Degraded`, and requires a full apply from
+the master. Slaves still detect shared-field drift after the write; edit-time
+read-only enforcement is a future API feature, not a v2 guarantee.

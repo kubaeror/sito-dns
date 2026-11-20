@@ -1345,14 +1345,32 @@ bytes.
 **Addresses:** P1-3..P1-6, plus HA hardening H-05..H-23 (bundle size, send timeout, handshake limits, signing-key identity, resync clearing, CA/key permissions, IPv6 URL, backoff, divergence cleanup, metrics).
 **Files:** `sito-ha/src/*`, `sito-api/src/handlers/ha.rs`, `docs/runbook-ha.md`.
 **Steps:**
-- [ ] Add heartbeat/pong deadline, applied config digest, bounded publish history.
-- [ ] `publish` returns `Result`; oversized bundle rejected before persist.
-- [ ] Send timeouts, per-slave queue bytes, handshake rate limits.
-- [ ] Per-slave resync ACK clears divergence; signing key fingerprint persisted.
-- [ ] CA/pin/SAN policy and key permissions; IPv6 URL; clean-close backoff.
-- [ ] Protocol v2; coordinated upgrade docs.
+- [x] Add heartbeat/pong deadline, applied config digest, bounded publish history.
+- [x] `publish` returns `Result`; oversized bundle rejected before persist.
+- [x] Send timeouts, per-slave queue bytes, handshake rate limits.
+- [x] Per-slave resync ACK clears divergence; signing key fingerprint persisted.
+- [x] CA/pin/SAN policy and key permissions; IPv6 URL; clean-close backoff.
+- [x] Protocol v2; coordinated upgrade docs.
 - **Acceptance:** partition/fork/drift/publish/oversize/IPv6 tests pass; health truthful.
 **Estimate:** L.
+
+**Status (2026-11-20):** Complete. HA protocol v2 is implemented: v1 peers
+and v1 state/watermark files are rejected with `protocol_mismatch`, the signed
+bundle binds `protocol_version`, `config_digest` and
+`signing_key_fingerprint`, and the watermark persists the key fingerprint.
+The pong watchdog, bounded 64-envelope publish history, honest
+`PublishOutcome` counts (`queued` vs connected/coalesced), 64/8 listener
+admission limits, 10 s send/handshake deadlines, 1 MiB message and 4 MiB
+per-slave queue budgets, IPv6 URLs, CA/SAN/pin policy, `ca.key` repair and
+fixed 1 s clean-close reconnect are covered by tests. Evidence:
+[`docs/audit6-test-matrix.md`](audit6-test-matrix.md#phase-2--ha-protocol-v2-and-failover-wp-29),
+[`docs/runbook-ha.md`](runbook-ha.md#7-ha-protocol-v2-upgrade-and-downgrade),
+[`docs/2.0-migration.md`](2.0-migration.md#82-ha-protocol-v2-upgrade) and the
+[API diff](2.0-public-api-diff.md#25-phase-2--ha-protocol-v2-and-failover-wp-29).
+Residuals: edit-time read-only enforcement for shared fields on slaves remains
+post-edit drift detection; the published API status is `queued` (delivery is
+confirmed only by the slave ACK), and downgrade requires restoring pre-upgrade
+state/watermark and certificate backups rather than an in-place rollback.
 
 ### WP-2.10 — Auth, RBAC, and self-service 2FA
 

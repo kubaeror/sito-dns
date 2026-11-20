@@ -614,6 +614,7 @@ replication_port = 8953
 
 # On Slave instance:
 # master_url = "wss://192.168.1.10:8953"
+# master_url = "wss://[2001:db8::10]:8953"   # bracketed IPv6 literal
 # master_fingerprint = "blake3:4f8a12..."
 # master_pubkey = "<ed25519 public key>"   # required on slaves (signed bundle verification)
 # cert = "/etc/sito/ha_slave.crt"
@@ -625,23 +626,44 @@ replication_port = 8953
 |---|---|---|---|
 | `replication_port` | integer | `8953` | Mutual-TLS WebSocket port for config synchronization. |
 | `listen_addr` | string | `"0.0.0.0"` | Address the master replication listener binds to. |
-| `master_url` | string | `None` | (Slave only) WebSocket URL of the master instance. |
-| `master_fingerprint` | string | `None` | (Slave only) Expected Blake3 public certificate fingerprint of master for pinning. |
-| `master_pubkey` | string | `None` | (Slave only, **required**) Ed25519 public key of the master used to verify signed configuration pushes. |
-| `cert` / `key` / `ca` | string | `None` | Paths to mTLS certificates and CA bundles for replication. When `ca` is set, the peer chain is validated against it **including hostname/SAN verification**, even when BLAKE3 pinning is also configured. |
+| `master_url` | string | `None` | (Slave only) WebSocket URL of the master instance. IPv6 literals must be bracketed, for example `wss://[2001:db8::10]:8953`. |
+| `master_fingerprint` | string | `None` | (Slave only) Expected Blake3 public certificate fingerprint of master for pinning. A configured pin is always enforced. |
+| `master_pubkey` | string | `None` | (Slave only, **required**) Ed25519 public key of the master used to verify signed configuration pushes. Protocol v2 also binds a BLAKE3 config digest and this key's fingerprint into every signed bundle. |
+| `cert` / `key` / `ca` | string | `None` | Paths to mTLS certificates and CA bundles for replication. When `ca` is set, the peer chain is validated against it **including hostname/SAN verification**, even when BLAKE3 pinning is also configured. CA-only verification is supported and does not require `allow_unpinned_tls`. |
 | `ping_interval_secs` | integer | `15` | Master heartbeat interval. Slaves silent for 3× this interval are disconnected and removed from the active tracker. |
 | `slave_token` | string | `None` | Pre-shared token for slave authentication (mandatory when serving plaintext `ws://`). |
 | `pinned_slave_fingerprints` | array of strings | `[]` | BLAKE3 fingerprints of slave certificates accepted by the master. |
-| `allow_unpinned_tls` | boolean | `false` | Allow TLS peers without a configured fingerprint (insecure; only for controlled networks). |
+| `allow_unpinned_tls` | boolean | `false` | Explicit no-verification opt-out. It only applies when neither `master_fingerprint` nor `ca` is configured; a configured pin or CA is always enforced. |
 | `allow_insecure_ws` | boolean | `false` | Allow plaintext `ws://` replication. Requires a non-empty `slave_token`; must be set explicitly on both ends. |
 | `stats_interval_secs` | integer | `30` | Interval between slave-to-master statistics reports. |
+
+HA protocol **v2** is required on every node. A `Hello` without
+`protocol_version`, a v1 `ConfigPush`, or a v1 `ha_state.toml`/
+`ha_watermark.toml` is refused with an actionable `protocol_mismatch` (close
+reason, log, readiness reason and the `sito_ha_protocol_rejections_total`
+counter). Rejecting a bad peer never changes the listener or master readiness.
+Upgrade the master first and then each slave; downgrade requires restoring the
+pre-upgrade state/watermark and certificate backups. See the
+[HA runbook §7](runbook-ha.md#7-ha-protocol-v2-upgrade-and-downgrade).
+
+Runtime limits are fixed: 1 MiB maximum WebSocket message/frame, 4 MiB of
+queued bundles per slave (older pushes coalesce to the latest active bundle),
+10 s send and handshake deadlines, and 64 global/8 per-source-IP concurrent
+handshakes. A publish response with `ha_publish.status = "queued"` means the
+bundle is persisted and queued, not delivered; inspect
+`slaves_connected`/`slaves_queued`/`slaves_coalesced` and the slave ACKs in
+`GET /api/v1/ha/slaves`. An oversized bundle returns `TooLarge`, is not
+persisted/broadcast, and is not retried: reduce the shared configuration.
+Private keys (`cert`/`key`, `ca.key`, and the Ed25519 signing key) are `0600`;
+reusing an existing CA repairs `ca.key` to `0600` without rewriting it.
 
 The slave stores a **single** `master_fingerprint`; the master stores a list of
 accepted `pinned_slave_fingerprints`. During certificate rotation, the master
 can pin both the old and new slave fingerprints at once, while each slave must
 switch its one master fingerprint to the new value. `allow_unpinned_tls = true`
-is an explicit insecure opt-out; with `ca` configured, the server name is still
-checked against the certificate SAN.
+is an explicit insecure opt-out only when no pin and no CA are configured; with
+`ca` configured, the chain and server-name/SAN are still checked. CA-only
+verification is a supported trust mode.
 
 Private keys referenced by `key` are read by the unprivileged service account
 (`sito` under systemd, uid/gid `65532` in the container image). Generate them
