@@ -15,7 +15,9 @@ use serde::Deserialize;
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use crate::auth::manager::{LoginResult, ReauthError, TotpMutationError, UserMutationError};
+use crate::auth::manager::{
+    LoginResult, MAX_LOGIN_PASSWORD_BYTES, ReauthError, TotpMutationError, UserMutationError,
+};
 use crate::auth::rbac::AuthUser;
 use crate::auth::resolve_client_ip;
 use crate::auth::session::{

@@ -8,7 +8,8 @@ use axum::response::{IntoResponse, Response};
 use std::str::FromStr;
 
 use crate::auth::manager::{
-    LoginResult, ReauthError, TotpMutationError, TotpVerifyResult, UserMutationError,
+    LoginResult, MAX_LOGIN_PASSWORD_BYTES, ReauthError, TotpMutationError, TotpVerifyResult,
+    UserMutationError,
 };
 use crate::auth::rbac::{RequireAdmin, RequireViewer};
 use crate::auth::session::{
@@ -871,6 +872,16 @@ pub async fn change_password(
         ));
     }
     validate_password_policy(&req.new_password)?;
+    // Match login/reauth: the current password is an Argon2 input, so an
+    // oversized value is rejected before it can reach the verifier. The new
+    // password keeps its own policy (which also caps at the same length).
+    if let Some(current) = req.current_password.as_deref()
+        && current.trim().len() > MAX_LOGIN_PASSWORD_BYTES
+    {
+        return Err(ProblemDetails::bad_request(format!(
+            "Current password must be at most {MAX_LOGIN_PASSWORD_BYTES} bytes"
+        )));
+    }
 
     let target = req
         .username
@@ -1260,6 +1271,34 @@ mod tests {
         .await
         .expect_err("wrong current password rejected");
         assert_eq!(wrong.status, 401);
+
+        // Oversized current passwords are rejected before Argon2 with a clear
+        // validation error, mirroring login/reauth caps (WP-2.10).
+        let oversized = change_password(
+            admin(),
+            State(ctx.clone()),
+            Json(ChangePasswordRequest {
+                username: None,
+                current_password: Some("p".repeat(MAX_LOGIN_PASSWORD_BYTES + 1)),
+                new_password: "NewAdminPassword1".to_string(),
+            }),
+        )
+        .await
+        .expect_err("oversized current password rejected");
+        assert_eq!(oversized.status, 400);
+        assert!(
+            oversized
+                .detail
+                .contains("Current password must be at most"),
+            "unexpected detail: {}",
+            oversized.detail
+        );
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("admin", "adminadmin")
+                .await,
+            "an oversized current password must not change the password"
+        );
 
         let _ = change_password(
             admin(),

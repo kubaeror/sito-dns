@@ -2164,6 +2164,30 @@ async fn test_account_password_change() {
         "wrong current password must not change the password"
     );
 
+    // WP-2.10: an oversized current password is rejected before Argon2 with a
+    // visible validation error, matching the login/reauth length cap.
+    let resp = account_password_handler(
+        State(ctx.clone()),
+        headers.clone(),
+        Form(AccountPasswordForm {
+            current_password: "p".repeat(MAX_LOGIN_PASSWORD_BYTES + 1),
+            new_password: "NewAdminPassword1".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = response_body(resp).await;
+    assert!(
+        body.contains("Current password must be at most"),
+        "visible error missing: {body}"
+    );
+    assert!(
+        ctx.auth_mgr
+            .verify_user_password("admin", "adminadmin")
+            .await,
+        "an oversized current password must not change the password"
+    );
+
     let resp = account_password_handler(
         State(ctx.clone()),
         headers,

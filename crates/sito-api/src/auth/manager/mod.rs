@@ -131,6 +131,13 @@ pub const MAX_PARTIAL_TOKENS: usize = 10_000;
 pub const MAX_LOGIN_USERNAME_BYTES: usize = 64;
 /// Maximum accepted login password length (bytes) before lockout/Argon2.
 pub const MAX_LOGIN_PASSWORD_BYTES: usize = 1024;
+/// Maximum number of Argon2 hash/verify operations that may run concurrently.
+///
+/// Each operation allocates 64 MiB, so four permits cap the password-hashing
+/// arena at roughly 256 MiB while still allowing a small login burst (and the
+/// login/reauth/change-password paths) to make progress. Larger values trade
+/// memory for throughput; keep this documented in `docs/security-audit.md`.
+pub const ARGON2_MAX_CONCURRENCY: usize = 4;
 
 /// Digest key used for account lockout bookkeeping. Hashing bounds the key
 /// size and prevents the raw (attacker-controlled) username from being stored.
@@ -224,6 +231,85 @@ struct PendingTotp {
 struct LoginGate {
     reached: Arc<tokio::sync::Notify>,
     resume: Arc<tokio::sync::Notify>,
+}
+
+/// Test-only instrumentation for the Argon2 concurrency regression test.
+///
+/// Every hash/verify records an attempt before waiting for a semaphore permit
+/// and then parks inside its blocking task until the test releases it. That
+/// lets the test observe the saturated bound deterministically, without sleeps.
+#[cfg(test)]
+#[derive(Default)]
+struct Argon2ProbeState {
+    /// Operations that reached the semaphore wait.
+    attempted: usize,
+    /// Operations currently inside an Argon2 computation.
+    active: usize,
+    /// Highest observed `active` value.
+    max_active: usize,
+    /// Set by the test once the saturated state has been observed.
+    released: bool,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Argon2Probe {
+    state: Mutex<Argon2ProbeState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl Argon2Probe {
+    /// Records that an operation reached the permit wait.
+    fn attempt(&self) {
+        let mut state = lock(&self.state);
+        state.attempted += 1;
+        self.changed.notify_all();
+    }
+
+    /// Parks the operation while it holds a permit until the test releases it.
+    fn enter(&self) {
+        let mut state = lock(&self.state);
+        state.active += 1;
+        state.max_active = state.max_active.max(state.active);
+        self.changed.notify_all();
+        while !state.released {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.active -= 1;
+        self.changed.notify_all();
+    }
+
+    /// Lets every parked operation finish.
+    fn release(&self) {
+        let mut state = lock(&self.state);
+        state.released = true;
+        self.changed.notify_all();
+    }
+
+    /// Blocks until `predicate` holds. The timeout is a failure guard against a
+    /// regression that never saturates the bound, not a timing dependency.
+    fn wait_until(&self, predicate: impl Fn(&Argon2ProbeState) -> bool) {
+        let state = lock(&self.state);
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(10), |state| !predicate(state))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(state);
+        assert!(
+            !timeout.timed_out(),
+            "timed out waiting for the Argon2 probe condition"
+        );
+    }
+
+    /// Snapshot of `(attempted, active, max_active)`.
+    fn snapshot(&self) -> (usize, usize, usize) {
+        let state = lock(&self.state);
+        (state.attempted, state.active, state.max_active)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -330,20 +416,72 @@ fn dummy_password_hash() -> &'static str {
     })
 }
 
-async fn hash_password_blocking(password: String) -> Result<(String, bool), String> {
-    tokio::task::spawn_blocking(move || {
-        let hash = hash_password(&password)?;
-        let is_default = verify_password("adminadmin", &hash);
-        Ok((hash, is_default))
-    })
-    .await
-    .map_err(|e| format!("password hashing task failed: {e}"))?
-}
+impl AuthManager {
+    /// Hashes a password on the blocking pool while holding an Argon2 permit.
+    ///
+    /// The permit is acquired before the blocking task is spawned and moved
+    /// into it, so at most [`ARGON2_MAX_CONCURRENCY`] hashes (or verifications)
+    /// can consume the 64 MiB working set at once. Waiting for a permit is
+    /// cancellation-safe: a cancelled caller drops its place in the queue
+    /// before any hashing starts. If the caller is cancelled after the task was
+    /// spawned, the task keeps the permit until it finishes, so abandoned work
+    /// cannot widen the bound.
+    async fn hash_password_blocking(&self, password: String) -> Result<(String, bool), String> {
+        #[cfg(test)]
+        let probe = lock(&self.argon2_probe).clone();
+        #[cfg(test)]
+        if let Some(probe) = &probe {
+            probe.attempt();
+        }
+        let permit = Arc::clone(&self.argon2_semaphore)
+            .acquire_owned()
+            .await
+            .map_err(|e| format!("password hashing concurrency limiter closed: {e}"))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            #[cfg(test)]
+            if let Some(probe) = probe {
+                probe.enter();
+            }
+            let hash = hash_password(&password)?;
+            let is_default = verify_password("adminadmin", &hash);
+            Ok((hash, is_default))
+        })
+        .await
+        .map_err(|e| format!("password hashing task failed: {e}"))?
+    }
 
-async fn verify_password_blocking(password: String, hash: String) -> bool {
-    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+    /// Verifies a password on the blocking pool under the same Argon2 permit
+    /// bound as [`Self::hash_password_blocking`].
+    async fn verify_password_blocking(&self, password: String, hash: String) -> bool {
+        #[cfg(test)]
+        let probe = lock(&self.argon2_probe).clone();
+        #[cfg(test)]
+        if let Some(probe) = &probe {
+            probe.attempt();
+        }
+        let Ok(permit) = Arc::clone(&self.argon2_semaphore).acquire_owned().await else {
+            return false;
+        };
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            #[cfg(test)]
+            if let Some(probe) = probe {
+                probe.enter();
+            }
+            verify_password(&password, &hash)
+        })
         .await
         .unwrap_or(false)
+    }
+
+    /// Installs a fresh probe for the Argon2 concurrency regression test.
+    #[cfg(test)]
+    fn install_argon2_probe(&self) -> Arc<Argon2Probe> {
+        let probe = Arc::new(Argon2Probe::default());
+        *lock(&self.argon2_probe) = Some(probe.clone());
+        probe
+    }
 }
 
 /// Test-only record of `(path, thread)` for every secret-file write, used to
@@ -613,6 +751,11 @@ pub struct AuthManager {
     /// Held only across the snapshot and its `spawn_blocking` write; callers
     /// must not nest `save_*_async` calls while it is held.
     persist_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Bounds concurrent Argon2 hash/verify operations ([`ARGON2_MAX_CONCURRENCY`]).
+    argon2_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Test-only probe used by the Argon2 concurrency regression test.
+    #[cfg(test)]
+    argon2_probe: Arc<Mutex<Option<Arc<Argon2Probe>>>>,
     users_path: Option<PathBuf>,
     sessions_path: Option<PathBuf>,
     tokens_path: Option<PathBuf>,

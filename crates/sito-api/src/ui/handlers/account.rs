@@ -106,6 +106,18 @@ pub async fn account_password_handler(
             ProblemDetails::bad_request("Current password is required"),
         );
     }
+    // Same pre-Argon2 cap as login and reauth; keep the new-password policy
+    // untouched (it already rejects values above the same length).
+    if form.current_password.trim().len() > MAX_LOGIN_PASSWORD_BYTES {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request(format!(
+                "Current password must be at most {MAX_LOGIN_PASSWORD_BYTES} bytes"
+            )),
+        );
+    }
     if !ctx
         .auth_mgr
         .verify_user_password(&user.username, form.current_password.trim())
