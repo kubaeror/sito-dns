@@ -756,10 +756,19 @@ async fn stage_config(
     // never be used to publish a changed `[filtering]` section. Fail loudly
     // instead of leaving the runtime snapshot and filter engine disagreeing.
     match filter_apply {
-        // The setup wizard owns `DeferredFirstBoot`: the wizard queues the
-        // initial filter refresh and gates DNS listeners until it finishes, so
-        // the candidate filtering config may be published in the same step.
-        FilterApply::Sync | FilterApply::DeferredFirstBoot => {}
+        FilterApply::Sync => {}
+        FilterApply::DeferredFirstBoot => {
+            // Only the genuine first boot may publish a changed filtering
+            // config with the old snapshot still live. In recovery bootstrap
+            // (no setup-pending flag and no gated DNS starter) the wizard must
+            // use `Sync`, otherwise success would be reported while the old
+            // rules keep serving.
+            if !(ctx.is_setup_pending() || ctx.dns_starter.is_some()) {
+                return Err(ProblemDetails::internal_error(
+                    "DeferredFirstBoot is only valid during first-boot setup; use FilterApply::Sync",
+                ));
+            }
+        }
         FilterApply::Deferred => {
             let current = ctx.config.load();
             if candidate.filtering != current.filtering {
@@ -887,12 +896,12 @@ fn rewrites_from_config(cfg: &Config) -> Result<sito_rewrites::RewritesConfig, P
 
 /// Queues a background blocklist refresh for the given filtering config and
 /// returns its join handle. Used by the wizard so the HTTP request does not
-/// download lists synchronously; the caller can await the handle to know when
-/// the filter engine is ready.
+/// download lists synchronously; the caller must await the handle and check
+/// its result before reporting setup success.
 pub fn queue_filter_refresh(
     ctx: &ServerContext,
     filtering: sito_core::config::FilteringConfig,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<Result<(), ApplyError>> {
     let engine = ctx.filter.clone();
     let metrics = ctx.metrics.clone();
     let cache = ctx.cache.clone();
@@ -909,17 +918,20 @@ pub fn queue_filter_refresh(
                 cache.flush();
                 metrics.set_filter_rules(engine.rule_count());
                 tracing::info!("Background blocklist refresh completed");
+                Ok(())
             }
-            Err(ApplyError::GenerationConflict { .. }) => {
+            Err(error @ ApplyError::GenerationConflict { .. }) => {
                 tracing::debug!(
                     "Discarding a background blocklist refresh compiled for an older configuration"
                 );
+                Err(error)
             }
             Err(error) => {
                 tracing::error!(
                     "Background blocklist refresh failed; the filter engine keeps its previous \
                      snapshot: {error}"
                 );
+                Err(error)
             }
         }
     })
@@ -1141,6 +1153,7 @@ mod tests {
         let mut candidate = seed.clone();
         candidate.upstream.servers = vec!["9.9.9.9".to_string()];
         candidate.dns.cache.min_ttl = candidate.dns.cache.min_ttl.saturating_add(5);
+        candidate.dns.dnssec.validate = !seed.dns.dnssec.validate;
         let filter_apply = filter_apply_for(&ctx.config.load(), &candidate);
         assert_eq!(filter_apply, FilterApply::Deferred);
 
@@ -1150,6 +1163,7 @@ mod tests {
         let live = ctx.config.load();
         assert_eq!(live.upstream.servers, vec!["9.9.9.9"]);
         assert_eq!(live.dns.cache.min_ttl, candidate.dns.cache.min_ttl);
+        assert_eq!(live.dns.dnssec.validate, candidate.dns.dnssec.validate);
 
         let mut filtered = candidate.clone();
         filtered

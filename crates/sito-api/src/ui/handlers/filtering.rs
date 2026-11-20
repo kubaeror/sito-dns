@@ -15,7 +15,22 @@ use super::*;
 pub(crate) fn bundled_list_views(
     manifest: Result<sito_clients::BundledManifest, serde_json::Error>,
     statuses: &[sito_clients::RuntimeListStatus],
+    can_view_urls: bool,
 ) -> Vec<crate::ui::templates::BundledListView> {
+    let redact_source = |source: String| -> String {
+        if can_view_urls {
+            source
+        } else {
+            redact_subscription_url(&source)
+        }
+    };
+    let redact_error = |error: String| -> String {
+        if can_view_urls {
+            error
+        } else {
+            redact_text_urls(&error)
+        }
+    };
     let manifest = match manifest {
         Ok(manifest) => manifest,
         Err(e) => {
@@ -47,9 +62,11 @@ pub(crate) fn bundled_list_views(
                 id: list.id.clone(),
                 kind: list.kind.clone(),
                 version: list.version.clone(),
-                source: status
-                    .and_then(|status| status.source_url.clone())
-                    .unwrap_or_else(|| list.source.clone()),
+                source: redact_source(
+                    status
+                        .and_then(|status| status.source_url.clone())
+                        .unwrap_or_else(|| list.source.clone()),
+                ),
                 license: list.license.clone(),
                 entries: status.map_or(list.entries, |status| status.entries),
                 state: if status.is_some_and(|status| !status.bundled) {
@@ -59,7 +76,9 @@ pub(crate) fn bundled_list_views(
                 },
                 last_refresh: format_refresh(status.and_then(|status| status.last_refresh_unix)),
                 last_attempt: format_refresh(status.and_then(|status| status.last_attempt_unix)),
-                last_error: status.and_then(|status| status.last_error.clone()),
+                last_error: status
+                    .and_then(|status| status.last_error.clone())
+                    .map(redact_error),
             }
         })
         .collect();
@@ -71,7 +90,7 @@ pub(crate) fn bundled_list_views(
             id: status.category.clone(),
             kind: "custom".to_string(),
             version: "—".to_string(),
-            source: status.source_url.clone().unwrap_or_default(),
+            source: redact_source(status.source_url.clone().unwrap_or_default()),
             license: "—".to_string(),
             entries: status.entries,
             state: if status.bundled {
@@ -81,7 +100,7 @@ pub(crate) fn bundled_list_views(
             },
             last_refresh: format_refresh(status.last_refresh_unix),
             last_attempt: format_refresh(status.last_attempt_unix),
-            last_error: status.last_error.clone(),
+            last_error: status.last_error.clone().map(redact_error),
         });
     }
     bundled_lists.sort_by(|a, b| a.id.cmp(&b.id));
@@ -102,6 +121,30 @@ pub(crate) fn redact_subscription_url(url: &str) -> String {
     } else {
         format!("{scheme}://{host}")
     }
+}
+
+/// Redacts scheme URLs embedded in a free-form error string. Runtime-list
+/// errors can include the failing source; Viewers must not receive its path or
+/// credentials, so each URL is reduced to scheme+host.
+pub(crate) fn redact_text_urls(text: &str) -> String {
+    text.split_whitespace()
+        .map(|token| {
+            let Some(start) = ["http://", "https://", "file://"]
+                .iter()
+                .filter_map(|scheme| token.find(scheme))
+                .min()
+            else {
+                return token.to_string();
+            };
+            let (prefix, rest) = token.split_at(start);
+            let suffix_start = rest
+                .find([',', ';', ')', ']', '}', '"', '\''])
+                .unwrap_or(rest.len());
+            let (url, suffix) = rest.split_at(suffix_start);
+            format!("{prefix}{}{suffix}", redact_subscription_url(url))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
@@ -147,7 +190,7 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
 
     // Curated lists bundled into the binary plus any runtime refresh state.
     let manifest = sito_clients::BundledManifest::try_bundled();
-    let bundled_lists = bundled_list_views(manifest, &ctx.runtime_lists.statuses());
+    let bundled_lists = bundled_list_views(manifest, &ctx.runtime_lists.statuses(), can_view_urls);
 
     HtmlTemplate(FilteringTemplate {
         csrf_token: &csrf,

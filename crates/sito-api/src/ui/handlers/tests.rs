@@ -174,7 +174,7 @@ fn test_bundled_list_views_corrupt_manifest_returns_runtime_rows_without_panic()
         bundled: false,
     }];
 
-    let views = bundled_list_views(Err(corrupt), &statuses);
+    let views = bundled_list_views(Err(corrupt), &statuses, true);
     assert_eq!(
         views.len(),
         1,
@@ -195,7 +195,7 @@ fn test_bundled_list_views_corrupt_manifest_returns_runtime_rows_without_panic()
     // The healthy path still merges bundled metadata with runtime status.
     let manifest =
         sito_clients::BundledManifest::try_bundled().expect("bundled manifest must parse");
-    let views = bundled_list_views(Ok(manifest), &[]);
+    let views = bundled_list_views(Ok(manifest), &[], true);
     assert!(views.iter().any(|view| view.id == "adult"));
     assert!(
         views.iter().all(|view| view.kind != "custom"),
@@ -929,6 +929,15 @@ async fn test_wizard_invalid_ports_and_ips() {
 
 /// P2-41/viewer: the filtering page shows only scheme+host to Viewers while
 /// Operators keep the full subscription URL.
+#[test]
+fn test_redact_text_urls_preserves_punctuation_and_hides_credentials() {
+    assert_eq!(
+        redact_text_urls("failed (https://user:pass@lists.example/private?token=x); retry"),
+        "failed (https://lists.example); retry"
+    );
+    assert_eq!(redact_text_urls("plain error"), "plain error");
+}
+
 #[tokio::test]
 async fn test_filtering_page_redacts_subscription_urls_below_operator() {
     let temp_dir =
@@ -944,6 +953,17 @@ async fn test_filtering_page_redacts_subscription_urls_below_operator() {
         refresh_hours: None,
     }];
     ctx.set_config(config);
+    ctx.runtime_lists.mark_refreshed(
+        "adult",
+        "https://bundled.example.net/source/runtime-secret-token.txt",
+    );
+    ctx.runtime_lists.record_attempt(
+        "adult",
+        Some(
+            "fetch failed for https://bundled.example.net/source/runtime-secret-token.txt"
+                .to_string(),
+        ),
+    );
 
     ctx.auth_mgr
         .create_user("view_user", "pass", Role::Viewer)
@@ -978,6 +998,14 @@ async fn test_filtering_page_redacts_subscription_urls_below_operator() {
         !viewer_html.contains("private-token"),
         "a Viewer must not see the full subscription URL: {viewer_html}"
     );
+    assert!(
+        viewer_html.contains("https://bundled.example.net"),
+        "a Viewer may see the runtime source host"
+    );
+    assert!(
+        !viewer_html.contains("runtime-secret-token"),
+        "a Viewer must not see the runtime source URL or error URL: {viewer_html}"
+    );
 
     let LoginResult::Success(oper_session) =
         ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1").await
@@ -988,6 +1016,10 @@ async fn test_filtering_page_redacts_subscription_urls_below_operator() {
     assert!(
         operator_html.contains("https://lists.example.net/subscriptions/private-token.txt"),
         "an Operator must see the full subscription URL"
+    );
+    assert!(
+        operator_html.contains("https://bundled.example.net/source/runtime-secret-token.txt"),
+        "an Operator must see the full runtime source URL"
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);

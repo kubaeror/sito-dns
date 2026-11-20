@@ -660,6 +660,23 @@ async fn create_private_dir(path: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
+/// Rejects release asset names that could escape the scratch directory when
+/// joined into a temporary path.
+fn safe_asset_name(name: &str) -> Result<&str, UpdateError> {
+    if name.is_empty()
+        || name.contains(['/', '\\'])
+        || Path::new(name)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            != Some(name)
+    {
+        return Err(UpdateError::Other(format!(
+            "Release asset name '{name}' is not a plain file name"
+        )));
+    }
+    Ok(name)
+}
+
 /// Downloads release signature assets (when present) and applies the configured
 /// signature policy to the archive on disk.
 #[allow(clippy::too_many_arguments)]
@@ -713,8 +730,11 @@ async fn apply_signature_policy(
         std::env::temp_dir().join(format!("sito-update-verify-{}", rand::random::<u64>()));
     let _temp_guard = TempFileGuard::new(temp_dir.clone());
     create_private_dir(&temp_dir).await?;
-    let sig_path = temp_dir.join(format!("{}.sig", archive.name));
-    let cert_path = temp_dir.join(format!("{}.pem", archive.name));
+    let archive_name = safe_asset_name(&archive.name)?;
+    safe_asset_name(&sig.name)?;
+    safe_asset_name(&cert.name)?;
+    let sig_path = temp_dir.join(format!("{archive_name}.sig"));
+    let cert_path = temp_dir.join(format!("{archive_name}.pem"));
 
     debug!(asset = %sig.name, "Downloading release signature");
     download_capped(
@@ -832,13 +852,57 @@ async fn write_private_executable(path: &Path, content: &[u8]) -> Result<(), Upd
     Ok(())
 }
 
+/// Reads at most `cap` bytes while still draining the pipe, so a noisy staged
+/// binary cannot exhaust memory or block on a full pipe.
+async fn read_capped_output<R: tokio::io::AsyncRead + Unpin>(mut reader: R, cap: usize) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+
+    let mut output = Vec::with_capacity(cap.min(4096));
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        if output.len() < cap {
+            let take = (cap - output.len()).min(read);
+            output.extend_from_slice(&buffer[..take]);
+        }
+    }
+    output
+}
+
 /// Runs the staged binary once to prove it is executable before replacing the
-/// running server binary.
+/// running server binary. Output is captured with a hard cap and the child is
+/// killed if the verification future is cancelled by the timeout.
 async fn verify_executable_version(path: &Path) -> Result<(), UpdateError> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::process::Command::new(path).arg("--version").output(),
-    )
+    const MAX_OUTPUT_BYTES: usize = 4096;
+
+    let (status, stderr) = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut child = tokio::process::Command::new(path)
+            .arg("--version")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let read_stdout = async {
+            match stdout {
+                Some(stdout) => read_capped_output(stdout, MAX_OUTPUT_BYTES).await,
+                None => Vec::new(),
+            }
+        };
+        let read_stderr = async {
+            match stderr {
+                Some(stderr) => read_capped_output(stderr, MAX_OUTPUT_BYTES).await,
+                None => Vec::new(),
+            }
+        };
+        let (_, stderr) = tokio::join!(read_stdout, read_stderr);
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, stderr))
+    })
     .await
     .map_err(|_| {
         UpdateError::Other(
@@ -850,10 +914,11 @@ async fn verify_executable_version(path: &Path) -> Result<(), UpdateError> {
             "The downloaded executable could not be run for verification: {e}"
         ))
     })?;
-    if !output.status.success() {
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
         return Err(UpdateError::Other(format!(
-            "The downloaded executable failed --version verification with status {}",
-            output.status
+            "The downloaded executable failed --version verification with status {status}: {}",
+            detail.lines().last().unwrap_or("no stderr")
         )));
     }
     Ok(())
@@ -1293,6 +1358,26 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         let bomb = builder.into_inner().unwrap().finish().unwrap();
         let err = extract_binary_from_archive(&bomb).unwrap_err();
         assert!(matches!(err, UpdateError::Archive(_)));
+    }
+
+    #[test]
+    fn test_asset_names_cannot_escape_the_scratch_directory() {
+        assert_eq!(
+            safe_asset_name("sito-v1.2.3-x86_64-unknown-linux-gnu.tar.gz").unwrap(),
+            "sito-v1.2.3-x86_64-unknown-linux-gnu.tar.gz"
+        );
+        for name in [
+            "",
+            "../escape",
+            "dir/asset.tar.gz",
+            "dir\\asset.tar.gz",
+            "/etc/passwd",
+        ] {
+            assert!(
+                safe_asset_name(name).is_err(),
+                "asset name {name:?} must be rejected"
+            );
+        }
     }
 
     #[test]

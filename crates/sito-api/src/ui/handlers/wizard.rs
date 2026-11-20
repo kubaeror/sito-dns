@@ -630,7 +630,7 @@ pub async fn wizard_complete_handler(
         return error_response(StatusCode::BAD_REQUEST, "Username does not exist.");
     }
 
-    let (report, filtering, credential_undo) = match apply_wizard_configuration(
+    let (report, filtering, deferred_filter, credential_undo) = match apply_wizard_configuration(
         &ctx,
         &hooks,
         &form,
@@ -650,6 +650,7 @@ pub async fn wizard_complete_handler(
         credential_undo,
         report,
         filtering,
+        deferred_filter,
     )
     .await
 }
@@ -668,12 +669,13 @@ async fn apply_wizard_configuration(
     (
         crate::config_apply::AppliedReport,
         sito_core::config::FilteringConfig,
+        bool,
         WizardCredentialUndo,
     ),
     Response,
 > {
     let mut credential_undo = WizardCredentialUndo::default();
-    let (report, filtering) = {
+    let (report, filtering, deferred_filter) = {
         let _apply_guard = ctx.lock_config_apply().await;
         let base_cfg = (**ctx.config.load()).clone();
         let new_cfg = match form.build_config(&base_cfg) {
@@ -735,14 +737,20 @@ async fn apply_wizard_configuration(
         }
 
         // Apply first, persist second (WP-4.2): a configuration that cannot be
-        // applied never reaches the file. The blocklist fetch is deferred to a
-        // background refresh so the wizard request does not download lists
-        // synchronously; the DNS listeners are only started after the refresh
-        // finished.
+        // applied never reaches the file. On genuine first boot the blocklist
+        // fetch is deferred so the wizard request does not download lists
+        // synchronously; recovery bootstrap (where DNS is already serving) must
+        // compile the changed filtering synchronously instead.
+        let first_boot = ctx.is_setup_pending() || ctx.dns_starter.is_some();
+        let filter_apply = if first_boot {
+            FilterApply::DeferredFirstBoot
+        } else {
+            FilterApply::Sync
+        };
         let report = match apply_and_persist_config_locked(
             ctx,
             &new_cfg,
-            FilterApply::DeferredFirstBoot,
+            filter_apply,
             hooks.as_dyn(),
         )
         .await
@@ -760,13 +768,17 @@ async fn apply_wizard_configuration(
                 ));
             }
         };
-        (report, new_cfg.filtering.clone())
+        (
+            report,
+            new_cfg.filtering.clone(),
+            matches!(filter_apply, FilterApply::DeferredFirstBoot),
+        )
     };
-    Ok((report, filtering, credential_undo))
+    Ok((report, filtering, deferred_filter, credential_undo))
 }
 
-/// Removes the bootstrap admin, marks setup complete, and starts the deferred
-/// filter refresh. Returns the login redirect.
+/// Refreshes deferred filtering (if needed), removes the bootstrap admin and
+/// marks setup complete. Returns the login redirect.
 async fn finish_wizard_setup(
     ctx: &ServerContext,
     admin_user: &str,
@@ -774,12 +786,38 @@ async fn finish_wizard_setup(
     credential_undo: WizardCredentialUndo,
     report: crate::config_apply::AppliedReport,
     filtering: sito_core::config::FilteringConfig,
+    deferred_filter: bool,
 ) -> Response {
     if !report.restart_required.is_empty() {
         tracing::warn!(
             fields = ?report.restart_required,
             "Wizard configuration saved; these settings need a restart to take effect"
         );
+    }
+
+    // A first-boot apply deliberately kept the old filter snapshot until this
+    // refresh completes. Do not retire the setup token or claim success when
+    // the new filtering could not be compiled.
+    if deferred_filter {
+        match crate::config_apply::queue_filter_refresh(ctx, filtering).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!("Wizard filter refresh failed: {error}");
+                credential_undo.rollback(ctx).await;
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The filtering configuration could not be applied. Setup was not completed.",
+                );
+            }
+            Err(join_error) => {
+                tracing::error!("Wizard filter refresh task failed: {join_error}");
+                credential_undo.rollback(ctx).await;
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The filtering configuration could not be applied. Setup was not completed.",
+                );
+            }
+        }
     }
 
     if bootstrapping {
@@ -810,20 +848,12 @@ async fn finish_wizard_setup(
     ctx.auth_mgr.consume_setup_token();
     ctx.set_setup_pending(false);
 
-    // Queue the blocklist fetch/compile off the request path. When the DNS
-    // listeners are still gated (first boot), start them only after the
-    // filter engine has the new rules.
-    let filter_handle = crate::config_apply::queue_filter_refresh(ctx, filtering);
-    match ctx.dns_starter.clone() {
-        Some(starter) => {
-            tokio::spawn(async move {
-                let _ = filter_handle.await;
-                if let Err(e) = starter.send(()) {
-                    tracing::warn!("Failed to notify DNS listener starter after setup: {e}");
-                }
-            });
-        }
-        None => drop(filter_handle),
+    // First-boot listeners were gated until the filtering refresh above
+    // finished; recovery bootstrap has no starter.
+    if let Some(starter) = ctx.dns_starter.clone()
+        && let Err(e) = starter.send(())
+    {
+        tracing::warn!("Failed to notify DNS listener starter after setup: {e}");
     }
 
     Redirect::to("/login").into_response()

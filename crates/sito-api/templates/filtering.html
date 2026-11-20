@@ -139,7 +139,11 @@
             {% endif %}
           </td>
           <td class="mono" style="font-size: 0.8rem; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+            {% if list.source == "***" %}
+            {{ list.source }}
+            {% else %}
             <a href="{{ list.source }}" target="_blank" rel="noopener">{{ list.source }}</a>
+            {% endif %}
           </td>
         </tr>
         {% endfor %}

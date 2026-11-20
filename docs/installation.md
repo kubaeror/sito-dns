@@ -351,7 +351,11 @@ The CLI updater downloads assets with `0600` permissions, verifies the staged
 binary with `--version`, keeps a backup of the current executable and restores
 it if replacement fails, then renames the verified binary into place. It also
 refuses to report “up to date” when the release tag cannot be compared as
-semver; use `sito update --force` for an explicit reinstall.
+semver; use `sito update --force` for an explicit reinstall. The updater does
+not preserve file capabilities; if you installed the binary manually with
+`setcap`, re-apply
+`sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito` after the update.
+The installer restores capabilities itself.
 
 The installer stops the service, writes the replacement binary to a temporary
 file in the destination directory, flushes it, and renames it over
