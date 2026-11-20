@@ -78,6 +78,8 @@ mod tests {
         );
 
         let bundle = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             protocol_version: PROTOCOL_VERSION,
             version: 1,
             term: 2,
@@ -134,6 +136,7 @@ mod tests {
         assert!(ConfigBundle::from_json(legacy_bundle).is_err());
 
         let watermark = AppliedWatermark {
+            signing_key_fingerprint: None,
             protocol_version: PROTOCOL_VERSION,
             version: 7,
             term: 1,

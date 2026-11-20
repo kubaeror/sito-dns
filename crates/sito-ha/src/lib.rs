@@ -20,8 +20,8 @@ pub mod transport;
 pub use bundle::{
     AppliedWatermark, ConfigBundle, FilterListMetadata, build_and_sign_push, build_config_bundle,
     config_digest, push_payload_hash, sanitize_config_for_bundle, sanitized_configs_equal,
-    scan_for_secrets, substitute_secrets, verify_and_unpack_push,
-    verify_and_unpack_push_with_watermark, watermark_covers,
+    scan_for_secrets, seal_bundle_identity, signing_key_fingerprint, substitute_secrets,
+    verify_and_unpack_push, verify_and_unpack_push_with_watermark, watermark_covers,
 };
 pub use config::{HaConfig, config_from, config_from_unvalidated, readiness_required};
 pub use crypto::{
@@ -138,6 +138,8 @@ mod tests {
 
         // Update bundle on master
         let bundle = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             protocol_version: crate::protocol::PROTOCOL_VERSION,
             version: 2,
             term: 0,
@@ -207,6 +209,126 @@ mod tests {
         assert!(
             stats_received,
             "Slave stats report should be received by coordinator"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A slave configured with a bracketed IPv6 URL must resolve/connect to
+    /// `[::1]` and synchronize. Skipped when the environment has no IPv6
+    /// loopback.
+    #[tokio::test]
+    async fn test_ha_master_slave_end_to_end_ipv6_loopback() {
+        let Ok(probe) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            eprintln!("skipping IPv6 loopback test: [::1] is not available");
+            return;
+        };
+        let replication_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ha_e2e_ipv6_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let certs = generate_ha_certs(&temp_dir, true, true).unwrap();
+        let signing_key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let coordinator = MasterCoordinator::new(
+            "master-ipv6".to_string(),
+            1,
+            signing_key.clone(),
+            sito_stats::MetricsRegistry::new("0.1.0", "test"),
+        );
+
+        let master_ha_cfg = HaConfig {
+            replication_port,
+            listen_addr: "::1".to_string(),
+            cert: certs.master_cert_path.clone(),
+            key: certs.master_key_path.clone(),
+            pinned_slave_fingerprints: vec![certs.slave_fingerprint.clone().unwrap()],
+            ..Default::default()
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let _server_handle = spawn_master_server(master_ha_cfg, coordinator.clone(), shutdown_rx);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let master_url = format!("wss://[::1]:{replication_port}");
+        let slave_tracker =
+            SlaveStatusTracker::new("slave-ipv6".to_string(), 0, Some(master_url.clone()));
+
+        let base_config = sito_core::config::Config::default();
+        let config_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(base_config.clone())));
+        let filter_engine = Arc::new(
+            sito_filter::HostsFilterEngine::init(base_config.filtering.clone(), temp_dir.clone())
+                .await,
+        );
+        let rewrites_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            sito_rewrites::RewriteTable::new(Default::default()),
+        )));
+        let clients_arc = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            sito_clients::ClientRegistry::new(Default::default()),
+        )));
+        let runtime = Arc::new(sito_runtime::RuntimeState::new(
+            config_arc,
+            clients_arc,
+            rewrites_arc,
+        ));
+        let applier = Arc::new(crate::slave::worker::test_support::TestApplier::new(
+            runtime.clone(),
+            filter_engine.clone(),
+            None,
+        ));
+        let handles = SlaveAppHandles {
+            runtime,
+            filter: filter_engine,
+            metrics: sito_stats::MetricsRegistry::new("0.1.0", "slave-ipv6"),
+            config_path: None,
+            applier,
+        };
+
+        let slave_ha_cfg = HaConfig {
+            master_url: Some(master_url),
+            master_fingerprint: certs.master_fingerprint.clone(),
+            master_pubkey: Some(signing_key.public_key_hex()),
+            cert: certs.slave_cert_path.clone(),
+            key: certs.slave_key_path.clone(),
+            ca: Some(certs.ca_cert_path.clone()),
+            stats_interval_secs: 1,
+            ..Default::default()
+        };
+
+        let bundle = ConfigBundle {
+            version: 2,
+            timestamp: 1,
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
+            custom_rules: vec!["||ipv6-sync.example^".to_string()],
+            ..ConfigBundle::default()
+        };
+        coordinator.update_bundle(bundle).unwrap();
+
+        let (_resync_tx, resync_rx) = tokio::sync::mpsc::channel(1);
+        let _worker = spawn_slave_worker(
+            slave_ha_cfg,
+            slave_tracker.clone(),
+            handles,
+            resync_rx,
+            shutdown_tx.subscribe(),
+        );
+
+        let mut synced = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if slave_tracker.get_version() == 2 && slave_tracker.get_state() == SlaveState::Synced {
+                synced = true;
+                break;
+            }
+        }
+        assert!(
+            synced,
+            "slave must synchronize over wss://[::1] (state {:?}, reason {:?})",
+            slave_tracker.get_state(),
+            slave_tracker.readiness().reason
         );
 
         let _ = shutdown_tx.send(true);
@@ -448,6 +570,8 @@ mod tests {
         );
         coordinator
             .update_bundle(ConfigBundle {
+                config_digest: String::new(),
+                signing_key_fingerprint: String::new(),
                 protocol_version: crate::protocol::PROTOCOL_VERSION,
                 version: 2,
                 term: 0,
@@ -528,6 +652,8 @@ mod tests {
         );
         coordinator
             .update_bundle(ConfigBundle {
+                config_digest: String::new(),
+                signing_key_fingerprint: String::new(),
                 protocol_version: crate::protocol::PROTOCOL_VERSION,
                 version: 2,
                 term: 0,
@@ -608,6 +734,8 @@ mod tests {
         .with_token(Some("tok".to_string()));
         coordinator
             .update_bundle(ConfigBundle {
+                config_digest: String::new(),
+                signing_key_fingerprint: String::new(),
                 protocol_version: crate::protocol::PROTOCOL_VERSION,
                 version: 2,
                 term: 0,
@@ -683,6 +811,8 @@ mod tests {
 
         coordinator
             .update_bundle(ConfigBundle {
+                config_digest: String::new(),
+                signing_key_fingerprint: String::new(),
                 protocol_version: crate::protocol::PROTOCOL_VERSION,
                 version: 2,
                 term: 0,

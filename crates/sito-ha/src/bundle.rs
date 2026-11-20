@@ -114,6 +114,8 @@ pub fn build_config_bundle(
 
     #[allow(clippy::cast_sign_loss)]
     let mut bundle = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         protocol_version: PROTOCOL_VERSION,
         version,
         term,
@@ -248,6 +250,31 @@ pub fn config_digest(document: &str) -> String {
     blake3::hash(document.as_bytes()).to_hex().to_string()
 }
 
+/// Computes the BLAKE3 fingerprint of an Ed25519 public key.
+///
+/// Stored as `blake3:<hex>` in bundles and watermarks (the same shape used for
+/// certificate pins). Comparison helpers normalize the prefix away.
+#[must_use]
+pub fn signing_key_fingerprint(pubkey: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(pubkey).to_hex())
+}
+
+fn strip_blake3_prefix(value: &str) -> &str {
+    value.trim().trim_start_matches("blake3:")
+}
+
+/// Fills the signed identity fields from the content and the master key.
+///
+/// The digest binds `config_toml`; the fingerprint binds the Ed25519 key that
+/// signed the payload, so a slave can prove the configured `master_pubkey` is
+/// the one that produced the bundle rather than only trusting a detached
+/// signature.
+pub fn seal_bundle_identity(bundle: &mut ConfigBundle, master_pubkey: &[u8]) {
+    bundle.protocol_version = PROTOCOL_VERSION;
+    bundle.config_digest = config_digest(&bundle.config_toml);
+    bundle.signing_key_fingerprint = signing_key_fingerprint(master_pubkey);
+}
+
 /// Extracts the signed payload hash from a `ConfigPush` envelope.
 pub fn push_payload_hash(push: &HaMessage) -> Result<String, HaError> {
     match push {
@@ -272,7 +299,10 @@ pub fn build_and_sign_push(
     bundle: &ConfigBundle,
     signing_key: &Ed25519SigningKey,
 ) -> Result<HaMessage, HaError> {
-    let bundle = bundle.sanitized();
+    let mut bundle = bundle.sanitized();
+    // The identity is derived from the master key and payload; never trust a
+    // caller-supplied value for a bundle this node signs.
+    seal_bundle_identity(&mut bundle, &signing_key.public_key());
     let bundle_json = bundle.to_json()?;
     let payload_bytes = bundle_json.as_bytes();
 
@@ -414,6 +444,33 @@ fn verify_and_unpack_push_inner(
         )));
     }
 
+    // Signed identity binding: the key that produced the signature must be the
+    // one named in the payload, and the digest must describe the payload's
+    // config_toml. A signed payload from a v2 peer that predates identity
+    // binding has empty fields and is refused rather than treated as trusted.
+    let expected_fingerprint = signing_key_fingerprint(master_pubkey);
+    if strip_blake3_prefix(&bundle.signing_key_fingerprint)
+        != strip_blake3_prefix(&expected_fingerprint)
+    {
+        return Err(HaError::Validation {
+            field: "signing_key_fingerprint".to_string(),
+            reason: format!(
+                "Signed bundle fingerprint '{}' does not match the configured master_pubkey fingerprint '{expected_fingerprint}'; a different signing key produced this push",
+                bundle.signing_key_fingerprint
+            ),
+        });
+    }
+    let expected_config_digest = config_digest(&bundle.config_toml);
+    if strip_blake3_prefix(&bundle.config_digest) != expected_config_digest {
+        return Err(HaError::Validation {
+            field: "config_digest".to_string(),
+            reason: format!(
+                "Signed bundle config_digest '{}' does not match BLAKE3(config_toml) {expected_config_digest}",
+                bundle.config_digest
+            ),
+        });
+    }
+
     // 5. Envelope/payload version binding: the version the monotonicity guard
     // checked must be the same one actually carried inside the signed payload,
     // otherwise an attacker can replay an old signed bundle with a bumped
@@ -519,6 +576,21 @@ pub fn verify_and_unpack_push_with_watermark(
             }
         }
         if bundle.term == watermark.term {
+            // A key change mid-term is a re-enrollment, not a normal publish:
+            // require the explicit higher-term promotion path instead of
+            // silently trusting a new master identity.
+            if let Some(ref applied_fingerprint) = watermark.signing_key_fingerprint
+                && strip_blake3_prefix(applied_fingerprint)
+                    != strip_blake3_prefix(&bundle.signing_key_fingerprint)
+            {
+                return Err(HaError::Validation {
+                    field: "signing_key_fingerprint".to_string(),
+                    reason: format!(
+                        "Push is signed by key '{}' but the applied watermark for term {} records '{}'; a same-term signing-key change requires an explicit higher-term promotion",
+                        bundle.signing_key_fingerprint, watermark.term, applied_fingerprint
+                    ),
+                });
+            }
             if bundle.version < watermark.version {
                 return Err(HaError::Validation {
                     field: "version".to_string(),
@@ -682,6 +754,8 @@ password = "mikrotik_secret_password"
         );
 
         let bundle = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             protocol_version: crate::protocol::PROTOCOL_VERSION,
             version: 7,
             term: 0,
@@ -722,6 +796,8 @@ password = "mikrotik_secret_password"
         let signing_key = Ed25519SigningKey::generate().unwrap();
 
         let bundle = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             protocol_version: crate::protocol::PROTOCOL_VERSION,
             version: 10,
             term: 0,
@@ -742,7 +818,9 @@ password = "mikrotik_secret_password"
 
         // Successful unpack
         let unpacked = verify_and_unpack_push(&push_msg, 9, &signing_key.public_key()).unwrap();
-        assert_eq!(unpacked, bundle);
+        let mut expected = bundle.clone();
+        seal_bundle_identity(&mut expected, &signing_key.public_key());
+        assert_eq!(unpacked, expected);
 
         // Monotonicity rejection: version 10 <= 10
         let mono_err = verify_and_unpack_push(&push_msg, 10, &signing_key.public_key());
@@ -755,10 +833,123 @@ password = "mikrotik_secret_password"
     }
 
     #[test]
+    fn test_signed_identity_must_match_key_and_config() {
+        use serde_json::json;
+
+        fn base_bundle(version: u64) -> ConfigBundle {
+            ConfigBundle {
+                version,
+                timestamp: 1,
+                config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
+                ..ConfigBundle::default()
+            }
+        }
+
+        fn sign_value(value: &serde_json::Value, key: &Ed25519SigningKey) -> HaMessage {
+            let payload = serde_json::to_vec(value).unwrap();
+            let hash = blake3::hash(&payload);
+            let hash_hex = hash.to_hex().to_string();
+            let sig = key.sign(hash.as_bytes());
+            HaMessage::ConfigPush {
+                version: value["version"].as_u64().unwrap(),
+                protocol_version: value["protocol_version"].as_u64().unwrap() as u32,
+                term: value["term"].as_u64().unwrap(),
+                hash_blake3: hash_hex.clone(),
+                signature_ed25519: hex::encode(sig),
+                payload_b64: BASE64_STANDARD.encode(&payload),
+                payload_hash_blake3: hash_hex,
+            }
+        }
+
+        let key = Ed25519SigningKey::generate().unwrap();
+        let other = Ed25519SigningKey::generate().unwrap();
+
+        // A payload signed by `key` that claims another key's fingerprint must
+        // be refused even though the Ed25519 signature itself is valid.
+        let mut bundle = base_bundle(10);
+        seal_bundle_identity(&mut bundle, &key.public_key());
+        bundle.signing_key_fingerprint = signing_key_fingerprint(&other.public_key());
+        let mut value = serde_json::to_value(&bundle).unwrap();
+        let push = sign_value(&value, &key);
+        let err = verify_and_unpack_push(&push, 9, &key.public_key())
+            .expect_err("a fingerprint that names another key must be rejected");
+        assert!(
+            matches!(err, HaError::Validation { ref field, .. } if field == "signing_key_fingerprint")
+        );
+
+        // A config_digest that does not describe config_toml is refused.
+        value["signing_key_fingerprint"] = json!(signing_key_fingerprint(&key.public_key()));
+        value["config_digest"] = json!("00".repeat(32));
+        let push = sign_value(&value, &key);
+        let err = verify_and_unpack_push(&push, 9, &key.public_key())
+            .expect_err("a mismatched config_digest must be rejected");
+        assert!(matches!(err, HaError::Validation { ref field, .. } if field == "config_digest"));
+
+        // A v2 payload that predates identity binding (fields absent) is
+        // refused at deserialization instead of being treated as trusted.
+        let mut value = serde_json::to_value(base_bundle(10)).unwrap();
+        value.as_object_mut().unwrap().remove("config_digest");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("signing_key_fingerprint");
+        let push = sign_value(&value, &key);
+        let err = verify_and_unpack_push(&push, 9, &key.public_key())
+            .expect_err("an identity-less v2 payload must not verify");
+        assert!(
+            matches!(err, HaError::Serialization(ref reason) if reason.contains("config_digest")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_same_term_key_rotation_requires_promotion() {
+        let key_a = Ed25519SigningKey::generate().unwrap();
+        let key_b = Ed25519SigningKey::generate().unwrap();
+        let mut applied = ConfigBundle {
+            version: 5,
+            timestamp: 1,
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
+            ..ConfigBundle::default()
+        };
+        seal_bundle_identity(&mut applied, &key_a.public_key());
+        let push_a = build_and_sign_push(&applied, &key_a).unwrap();
+        let payload_hash = push_payload_hash(&push_a).unwrap();
+        let watermark = AppliedWatermark {
+            protocol_version: PROTOCOL_VERSION,
+            version: 5,
+            term: 0,
+            payload_hash,
+            signing_key_fingerprint: Some(signing_key_fingerprint(&key_a.public_key())),
+            timestamp: 1,
+            forked: false,
+            forked_at_version: 0,
+            applied_config_digest: None,
+        };
+
+        let mut rotated = ConfigBundle {
+            version: 6,
+            timestamp: 2,
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
+            ..ConfigBundle::default()
+        };
+        seal_bundle_identity(&mut rotated, &key_b.public_key());
+        let push_b = build_and_sign_push(&rotated, &key_b).unwrap();
+        let err =
+            verify_and_unpack_push_with_watermark(&push_b, Some(&watermark), &key_b.public_key())
+                .expect_err("a same-term signing-key change must require promotion");
+        assert!(
+            matches!(err, HaError::Validation { ref field, .. } if field == "signing_key_fingerprint")
+        );
+    }
+
+    #[test]
     fn test_envelope_version_must_match_signed_payload() {
         let signing_key = Ed25519SigningKey::generate().unwrap();
 
         let bundle = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             protocol_version: crate::protocol::PROTOCOL_VERSION,
             version: 10,
             term: 0,

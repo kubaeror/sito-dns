@@ -128,6 +128,7 @@ impl SlaveStatusTracker {
         #[allow(clippy::cast_sign_loss)]
         let timestamp = Utc::now().timestamp_millis() as u64;
         let mut watermark = self.get_watermark().unwrap_or(AppliedWatermark {
+            signing_key_fingerprint: None,
             protocol_version: crate::protocol::PROTOCOL_VERSION,
             version,
             term,
@@ -190,6 +191,22 @@ impl SlaveStatusTracker {
         payload_hash: &str,
         config_digest: Option<&str>,
     ) -> Result<(), HaError> {
+        self.persist_watermark_with_identity(version, term, payload_hash, config_digest, None)
+    }
+
+    /// Persists the applied watermark including the signing-key fingerprint of
+    /// the master that produced the bundle.
+    ///
+    /// The fingerprint makes a same-term key change (lost/replaced signing key
+    /// without an explicit promotion) detectable on the next push.
+    pub fn persist_watermark_with_identity(
+        &self,
+        version: u64,
+        term: u64,
+        payload_hash: &str,
+        config_digest: Option<&str>,
+        signing_key_fingerprint: Option<&str>,
+    ) -> Result<(), HaError> {
         if version == u64::MAX {
             return Err(HaError::Validation {
                 field: "ha_watermark".to_string(),
@@ -209,6 +226,7 @@ impl SlaveStatusTracker {
             version,
             term,
             payload_hash: payload_hash.trim_start_matches("blake3:").to_string(),
+            signing_key_fingerprint: signing_key_fingerprint.map(str::to_string),
             timestamp,
             forked: false,
             forked_at_version: 0,
@@ -416,6 +434,8 @@ mod tests {
 
     fn bundle(version: u64) -> ConfigBundle {
         ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             protocol_version: crate::protocol::PROTOCOL_VERSION,
             version,
             term: 0,
@@ -505,6 +525,32 @@ mod tests {
     }
 
     #[test]
+    fn test_watermark_persists_signing_key_fingerprint() {
+        let path = temp_path("fingerprint");
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        let fingerprint = "blake3:abc123";
+        tracker
+            .persist_watermark_with_identity(5, 0, "payload", Some("digest"), Some(fingerprint))
+            .unwrap();
+
+        let restarted = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        assert_eq!(
+            restarted
+                .get_watermark()
+                .unwrap()
+                .signing_key_fingerprint
+                .as_deref(),
+            Some(fingerprint)
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn test_stale_master_term_is_rejected_and_new_term_wins() {
         let path = temp_path("term");
         let signing_key = Ed25519SigningKey::generate().unwrap();
@@ -514,6 +560,8 @@ mod tests {
 
         // The slave is at epoch 2, version 10.
         let current = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             term: 2,
             ..bundle(10)
         };
@@ -524,6 +572,8 @@ mod tests {
         // A stale master from epoch 1 with a higher version must not overwrite
         // the newer configuration.
         let stale = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             term: 1,
             ..bundle(11)
         };
@@ -539,6 +589,8 @@ mod tests {
         // A term bump alone is not permission to roll the version back: a
         // promoted master with a stale state file is rejected.
         let stale_promotion = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             term: 3,
             ..bundle(1)
         };
@@ -554,6 +606,8 @@ mod tests {
         // An explicit promotion must raise both term and version above the
         // applied high-water mark.
         let promoted = ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             term: 3,
             ..bundle(11)
         };
@@ -636,6 +690,8 @@ mod tests {
         // Same version, different signed content: a content replay.
         let other = build_and_sign_push(
             &ConfigBundle {
+                config_digest: String::new(),
+                signing_key_fingerprint: String::new(),
                 custom_rules: vec!["||evil.example^".to_string()],
                 ..bundle(5)
             },

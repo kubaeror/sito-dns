@@ -242,6 +242,8 @@ mod tests {
 
     fn test_bundle(version: u64) -> sito_ha::ConfigBundle {
         sito_ha::ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             protocol_version: sito_ha::PROTOCOL_VERSION,
             version,
             term: 0,

@@ -63,20 +63,27 @@ pub fn spawn_master_server(
             None
         };
 
-        let listen_addr = format!("{}:{}", ha_config.listen_addr, ha_config.replication_port);
-        let listener = match TcpListener::bind(&listen_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                coordinator
-                    .metrics
-                    .inc_ha_startup_noop("master", "bind_failed");
-                coordinator.mark_replication_failed(format!(
-                    "Failed to bind master replication listener on '{listen_addr}': {e}"
-                ));
-                error!("Failed to bind master HA replication listener on '{listen_addr}': {e}");
-                return;
-            }
+        let listen_addr = if ha_config.listen_addr.contains(':') {
+            format!("[{}]:{}", ha_config.listen_addr, ha_config.replication_port)
+        } else {
+            format!("{}:{}", ha_config.listen_addr, ha_config.replication_port)
         };
+        let listener =
+            match TcpListener::bind((ha_config.listen_addr.as_str(), ha_config.replication_port))
+                .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    coordinator
+                        .metrics
+                        .inc_ha_startup_noop("master", "bind_failed");
+                    coordinator.mark_replication_failed(format!(
+                        "Failed to bind master replication listener on '{listen_addr}': {e}"
+                    ));
+                    error!("Failed to bind master HA replication listener on '{listen_addr}': {e}");
+                    return;
+                }
+            };
 
         coordinator.mark_replication_ready();
         info!(addr = %listen_addr, "Master HA replication listener active");

@@ -180,6 +180,13 @@ impl ClientCertVerifier for PinnedClientCertVerifier {
 
 /// A client-side server certificate verifier enforcing BLAKE3 fingerprint pinning
 /// of the master node (and optionally chain validation against a provided CA).
+///
+/// TLS trust policy:
+/// - a configured pin is always enforced;
+/// - a configured CA is always enforced (chain, SAN and validity), even when
+///   `allow_unpinned_tls` is true;
+/// - `allow_unpinned_tls` only permits the explicit no-verification mode when
+///   neither a pin nor a CA is configured.
 #[derive(Debug)]
 pub struct PinnedServerCertVerifier {
     pinned_fingerprint: Option<String>,
@@ -335,9 +342,9 @@ pub fn build_client_tls_config(
     allow_unpinned_tls: bool,
     ca_path: Option<&Path>,
 ) -> Result<Arc<rustls::ClientConfig>, HaError> {
-    if master_fingerprint.is_none() && !allow_unpinned_tls {
+    if master_fingerprint.is_none() && ca_path.is_none() && !allow_unpinned_tls {
         return Err(HaError::Tls(
-            "TLS connection requires master_fingerprint for certificate pinning unless allow_unpinned_tls = true".to_string(),
+            "TLS connection requires master_fingerprint (pin) or ca (chain validation), unless allow_unpinned_tls = true explicitly disables verification".to_string(),
         ));
     }
 
@@ -371,6 +378,48 @@ pub fn build_client_tls_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::certs::{GeneratedCerts, compute_blake3_fingerprint, generate_ha_certs};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
+        IsCa, Issuer, KeyPair,
+    };
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_mtls_{label}_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn der(path: &Path) -> CertificateDer<'static> {
+        load_certs_pem(path).unwrap().remove(0)
+    }
+
+    fn server_name(name: &str) -> ServerName<'static> {
+        ServerName::try_from(name.to_string()).unwrap()
+    }
+
+    /// Builds an expired leaf certificate signed by the CA in `certs`.
+    fn expired_leaf_signed_by(certs: &GeneratedCerts, dns: &str) -> CertificateDer<'static> {
+        let ca_key = KeyPair::from_pem(&certs.ca_key_pem).unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "sito-ha-ca");
+        ca_params.distinguished_name = dn;
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+
+        let mut params = CertificateParams::new(vec![dns.to_string()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2020, 1, 2);
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let key = KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        cert.der().clone()
+    }
 
     #[test]
     fn test_pinned_client_cert_verifier_rejects_empty_pins() {
@@ -398,5 +447,144 @@ mod tests {
                 .verify_client_cert(&dummy_cert, &[], now)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_server_ca_only_verification_and_wrong_ca() {
+        let dir = temp_dir("ca-only");
+        let foreign_dir = temp_dir("ca-only-foreign");
+        let certs = generate_ha_certs(&dir, true, true).unwrap();
+        let foreign = generate_ha_certs(&foreign_dir, true, true).unwrap();
+        let master_der = der(certs.master_cert_path.as_ref().unwrap());
+        let name = server_name("127.0.0.1");
+        let now = UnixTime::now();
+
+        // CA-only is a valid trust mode: no pin, but the chain/SAN must verify.
+        let verifier = PinnedServerCertVerifier::new(None, true)
+            .with_ca(&certs.ca_cert_path)
+            .unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&master_der, &[], &name, &[], now)
+                .is_ok()
+        );
+
+        // A different CA must not validate the master certificate, even with
+        // allow_unpinned_tls set (the CA remains mandatory once configured).
+        let wrong_ca = PinnedServerCertVerifier::new(None, true)
+            .with_ca(&foreign.ca_cert_path)
+            .unwrap();
+        assert!(
+            wrong_ca
+                .verify_server_cert(&master_der, &[], &name, &[], now)
+                .is_err()
+        );
+
+        // No pin and no CA: only the explicit no-verification mode passes.
+        let no_trust = PinnedServerCertVerifier::new(None, false);
+        assert!(
+            no_trust
+                .verify_server_cert(&master_der, &[], &name, &[], now)
+                .is_err()
+        );
+
+        // The same policy is enforced by the client-config builder: CA-only is
+        // allowed without allow_unpinned_tls, but no trust anchor is not.
+        assert!(
+            build_client_tls_config(None, None, None, false, Some(&certs.ca_cert_path)).is_ok()
+        );
+        assert!(build_client_tls_config(None, None, None, false, None).is_err());
+        assert!(build_client_tls_config(None, None, None, true, None).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&foreign_dir);
+    }
+
+    #[test]
+    fn test_pin_plus_ca_enforces_san() {
+        let dir = temp_dir("pin-san");
+        let certs = generate_ha_certs(&dir, true, true).unwrap();
+        let master_der = der(certs.master_cert_path.as_ref().unwrap());
+        let pin = certs.master_fingerprint.clone();
+        let now = UnixTime::now();
+
+        let verifier = PinnedServerCertVerifier::new(pin.as_deref(), true)
+            .with_ca(&certs.ca_cert_path)
+            .unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&master_der, &[], &server_name("127.0.0.1"), &[], now)
+                .is_ok(),
+            "the generated master certificate must match its SAN"
+        );
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &master_der,
+                    &[],
+                    &server_name("wrong-host.example"),
+                    &[],
+                    now
+                )
+                .is_err(),
+            "a matching pin must not bypass the configured CA/SAN check"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_client_cert_chain_must_match_configured_ca() {
+        let dir = temp_dir("client-chain");
+        let foreign_dir = temp_dir("client-chain-foreign");
+        let certs = generate_ha_certs(&dir, true, true).unwrap();
+        let foreign = generate_ha_certs(&foreign_dir, true, true).unwrap();
+        let slave_der = der(certs.slave_cert_path.as_ref().unwrap());
+        let slave_fp = compute_blake3_fingerprint(slave_der.as_ref());
+        let now = UnixTime::now();
+
+        let with_legit_ca = PinnedClientCertVerifier::new(std::slice::from_ref(&slave_fp))
+            .with_ca(&certs.ca_cert_path)
+            .unwrap();
+        assert!(
+            with_legit_ca
+                .verify_client_cert(&slave_der, &[], now)
+                .is_ok()
+        );
+
+        // The pinned certificate is genuine, but it is not part of the foreign
+        // CA: the chain check must reject it.
+        let with_foreign_ca = PinnedClientCertVerifier::new(&[slave_fp])
+            .with_ca(&foreign.ca_cert_path)
+            .unwrap();
+        assert!(
+            with_foreign_ca
+                .verify_client_cert(&slave_der, &[], now)
+                .is_err(),
+            "a matching pin must not bypass client-chain validation"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&foreign_dir);
+    }
+
+    #[test]
+    fn test_expired_server_certificate_is_rejected() {
+        let dir = temp_dir("expired");
+        let certs = generate_ha_certs(&dir, true, true).unwrap();
+        let expired = expired_leaf_signed_by(&certs, "127.0.0.1");
+        let now = UnixTime::now();
+
+        let verifier = PinnedServerCertVerifier::new(None, true)
+            .with_ca(&certs.ca_cert_path)
+            .unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&expired, &[], &server_name("127.0.0.1"), &[], now)
+                .is_err(),
+            "an expired certificate must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

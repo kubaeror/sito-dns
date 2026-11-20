@@ -247,18 +247,27 @@ impl MasterCoordinator {
                 // A v1 state file is a bare flattened bundle. Do not silently
                 // back it up and restart the sequence at version 0: make the
                 // protocol break explicit so the operator can migrate/restore.
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data)
-                    && value.get("bundle").is_none()
-                    && (value.get("version").is_some() || value.get("config_toml").is_some())
-                {
-                    return Err(HaError::Validation {
-                        field: "ha_protocol_version".to_string(),
-                        reason: format!(
-                            "protocol_mismatch: HA state at {} uses the v1 format (no protocol_version/bundle wrapper); this node requires HA protocol v{}. Restore a v2 state file/backup or re-enroll every slave after an explicit version promotion",
-                            path.display(),
-                            crate::protocol::PROTOCOL_VERSION
-                        ),
-                    });
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if value.get("bundle").is_some() {
+                        return Err(HaError::Validation {
+                            field: "ha_protocol_version".to_string(),
+                            reason: format!(
+                                "protocol_mismatch: HA state at {} is missing the protocol v{} signed identity fields (config_digest/signing_key_fingerprint); restore a current state file/backup or re-enroll every slave after an explicit version promotion",
+                                path.display(),
+                                crate::protocol::PROTOCOL_VERSION
+                            ),
+                        });
+                    }
+                    if value.get("version").is_some() || value.get("config_toml").is_some() {
+                        return Err(HaError::Validation {
+                            field: "ha_protocol_version".to_string(),
+                            reason: format!(
+                                "protocol_mismatch: HA state at {} uses the v1 format (no protocol_version/bundle wrapper); this node requires HA protocol v{}. Restore a v2 state file/backup or re-enroll every slave after an explicit version promotion",
+                                path.display(),
+                                crate::protocol::PROTOCOL_VERSION
+                            ),
+                        });
+                    }
                 }
                 let backup = path.with_extension(format!("corrupt.{}", Utc::now().timestamp()));
                 if let Err(rename_err) = std::fs::rename(&path, &backup) {
@@ -335,6 +344,9 @@ impl MasterCoordinator {
         // client secrets; strip them before signing/broadcasting.
         let mut bundle = bundle;
         bundle.strip_structured_secrets();
+        // Upgrade/repair the persisted identity: the state file must name the
+        // key and digest that the restored push actually carries.
+        crate::bundle::seal_bundle_identity(&mut bundle, &self.signing_key.public_key());
         let push = build_and_sign_push(&bundle, &self.signing_key)?;
         Self::ensure_push_fits(&push)?;
         self.current_version.store(bundle.version, Ordering::SeqCst);

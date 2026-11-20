@@ -64,6 +64,10 @@ impl MasterCoordinator {
         // structured `clients` value is sanitized exactly like `config_toml`.
         let mut bundle = bundle;
         bundle.strip_structured_secrets();
+        // Bind the signed identity before persisting or broadcasting so the
+        // stored bundle, the pushed envelope, and the slave watermark all name
+        // the same key/config digest.
+        seal_bundle_identity(&mut bundle, &self.signing_key.public_key());
 
         let version = bundle.version;
         let current = self.current_version.load(Ordering::SeqCst);

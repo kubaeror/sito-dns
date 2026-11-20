@@ -16,6 +16,8 @@ fn test_coordinator() -> MasterCoordinator {
 
 fn test_bundle(version: u64) -> ConfigBundle {
     ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         version,
         term: 0,
@@ -1248,6 +1250,8 @@ fn test_update_bundle_strips_structured_client_secrets() {
     clients.insert("client_id_secrets".to_string(), toml::Value::Table(secrets));
 
     let bundle = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         clients: Some(toml::Value::Table(clients)),
         ..test_bundle(2)
     };

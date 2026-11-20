@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 
 use sito_stats::MetricsRegistry;
 
-use crate::bundle::{ConfigBundle, build_and_sign_push};
+use crate::bundle::{ConfigBundle, build_and_sign_push, seal_bundle_identity};
 use crate::config::HaConfig;
 use crate::crypto::Ed25519SigningKey;
 use crate::error::HaError;

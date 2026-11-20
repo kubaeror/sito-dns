@@ -25,6 +25,14 @@ use super::SlaveAppHandles;
 use super::apply::apply_config_push;
 use super::stats::build_stats_report;
 
+/// Delay before reconnecting after a clean master close.
+///
+/// A clean close usually means a master restart/rollout, so reconnect promptly
+/// with a fixed delay instead of growing an error backoff. Error paths still
+/// use the exponential backoff; a clean close resets it so a later failure
+/// starts from the minimum.
+pub(super) const CLEAN_CLOSE_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
 /// Spawns the slave replication worker loop.
 pub fn spawn_slave_worker(
     ha_config: HaConfig,
@@ -86,9 +94,11 @@ pub fn spawn_slave_worker(
                     // A failed apply stays Degraded with its reason.
                     mark_session_ended(&tracker);
                     // Avoid a tight reconnect loop when the master accepts and
-                    // immediately closes the connection.
+                    // immediately closes the connection. A clean close is a
+                    // fixed-delay reconnect (master restart/rollout), not an
+                    // error backoff.
                     tokio::select! {
-                        () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        () = tokio::time::sleep(CLEAN_CLOSE_RECONNECT_DELAY) => {}
                         msg = resync_rx.recv(), if resync_open => {
                             if msg.is_none() {
                                 resync_open = false;
@@ -130,7 +140,7 @@ pub fn spawn_slave_worker(
     })
 }
 
-fn parse_ws_url(url: &str) -> Result<(bool, String, u16), HaError> {
+pub(super) fn parse_ws_url(url: &str) -> Result<(bool, String, u16), HaError> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| HaError::Connection(format!("Invalid URL: missing '://' in '{url}'")))?;
@@ -180,10 +190,16 @@ pub(super) async fn connect_and_run(
     let (is_secure, host, port) = parse_ws_url(master_url)?;
     let addr_str = format!("{host}:{port}");
 
-    let tcp_stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr_str))
-        .await
-        .map_err(|_| HaError::Timeout(format!("Connection to master '{addr_str}' timed out")))?
-        .map_err(|e| HaError::Connection(format!("TCP connect error to '{addr_str}': {e}")))?;
+    // Resolve and connect with the host/port pair instead of formatting a
+    // socket address: bracketed IPv6 literals (`[::1]`) must not become
+    // `::1:8953`, and DNS names must still go through the resolver.
+    let tcp_stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| HaError::Timeout(format!("Connection to master '{addr_str}' timed out")))?
+    .map_err(|e| HaError::Connection(format!("TCP connect error to '{addr_str}': {e}")))?;
 
     if is_secure {
         let tls_cfg = build_client_tls_config(

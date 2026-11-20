@@ -3,7 +3,8 @@
 use super::apply::apply_config_push;
 use super::config_merge::{build_persisted_config, local_client_id_secrets};
 use super::session::{
-    connect_and_run, handle_master_message, mark_session_ended, record_master_liveness_loss,
+    CLEAN_CLOSE_RECONNECT_DELAY, connect_and_run, handle_master_message, mark_session_ended,
+    parse_ws_url, record_master_liveness_loss,
 };
 use super::stats::build_stats_report;
 use super::{SlaveAppHandles, SlaveConfigApplier, spawn_slave_worker};
@@ -12,7 +13,7 @@ use crate::config::HaConfig;
 use crate::error::HaError;
 use crate::protocol::{AckConflict, HaMessage};
 use crate::slave::state::{SlaveState, SlaveStatusTracker};
-use crate::transport::{SLAVE_HANDSHAKE_TIMEOUT, ws_config};
+use crate::transport::{ExponentialBackoff, SLAVE_HANDSHAKE_TIMEOUT, ws_config};
 use futures_util::SinkExt;
 use sito_core::config::Config;
 use sito_filter::HostsFilterEngine;
@@ -195,6 +196,8 @@ fn test_bundle(
     rewrites: Option<toml::Value>,
 ) -> ConfigBundle {
     ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         version,
         term: 0,
@@ -1313,6 +1316,8 @@ async fn test_same_version_fork_latches_and_blocks_same_term_versions() {
 
     // Applied state: term 0, version 50, payload B.
     let applied = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 0,
         ..test_bundle(50, config_toml, None, None)
     };
@@ -1383,6 +1388,8 @@ async fn test_same_version_fork_latches_and_blocks_same_term_versions() {
 
     // The forked master's next version in the same term is refused.
     let forked_next = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 0,
         ..test_bundle(51, config_toml, None, None)
     };
@@ -1421,6 +1428,8 @@ async fn test_same_version_fork_latches_and_blocks_same_term_versions() {
     // An explicit higher-term promotion (with a higher version) resumes
     // replication and clears the latch.
     let promoted = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 1,
         ..test_bundle(51, config_toml, None, None)
     };
@@ -1477,6 +1486,8 @@ async fn test_fork_latch_write_failure_still_refuses_same_term_push() {
     let config_toml = "config_version = 2\n[server]\nrole = \"slave\"\n";
 
     let applied = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 0,
         ..test_bundle(50, config_toml, None, None)
     };
@@ -1545,6 +1556,8 @@ async fn test_fork_latch_write_failure_still_refuses_same_term_push() {
     assert_eq!(tracker.get_state(), SlaveState::Degraded);
 
     let forked_next = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 0,
         ..test_bundle(51, config_toml, None, None)
     };
@@ -1607,6 +1620,8 @@ async fn test_stale_master_push_is_rejected_without_overwriting() {
 
     // The slave has applied an epoch-1, version-5 bundle.
     let current = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 1,
         ..test_bundle(
             5,
@@ -1626,6 +1641,8 @@ async fn test_stale_master_push_is_rejected_without_overwriting() {
 
     // A stale epoch-0 master offers a higher version.
     let stale = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         term: 0,
         ..test_bundle(
             6,
@@ -1850,6 +1867,57 @@ async fn test_early_ack_marks_synced_but_keeps_degraded() {
     assert_eq!(
         tracker.degraded_reason.lock().unwrap().as_deref(),
         Some("previous apply failed")
+    );
+}
+
+/// Bracketed IPv6 master URLs must be parsed into a host/port pair (not a
+/// formatted socket address), and malformed forms must fail loudly.
+#[test]
+fn test_parse_ws_url_ipv6_and_invalid_forms() {
+    assert_eq!(
+        parse_ws_url("wss://[::1]").unwrap(),
+        (true, "::1".to_string(), 8953)
+    );
+    assert_eq!(
+        parse_ws_url("wss://[2001:db8::1]:8953").unwrap(),
+        (true, "2001:db8::1".to_string(), 8953)
+    );
+    assert_eq!(
+        parse_ws_url("ws://[::1]:9000/path").unwrap(),
+        (false, "::1".to_string(), 9000)
+    );
+
+    let err = parse_ws_url("wss://[::1").expect_err("unclosed bracket must fail");
+    assert!(err.to_string().contains("Unclosed IPv6 bracket"));
+
+    let err = parse_ws_url("wss://[::1]:not-a-port").expect_err("invalid port must fail");
+    assert!(err.to_string().contains("Invalid port"));
+
+    let err = parse_ws_url("wss://[::1]:99999").expect_err("out-of-range port must fail");
+    assert!(err.to_string().contains("Invalid port"));
+}
+
+/// A clean master close uses a fixed 1 s reconnect delay and resets the error
+/// backoff, while error paths keep growing exponentially.
+#[test]
+fn test_clean_close_reconnect_is_fixed_and_resets_error_backoff() {
+    assert_eq!(CLEAN_CLOSE_RECONNECT_DELAY, Duration::from_secs(1));
+
+    let mut backoff = ExponentialBackoff::default();
+    let first = backoff.next_delay();
+    let second = backoff.next_delay();
+    assert!(
+        second > first,
+        "error backoff must grow: {first:?} then {second:?}"
+    );
+
+    // A clean close resets the generator, so the next failure starts at the
+    // minimum delay instead of inheriting the clean-close loop.
+    backoff.reset();
+    let after_clean_close = backoff.next_delay();
+    assert!(
+        after_clean_close <= Duration::from_millis(1300),
+        "a clean close must reset the error backoff: {after_clean_close:?}"
     );
 }
 
@@ -2099,6 +2167,8 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
 
     let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
     let bundle = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         clients: Some(toml::Value::Table(clients)),
         ..test_bundle(2, &sanitized, None, None)
     };

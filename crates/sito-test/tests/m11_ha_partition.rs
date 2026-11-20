@@ -105,6 +105,8 @@ fn signed_push(
 ) -> HaMessage {
     build_and_sign_push(
         &ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             protocol_version: sito_ha::PROTOCOL_VERSION,
             version,
             term,
@@ -505,6 +507,8 @@ async fn test_delayed_same_version_fork_ack_after_newer_publish_is_divergence() 
 
 fn bundle(version: u64) -> ConfigBundle {
     ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         protocol_version: sito_ha::PROTOCOL_VERSION,
         version,
         term: 0,
@@ -578,6 +582,8 @@ async fn test_publish_bundle_propagates_sanitize_failure_and_rejects_oversize() 
     .with_state_path(state_path.clone());
 
     let oversized = ConfigBundle {
+        config_digest: String::new(),
+        signing_key_fingerprint: String::new(),
         protocol_version: sito_ha::PROTOCOL_VERSION,
         version: 1,
         term: 0,

@@ -187,6 +187,9 @@ pub fn generate_ha_certs_with_options(
     // Check if CA already exists; if not, create new CA
     let (ca_cert_pem, ca_key_pem, ca_params, ca_key) =
         if ca_cert_path.exists() && ca_key_path.exists() {
+            // Reusing a CA must not preserve an insecure key mode: repair an
+            // existing ca.key before it is used to sign new certificates.
+            repair_private_key_permissions(&ca_key_path)?;
             let cert_pem = std::fs::read_to_string(&ca_cert_path)?;
             let key_pem = std::fs::read_to_string(&ca_key_path)?;
             let ca_key = KeyPair::from_pem(&key_pem).map_err(|e| {
@@ -398,6 +401,25 @@ fn transfer_ownership(_certs: &GeneratedCerts, _owner: CertOwnership) -> Result<
     })
 }
 
+/// Repairs an existing private key file to owner-only (0600) on Unix.
+fn repair_private_key_permissions(path: &Path) -> Result<(), HaError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let metadata = std::fs::metadata(path)?;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 fn write_private_key_file(path: &Path, content: &str) -> Result<(), HaError> {
     #[cfg(unix)]
     {
@@ -483,6 +505,47 @@ mod tests {
                 assert_eq!(mode, 0o600, "{} must be 0600", key_path.display());
             }
         }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_reusing_ca_repairs_insecure_key_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ha_ca_reuse_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let certs = generate_ha_certs(&temp_dir, true, false).unwrap();
+        let cert_before = std::fs::read(&certs.ca_cert_path).unwrap();
+        let key_before = std::fs::read(&certs.ca_key_path).unwrap();
+
+        std::fs::set_permissions(&certs.ca_key_path, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let reused = generate_ha_certs(&temp_dir, true, false).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&reused.ca_key_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "reusing a CA must repair ca.key to 0600"
+        );
+        assert_eq!(
+            std::fs::read(&reused.ca_key_path).unwrap(),
+            key_before,
+            "repairing permissions must not rewrite the CA key"
+        );
+        assert_eq!(
+            std::fs::read(&reused.ca_cert_path).unwrap(),
+            cert_before,
+            "the existing CA certificate must be reused unchanged"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

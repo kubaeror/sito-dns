@@ -28,6 +28,17 @@ pub struct ConfigBundle {
     /// deserialize instead of being interpreted with v2 semantics. The field is
     /// signed as part of the bundle JSON.
     pub protocol_version: u32,
+    /// BLAKE3 digest of `config_toml` (normalized hex, no prefix).
+    ///
+    /// Bound into the signed payload and recomputed by the slave before apply.
+    /// The master fills it when signing; a manually built payload with a
+    /// mismatched digest is refused.
+    pub config_digest: String,
+    /// BLAKE3 fingerprint of the master's Ed25519 signing public key.
+    ///
+    /// Bound into the signed payload and checked against the configured
+    /// `master_pubkey` before apply. The master computes it when signing.
+    pub signing_key_fingerprint: String,
     pub version: u64,
     /// Cluster epoch/term that produced this bundle.
     ///
@@ -53,6 +64,8 @@ impl Default for ConfigBundle {
     fn default() -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
             version: 0,
             term: 0,
             timestamp: 0,
@@ -128,6 +141,12 @@ pub struct AppliedWatermark {
     pub term: u64,
     /// BLAKE3 hash of the signed bundle payload that produced `version`.
     pub payload_hash: String,
+    /// Ed25519 signing-key fingerprint that produced the applied bundle.
+    ///
+    /// Absent in watermarks written before identity binding existed; the next
+    /// successful apply records it. A same-term push from a different key is
+    /// rejected until an explicit higher-term promotion.
+    pub signing_key_fingerprint: Option<String>,
     /// Unix milliseconds at which the bundle was applied.
     pub timestamp: u64,
     /// Set when a same-version payload-hash mismatch proved that this node and
@@ -157,6 +176,8 @@ impl Serialize for AppliedWatermark {
             version: u64,
             term: u64,
             payload_hash: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            signing_key_fingerprint: Option<&'a str>,
             timestamp: u64,
             forked: bool,
             forked_at_version: u64,
@@ -172,6 +193,7 @@ impl Serialize for AppliedWatermark {
                 version: self.version,
                 term: self.term,
                 payload_hash: &self.payload_hash,
+                signing_key_fingerprint: self.signing_key_fingerprint.as_deref(),
                 timestamp: self.timestamp,
                 forked: self.forked,
                 forked_at_version: self.forked_at_version,
@@ -199,6 +221,8 @@ impl<'de> Deserialize<'de> for AppliedWatermark {
             #[serde(default)]
             term: u64,
             payload_hash: String,
+            #[serde(default)]
+            signing_key_fingerprint: Option<String>,
             timestamp: u64,
             #[serde(default)]
             forked: bool,
@@ -220,6 +244,7 @@ impl<'de> Deserialize<'de> for AppliedWatermark {
             version: envelope.watermark.version,
             term: envelope.watermark.term,
             payload_hash: envelope.watermark.payload_hash,
+            signing_key_fingerprint: envelope.watermark.signing_key_fingerprint,
             timestamp: envelope.watermark.timestamp,
             forked: envelope.watermark.forked,
             forked_at_version: envelope.watermark.forked_at_version,
