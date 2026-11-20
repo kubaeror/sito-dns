@@ -14,8 +14,19 @@
         "tags": [
           "crate::handlers::auth_handlers"
         ],
-        "summary": "Change a password. Self-service requires the current password; an Admin may\noverride another account (audited) with `username` set.",
+        "summary": "Change a password. Every authenticated role may change their own password\nafter proving it (plus TOTP when enabled); an Admin overriding another\naccount must present a fresh session-bound re-authentication ticket.",
         "operationId": "change_password",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Session-bound re-authentication ticket; required for an Admin overriding another account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -48,7 +59,7 @@
             }
           },
           "401": {
-            "description": "Missing/wrong current password",
+            "description": "Missing/wrong current password or second factor",
             "content": {
               "application/json": {
                 "schema": {
@@ -283,6 +294,17 @@
         ],
         "summary": "Create a new API token.",
         "operationId": "create_token",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Session-bound re-authentication ticket; required to mint an Admin-scoped token from a user session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -724,6 +746,17 @@
         ],
         "summary": "Create a local user account.",
         "operationId": "create_user",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Session-bound re-authentication ticket; required to create an Admin from a user session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -808,6 +841,15 @@
             "name": "username",
             "in": "path",
             "description": "Username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Session-bound re-authentication ticket; required for session callers",
             "required": true,
             "schema": {
               "type": "string"
@@ -1126,7 +1168,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Client created",
             "content": {
               "application/json": {
@@ -1192,7 +1234,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Client group added",
             "content": {
               "application/json": {
@@ -2037,7 +2079,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Filter list added",
             "content": {
               "application/json": {
@@ -2737,7 +2779,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "DNS rewrite created",
             "content": {
               "application/json": {
@@ -3585,6 +3627,13 @@
           },
           "new_password": {
             "type": "string"
+          },
+          "totp_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Current TOTP or backup code; required for self-service when TOTP is\nenabled."
           },
           "username": {
             "type": [

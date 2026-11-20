@@ -274,6 +274,30 @@ impl AuthManager {
             && Some(grant.credential_epoch) == credential_epoch
     }
 
+    /// Atomically validates and consumes a re-authentication ticket.
+    ///
+    /// Validation and removal happen under one lock, so concurrent requests
+    /// cannot both authorize with the same ticket. The ticket is removed before
+    /// the sensitive mutation runs: a later mutation failure still leaves it
+    /// consumed (fail-closed), and the caller must re-authenticate again.
+    pub fn take_reauth_token(&self, token: &str, username: &str, session_id: &str) -> bool {
+        let credential_epoch = lock(&self.users)
+            .get(username)
+            .map(|user| user.credential_epoch);
+        let now = Instant::now();
+        let mut tokens = lock(&self.reauth_tokens);
+        tokens.retain(|_, grant| now < grant.expires_at);
+        let matches = tokens.get(token).is_some_and(|grant| {
+            grant.username == username
+                && grant.session_id == session_id
+                && Some(grant.credential_epoch) == credential_epoch
+        });
+        if matches {
+            tokens.remove(token);
+        }
+        matches
+    }
+
     /// Consumes a re-authentication ticket (single-use for an operation).
     ///
     /// The credential epoch is deliberately not re-checked here: the caller

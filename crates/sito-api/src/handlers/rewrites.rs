@@ -12,6 +12,7 @@ use crate::models::{AddRewriteRequest, GenericMessageResponse, RewriteDto};
 use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use rand::RngExt;
 use sito_rewrites::{RewriteEntryConfig, RewritesConfig};
 
@@ -155,7 +156,7 @@ pub async fn get_rewrites(
     path = "/api/v1/rewrites",
     request_body = AddRewriteRequest,
     responses(
-        (status = 200, description = "DNS rewrite created", body = RewriteDto),
+        (status = 201, description = "DNS rewrite created", body = RewriteDto),
         (status = 400, description = "Bad Request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
@@ -166,7 +167,7 @@ pub async fn add_rewrite(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
     Json(payload): Json<AddRewriteRequest>,
-) -> Result<Json<RewriteDto>, ProblemDetails> {
+) -> Result<(StatusCode, Json<RewriteDto>), ProblemDetails> {
     let _apply_guard = ctx.lock_config_apply().await;
     let mut store = load_rewrite_store(&ctx);
 
@@ -183,13 +184,16 @@ pub async fn add_rewrite(
     store.ids.push(id.clone());
     save_rewrite_store_locked(&ctx, &store).await?;
 
-    Ok(Json(RewriteDto {
-        id,
-        domain: payload.domain,
-        record_type: payload.record_type,
-        answer: payload.answer,
-        exception_clients: payload.exception_clients,
-    }))
+    Ok((
+        StatusCode::CREATED,
+        Json(RewriteDto {
+            id,
+            domain: payload.domain,
+            record_type: payload.record_type,
+            answer: payload.answer,
+            exception_clients: payload.exception_clients,
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -390,7 +394,7 @@ mod tests {
             "nothing may be persisted for an invalid add"
         );
 
-        let created = add_rewrite(
+        let (status, Json(created)) = add_rewrite(
             operator(),
             State(ctx.clone()),
             Json(AddRewriteRequest {
@@ -401,8 +405,9 @@ mod tests {
             }),
         )
         .await
-        .expect("valid add")
-        .0;
+        .expect("valid add");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.answer, "10.0.0.1");
 
         // An invalid update returns 400 and leaves the stored entry unchanged.
         let err = update_rewrite(
@@ -451,6 +456,7 @@ mod tests {
         )
         .await
         .unwrap()
+        .1
         .0;
         let b = add_rewrite(
             operator(),
@@ -464,6 +470,7 @@ mod tests {
         )
         .await
         .unwrap()
+        .1
         .0;
 
         // Delete the first entry: the second entry's id must keep working.

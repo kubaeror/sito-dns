@@ -140,6 +140,9 @@ impl AuthManager {
             setup_completion_lock: Arc::new(tokio::sync::Mutex::new(())),
             user_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
             persist_lock: Arc::new(tokio::sync::Mutex::new(())),
+            argon2_semaphore: Arc::new(tokio::sync::Semaphore::new(ARGON2_MAX_CONCURRENCY)),
+            #[cfg(test)]
+            argon2_probe: Arc::new(Mutex::new(None)),
             users_path: Some(path.clone()),
             sessions_path: None,
             tokens_path: None,

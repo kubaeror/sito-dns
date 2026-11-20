@@ -1334,12 +1334,27 @@ cancelled losers may not get an attempt entry.
 **Addresses:** P1-15, P1-16, P1-20, P2-52, P2-54.
 **Files:** `sito-api/src/{auth/*,handlers/auth_handlers.rs,ui/*}`, templates.
 **Steps:**
-- [ ] Re-auth for TOTP enable/disable, password, wizard, role changes.
-- [ ] Wizard bootstrap-only; self-service TOTP for all roles; UI enrollment.
-- [ ] Login length/lockout digest keys; Argon2 semaphore.
-- [ ] Status codes 201/202/409; `totp_enabled` truthful.
+- [x] Re-auth for TOTP enable/disable, password, wizard, role changes.
+- [x] Wizard bootstrap-only; self-service TOTP for all roles; UI enrollment.
+- [x] Login length/lockout digest keys; Argon2 semaphore.
+- [x] Status codes 201/202/409; `totp_enabled` truthful.
 - **Acceptance:** stolen-session/reauth tests pass; all roles can enroll 2FA.
 **Estimate:** M.
+
+**Status (2026-11-20):** Complete. Password changes are self-service for every
+role with current-password proof and a required TOTP/backup code when enrolled;
+Admin overrides, role changes, Admin creation and Admin-scoped token creation
+from a browser session require a fresh session-bound `X-Reauth-Token` (Admin API
+tokens are exempt). Argon2 hash/verify work is bounded to four concurrent
+operations and all login/re-auth/change-password inputs are length-capped.
+The wizard now treats an unchecked cache/filtering/DNSSEC/CNAME box as an
+explicit disable, and the unimplemented upstream weight control is removed.
+`create_client`, `add_client_group`, `add_filter_list` and `add_rewrite` return
+`201`; the TOTP challenge remains `202`, duplicate groups remain `409`, and
+`update_user` reports the real TOTP state. Evidence: Phase 2 — auth, RBAC and
+self-service 2FA section in `docs/audit6-test-matrix.md` and §20 of
+`docs/2.0-public-api-diff.md`. Deferred residuals: second proof for
+`delete_user`/`delete_token` and real weighted upstream balancing are WP-2.11+.
 
 ### WP-2.11 — API v2, OpenAPI, config apply, updater
 

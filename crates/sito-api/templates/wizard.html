@@ -25,6 +25,7 @@
           @submit="if (!confirm($el.dataset.confirm)) { $event.preventDefault(); }"
           data-confirm="Complete setup and apply the configuration?">
       <input type="hidden" name="setup_token" value="{{ setup_token }}">
+      <input type="hidden" name="reauth_token" value="{{ reauth_token }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <!-- Section 1: Administrator Account -->
       <div style="margin-bottom: 24px;">
@@ -132,7 +133,7 @@
             <select id="wiz-strategy" name="upstream_strategy" class="form-select">
               <option value="failover" selected>Failover (Sequential with primary fallback)</option>
               <option value="parallel">Parallel (Query all, fastest answer wins)</option>
-              <option value="load_balance">Load Balance (Round-robin / weighted)</option>
+              <option value="load_balance">Load Balance (Round-robin)</option>
             </select>
           </div>
           <div class="form-group">
@@ -155,6 +156,7 @@
         <div class="grid-2">
           <div class="form-group">
             <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-bottom: 6px;">
+              <input type="hidden" name="cache_enabled_present" value="1">
               <input type="checkbox" name="cache_enabled" checked style="width: 16px; height: 16px;">
               <span class="form-label" style="margin-bottom: 0;">Enable In-Memory DNS Cache</span>
             </label>
@@ -177,6 +179,7 @@
           </div>
           <div class="form-group">
             <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-top: 24px;">
+              <input type="hidden" name="dnssec_validate_present" value="1">
               <input type="checkbox" name="dnssec_validate" checked style="width: 16px; height: 16px;">
               <span style="font-size: 0.875rem;">Enable Cryptographic DNSSEC Validation</span>
             </label>
@@ -193,6 +196,7 @@
         <div class="grid-2">
           <div class="form-group">
             <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-bottom: 6px;">
+              <input type="hidden" name="filtering_enabled_present" value="1">
               <input type="checkbox" name="filtering_enabled" checked style="width: 16px; height: 16px;">
               <span class="form-label" style="margin-bottom: 0;">Enable DNS-Based Filtering</span>
             </label>
@@ -210,6 +214,7 @@
         </div>
         <div class="form-group">
           <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+            <input type="hidden" name="cname_cloaking_present" value="1">
             <input type="checkbox" name="cname_cloaking" checked style="width: 16px; height: 16px;">
             <span style="font-size: 0.875rem;">Enable CNAME Cloaking Defense (Uncloaks third-party tracking aliases)</span>
           </label>

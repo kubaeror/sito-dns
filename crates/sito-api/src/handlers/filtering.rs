@@ -261,7 +261,7 @@ pub async fn refresh_integration_list(
     path = "/api/v1/filtering/lists",
     request_body = AddFilterListRequest,
     responses(
-        (status = 200, description = "Filter list added", body = FilterListDto),
+        (status = 201, description = "Filter list added", body = FilterListDto),
         (status = 400, description = "Bad Request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
@@ -272,7 +272,7 @@ pub async fn add_filter_list(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
     Json(payload): Json<AddFilterListRequest>,
-) -> Result<Json<FilterListDto>, ProblemDetails> {
+) -> Result<(StatusCode, Json<FilterListDto>), ProblemDetails> {
     let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     let name = payload.name.trim().to_string();
@@ -302,7 +302,7 @@ pub async fn add_filter_list(
 
     let mut dto = filter_list_dto(&ctx, &new_list).await;
     dto.id = name;
-    Ok(Json(dto))
+    Ok((StatusCode::CREATED, Json(dto)))
 }
 
 #[utoipa::path(
@@ -647,6 +647,45 @@ mod tests {
         let missing = dtos.iter().find(|d| d.name == "Missing").unwrap();
         assert_eq!(local.rule_count, 3);
         assert_eq!(missing.rule_count, 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-2.10: creating a filter list returns 201 (not 200) with the created
+    /// DTO, matching the other create endpoints.
+    #[tokio::test]
+    async fn test_add_filter_list_returns_201_with_body() {
+        let temp_dir = crate::test_support::temp_dir("sito_filter_add_status");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let list_path = temp_dir.join("add-list.txt");
+        std::fs::write(&list_path, "||ads.example^\n").unwrap();
+
+        let response = add_filter_list(
+            operator(),
+            State(ctx.clone()),
+            Json(AddFilterListRequest {
+                name: "Local".to_string(),
+                url: format!("file://{}", list_path.display()),
+                enabled: true,
+                refresh_hours: 24,
+            }),
+        )
+        .await
+        .expect("filter list added");
+
+        let (status, Json(dto)) = response;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(dto.id, "Local");
+        assert_eq!(dto.name, "Local");
+        assert!(
+            ctx.config
+                .load()
+                .filtering
+                .lists
+                .iter()
+                .any(|list| list.name == "Local"),
+            "the created list must be persisted"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -21,7 +21,8 @@ impl AuthManager {
         password: &str,
     ) -> Result<Option<String>, UserMutationError> {
         let _mutation = self.user_mutation_lock.lock().await;
-        let (hash, is_default) = hash_password_blocking(password.to_string())
+        let (hash, is_default) = self
+            .hash_password_blocking(password.to_string())
             .await
             .map_err(UserMutationError::Persistence)?;
 
@@ -82,7 +83,9 @@ impl AuthManager {
     ) -> Result<(), String> {
         let _mutation = self.user_mutation_lock.lock().await;
         let is_default = username == "admin"
-            && verify_password_blocking("adminadmin".to_string(), previous_hash.to_string()).await;
+            && self
+                .verify_password_blocking("adminadmin".to_string(), previous_hash.to_string())
+                .await;
         let (previous_current_hash, previous_epoch, mutated_epoch) = {
             let mut users = lock(&self.users);
             let Some(user) = users.get_mut(username) else {
@@ -126,7 +129,9 @@ impl AuthManager {
             Some(hash) => (hash, true),
             None => (dummy_password_hash().to_string(), false),
         };
-        let verified = verify_password_blocking(password.to_string(), hash).await;
+        let verified = self
+            .verify_password_blocking(password.to_string(), hash)
+            .await;
         exists && verified
     }
 
@@ -257,9 +262,9 @@ impl AuthManager {
         // Unknown user: run a dummy verification so the response time does not
         // reveal whether the account exists.
         let Some((hash, role, credential_epoch, totp_enabled)) = stored else {
-            let _ =
-                verify_password_blocking(password.to_string(), dummy_password_hash().to_string())
-                    .await;
+            let _ = self
+                .verify_password_blocking(password.to_string(), dummy_password_hash().to_string())
+                .await;
             let (locked, rem) = self.lockout.record_failure(&key);
             return if locked {
                 LoginResult::LockedOut {
@@ -272,7 +277,9 @@ impl AuthManager {
             };
         };
 
-        let password_valid = verify_password_blocking(password.to_string(), hash.clone()).await;
+        let password_valid = self
+            .verify_password_blocking(password.to_string(), hash.clone())
+            .await;
         if !password_valid {
             let (locked, rem) = self.lockout.record_failure(&key);
             return if locked {

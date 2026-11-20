@@ -164,6 +164,70 @@ async fn test_reauth_rejects_oversized_credentials_before_lockout() {
     );
 }
 
+/// WP-2.10: Argon2 hashing/verification is bounded by a semaphore so a burst
+/// of logins cannot allocate an unbounded number of 64 MiB working sets.
+///
+/// The test-only probe parks each operation while it holds a permit, so the
+/// saturated bound is observed deterministically without timing sleeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_argon2_verification_concurrency_is_bounded() {
+    let mgr = AuthManager::new();
+    let probe = mgr.install_argon2_probe();
+    let hash = hash_password("concurrency-probe-password").expect("valid hash");
+
+    let mut tasks = Vec::new();
+    for _ in 0..(ARGON2_MAX_CONCURRENCY * 2) {
+        let mgr = mgr.clone();
+        let hash = hash.clone();
+        tasks.push(tokio::spawn(async move {
+            mgr.verify_password_blocking("concurrency-probe-password".to_string(), hash)
+                .await
+        }));
+    }
+
+    // Wait until every operation reached the permit queue, then until the
+    // permit pool is saturated. Both waits are condition-driven, not timed.
+    let waiter = probe.clone();
+    tokio::task::spawn_blocking(move || {
+        waiter.wait_until(|state| state.attempted == ARGON2_MAX_CONCURRENCY * 2);
+    })
+    .await
+    .expect("probe waiter");
+    let waiter = probe.clone();
+    tokio::task::spawn_blocking(move || {
+        waiter.wait_until(|state| state.active >= ARGON2_MAX_CONCURRENCY);
+    })
+    .await
+    .expect("probe waiter");
+
+    let (attempted, active, max_active) = probe.snapshot();
+    assert_eq!(attempted, ARGON2_MAX_CONCURRENCY * 2);
+    assert_eq!(
+        active, ARGON2_MAX_CONCURRENCY,
+        "no more than {ARGON2_MAX_CONCURRENCY} Argon2 operations may run at once"
+    );
+    assert_eq!(max_active, ARGON2_MAX_CONCURRENCY);
+    assert_eq!(
+        mgr.argon2_semaphore.available_permits(),
+        0,
+        "the saturated operations must hold every Argon2 permit"
+    );
+
+    probe.release();
+    for task in tasks {
+        assert!(
+            task.await.expect("verification task"),
+            "the probe password must verify"
+        );
+    }
+    let (_, active, max_active) = probe.snapshot();
+    assert_eq!(active, 0);
+    assert_eq!(
+        max_active, ARGON2_MAX_CONCURRENCY,
+        "concurrent Argon2 work must stay bounded for the whole run"
+    );
+}
+
 #[tokio::test]
 async fn test_auth_manager_totp_flow() {
     let mgr = AuthManager::new();

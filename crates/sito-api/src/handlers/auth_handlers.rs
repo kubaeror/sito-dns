@@ -8,9 +8,10 @@ use axum::response::{IntoResponse, Response};
 use std::str::FromStr;
 
 use crate::auth::manager::{
-    LoginResult, ReauthError, TotpMutationError, TotpVerifyResult, UserMutationError,
+    LoginResult, MAX_LOGIN_PASSWORD_BYTES, MAX_LOGIN_USERNAME_BYTES, MAX_TOTP_CODE_BYTES,
+    ReauthError, TotpMutationError, TotpVerifyResult, UserMutationError,
 };
-use crate::auth::rbac::{RequireAdmin, RequireViewer};
+use crate::auth::rbac::{AuthUser, RequireAdmin, RequireViewer};
 use crate::auth::session::{
     Session, build_clear_csrf_cookie, build_clear_partial_cookie, build_clear_session_cookie,
     build_csrf_cookie, build_partial_cookie, extract_partial_cookie, extract_session_cookie,
@@ -46,18 +47,48 @@ fn current_session_id(ctx: &ServerContext, headers: &HeaderMap) -> Option<String
         .filter(|session_id| ctx.auth_mgr.validate_session(session_id).is_some())
 }
 
-/// Validates the `X-Reauth-Token` header for a sensitive TOTP operation and
-/// returns the ticket together with the session it was validated against.
+/// Atomically validates and consumes the `X-Reauth-Token` header for a
+/// sensitive operation and returns the session it was bound to.
 ///
-/// Callers must use the returned session id when consuming the ticket instead
-/// of looking the session up a second time: the session can expire between the
-/// validation and the operation, and a second lookup would then silently skip
-/// the single-use consume (leaving the ticket live until its TTL).
+/// The ticket is removed before the caller performs the mutation, so two
+/// concurrent requests cannot both authorize with it. A failed mutation still
+/// leaves the ticket consumed (fail-closed): the caller must re-authenticate
+/// again.
 fn require_reauth_token(
     ctx: &ServerContext,
     headers: &HeaderMap,
     username: &str,
-) -> Result<(String, String), ProblemDetails> {
+) -> Result<String, ProblemDetails> {
+    let token = headers
+        .get(REAUTH_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            ProblemDetails::unauthorized(
+                "Re-authentication required: provide a fresh X-Reauth-Token from POST /api/v1/auth/reauth",
+            )
+        })?;
+    let session_id = current_session_id(ctx, headers).ok_or_else(|| {
+        ProblemDetails::forbidden("Re-authentication requires an authenticated user session")
+    })?;
+    if !ctx.auth_mgr.take_reauth_token(token, username, &session_id) {
+        return Err(ProblemDetails::unauthorized(
+            "Re-authentication token is invalid, expired, already used, or bound to another session",
+        ));
+    }
+    Ok(session_id)
+}
+
+/// Validates the `X-Reauth-Token` header without consuming it.
+///
+/// Used only for the TOTP enrollment *start* (creating a pending secret); the
+/// ticket is consumed atomically by the enable/disable mutation itself.
+fn check_reauth_token(
+    ctx: &ServerContext,
+    headers: &HeaderMap,
+    username: &str,
+) -> Result<String, ProblemDetails> {
     let token = headers
         .get(REAUTH_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -79,7 +110,43 @@ fn require_reauth_token(
             "Re-authentication token is invalid, expired, or bound to another session",
         ));
     }
-    Ok((token.to_string(), session_id))
+    Ok(session_id)
+}
+
+/// Requires a fresh, session-bound re-authentication ticket for a sensitive
+/// mutation initiated from a user session.
+///
+/// The ticket is consumed here, before the mutation. Admin API tokens are
+/// deliberately exempt: a bearer token is a standalone privileged credential,
+/// not a stolen browser session, so it cannot be escalated by the
+/// session-theft path this check closes. See `docs/user-management.md`.
+fn require_sensitive_reauth(
+    ctx: &ServerContext,
+    headers: &HeaderMap,
+    user: &AuthUser,
+) -> Result<(), ProblemDetails> {
+    if user.token_id.is_some() {
+        return Ok(());
+    }
+    require_reauth_token(ctx, headers, &user.username).map(|_| ())
+}
+
+/// Maps a failed re-authentication onto the REST error contract.
+fn reauth_problem(err: ReauthError) -> ProblemDetails {
+    match err {
+        ReauthError::InvalidCredentials => {
+            ProblemDetails::unauthorized("Re-authentication failed: invalid password or code")
+        }
+        ReauthError::SecondFactorRequired => ProblemDetails::unauthorized(
+            "A current TOTP or backup code is required to re-authenticate",
+        ),
+        ReauthError::RateLimited => ProblemDetails::too_many_requests(
+            "Too many re-authentication attempts from this IP address. Please wait.",
+        ),
+        ReauthError::LockedOut { remaining_seconds } => ProblemDetails::too_many_requests(format!(
+            "Account locked out due to repeated failures. Try again in {remaining_seconds}s."
+        )),
+    }
 }
 
 /// True when the request asked for the partial token in the JSON body.
@@ -390,7 +457,9 @@ pub async fn get_totp_setup(
     headers: HeaderMap,
 ) -> Result<Json<TotpSetupResponse>, ProblemDetails> {
     let username = session_username(&viewer)?;
-    let _ = require_reauth_token(&ctx, &headers, username)?;
+    // Starting enrollment only creates a pending secret; the enable mutation
+    // consumes the ticket atomically.
+    let _ = check_reauth_token(&ctx, &headers, username)?;
     let setup = ctx
         .auth_mgr
         .begin_totp_enrollment(username)
@@ -421,7 +490,9 @@ pub async fn enable_totp(
     Json(req): Json<TotpConfirmRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
     let username = session_username(&viewer)?.to_string();
-    let (reauth_token, session_id) = require_reauth_token(&ctx, &headers, &username)?;
+    // The ticket is consumed atomically before the mutation; a failure below
+    // leaves it consumed (fail-closed).
+    let _session_id = require_reauth_token(&ctx, &headers, &username)?;
     ctx.auth_mgr
         .try_confirm_totp_setup(&username, &req.code)
         .await
@@ -434,19 +505,6 @@ pub async fn enable_totp(
                 "Failed to persist the user store while enabling TOTP: {detail}"
             )),
         })?;
-    // Enabling/replacing TOTP revokes the session that authorized it, so the
-    // ticket is consumed explicitly as well. The session id comes from the
-    // validation lookup above: re-reading the cookie here would skip the
-    // consume once the session has been purged.
-    if !ctx
-        .auth_mgr
-        .consume_reauth_token(&reauth_token, &username, &session_id)
-    {
-        tracing::warn!(
-            user = %username,
-            "Re-authentication ticket was already consumed or expired after enabling TOTP"
-        );
-    }
     Ok(Json(GenericMessageResponse {
         message: "TOTP 2FA enabled successfully".to_string(),
     }))
@@ -479,7 +537,8 @@ pub async fn disable_totp(
     Json(_req): Json<DisableTotpRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
     let username = session_username(&viewer)?.to_string();
-    let (reauth_token, session_id) = require_reauth_token(&ctx, &headers, &username)?;
+    // Atomic single-use: the ticket cannot authorize a concurrent disable.
+    let _session_id = require_reauth_token(&ctx, &headers, &username)?;
 
     ctx.auth_mgr
         .try_disable_totp(&username)
@@ -493,17 +552,6 @@ pub async fn disable_totp(
                 "Failed to persist the user store while disabling TOTP: {detail}"
             )),
         })?;
-    // Disabling the second factor revokes the authorizing session; consume
-    // the ticket with the session id from the single validation lookup above.
-    if !ctx
-        .auth_mgr
-        .consume_reauth_token(&reauth_token, &username, &session_id)
-    {
-        tracing::warn!(
-            user = %username,
-            "Re-authentication ticket was already consumed or expired after disabling TOTP"
-        );
-    }
     Ok(Json(GenericMessageResponse {
         message: "TOTP 2FA disabled successfully".to_string(),
     }))
@@ -549,6 +597,7 @@ pub async fn list_tokens(
     post,
     path = "/api/v1/auth/tokens",
     request_body = CreateTokenRequest,
+    params(("X-Reauth-Token" = String, Header, description = "Session-bound re-authentication ticket; required to mint an Admin-scoped token from a user session")),
     responses(
         (status = 201, description = "API token created", body = CreateTokenResponse),
         (status = 400, description = "Invalid scope", body = ProblemDetails),
@@ -560,6 +609,7 @@ pub async fn list_tokens(
 pub async fn create_token(
     admin: RequireAdmin,
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Json(req): Json<CreateTokenRequest>,
 ) -> Result<Response, ProblemDetails> {
     let scope = Role::from_str(&req.scope)
@@ -572,6 +622,11 @@ pub async fn create_token(
         return Err(ProblemDetails::bad_request(
             "Token name must be at most 128 characters",
         ));
+    }
+    // An Admin-scoped token is equivalent to the Admin credential itself, so a
+    // stolen browser session needs a second proof. API tokens are exempt.
+    if scope == Role::Admin {
+        require_sensitive_reauth(&ctx, &headers, &admin)?;
     }
 
     // Session-created tokens belong to the signed-in account. A bearer-token
@@ -724,6 +779,7 @@ pub async fn list_users(
     post,
     path = "/api/v1/auth/users",
     request_body = CreateUserRequest,
+    params(("X-Reauth-Token" = String, Header, description = "Session-bound re-authentication ticket; required to create an Admin from a user session")),
     responses(
         (status = 201, description = "User created", body = UserDto),
         (status = 400, description = "Invalid username, password or role", body = ProblemDetails),
@@ -734,14 +790,21 @@ pub async fn list_users(
     security(("bearer_auth" = []), ("cookie_auth" = []))
 )]
 pub async fn create_user(
-    _admin: RequireAdmin,
+    admin: RequireAdmin,
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<Response, ProblemDetails> {
     validate_username(&req.username)?;
     validate_password_policy(&req.password)?;
     let role = Role::from_str(req.role.trim())
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid role: {e}")))?;
+    // Creating an Admin from a browser session is a privilege escalation
+    // primitive; require a fresh re-authentication ticket. API tokens are
+    // already privileged credentials and stay exempt.
+    if role == Role::Admin {
+        require_sensitive_reauth(&ctx, &headers, &admin)?;
+    }
     // Normalize surrounding whitespace exactly like the web UI so both paths
     // create the same account name.
     let username = req.username.trim();
@@ -773,7 +836,10 @@ pub async fn create_user(
     put,
     path = "/api/v1/auth/users/{username}",
     request_body = UpdateUserRequest,
-    params(("username" = String, Path, description = "Username")),
+    params(
+        ("username" = String, Path, description = "Username"),
+        ("X-Reauth-Token" = String, Header, description = "Session-bound re-authentication ticket; required for session callers")
+    ),
     responses(
         (status = 200, description = "User role updated", body = UserDto),
         (status = 400, description = "Invalid role or last-admin protection", body = ProblemDetails),
@@ -786,11 +852,15 @@ pub async fn create_user(
 pub async fn update_user(
     admin: RequireAdmin,
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Path(username): Path<String>,
     Json(req): Json<UpdateUserRequest>,
 ) -> Result<Json<UserDto>, ProblemDetails> {
     let role = Role::from_str(req.role.trim())
         .map_err(|e| ProblemDetails::bad_request(format!("Invalid role: {e}")))?;
+    // Promotion and demotion both change effective privileges; a stolen Admin
+    // browser session must re-authenticate first. API tokens are exempt.
+    require_sensitive_reauth(&ctx, &headers, &admin)?;
 
     // Check and mutate atomically so concurrent demotions cannot race past the
     // last-admin guard.
@@ -846,51 +916,86 @@ pub async fn delete_user(
     }))
 }
 
-/// Change a password. Self-service requires the current password; an Admin may
-/// override another account (audited) with `username` set.
+/// Change a password. Every authenticated role may change their own password
+/// after proving it (plus TOTP when enabled); an Admin overriding another
+/// account must present a fresh session-bound re-authentication ticket.
 #[utoipa::path(
     post,
     path = "/api/v1/auth/change-password",
     request_body = ChangePasswordRequest,
+    params(("X-Reauth-Token" = String, Header, description = "Session-bound re-authentication ticket; required for an Admin overriding another account")),
     responses(
         (status = 200, description = "Password changed", body = GenericMessageResponse),
         (status = 400, description = "Password policy violation", body = ProblemDetails),
-        (status = 401, description = "Missing/wrong current password", body = ProblemDetails),
+        (status = 401, description = "Missing/wrong current password or second factor", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = []))
 )]
 pub async fn change_password(
-    admin: RequireAdmin,
+    caller: RequireViewer,
     State(ctx): State<ServerContext>,
+    MaybeConnectInfo(peer_addr): MaybeConnectInfo,
+    headers: HeaderMap,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
-    if admin.token_id.is_some() {
+    if caller.token_id.is_some() {
         return Err(ProblemDetails::forbidden(
             "Changing passwords requires an authenticated user session, not an API token",
         ));
     }
     validate_password_policy(&req.new_password)?;
+    // Match login/reauth: the current password is an Argon2 input, so an
+    // oversized value is rejected before it can reach the verifier. The new
+    // password keeps its own policy (which also caps at the same length).
+    if let Some(current) = req.current_password.as_deref()
+        && current.trim().len() > MAX_LOGIN_PASSWORD_BYTES
+    {
+        return Err(ProblemDetails::bad_request(format!(
+            "Current password must be at most {MAX_LOGIN_PASSWORD_BYTES} bytes"
+        )));
+    }
+    if let Some(code) = req.totp_code.as_deref()
+        && code.trim().len() > MAX_TOTP_CODE_BYTES
+    {
+        return Err(ProblemDetails::bad_request(format!(
+            "TOTP code must be at most {MAX_TOTP_CODE_BYTES} bytes"
+        )));
+    }
 
     let target = req
         .username
         .as_deref()
         .map(str::trim)
         .filter(|u| !u.is_empty())
-        .unwrap_or(&admin.username)
+        .unwrap_or(&caller.username)
         .to_string();
+    if target.len() > MAX_LOGIN_USERNAME_BYTES {
+        return Err(ProblemDetails::bad_request(format!(
+            "Username must be at most {MAX_LOGIN_USERNAME_BYTES} bytes"
+        )));
+    }
 
-    let is_override = target != admin.username;
+    let is_override = target != caller.username;
     if is_override {
+        // Only an Admin may reset somebody else's password, and only with a
+        // fresh proof of the Admin's own session. The ticket is consumed at
+        // authorization, so a failed mutation still forces re-authentication.
+        if caller.role < Role::Admin {
+            return Err(ProblemDetails::forbidden(
+                "Only an Admin may change another account's password",
+            ));
+        }
+        require_reauth_token(&ctx, &headers, &caller.username)?;
         if !ctx.auth_mgr.has_user(&target) {
             return Err(ProblemDetails::not_found(format!(
                 "User '{target}' not found"
             )));
         }
         tracing::warn!(
-            actor = %admin.username,
+            actor = %caller.username,
             target = %target,
-            "Administrator overrode a user password without the current password"
+            "Administrator overrode a user password after re-authentication"
         );
     } else {
         let current = req
@@ -901,9 +1006,37 @@ pub async fn change_password(
             .ok_or_else(|| {
                 ProblemDetails::unauthorized("Current password is required to change your password")
             })?;
-        if !ctx.auth_mgr.verify_user_password(&target, current).await {
-            return Err(ProblemDetails::unauthorized(
-                "Current password is incorrect",
+        let session_id = current_session_id(&ctx, &headers).ok_or_else(|| {
+            ProblemDetails::forbidden(
+                "Changing a password requires an authenticated user session cookie",
+            )
+        })?;
+        // Reuse the re-authentication flow so wrong passwords/codes share the
+        // login lockout and IP throttle instead of being an unthrottled
+        // verification oracle for a stolen session.
+        let client_ip = {
+            let config = ctx.config.load();
+            let trusted_proxies = &config.get_web_config().trusted_proxies;
+            resolve_client_ip(peer_addr, &headers, trusted_proxies)
+        };
+        let code = req
+            .totp_code
+            .as_deref()
+            .map(str::trim)
+            .filter(|code| !code.is_empty());
+        let ticket = ctx
+            .auth_mgr
+            .reauth(&caller.username, current, code, &session_id, &client_ip)
+            .await
+            .map_err(reauth_problem)?;
+        // The ticket is internal to this request; retire it immediately so it
+        // can never be replayed by another operation.
+        if !ctx
+            .auth_mgr
+            .take_reauth_token(&ticket.token, &caller.username, &session_id)
+        {
+            return Err(ProblemDetails::internal_error(
+                "Re-authentication ticket could not be retired",
             ));
         }
     }
@@ -941,6 +1074,15 @@ mod tests {
         })
     }
 
+    fn session_headers(session: &crate::auth::session::Session) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            session.to_cookie_header().parse().unwrap(),
+        );
+        headers
+    }
+
     async fn login_session(
         ctx: &ServerContext,
         username: &str,
@@ -951,12 +1093,7 @@ mod tests {
         else {
             panic!("login failed for {username}");
         };
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::COOKIE,
-            session.to_cookie_header().parse().unwrap(),
-        );
-        (viewer(username, session.role), headers)
+        (viewer(username, session.role), session_headers(&session))
     }
 
     fn with_reauth_token(mut headers: HeaderMap, token: &str) -> HeaderMap {
@@ -965,6 +1102,37 @@ mod tests {
             HeaderValue::from_str(token).unwrap(),
         );
         headers
+    }
+
+    /// Logs in and mints a fresh session-bound re-authentication ticket.
+    async fn login_with_reauth_ticket(
+        ctx: &ServerContext,
+        username: &str,
+        password: &str,
+    ) -> (RequireAdmin, HeaderMap) {
+        // Use a separate source IP from `login_session` so routine helper logins
+        // in a single test do not trip the shared per-IP login bucket.
+        let LoginResult::Success(session) =
+            ctx.auth_mgr.login(username, password, "127.0.0.250").await
+        else {
+            panic!("login failed for {username}");
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            session.to_cookie_header().parse().unwrap(),
+        );
+        let ticket = ctx
+            .auth_mgr
+            .reauth(username, password, None, &session.id, "")
+            .await
+            .expect("reauth ticket");
+        let admin = RequireAdmin(AuthUser {
+            username: username.to_string(),
+            role: session.role,
+            token_id: None,
+        });
+        (admin, with_reauth_token(headers, &ticket.token))
     }
 
     async fn body_json(response: Response) -> serde_json::Value {
@@ -1175,6 +1343,7 @@ mod tests {
         let created = create_user(
             admin(),
             State(ctx.clone()),
+            HeaderMap::new(),
             Json(CreateUserRequest {
                 username: "alice".to_string(),
                 password: "AlicePassword1".to_string(),
@@ -1190,6 +1359,7 @@ mod tests {
         let conflict = create_user(
             admin(),
             State(ctx.clone()),
+            HeaderMap::new(),
             Json(CreateUserRequest {
                 username: "alice".to_string(),
                 password: "AlicePassword2".to_string(),
@@ -1200,9 +1370,12 @@ mod tests {
         .expect_err("duplicate user rejected");
         assert_eq!(conflict.status, 409);
 
+        // A role change from a browser session requires a fresh reauth ticket.
+        let (admin_session, headers) = login_with_reauth_ticket(&ctx, "admin", "adminadmin").await;
         let updated = update_user(
-            admin(),
+            admin_session,
             State(ctx.clone()),
+            headers,
             AxumPath("alice".to_string()),
             Json(UpdateUserRequest {
                 role: "viewer".to_string(),
@@ -1213,9 +1386,11 @@ mod tests {
         assert_eq!(updated.0.role, "viewer");
 
         // Last-admin protection: demoting/deleting the only Admin fails.
+        let (admin_session, headers) = login_with_reauth_ticket(&ctx, "admin", "adminadmin").await;
         let demote = update_user(
-            admin(),
+            admin_session,
             State(ctx.clone()),
+            headers,
             AxumPath("admin".to_string()),
             Json(UpdateUserRequest {
                 role: "viewer".to_string(),
@@ -1230,9 +1405,11 @@ mod tests {
         assert_eq!(delete.status, 400);
 
         // Unknown accounts stay 404 on both mutations.
+        let (admin_session, headers) = login_with_reauth_ticket(&ctx, "admin", "adminadmin").await;
         let unknown_role = update_user(
-            admin(),
+            admin_session,
             State(ctx.clone()),
+            headers,
             AxumPath("ghost".to_string()),
             Json(UpdateUserRequest {
                 role: "admin".to_string(),
@@ -1247,13 +1424,19 @@ mod tests {
                 .expect_err("unknown user rejected");
         assert_eq!(unknown_delete.status, 404);
 
-        // Self-service password change requires the current password.
+        // Self-service password change requires the current password and a
+        // live session for the re-authentication/lockout path.
+        let (admin_caller, admin_headers) = login_session(&ctx, "admin", "adminadmin").await;
+        let peer = Some(std::net::SocketAddr::from(([127, 0, 0, 200], 4242)));
         let wrong = change_password(
-            admin(),
+            RequireViewer(admin_caller.0.clone()),
             State(ctx.clone()),
+            MaybeConnectInfo(peer),
+            admin_headers.clone(),
             Json(ChangePasswordRequest {
                 username: None,
                 current_password: Some("wrong".to_string()),
+                totp_code: None,
                 new_password: "NewAdminPassword1".to_string(),
             }),
         )
@@ -1261,12 +1444,46 @@ mod tests {
         .expect_err("wrong current password rejected");
         assert_eq!(wrong.status, 401);
 
-        let _ = change_password(
-            admin(),
+        // Oversized current passwords are rejected before Argon2 with a clear
+        // validation error, mirroring login/reauth caps (WP-2.10).
+        let oversized = change_password(
+            RequireViewer(admin_caller.0.clone()),
             State(ctx.clone()),
+            MaybeConnectInfo(peer),
+            admin_headers.clone(),
+            Json(ChangePasswordRequest {
+                username: None,
+                current_password: Some("p".repeat(MAX_LOGIN_PASSWORD_BYTES + 1)),
+                totp_code: None,
+                new_password: "NewAdminPassword1".to_string(),
+            }),
+        )
+        .await
+        .expect_err("oversized current password rejected");
+        assert_eq!(oversized.status, 400);
+        assert!(
+            oversized
+                .detail
+                .contains("Current password must be at most"),
+            "unexpected detail: {}",
+            oversized.detail
+        );
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("admin", "adminadmin")
+                .await,
+            "an oversized current password must not change the password"
+        );
+
+        let _ = change_password(
+            admin_caller,
+            State(ctx.clone()),
+            MaybeConnectInfo(peer),
+            admin_headers,
             Json(ChangePasswordRequest {
                 username: None,
                 current_password: Some("adminadmin".to_string()),
+                totp_code: None,
                 new_password: "NewAdminPassword1".to_string(),
             }),
         )
@@ -1279,13 +1496,18 @@ mod tests {
             LoginResult::Success(_)
         ));
 
-        // Admin override for another account (no current password required).
+        // Admin override for another account requires a session-bound ticket.
+        let (admin_session, headers) =
+            login_with_reauth_ticket(&ctx, "admin", "NewAdminPassword1").await;
         let _ = change_password(
-            admin(),
+            RequireViewer(admin_session.0),
             State(ctx.clone()),
+            MaybeConnectInfo(None),
+            headers,
             Json(ChangePasswordRequest {
                 username: Some("alice".to_string()),
                 current_password: None,
+                totp_code: None,
                 new_password: "AliceNewPassword1".to_string(),
             }),
         )
@@ -1293,7 +1515,7 @@ mod tests {
         .expect("admin override");
         assert!(matches!(
             ctx.auth_mgr
-                .login("alice", "AliceNewPassword1", "127.0.0.1")
+                .login("alice", "AliceNewPassword1", "127.0.0.99")
                 .await,
             LoginResult::Success(_)
         ));
@@ -1302,6 +1524,541 @@ mod tests {
             .await
             .expect("user deleted");
         assert!(!ctx.auth_mgr.has_user("alice"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-2.10: every role may change its own password after proving it, but a
+    /// non-Admin can never override another account.
+    #[tokio::test]
+    async fn test_self_service_password_change_for_all_roles() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_self_service_pw");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("view_user", "ViewerPass1", Role::Viewer)
+            .await;
+        ctx.auth_mgr
+            .create_user("oper_user", "OperatorPass1", Role::Operator)
+            .await;
+
+        for (username, old_password, new_password) in [
+            ("view_user", "ViewerPass1", "ViewerPass2"),
+            ("oper_user", "OperatorPass1", "OperatorPass2"),
+        ] {
+            let (caller, headers) = login_session(&ctx, username, old_password).await;
+            let changed = change_password(
+                caller,
+                State(ctx.clone()),
+                MaybeConnectInfo(None),
+                headers,
+                Json(ChangePasswordRequest {
+                    username: None,
+                    current_password: Some(old_password.to_string()),
+                    totp_code: None,
+                    new_password: new_password.to_string(),
+                }),
+            )
+            .await
+            .expect("self-service password change");
+            assert!(changed.0.message.contains(username));
+            assert!(
+                ctx.auth_mgr
+                    .verify_user_password(username, new_password)
+                    .await,
+                "{username} must be able to rotate their own password"
+            );
+        }
+
+        // A non-Admin cannot reset another account's password.
+        let (non_admin, non_admin_headers) = login_session(&ctx, "view_user", "ViewerPass2").await;
+        let err = change_password(
+            non_admin,
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            non_admin_headers,
+            Json(ChangePasswordRequest {
+                username: Some("admin".to_string()),
+                current_password: None,
+                totp_code: None,
+                new_password: "EscalatedPassword1".to_string(),
+            }),
+        )
+        .await
+        .expect_err("non-Admin override must be rejected");
+        assert_eq!(err.status, 403);
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("admin", "adminadmin")
+                .await,
+            "the target password must be untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-2.10: a TOTP-enrolled account must supply a valid code alongside the
+    /// current password before the password can be rotated.
+    #[tokio::test]
+    async fn test_self_service_password_change_requires_totp_when_enabled() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_pw_totp");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("alice", "AlicePassword1", Role::Operator)
+            .await;
+        let setup = ctx.auth_mgr.init_totp_setup("alice").await.expect("setup");
+        assert!(
+            ctx.auth_mgr
+                .confirm_totp_setup("alice", &setup.backup_codes[0])
+                .await
+        );
+        let LoginResult::TotpRequired { partial_token } = ctx
+            .auth_mgr
+            .login("alice", "AlicePassword1", "127.0.0.1")
+            .await
+        else {
+            panic!("TOTP challenge expected");
+        };
+        let TotpVerifyResult::Success(session) = ctx
+            .auth_mgr
+            .verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1")
+            .await
+        else {
+            panic!("TOTP verification failed");
+        };
+        let headers = session_headers(&session);
+
+        let missing = change_password(
+            viewer("alice", Role::Operator),
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            headers.clone(),
+            Json(ChangePasswordRequest {
+                username: None,
+                current_password: Some("AlicePassword1".to_string()),
+                totp_code: None,
+                new_password: "AlicePassword2".to_string(),
+            }),
+        )
+        .await
+        .expect_err("missing TOTP code must be rejected");
+        assert_eq!(missing.status, 401);
+
+        let wrong = change_password(
+            viewer("alice", Role::Operator),
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            headers.clone(),
+            Json(ChangePasswordRequest {
+                username: None,
+                current_password: Some("AlicePassword1".to_string()),
+                totp_code: Some("000000".to_string()),
+                new_password: "AlicePassword2".to_string(),
+            }),
+        )
+        .await
+        .expect_err("wrong TOTP code must be rejected");
+        assert_eq!(wrong.status, 401);
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("alice", "AlicePassword1")
+                .await
+        );
+
+        let changed = change_password(
+            viewer("alice", Role::Operator),
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            headers,
+            Json(ChangePasswordRequest {
+                username: None,
+                current_password: Some("AlicePassword1".to_string()),
+                totp_code: Some(setup.backup_codes[2].clone()),
+                new_password: "AlicePassword2".to_string(),
+            }),
+        )
+        .await
+        .expect("valid backup code must authorize the change");
+        assert!(changed.0.message.contains("alice"));
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("alice", "AlicePassword2")
+                .await
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-2.10: a stolen Admin browser session cannot change a role, create an
+    /// Admin, mint an Admin-scoped token, or reset another password without a
+    /// fresh re-authentication ticket.
+    #[tokio::test]
+    async fn test_stolen_admin_session_requires_reauth_for_sensitive_changes() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_stolen_session");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("alice", "AlicePassword1", Role::Viewer)
+            .await;
+
+        let (viewer_session, headers) = login_session(&ctx, "admin", "adminadmin").await;
+        let stolen_admin = RequireAdmin(viewer_session.0.clone());
+
+        let role = update_user(
+            stolen_admin.clone(),
+            State(ctx.clone()),
+            headers.clone(),
+            AxumPath("alice".to_string()),
+            Json(UpdateUserRequest {
+                role: "admin".to_string(),
+            }),
+        )
+        .await
+        .expect_err("role change without a ticket");
+        assert_eq!(role.status, 401);
+
+        let created = create_user(
+            stolen_admin.clone(),
+            State(ctx.clone()),
+            headers.clone(),
+            Json(CreateUserRequest {
+                username: "newadmin".to_string(),
+                password: "NewAdminPass1".to_string(),
+                role: "admin".to_string(),
+            }),
+        )
+        .await
+        .expect_err("Admin creation without a ticket");
+        assert_eq!(created.status, 401);
+
+        let token = create_token(
+            stolen_admin.clone(),
+            State(ctx.clone()),
+            headers.clone(),
+            Json(CreateTokenRequest {
+                name: "admin-token".to_string(),
+                scope: "admin".to_string(),
+            }),
+        )
+        .await
+        .expect_err("Admin token creation without a ticket");
+        assert_eq!(token.status, 401);
+
+        let reset = change_password(
+            RequireViewer(viewer_session.0),
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            headers.clone(),
+            Json(ChangePasswordRequest {
+                username: Some("alice".to_string()),
+                current_password: None,
+                totp_code: None,
+                new_password: "HijackedPassword1".to_string(),
+            }),
+        )
+        .await
+        .expect_err("password reset without a ticket");
+        assert_eq!(reset.status, 401);
+
+        assert_eq!(ctx.auth_mgr.role_of("alice"), Some(Role::Viewer));
+        assert!(!ctx.auth_mgr.has_user("newadmin"));
+        assert!(
+            !ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|t| t.name == "admin-token")
+        );
+        assert!(
+            ctx.auth_mgr
+                .verify_user_password("alice", "AlicePassword1")
+                .await
+        );
+
+        // A fresh ticket authorizes exactly one mutation; it is consumed.
+        let (admin_session, ticket_headers) =
+            login_with_reauth_ticket(&ctx, "admin", "adminadmin").await;
+        let promoted = update_user(
+            admin_session,
+            State(ctx.clone()),
+            ticket_headers.clone(),
+            AxumPath("alice".to_string()),
+            Json(UpdateUserRequest {
+                role: "operator".to_string(),
+            }),
+        )
+        .await
+        .expect("role change with a ticket");
+        assert_eq!(promoted.0.role, "operator");
+
+        let reused = update_user(
+            RequireAdmin(AuthUser {
+                username: "admin".to_string(),
+                role: Role::Admin,
+                token_id: None,
+            }),
+            State(ctx.clone()),
+            ticket_headers,
+            AxumPath("alice".to_string()),
+            Json(UpdateUserRequest {
+                role: "viewer".to_string(),
+            }),
+        )
+        .await
+        .expect_err("a consumed ticket must not authorize a second change");
+        assert_eq!(reused.status, 401);
+        assert_eq!(ctx.auth_mgr.role_of("alice"), Some(Role::Operator));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-2.10 review: repeated wrong current passwords for a self-service
+    /// change hit the shared login lockout instead of being an unthrottled
+    /// verification oracle.
+    #[tokio::test]
+    async fn test_self_service_password_change_hits_lockout() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_self_service_lockout");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("alice", "AlicePassword1", Role::Viewer)
+            .await;
+        let (caller, headers) = login_session(&ctx, "alice", "AlicePassword1").await;
+
+        // Give each attempt a distinct source IP so the per-IP bucket does not
+        // mask the per-account lockout being asserted.
+        for attempt in 1..=crate::auth::lockout::MAX_FAILED_ATTEMPTS {
+            let peer = Some(std::net::SocketAddr::from((
+                [127, 0, 1, attempt as u8],
+                5000 + attempt as u16,
+            )));
+            let result = change_password(
+                RequireViewer(caller.0.clone()),
+                State(ctx.clone()),
+                MaybeConnectInfo(peer),
+                headers.clone(),
+                Json(ChangePasswordRequest {
+                    username: None,
+                    current_password: Some("wrong-password".to_string()),
+                    totp_code: None,
+                    new_password: format!("AlicePassword{}", attempt + 1),
+                }),
+            )
+            .await;
+            if attempt < crate::auth::lockout::MAX_FAILED_ATTEMPTS {
+                assert_eq!(result.expect_err("wrong password").status, 401);
+            } else {
+                assert_eq!(
+                    result.expect_err("lockout").status,
+                    429,
+                    "the threshold-crossing attempt must be the lockout"
+                );
+            }
+        }
+
+        let locked = change_password(
+            RequireViewer(caller.0),
+            State(ctx.clone()),
+            MaybeConnectInfo(Some(std::net::SocketAddr::from(([127, 0, 2, 1], 6000)))),
+            headers,
+            Json(ChangePasswordRequest {
+                username: None,
+                current_password: Some("AlicePassword1".to_string()),
+                totp_code: None,
+                new_password: "AlicePassword2".to_string(),
+            }),
+        )
+        .await
+        .expect_err("a locked account cannot change its password");
+        assert_eq!(locked.status, 429);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Repeated wrong second factors also hit the shared lockout during a
+    /// self-service password change, not just wrong passwords.
+    #[tokio::test]
+    async fn test_self_service_password_change_wrong_totp_hits_lockout() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_self_service_totp_lockout");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("bob", "BobPassword1", Role::Viewer)
+            .await;
+        let setup = ctx.auth_mgr.init_totp_setup("bob").await.expect("setup");
+        assert!(
+            ctx.auth_mgr
+                .confirm_totp_setup("bob", &setup.backup_codes[0])
+                .await
+        );
+        let LoginResult::TotpRequired { partial_token } =
+            ctx.auth_mgr.login("bob", "BobPassword1", "127.0.0.1").await
+        else {
+            panic!("TOTP challenge expected");
+        };
+        let TotpVerifyResult::Success(session) = ctx
+            .auth_mgr
+            .verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1")
+            .await
+        else {
+            panic!("TOTP verification failed");
+        };
+        let headers = session_headers(&session);
+
+        for attempt in 1..=crate::auth::lockout::MAX_FAILED_ATTEMPTS {
+            let peer = Some(std::net::SocketAddr::from((
+                [127, 0, 5, attempt as u8],
+                9000 + attempt as u16,
+            )));
+            let result = change_password(
+                viewer("bob", Role::Viewer),
+                State(ctx.clone()),
+                MaybeConnectInfo(peer),
+                headers.clone(),
+                Json(ChangePasswordRequest {
+                    username: None,
+                    current_password: Some("BobPassword1".to_string()),
+                    totp_code: Some("000000".to_string()),
+                    new_password: format!("BobPassword{}", attempt + 1),
+                }),
+            )
+            .await;
+            if attempt < crate::auth::lockout::MAX_FAILED_ATTEMPTS {
+                assert_eq!(result.expect_err("wrong code").status, 401);
+            } else {
+                assert_eq!(
+                    result.expect_err("lockout").status,
+                    429,
+                    "the threshold-crossing TOTP failure must be the lockout"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Oversized TOTP/backup codes are rejected before the re-authentication
+    /// verifier, matching the other credential caps.
+    #[tokio::test]
+    async fn test_change_password_rejects_oversized_totp_code() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_totp_cap");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let (caller, headers) = login_session(&ctx, "admin", "adminadmin").await;
+
+        let err = change_password(
+            RequireViewer(caller.0),
+            State(ctx.clone()),
+            MaybeConnectInfo(None),
+            headers,
+            Json(ChangePasswordRequest {
+                username: None,
+                current_password: Some("adminadmin".to_string()),
+                totp_code: Some("1".repeat(MAX_TOTP_CODE_BYTES + 1)),
+                new_password: "NewAdminPassword1".to_string(),
+            }),
+        )
+        .await
+        .expect_err("oversized TOTP code rejected");
+        assert_eq!(err.status, 400);
+        assert!(err.detail.contains("TOTP code must be at most"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-2.10 review: authorization consumes the ticket atomically, so two
+    /// concurrent requests with the same ticket cannot both mutate.
+    #[tokio::test]
+    async fn test_reauth_ticket_is_single_use_under_concurrency() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_ticket_race");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("alice", "AlicePassword1", Role::Viewer)
+            .await;
+        let (admin_session, headers) = login_with_reauth_ticket(&ctx, "admin", "adminadmin").await;
+        let second_admin = RequireAdmin(admin_session.0.clone());
+
+        let first = update_user(
+            admin_session,
+            State(ctx.clone()),
+            headers.clone(),
+            AxumPath("alice".to_string()),
+            Json(UpdateUserRequest {
+                role: "operator".to_string(),
+            }),
+        );
+        let second = update_user(
+            second_admin,
+            State(ctx.clone()),
+            headers,
+            AxumPath("alice".to_string()),
+            Json(UpdateUserRequest {
+                role: "operator".to_string(),
+            }),
+        );
+        let (first, second) = tokio::join!(first, second);
+        let successes = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        assert_eq!(successes, 1, "exactly one request may use the ticket");
+        let rejected = first.err().or_else(|| second.err()).expect("one 401");
+        assert_eq!(rejected.status, 401);
+        assert_eq!(ctx.auth_mgr.role_of("alice"), Some(Role::Operator));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Admin API tokens are standalone privileged credentials, so they are
+    /// exempt from the session re-authentication requirement.
+    #[tokio::test]
+    async fn test_admin_api_token_is_exempt_from_sensitive_reauth() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_token_reauth_exempt");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .create_user("alice", "AlicePassword1", Role::Viewer)
+            .await;
+        let (meta, _) = ctx
+            .auth_mgr
+            .create_token("ci-admin", Role::Admin, Some("admin"))
+            .await
+            .expect("admin token");
+        let bearer = RequireAdmin(AuthUser {
+            username: "ci-admin".to_string(),
+            role: Role::Admin,
+            token_id: Some(meta.id.clone()),
+        });
+
+        let updated = update_user(
+            bearer.clone(),
+            State(ctx.clone()),
+            HeaderMap::new(),
+            AxumPath("alice".to_string()),
+            Json(UpdateUserRequest {
+                role: "operator".to_string(),
+            }),
+        )
+        .await
+        .expect("API tokens are exempt from reauth");
+        assert_eq!(updated.0.role, "operator");
+
+        let created = create_user(
+            bearer.clone(),
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Json(CreateUserRequest {
+                username: "secondadmin".to_string(),
+                password: "SecondAdmin1".to_string(),
+                role: "admin".to_string(),
+            }),
+        )
+        .await
+        .expect("API tokens may create an Admin");
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let token = create_token(
+            bearer,
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Json(CreateTokenRequest {
+                name: "child-admin".to_string(),
+                scope: "admin".to_string(),
+            }),
+        )
+        .await
+        .expect("API tokens may mint an Admin token");
+        assert_eq!(token.status(), StatusCode::CREATED);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -1629,9 +2386,11 @@ mod tests {
         .expect("challenge");
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
+        let (admin_session, headers) = login_with_reauth_ticket(&ctx, "admin", "adminadmin").await;
         let updated = update_user(
-            admin(),
+            admin_session,
             State(ctx.clone()),
+            headers,
             AxumPath("alice".to_string()),
             Json(UpdateUserRequest {
                 role: "operator".to_string(),
@@ -1659,11 +2418,14 @@ mod tests {
             token_id: Some("tok_123".to_string()),
         });
         let err = change_password(
-            token_admin,
+            RequireViewer(token_admin.0),
             State(ctx.clone()),
+            MaybeConnectInfo(None),
+            HeaderMap::new(),
             Json(ChangePasswordRequest {
                 username: None,
                 current_password: Some("adminadmin".to_string()),
+                totp_code: None,
                 new_password: "NewPassword123".to_string(),
             }),
         )
@@ -1683,6 +2445,7 @@ mod tests {
             let err = create_user(
                 admin(),
                 State(ctx.clone()),
+                HeaderMap::new(),
                 Json(CreateUserRequest {
                     username: "bob".to_string(),
                     password: password.to_string(),
@@ -1705,6 +2468,7 @@ mod tests {
         let created = create_user(
             admin(),
             State(ctx.clone()),
+            HeaderMap::new(),
             Json(CreateUserRequest {
                 username: "  alice  ".to_string(),
                 password: "AlicePassword1".to_string(),
@@ -1725,6 +2489,7 @@ mod tests {
             let err = create_user(
                 admin(),
                 State(ctx.clone()),
+                HeaderMap::new(),
                 Json(CreateUserRequest {
                     username: username.to_string(),
                     password: "AlicePassword1".to_string(),
@@ -1747,6 +2512,7 @@ mod tests {
         let resp = create_token(
             admin(),
             State(ctx.clone()),
+            HeaderMap::new(),
             Json(CreateTokenRequest {
                 name: "  ci-deploy  ".to_string(),
                 scope: "viewer".to_string(),
@@ -1791,6 +2557,7 @@ mod tests {
         let resp = create_token(
             bearer,
             State(ctx.clone()),
+            HeaderMap::new(),
             Json(CreateTokenRequest {
                 name: "child".to_string(),
                 scope: "viewer".to_string(),
@@ -1824,6 +2591,7 @@ mod tests {
         let err = create_token(
             stale_bearer,
             State(ctx.clone()),
+            HeaderMap::new(),
             Json(CreateTokenRequest {
                 name: "escaped".to_string(),
                 scope: "viewer".to_string(),
@@ -1858,6 +2626,7 @@ mod tests {
         let err = create_user(
             admin(),
             State(ctx.clone()),
+            HeaderMap::new(),
             Json(CreateUserRequest {
                 username: "alice".to_string(),
                 password: "AlicePassword1".to_string(),
@@ -1888,12 +2657,16 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((temp_dir.join("users.toml"), 0));
 
+        let (admin_session, headers) = login_with_reauth_ticket(&ctx, "admin", "adminadmin").await;
         let err = change_password(
-            admin(),
+            RequireViewer(admin_session.0),
             State(ctx.clone()),
+            MaybeConnectInfo(None),
+            headers,
             Json(ChangePasswordRequest {
                 username: Some("alice".to_string()),
                 current_password: None,
+                totp_code: None,
                 new_password: "AlicePassword2".to_string(),
             }),
         )

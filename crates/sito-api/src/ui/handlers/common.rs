@@ -184,3 +184,72 @@ pub(crate) fn admin_or_forbidden(
     }
     Ok((user, csrf))
 }
+
+/// Maps a failed re-authentication onto the UI error contract.
+pub(crate) fn reauth_problem(err: ReauthError) -> ProblemDetails {
+    match err {
+        ReauthError::InvalidCredentials => ProblemDetails::bad_request(
+            "Re-authentication failed: invalid password or second factor",
+        ),
+        ReauthError::SecondFactorRequired => ProblemDetails::bad_request(
+            "A current TOTP or backup code is required to re-authenticate",
+        ),
+        ReauthError::RateLimited => {
+            ProblemDetails::too_many_requests("Too many attempts. Please wait.")
+        }
+        ReauthError::LockedOut { remaining_seconds } => ProblemDetails::too_many_requests(format!(
+            "Account locked out due to repeated failures. Try again in {remaining_seconds}s."
+        )),
+    }
+}
+
+/// Runs the existing re-authentication flow for a UI form that collected the
+/// caller's current password (and TOTP code when enabled).
+///
+/// The issued ticket is consumed immediately at the authorization point: a
+/// failed following mutation still leaves it consumed (fail-closed), and the
+/// caller must prove the credential again.
+pub(crate) async fn ui_reauth(
+    ctx: &ServerContext,
+    user: &AuthUser,
+    headers: &HeaderMap,
+    peer_addr: Option<std::net::SocketAddr>,
+    password: Option<&str>,
+    code: Option<&str>,
+) -> Result<(), ProblemDetails> {
+    let session_id = current_session_id(ctx, headers).ok_or_else(|| {
+        ProblemDetails::forbidden("Re-authentication requires an authenticated user session")
+    })?;
+    let password = password
+        .map(str::trim)
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| {
+            ProblemDetails::bad_request("Current password is required to re-authenticate")
+        })?;
+    if let Some(code) = code
+        && code.trim().len() > MAX_TOTP_CODE_BYTES
+    {
+        return Err(ProblemDetails::bad_request(format!(
+            "TOTP code must be at most {MAX_TOTP_CODE_BYTES} bytes"
+        )));
+    }
+    let client_ip = {
+        let config = ctx.config.load();
+        let trusted_proxies = &config.get_web_config().trusted_proxies;
+        resolve_client_ip(peer_addr, headers, trusted_proxies)
+    };
+    let ticket = ctx
+        .auth_mgr
+        .reauth(&user.username, password, code, &session_id, &client_ip)
+        .await
+        .map_err(reauth_problem)?;
+    if !ctx
+        .auth_mgr
+        .take_reauth_token(&ticket.token, &user.username, &session_id)
+    {
+        return Err(ProblemDetails::internal_error(
+            "Re-authentication ticket could not be retired",
+        ));
+    }
+    Ok(())
+}

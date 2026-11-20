@@ -2131,7 +2131,7 @@ async fn test_m8_master_api_mutation_publishes_bundle() {
         .unwrap();
 
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Coordinator bundle version must have incremented to 2
     assert_eq!(coordinator.get_current_version(), 2);
