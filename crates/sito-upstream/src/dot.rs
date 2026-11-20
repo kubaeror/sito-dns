@@ -141,6 +141,22 @@ impl DotUpstream {
             Err(_) => return Err(UpstreamError::Timeout),
         };
 
+        // RFC 7858 / RFC 8310: DoT uses the "dot" ALPN identifier. A server
+        // that negotiates no protocol at all is not a DoT endpoint (some
+        // middleboxes and misconfigured servers complete the TLS handshake),
+        // so refuse it instead of sending DNS over an unverified protocol.
+        let negotiated = tls_stream.get_ref().1.alpn_protocol();
+        if negotiated != Some(&b"dot"[..]) {
+            return Err(UpstreamError::Tls(format!(
+                "DoT server {} did not negotiate ALPN 'dot' (got {})",
+                self.server_addr,
+                negotiated.map_or_else(
+                    || "none".to_string(),
+                    |protocol| format!("'{}'", String::from_utf8_lossy(protocol))
+                )
+            )));
+        }
+
         debug!(
             "Established new DoT connection to {} ({})",
             self.server_addr, self.tls_server_name
@@ -265,6 +281,9 @@ impl DotUpstream {
 
         let id = PING_QUERY_ID.fetch_add(1, Ordering::Relaxed);
         let mut ping = Message::new(id, MessageType::Query, OpCode::Query);
+        // The root-NS pool ping must ask for recursion: a resolver that drops
+        // RD=0 queries would otherwise look dead and lose a healthy socket.
+        ping.metadata.recursion_desired = true;
         ping.queries
             .push(Query::query(sito_proto::Name::root(), RecordType::NS));
         let encoded = match encode_message(&ping) {
@@ -374,9 +393,17 @@ mod tests {
         cert: CertificateDer<'static>,
         connections: Arc<AtomicU32>,
         queries: Arc<AtomicU32>,
+        rd_queries: Arc<AtomicU32>,
     }
 
     async fn spawn_dot_server(close_first_connection: bool) -> DotTestServer {
+        spawn_dot_server_with_alpn(close_first_connection, Some(b"dot")).await
+    }
+
+    async fn spawn_dot_server_with_alpn(
+        close_first_connection: bool,
+        alpn: Option<&[u8]>,
+    ) -> DotTestServer {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = CertificateDer::from(cert.cert.clone());
         let key_der = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
@@ -389,21 +416,26 @@ mod tests {
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], key_der.into())
         .unwrap();
-        server_cfg.alpn_protocols = vec![b"dot".to_vec()];
+        if let Some(alpn) = alpn {
+            server_cfg.alpn_protocols = vec![alpn.to_vec()];
+        }
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicU32::new(0));
         let queries = Arc::new(AtomicU32::new(0));
+        let rd_queries = Arc::new(AtomicU32::new(0));
         let connection_counter = Arc::clone(&connections);
         let query_counter = Arc::clone(&queries);
+        let rd_counter = Arc::clone(&rd_queries);
 
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let acceptor = acceptor.clone();
                 let connection_index = connection_counter.fetch_add(1, Ordering::SeqCst);
                 let query_counter = Arc::clone(&query_counter);
+                let rd_counter = Arc::clone(&rd_counter);
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(stream).await else {
                         return;
@@ -422,6 +454,9 @@ mod tests {
                             break;
                         };
                         query_counter.fetch_add(1, Ordering::SeqCst);
+                        if query.metadata.recursion_desired {
+                            rd_counter.fetch_add(1, Ordering::SeqCst);
+                        }
                         let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
                         resp.queries = query.queries.clone();
                         let Ok(encoded) = encode_message(&resp) else {
@@ -455,6 +490,7 @@ mod tests {
             cert: cert_der,
             connections,
             queries,
+            rd_queries,
         }
     }
 
@@ -510,6 +546,56 @@ mod tests {
         )
         .expect("DotUpstream::new must succeed with both providers enabled");
         assert_eq!(upstream.server_name(), "dns.example.com");
+    }
+
+    /// WP-2.7: a TLS handshake that completes without the `dot` ALPN is not a
+    /// DoT endpoint and must be rejected instead of carrying DNS traffic.
+    #[tokio::test]
+    async fn test_dot_rejects_missing_alpn() {
+        let server = spawn_dot_server_with_alpn(false, None).await;
+        let upstream = test_upstream(&server);
+
+        let err = upstream.resolve(&make_query(1)).await.unwrap_err();
+        assert!(
+            matches!(err, UpstreamError::Tls(ref msg) if msg.contains("ALPN")),
+            "a server without ALPN must be rejected with a TLS error, got {err:?}"
+        );
+        assert_eq!(
+            server.queries.load(Ordering::SeqCst),
+            0,
+            "no DNS query may be sent without a negotiated ALPN"
+        );
+    }
+
+    /// WP-2.7: the idle pool ping uses the root NS name and must set RD=1 so a
+    /// resolver that refuses RD=0 queries is not mistaken for a dead socket.
+    #[tokio::test]
+    async fn test_dot_ping_idle_sets_recursion_desired() {
+        let server = spawn_dot_server(false).await;
+        let upstream = test_upstream(&server);
+
+        upstream
+            .resolve(&make_query(1))
+            .await
+            .expect("first DoT query should succeed");
+        assert_eq!(
+            server.rd_queries.load(Ordering::SeqCst),
+            0,
+            "the test query itself does not set RD"
+        );
+        age_pool(&upstream).await;
+
+        upstream
+            .refresh()
+            .await
+            .expect("a successful pool ping must not fail the refresh hook");
+
+        assert_eq!(server.queries.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            server.rd_queries.load(Ordering::SeqCst),
+            1,
+            "the root-NS pool ping must set RD=1"
+        );
     }
 
     #[tokio::test]

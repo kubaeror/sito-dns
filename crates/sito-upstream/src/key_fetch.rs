@@ -71,6 +71,10 @@ mod tests {
         let name = Name::from_str("example.com.").unwrap();
         let message = key_query(&name, RecordType::DNSKEY);
         assert!(
+            message.metadata.recursion_desired,
+            "key fetches must ask the upstream for recursion (RD=1)"
+        );
+        assert!(
             message.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok),
             "key fetches must set the DO bit"
         );

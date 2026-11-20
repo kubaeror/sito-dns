@@ -20,6 +20,21 @@ use sito_proto::{Message, decode_message, encode_message};
 /// Maximum accepted DNS message size over a DoQ stream.
 const MAX_DOQ_MESSAGE_BYTES: usize = 65_535;
 
+/// RFC 9250 section 4.2: DoQ connections negotiate the `doq` ALPN. Reject a
+/// completed QUIC handshake that selected anything else (or nothing).
+fn ensure_doq_alpn(negotiated: Option<&[u8]>, remote: SocketAddr) -> Result<(), UpstreamError> {
+    if negotiated == Some(&b"doq"[..]) {
+        return Ok(());
+    }
+    Err(UpstreamError::Tls(format!(
+        "DoQ server {remote} did not negotiate ALPN 'doq' (got {})",
+        negotiated.map_or_else(
+            || "none".to_string(),
+            |protocol| format!("'{}'", String::from_utf8_lossy(protocol))
+        )
+    )))
+}
+
 /// A DNS-over-QUIC upstream (RFC 9250).
 pub struct QuicUpstream {
     endpoint: quinn::Endpoint,
@@ -114,9 +129,67 @@ impl QuicUpstream {
             .map_err(|_| UpstreamError::Timeout)?
             .map_err(|e| UpstreamError::Io(format!("QUIC handshake failed: {e}")))?;
 
+        // RFC 9250 section 4.2: DoQ uses the "doq" ALPN. A handshake that
+        // completes without it is not DoQ, so never cache or use that
+        // connection.
+        let negotiated = conn
+            .handshake_data()
+            .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .and_then(|data| data.protocol);
+        if let Err(error) = ensure_doq_alpn(negotiated.as_deref(), self.remote_addr) {
+            conn.close(0u32.into(), b"ALPN mismatch");
+            return Err(error);
+        }
+
         trace!(peer = %self.remote_addr, "Established DoQ connection");
         *guard = Some(conn.clone());
         Ok(conn)
+    }
+
+    /// Opens one bidirectional stream, retrying once on failure.
+    ///
+    /// A cached connection can be wedged at its stream limit while the QUIC
+    /// connection itself still reports no close reason. Invalidate it and make
+    /// one fresh connection so a single stuck stream does not fail the query.
+    async fn open_stream(
+        &self,
+    ) -> Result<(quinn::Connection, quinn::SendStream, quinn::RecvStream), UpstreamError> {
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let conn = match self.get_connection().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt == 0 {
+                        continue;
+                    }
+                    break;
+                }
+            };
+
+            match tokio::time::timeout(self.timeout, conn.open_bi()).await {
+                Ok(Ok((send, recv))) => return Ok((conn, send, recv)),
+                Ok(Err(e)) => {
+                    let error = UpstreamError::Io(format!("failed to open DoQ stream: {e}"));
+                    trace!(
+                        peer = %self.remote_addr,
+                        "DoQ stream open failed ({}); invalidating connection and retrying",
+                        error
+                    );
+                    self.invalidate_connection(&conn).await;
+                    last_error = Some(error);
+                }
+                Err(_) => {
+                    trace!(
+                        peer = %self.remote_addr,
+                        "DoQ stream open timed out; invalidating connection and retrying"
+                    );
+                    self.invalidate_connection(&conn).await;
+                    last_error = Some(UpstreamError::Timeout);
+                }
+            }
+        }
+        Err(last_error.unwrap_or(UpstreamError::Timeout))
     }
 
     /// Forget the cached connection after a stream failure, unless another task
@@ -150,13 +223,9 @@ impl Upstream for QuicUpstream {
             )));
         };
 
-        let conn = self.get_connection().await?;
-        // A stream-slot timeout/open error must not invalidate the connection:
-        // the connection itself may be healthy and merely at its stream limit.
-        let (mut send, mut recv) = tokio::time::timeout(self.timeout, conn.open_bi())
-            .await
-            .map_err(|_| UpstreamError::Timeout)?
-            .map_err(|e| UpstreamError::Io(format!("failed to open DoQ stream: {e}")))?;
+        // `open_stream` invalidates a connection whose stream slot is wedged
+        // and reconnects once, so the caller still gets one query attempt.
+        let (conn, mut send, mut recv) = self.open_stream().await?;
 
         let result = async {
             let write = async {
@@ -223,6 +292,7 @@ mod tests {
     use super::*;
     use sito_proto::{MessageType, OpCode, Query, RecordType};
     use std::str::FromStr;
+    use std::sync::atomic::Ordering;
 
     fn make_query(id: u16) -> Message {
         let mut query = Message::new(id, MessageType::Query, OpCode::Query);
@@ -237,14 +307,12 @@ mod tests {
     /// certificate, replying with the given wire DNS message ID. When
     /// `wedged_first_connection` is set, the first connection is held open but
     /// never answered, so the client must reconnect after timing out.
-    fn spawn_doq_server(
-        response_id: u16,
-        wedged_first_connection: bool,
-    ) -> (SocketAddr, rustls::pki_types::CertificateDer<'static>) {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-
+    fn doq_server_config(
+        cert_der: &rustls::pki_types::CertificateDer<'static>,
+        key_der: rustls::pki_types::PrivatePkcs8KeyDer<'static>,
+        alpn: Option<&[u8]>,
+        max_bidi_streams: Option<u32>,
+    ) -> quinn::ServerConfig {
         let mut server_rustls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -253,11 +321,66 @@ mod tests {
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], key_der.into())
         .unwrap();
-        server_rustls.alpn_protocols = vec![b"doq".to_vec()];
+        if let Some(alpn) = alpn {
+            server_rustls.alpn_protocols = vec![alpn.to_vec()];
+        }
 
         let quic_crypto =
             quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(server_rustls)).unwrap();
-        let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+        if let Some(max_bidi_streams) = max_bidi_streams {
+            let mut transport = quinn::TransportConfig::default();
+            transport.max_concurrent_bidi_streams(max_bidi_streams.into());
+            server_cfg.transport_config(Arc::new(transport));
+        }
+        server_cfg
+    }
+
+    /// Serves queries on one accepted DoQ connection.
+    async fn serve_doq_connection(conn: quinn::Connection, response_id: u16) {
+        loop {
+            let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                break;
+            };
+            let mut len_buf = [0u8; 2];
+            if recv.read_exact(&mut len_buf).await.is_err() {
+                break;
+            }
+            let query_len = u16::from_be_bytes(len_buf) as usize;
+            let mut query_buf = vec![0u8; query_len];
+            if recv.read_exact(&mut query_buf).await.is_err() {
+                break;
+            }
+            let query = decode_message(&query_buf).unwrap();
+            // RFC 9250: queries use ID 0.
+            assert_eq!(query.metadata.id, 0);
+            let mut resp = Message::new(response_id, MessageType::Response, OpCode::Query);
+            resp.metadata.response_code = sito_proto::ResponseCode::NoError;
+            resp.queries = query.queries.clone();
+            let encoded = encode_message(&resp).unwrap();
+            let _ = send.write_all(&(encoded.len() as u16).to_be_bytes()).await;
+            let _ = send.write_all(&encoded).await;
+            let _ = send.finish();
+        }
+    }
+
+    fn spawn_doq_server(
+        response_id: u16,
+        wedged_first_connection: bool,
+    ) -> (SocketAddr, rustls::pki_types::CertificateDer<'static>) {
+        spawn_doq_server_with_alpn_and_wedge(response_id, wedged_first_connection, Some(b"doq"))
+    }
+
+    fn spawn_doq_server_with_alpn_and_wedge(
+        response_id: u16,
+        wedged_first_connection: bool,
+        alpn: Option<&[u8]>,
+    ) -> (SocketAddr, rustls::pki_types::CertificateDer<'static>) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
+        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+        let server_cfg = doq_server_config(&cert_der, key_der, alpn, None);
+
         let endpoint = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = endpoint.local_addr().unwrap();
 
@@ -282,43 +405,82 @@ mod tests {
                     held_open.push(conn);
                     continue;
                 }
-                let conn_for_task = conn.clone();
-                held_open.push(conn);
-                tokio::spawn(async move {
-                    loop {
-                        let Ok((mut send, mut recv)) = conn_for_task.accept_bi().await else {
-                            break;
-                        };
-                        let mut len_buf = [0u8; 2];
-                        if recv.read_exact(&mut len_buf).await.is_err() {
-                            break;
-                        }
-                        let query_len = u16::from_be_bytes(len_buf) as usize;
-                        let mut query_buf = vec![0u8; query_len];
-                        if recv.read_exact(&mut query_buf).await.is_err() {
-                            break;
-                        }
-                        let query = decode_message(&query_buf).unwrap();
-                        // RFC 9250: queries use ID 0.
-                        assert_eq!(query.metadata.id, 0);
-                        let mut resp =
-                            Message::new(response_id, MessageType::Response, OpCode::Query);
-                        resp.metadata.response_code = sito_proto::ResponseCode::NoError;
-                        resp.queries = query.queries.clone();
-                        let encoded = encode_message(&resp).unwrap();
-                        let _ = send.write_all(&(encoded.len() as u16).to_be_bytes()).await;
-                        let _ = send.write_all(&encoded).await;
-                        let _ = send.finish();
-                    }
-                });
+                held_open.push(conn.clone());
+                tokio::spawn(serve_doq_connection(conn, response_id));
             }
         });
 
         (addr, cert_der)
     }
 
+    /// Accepts the first connection with zero bidirectional stream credit and
+    /// every later connection normally, so the first `open_bi` times out while
+    /// a reconnect succeeds.
+    fn spawn_doq_server_with_first_connection_stream_limit(
+        response_id: u16,
+    ) -> (
+        SocketAddr,
+        rustls::pki_types::CertificateDer<'static>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.clone());
+        let key_bytes = cert.signing_key.serialize_der();
+        let normal = doq_server_config(
+            &cert_der,
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_bytes.clone()),
+            Some(b"doq"),
+            None,
+        );
+        let limited = doq_server_config(
+            &cert_der,
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_bytes),
+            Some(b"doq"),
+            Some(0),
+        );
+
+        let endpoint =
+            quinn::Endpoint::server(normal.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = Arc::clone(&connections);
+
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(incoming) = endpoint.accept().await {
+                let index = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let cfg = if index == 1 {
+                    limited.clone()
+                } else {
+                    normal.clone()
+                };
+                let Ok(connecting) = incoming.accept_with(Arc::new(cfg)) else {
+                    continue;
+                };
+                let Ok(conn) = connecting.await else {
+                    continue;
+                };
+                if index == 1 {
+                    // Keep the connection alive but grant no streams.
+                    held.push(conn);
+                    continue;
+                }
+                tokio::spawn(serve_doq_connection(conn, response_id));
+            }
+        });
+
+        (addr, cert_der, connections)
+    }
+
     fn client_config_trusting(
         cert: &rustls::pki_types::CertificateDer<'static>,
+    ) -> quinn::ClientConfig {
+        client_config_trusting_with_alpn(cert, Some(b"doq"))
+    }
+
+    fn client_config_trusting_with_alpn(
+        cert: &rustls::pki_types::CertificateDer<'static>,
+        alpn: Option<&[u8]>,
     ) -> quinn::ClientConfig {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.clone()).unwrap();
@@ -329,7 +491,9 @@ mod tests {
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
-        rustls_cfg.alpn_protocols = vec![b"doq".to_vec()];
+        if let Some(alpn) = alpn {
+            rustls_cfg.alpn_protocols = vec![alpn.to_vec()];
+        }
         let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg).unwrap();
         quinn::ClientConfig::new(Arc::new(quic_crypto))
     }
@@ -403,6 +567,52 @@ mod tests {
         .expect("second query must not hang on the wedged connection")
         .expect("a fresh DoQ connection must answer");
         assert_eq!(second.metadata.id, 0x2222);
+    }
+
+    /// WP-2.7: a completed QUIC handshake without the `doq` ALPN is not an
+    /// RFC 9250 resolver and must be rejected with a TLS error. rustls aborts
+    /// a mismatched handshake itself, so the post-handshake check is exercised
+    /// directly with the values rustls could hand back.
+    #[test]
+    fn test_doq_alpn_mismatch_rejected() {
+        let remote: SocketAddr = "127.0.0.1:853".parse().unwrap();
+        for negotiated in [None, Some(&b"h3"[..])] {
+            let err = ensure_doq_alpn(negotiated, remote).unwrap_err();
+            assert!(
+                matches!(err, UpstreamError::Tls(ref msg) if msg.contains("ALPN")),
+                "negotiated {negotiated:?} must be rejected, got {err:?}"
+            );
+        }
+        ensure_doq_alpn(Some(b"doq"), remote).expect("the doq ALPN must be accepted");
+    }
+
+    /// WP-2.7: a connection that grants no bidirectional streams makes
+    /// `open_bi` time out; the client must discard it, reconnect once and then
+    /// complete the query instead of failing the whole lookup.
+    #[tokio::test]
+    async fn test_doq_reconnects_after_stream_open_failure() {
+        let (addr, cert, connections) = spawn_doq_server_with_first_connection_stream_limit(0);
+        let upstream = QuicUpstream::with_client_config(
+            "localhost",
+            addr,
+            Duration::from_millis(200),
+            client_config_trusting(&cert),
+        )
+        .unwrap();
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(3),
+            upstream.resolve(&make_query(0x5151)),
+        )
+        .await
+        .expect("the reconnect must stay bounded")
+        .expect("the query must succeed on the second connection");
+        assert_eq!(resp.metadata.id, 0x5151);
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            2,
+            "the wedged stream must trigger exactly one reconnect"
+        );
     }
 
     #[tokio::test]
