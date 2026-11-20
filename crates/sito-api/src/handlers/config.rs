@@ -189,7 +189,8 @@ fn restore_placeholders(new: &mut toml::Table, current: &toml::Table) {
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Config",
 )]
 pub async fn get_config(
     _admin: RequireAdmin,
@@ -214,7 +215,8 @@ pub async fn get_config(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Config",
 )]
 pub async fn get_restart_required(
     _admin: RequireAdmin,
@@ -245,7 +247,8 @@ pub async fn get_restart_required(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Config",
 )]
 pub async fn update_config(
     _admin: RequireAdmin,
@@ -783,7 +786,8 @@ token = "ha-token"
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Config",
 )]
 pub async fn reload_config(
     _admin: RequireAdmin,
@@ -854,7 +858,8 @@ pub async fn reload_config(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Config",
 )]
 /// Create a compressed .tar.gz archive containing config.toml and metadata.json
 pub fn create_backup_archive(config_toml: &str) -> anyhow::Result<Vec<u8>> {
@@ -977,7 +982,8 @@ pub fn extract_backup_archive(archive_bytes: &[u8]) -> anyhow::Result<(String, B
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Config",
 )]
 pub async fn download_backup(
     _admin: RequireAdmin,
@@ -1019,7 +1025,8 @@ pub async fn download_backup(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Config",
 )]
 pub async fn prepare_restore(
     _admin: RequireAdmin,
@@ -1076,7 +1083,8 @@ pub async fn prepare_restore(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Config",
 )]
 pub async fn confirm_restore(
     _admin: RequireAdmin,

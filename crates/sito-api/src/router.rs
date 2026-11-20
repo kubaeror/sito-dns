@@ -265,12 +265,46 @@ async fn not_found_handler() -> impl IntoResponse {
 }
 
 /// Legacy alias for `GET|PUT /api/v1/upstream`; kept as a permanent redirect.
-async fn redirect_upstream_config() -> Response {
+fn redirect_upstream_config() -> Response {
     (
         StatusCode::PERMANENT_REDIRECT,
         [(axum::http::header::LOCATION, "/api/v1/upstream")],
     )
         .into_response()
+}
+
+/// Documented GET alias for `/api/v1/upstream`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/upstream/config",
+    responses(
+        (status = 308, description = "Permanent redirect to /api/v1/upstream", headers(("Location", description = "Canonical upstream-config path"))),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden")
+    ),
+    tag = "Upstream",
+    security(("bearer_auth" = []), ("cookie_auth" = []))
+)]
+#[allow(clippy::unused_async)]
+pub(crate) async fn redirect_upstream_config_get() -> Response {
+    redirect_upstream_config()
+}
+
+/// Documented PUT alias for `/api/v1/upstream`.
+#[utoipa::path(
+    put,
+    path = "/api/v1/upstream/config",
+    responses(
+        (status = 308, description = "Permanent redirect to /api/v1/upstream", headers(("Location", description = "Canonical upstream-config path"))),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden")
+    ),
+    tag = "Upstream",
+    security(("bearer_auth" = []), ("cookie_auth" = []))
+)]
+#[allow(clippy::unused_async)]
+pub(crate) async fn redirect_upstream_config_put() -> Response {
+    redirect_upstream_config()
 }
 
 /// Constructs the complete administrative HTTP router.
@@ -301,7 +335,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
             "/querylog",
             get(querylog::get_querylog).delete(querylog::delete_querylog),
         )
-        .route("/querylog/clear", post(querylog::delete_querylog))
+        .route("/querylog/clear", post(querylog::clear_querylog))
         .route("/querylog/stream", get(querylog::stream_querylog))
         // Filtering
         .route("/filtering/status", get(filtering::get_filtering_status))
@@ -369,7 +403,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
         )
         .route(
             "/upstream/config",
-            get(redirect_upstream_config).put(redirect_upstream_config),
+            get(redirect_upstream_config_get).put(redirect_upstream_config_put),
         )
         .route("/upstream/test", post(upstream::test_upstream_servers))
         // Cache

@@ -96,7 +96,8 @@ async fn filter_list_dto(ctx: &ServerContext, list: &FilterListConfig) -> Filter
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 #[allow(clippy::unused_async)]
 pub async fn get_filtering_status(
@@ -132,7 +133,8 @@ pub async fn get_filtering_status(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_filter_lists(
     _operator: RequireOperator,
@@ -154,7 +156,8 @@ pub async fn get_filter_lists(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Integrations"
+    tag = "Integrations",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 #[allow(clippy::unused_async)]
 pub async fn get_integration_lists(
@@ -182,7 +185,8 @@ pub async fn get_integration_lists(
         (status = 404, description = "Category is not configured in [integrations.lists]"),
         (status = 502, description = "Source could not be fetched")
     ),
-    tag = "Integrations"
+    tag = "Integrations",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn refresh_integration_list(
     _operator: RequireOperator,
@@ -287,7 +291,8 @@ pub async fn refresh_integration_list(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn add_filter_list(
     _operator: RequireOperator,
@@ -337,7 +342,8 @@ pub async fn add_filter_list(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn update_filter_list(
     _operator: RequireOperator,
@@ -409,7 +415,8 @@ pub async fn update_filter_list(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn delete_filter_list(
     _operator: RequireOperator,
@@ -446,7 +453,8 @@ pub async fn delete_filter_list(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn refresh_filtering(
     _operator: RequireOperator,
@@ -495,7 +503,8 @@ pub async fn refresh_filtering(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_filtering_rules(
     _operator: RequireOperator,
@@ -516,7 +525,8 @@ pub async fn get_filtering_rules(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn set_filtering_rules(
     _operator: RequireOperator,
@@ -544,7 +554,8 @@ pub async fn set_filtering_rules(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Filtering"
+    tag = "Filtering",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn check_filtering(
     _viewer: RequireViewer,

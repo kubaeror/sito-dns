@@ -18,7 +18,8 @@ use crate::state::ServerContext;
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Cache",
 )]
 pub async fn flush_cache(
     _operator: RequireOperator,
@@ -41,7 +42,8 @@ pub async fn flush_cache(
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
-    security(("bearer_auth" = []), ("cookie_auth" = []))
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    tag = "Cache",
 )]
 pub async fn invalidate_cache(
     _operator: RequireOperator,

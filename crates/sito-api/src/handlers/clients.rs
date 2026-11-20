@@ -241,7 +241,8 @@ fn group_to_dto(name: &str, group: &ClientGroupConfig) -> ClientGroupDto {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_clients(
     _operator: RequireOperator,
@@ -265,7 +266,8 @@ pub async fn get_clients(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_unidentified_clients(
     _operator: RequireOperator,
@@ -308,7 +310,8 @@ pub async fn get_unidentified_clients(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn create_client(
     _operator: RequireOperator,
@@ -368,7 +371,8 @@ pub async fn create_client(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 #[allow(clippy::unused_async)]
 pub async fn get_client_by_name(
@@ -417,7 +421,8 @@ pub async fn get_client_by_name(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn update_client(
     _operator: RequireOperator,
@@ -510,7 +515,8 @@ pub async fn update_client(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn delete_client(
     _operator: RequireOperator,
@@ -542,7 +548,8 @@ pub async fn delete_client(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_client_groups(
     _operator: RequireOperator,
@@ -581,7 +588,8 @@ pub async fn get_client_groups(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 #[allow(clippy::unused_async)]
 pub async fn get_client_group_by_name(
@@ -621,7 +629,8 @@ pub async fn get_client_group_by_name(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn update_client_group(
     _operator: RequireOperator,
@@ -691,7 +700,8 @@ pub async fn update_client_group(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn add_client_group(
     _operator: RequireOperator,
@@ -745,7 +755,8 @@ pub async fn add_client_group(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Clients"
+    tag = "Clients",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn delete_client_group(
     _operator: RequireOperator,

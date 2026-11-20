@@ -114,7 +114,8 @@ impl IntoResponse for QueryLogHandlerError {
         (status = 429, description = "Rate limited", body = ProblemDetails,
             headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
-    tag = "QueryLog"
+    tag = "QueryLog",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_querylog(
     _viewer: RequireViewer,
@@ -164,7 +165,8 @@ pub async fn get_querylog(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "QueryLog"
+    tag = "QueryLog",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn delete_querylog(
     _operator: RequireOperator,
@@ -192,12 +194,45 @@ pub async fn delete_querylog(
     .into_response())
 }
 
+/// POST alias for `DELETE /api/v1/querylog` (older UI clients).
+#[utoipa::path(
+    post,
+    path = "/api/v1/querylog/clear",
+    params(ClearQueryLogParams),
+    responses(
+        (status = 200, description = "Query log cleared successfully", body = GenericMessageResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden")
+    ),
+    tag = "QueryLog",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+)]
+pub async fn clear_querylog(
+    operator: RequireOperator,
+    headers: HeaderMap,
+    State(ctx): State<ServerContext>,
+    Query(params): Query<ClearQueryLogParams>,
+) -> Result<Response, ProblemDetails> {
+    delete_querylog(operator, headers, State(ctx), Query(params)).await
+}
+
 /// WebSocket live tail endpoint streaming query log entries in real-time.
 ///
 /// The Origin header is validated before the upgrade: `null` and cross-origin
 /// handshakes are rejected, and a session-authenticated browser request must
 /// send a same-origin `Origin`. Token clients (Bearer or deprecated
 /// `?token=`) are not browser-ambient and may omit it.
+#[utoipa::path(
+    get,
+    path = "/api/v1/querylog/stream",
+    responses(
+        (status = 101, description = "WebSocket upgrade accepted; query log entries stream as JSON text frames"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden (including cross-origin/Origin: null)")
+    ),
+    tag = "QueryLog",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+)]
 pub async fn stream_querylog(
     ws: WebSocketUpgrade,
     RequireViewer(viewer): RequireViewer,

@@ -32,13 +32,14 @@ pub struct ApplyUpdateResponse {
 #[utoipa::path(
     get,
     path = "/api/v1/system/update/check",
-    tag = "system",
+    tag = "System",
     params(CheckUpdateQuery),
     responses(
         (status = 200, description = "Update information retrieved successfully", body = UpdateInfo),
         (status = 400, description = "Invalid repository parameter", body = ProblemDetails),
         (status = 500, description = "Failed to query release info", body = ProblemDetails)
-    )
+    ),
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn check_update(
     _viewer: RequireViewer,
@@ -66,14 +67,15 @@ pub async fn check_update(
 #[utoipa::path(
     post,
     path = "/api/v1/system/update/apply",
-    tag = "system",
+    tag = "System",
     request_body(content = Option<ApplyUpdatePayload>, description = "Optional update configuration"),
     responses(
         (status = 200, description = "Update applied successfully", body = ApplyUpdateResponse),
         (status = 400, description = "Invalid request or running in Docker", body = ProblemDetails),
         (status = 409, description = "Another update is running, the version comparison is unknown, or the service is managed by systemd", body = ProblemDetails),
         (status = 500, description = "Update process failed", body = ProblemDetails)
-    )
+    ),
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn apply_update(
     _admin: RequireAdmin,
