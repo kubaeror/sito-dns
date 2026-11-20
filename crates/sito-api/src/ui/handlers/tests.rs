@@ -2233,6 +2233,7 @@ async fn test_account_password_change() {
 
     let resp = account_password_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Form(AccountPasswordForm {
             current_password: "wrong-password".to_string(),
@@ -2243,7 +2244,10 @@ async fn test_account_password_change() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = response_body(resp).await;
-    assert!(body.contains("Current password is incorrect"), "{body}");
+    assert!(
+        body.contains("Re-authentication failed: invalid password or second factor"),
+        "{body}"
+    );
     assert!(
         ctx.auth_mgr
             .verify_user_password("admin", "adminadmin")
@@ -2255,6 +2259,7 @@ async fn test_account_password_change() {
     // visible validation error, matching the login/reauth length cap.
     let resp = account_password_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Form(AccountPasswordForm {
             current_password: "p".repeat(MAX_LOGIN_PASSWORD_BYTES + 1),
@@ -2276,8 +2281,25 @@ async fn test_account_password_change() {
         "an oversized current password must not change the password"
     );
 
+    // Oversized TOTP/backup codes are rejected before the verifier.
     let resp = account_password_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers.clone(),
+        Form(AccountPasswordForm {
+            current_password: "adminadmin".to_string(),
+            code: Some("1".repeat(MAX_TOTP_CODE_BYTES + 1)),
+            new_password: "NewAdminPassword1".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = response_body(resp).await;
+    assert!(body.contains("TOTP code must be at most"), "{body}");
+
+    let resp = account_password_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers,
         Form(AccountPasswordForm {
             current_password: "  adminadmin  ".to_string(),
@@ -2293,6 +2315,73 @@ async fn test_account_password_change() {
             .await,
         LoginResult::Success(_)
     ));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// WP-2.10 review: the account-page password form goes through the shared
+/// re-authentication lockout, so a stolen session cannot brute-force the
+/// current password.
+#[tokio::test]
+async fn test_account_password_change_hits_lockout() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_account_pw_lockout_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+    let headers = session_headers(&session);
+
+    for attempt in 1..=crate::auth::lockout::MAX_FAILED_ATTEMPTS {
+        let peer = Some(std::net::SocketAddr::from((
+            [127, 0, 3, attempt as u8],
+            7000 + attempt as u16,
+        )));
+        let resp = account_password_handler(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(peer),
+            headers.clone(),
+            Form(AccountPasswordForm {
+                current_password: "wrong-password".to_string(),
+                code: None,
+                new_password: format!("NewAdminPassword{}", attempt + 1),
+            }),
+        )
+        .await;
+        if attempt < crate::auth::lockout::MAX_FAILED_ATTEMPTS {
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        } else {
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "the threshold-crossing attempt must be the lockout"
+            );
+        }
+    }
+
+    let resp = account_password_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(Some(std::net::SocketAddr::from(([127, 0, 4, 1], 8000)))),
+        headers,
+        Form(AccountPasswordForm {
+            current_password: "adminadmin".to_string(),
+            code: None,
+            new_password: "NewAdminPassword1".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        ctx.auth_mgr
+            .verify_user_password("admin", "adminadmin")
+            .await,
+        "the locked account password must remain unchanged"
+    );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -2333,6 +2422,7 @@ async fn test_account_password_change_requires_totp_code() {
 
     let missing = account_password_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Form(AccountPasswordForm {
             current_password: "AlicePassword1".to_string(),
@@ -2345,6 +2435,7 @@ async fn test_account_password_change_requires_totp_code() {
 
     let wrong = account_password_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Form(AccountPasswordForm {
             current_password: "AlicePassword1".to_string(),
@@ -2362,6 +2453,7 @@ async fn test_account_password_change_requires_totp_code() {
 
     let changed = account_password_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers,
         Form(AccountPasswordForm {
             current_password: "AlicePassword1".to_string(),
@@ -2913,7 +3005,7 @@ async fn test_account_totp_disable() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = response_body(resp).await;
-    assert!(body.contains("A TOTP or backup code is required"), "{body}");
+    assert!(body.contains("TOTP or backup code is required"), "{body}");
     assert!(ctx.auth_mgr.totp_enabled("admin"));
 
     let resp = account_totp_disable_handler(

@@ -309,6 +309,9 @@ pub struct UsersTemplate<'a> {
     pub active_tab: &'a str,
     pub version: &'a str,
     pub users: Vec<UserViewItem>,
+    /// Whether the signed-in caller (not the target row) has TOTP enabled;
+    /// role changes require the caller's TOTP code, not the target's.
+    pub caller_totp_enabled: bool,
     pub error_message: &'a str,
 }
 

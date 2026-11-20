@@ -508,7 +508,6 @@ pub async fn wizard_complete_handler(
     // may instead present a fresh re-authentication ticket (recovery edge:
     // the printed token was lost but the Admin can still prove their
     // credential). The requirement was captured under the completion lock.
-    let mut reauth_proof: Option<(String, String, String)> = None;
     if setup_token_required {
         let config = ctx.config.load();
         let trusted_proxies = config.get_web_config().trusted_proxies.clone();
@@ -546,9 +545,8 @@ pub async fn wizard_complete_handler(
             if let (Some(ticket), Some(session_id)) = (ticket, current_session_id(&ctx, &headers))
                 && ctx
                     .auth_mgr
-                    .check_reauth_token(ticket, &auth_user.username, &session_id)
+                    .take_reauth_token(ticket, &auth_user.username, &session_id)
             {
-                reauth_proof = Some((ticket.to_string(), session_id, auth_user.username.clone()));
                 authenticated = true;
             }
         }
@@ -652,7 +650,6 @@ pub async fn wizard_complete_handler(
         credential_undo,
         report,
         filtering,
-        reauth_proof,
     )
     .await
 }
@@ -777,7 +774,6 @@ async fn finish_wizard_setup(
     credential_undo: WizardCredentialUndo,
     report: crate::config_apply::AppliedReport,
     filtering: sito_core::config::FilteringConfig,
-    reauth_proof: Option<(String, String, String)>,
 ) -> Response {
     if !report.restart_required.is_empty() {
         tracing::warn!(
@@ -808,19 +804,10 @@ async fn finish_wizard_setup(
     }
 
     // All credential and configuration writes succeeded: only now retire the
-    // setup token (and any re-authentication ticket used instead) and let the
-    // server leave setup mode.
+    // setup token and let the server leave setup mode. Any Admin
+    // re-authentication ticket was already consumed when authorizing the
+    // completion.
     ctx.auth_mgr.consume_setup_token();
-    if let Some((token, session_id, username)) = reauth_proof
-        && !ctx
-            .auth_mgr
-            .consume_reauth_token(&token, &username, &session_id)
-    {
-        tracing::warn!(
-            user = %username,
-            "Re-authentication ticket was already consumed or expired after wizard completion"
-        );
-    }
     ctx.set_setup_pending(false);
 
     // Queue the blocklist fetch/compile off the request path. When the DNS

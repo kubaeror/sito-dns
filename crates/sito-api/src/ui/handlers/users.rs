@@ -37,6 +37,7 @@ pub(crate) fn render_users_page(
         active_tab: "users",
         version: env!("CARGO_PKG_VERSION"),
         users,
+        caller_totp_enabled: ctx.auth_mgr.totp_enabled(&user.username),
         error_message,
     })
     .into_response();
@@ -111,8 +112,8 @@ pub async fn users_create_handler(
 
     // Creating an Admin is a privilege escalation primitive; prove the caller's
     // own credential before doing it. Admin API tokens do not reach the UI.
-    let proof = if role == Role::Admin {
-        match ui_reauth(
+    if role == Role::Admin
+        && let Err(problem) = ui_reauth(
             &ctx,
             &user,
             &headers,
@@ -121,13 +122,9 @@ pub async fn users_create_handler(
             form.reauth_code.as_deref(),
         )
         .await
-        {
-            Ok(proof) => Some(proof),
-            Err(problem) => return users_problem_page(&ctx, &user, &csrf, problem),
-        }
-    } else {
-        None
-    };
+    {
+        return users_problem_page(&ctx, &user, &csrf, problem);
+    }
 
     if ctx.auth_mgr.has_user(username) {
         return users_problem_page(
@@ -149,9 +146,6 @@ pub async fn users_create_handler(
             &csrf,
             ProblemDetails::internal_error(format!("Failed to persist the user store: {e}")),
         );
-    }
-    if let Some(proof) = proof {
-        proof.consume(&ctx);
     }
     tracing::info!(
         actor = %user.username,
@@ -196,7 +190,7 @@ pub async fn users_role_handler(
             );
         }
     };
-    let proof = match ui_reauth(
+    if let Err(problem) = ui_reauth(
         &ctx,
         &user,
         &headers,
@@ -206,14 +200,12 @@ pub async fn users_role_handler(
     )
     .await
     {
-        Ok(proof) => proof,
-        Err(problem) => return users_problem_page(&ctx, &user, &csrf, problem),
-    };
+        return users_problem_page(&ctx, &user, &csrf, problem);
+    }
     if let Err(err) = ctx.auth_mgr.set_user_role_checked(&username, role).await {
         let problem = user_mutation_problem(&username, "demote", err);
         return users_problem_page(&ctx, &user, &csrf, problem);
     }
-    proof.consume(&ctx);
     tracing::info!(
         actor = %user.username,
         target = %username,

@@ -131,6 +131,10 @@ pub const MAX_PARTIAL_TOKENS: usize = 10_000;
 pub const MAX_LOGIN_USERNAME_BYTES: usize = 64;
 /// Maximum accepted login password length (bytes) before lockout/Argon2.
 pub const MAX_LOGIN_PASSWORD_BYTES: usize = 1024;
+/// Maximum accepted TOTP/backup-code length (bytes) before verification.
+/// Current TOTP codes are six digits and backup codes are 32 characters, so
+/// this is deliberately generous while still bounding attacker-controlled input.
+pub const MAX_TOTP_CODE_BYTES: usize = 256;
 /// Maximum number of Argon2 hash/verify operations that may run concurrently.
 ///
 /// Each operation allocates 64 MiB, so four permits cap the password-hashing

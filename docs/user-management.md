@@ -46,6 +46,12 @@ export SITO=http://127.0.0.1:8080
 export TOKEN='sito_...'   # an Admin API token, or use a session cookie instead
 ```
 
+Mutating requests authenticated with a **session cookie** must also send the
+session's `X-CSRF-Token` and a same-origin `Origin`/`Referer`; the curl examples
+below use Bearer tokens where the operation allows one and include the CSRF
+header for session-only operations. Browser-generated requests send both
+automatically.
+
 ## 1. Account Lifecycle
 
 1. **Bootstrap.** On a fresh installation the first administrator is created by
@@ -133,6 +139,13 @@ hijacked by a browser-side attacker, and it is already protected as a secret.
 Changing a password still always requires a user session (API tokens are
 rejected with `403`).
 
+A ticket is consumed atomically at authorization, before the mutation runs. It
+is single-use, and a failed mutation still leaves it consumed (fail-closed), so
+the caller must re-authenticate again. The OpenAPI document lists
+`X-Reauth-Token` as `required` on these operations because utoipa cannot express
+conditional-required parameters; it is only required for session callers and
+Admin-only operations.
+
 ## 3. Create, List, and Delete Accounts
 
 Requires an Admin session or an Admin-scoped API token.
@@ -189,14 +202,26 @@ Admin-managed until explicitly revoked.
 ## 4. Change a Role
 
 ```bash
+# Admin API token (exempt from the reauth ticket):
 curl -sS -X PUT "$SITO/api/v1/auth/users/alice" \
-  -H "Cookie: sito_session=<admin-session-id>" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"role":"viewer"}'
+```
+
+Every role change from a **user session** instead requires a fresh
+`X-Reauth-Token` plus the session cookie, `X-CSRF-Token` and `Origin`:
+
+```bash
+curl -sS -X PUT "$SITO/api/v1/auth/users/alice" \
+  -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+  -H "X-CSRF-Token: <csrf-token>" \
+  -H "Origin: $SITO" \
   -H "X-Reauth-Token: <reauth-token>" \
   -H 'Content-Type: application/json' \
   -d '{"role":"viewer"}'
 ```
 
-Every role change from a user session requires the re-authentication ticket;
 Admin API tokens are exempt. The UI users form asks for the caller's current
 password (and TOTP/backup code when enabled) instead of a ticket.
 
@@ -244,7 +269,9 @@ is enabled):
 
 ```bash
 curl -sS -X POST "$SITO/api/v1/auth/change-password" \
-  -H "Cookie: sito_session=<session-id>" \
+  -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
+  -H "X-CSRF-Token: <csrf-token>" \
+  -H "Origin: $SITO" \
   -H 'Content-Type: application/json' \
   -d '{"current_password":"CorrectHorse1","totp_code":"123456","new_password":"NewCorrectHorse2"}'
 ```
@@ -255,7 +282,9 @@ callers receive `403 Forbidden`:
 
 ```bash
 curl -sS -X POST "$SITO/api/v1/auth/change-password" \
-  -H "Cookie: sito_session=<admin-session-id>" \
+  -H "Cookie: sito_session=<admin-session-id>; sito_csrf=<csrf-token>" \
+  -H "X-CSRF-Token: <csrf-token>" \
+  -H "Origin: $SITO" \
   -H "X-Reauth-Token: <reauth-token>" \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice","new_password":"NewCorrectHorse2"}'
