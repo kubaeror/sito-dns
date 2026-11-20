@@ -349,8 +349,10 @@ signature policy.
 `sito update` verifies the release with cosign because
 `server.update_require_signature` defaults to `true`. The installer installs a
 checksum-verified `cosign` (v2.6.5, matching the release workflow) to
-`/usr/local/bin` when it is missing; `SITO_INSTALL_COSIGN=0` skips this, and
-`COSIGN_VERSION` pins a different cosign release. `sito update` refuses before
+`/usr/local/bin` when it is missing and records
+`/usr/local/bin/cosign.installed-by-sito`; `--uninstall` removes that marked
+binary but keeps a pre-existing user-managed cosign. `SITO_INSTALL_COSIGN=0`
+skips this, and `COSIGN_VERSION` pins a different cosign release. `sito update` refuses before
 downloading anything when signatures are required but cosign is unavailable,
 and names both the missing verifier and the configuration key. If you installed
 the binary manually, install cosign first; only set
@@ -361,17 +363,27 @@ The web UI's update button uses the same updater and signature policy. Under
 the hardened systemd unit the unprivileged service still cannot replace the
 root-owned binary, so use the CLI path above for system installs.
 
-The installer stops the service, writes the replacement binary to a temporary
-file in the destination directory, flushes it, and renames it over
-`/usr/local/bin/sito` (so a live upgrade cannot fail with `ETXTBSY`), then
-restores file capabilities and starts the service. It backs up the previous
-binary to `/usr/local/bin/sito.bak` and `/etc/sito/config.toml` to
-`/etc/sito/config.toml.bak`, and restores both automatically if the post-install
-health check fails. If you manage
-the binary manually, stop the service, replace `/usr/local/bin/sito`, re-apply
-the bind capability (`sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito`),
-then start the service again. Docker deployments are updated by pulling the new
-image tag, not from inside the container.
+The installer stops the service first, then backs up the previous binary to
+`/usr/local/bin/sito.bak` and `/etc/sito/config.toml` to
+`/etc/sito/config.toml.bak`. Backing up the config after the stop avoids
+capturing a file the running service was still rewriting. It writes the
+replacement binary to a temporary file in the destination directory, flushes
+it, and renames it over `/usr/local/bin/sito` (so a live upgrade cannot fail
+with `ETXTBSY`), re-applies the bind capability, and starts the service. A
+failed health check restores both backups; the config restore is itself
+temp-file + rename, so a crash cannot leave a truncated `config.toml`.
+
+If `setcap` fails or is unavailable, the installer prints a warning with the
+manual command instead of silently continuing, and verifies the result with
+`getcap` when it is installed. A `sito update` run as root performs its own
+atomic replacement and copies the existing executable's permission bits and
+extended attributes (including `security.capability`) onto the new binary, so
+an update cannot silently drop the capability needed for ports 53/443/853.
+If you manage the binary manually, stop the service, replace
+`/usr/local/bin/sito`, re-apply the bind capability
+(`sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito`), then start the
+service again. Docker deployments are updated by pulling the new image tag, not
+from inside the container.
 
 ---
 

@@ -20,6 +20,9 @@ esac
 # the installer E2E can run unprivileged without touching the real system.
 INSTALL_BIN="${SITO_INSTALL_BIN:-/usr/local/bin/sito}"
 COSIGN_INSTALL_BIN="${SITO_INSTALL_COSIGN_BIN:-/usr/local/bin/cosign}"
+# Marker proving this installer placed cosign. Only a marked binary is removed
+# on --uninstall; a pre-existing user-managed cosign is left untouched.
+COSIGN_MARKER="${COSIGN_INSTALL_BIN}.installed-by-sito"
 CONFIG_DIR="${SITO_CONFIG_DIR:-/etc/sito}"
 DATA_DIR="${SITO_DATA_DIR:-/var/lib/sito}"
 SERVICE_PATH="${SITO_SERVICE_PATH:-/etc/systemd/system/sito.service}"
@@ -81,11 +84,21 @@ if [ "${UNINSTALL}" -eq 1 ]; then
     if have_systemctl; then
         run_systemctl stop sito || true
         run_systemctl disable sito || true
-        rm -f "${SERVICE_PATH}"
+    fi
+    # Remove the unit unconditionally: a unit may predate this installer or the
+    # host may have lost systemd since it was written.
+    rm -f "${SERVICE_PATH}"
+    if have_systemctl; then
         run_systemctl daemon-reload || true
         run_systemctl reset-failed sito 2>/dev/null || true
     fi
     rm -f "${INSTALL_BIN}" "${BACKUP_BIN}" "${CONFIG_BACKUP}"
+    if [ -f "${COSIGN_MARKER}" ]; then
+        rm -f "${COSIGN_INSTALL_BIN}" "${COSIGN_MARKER}"
+        echo "Removed installer-managed cosign (${COSIGN_INSTALL_BIN})."
+    elif [ -e "${COSIGN_INSTALL_BIN}" ]; then
+        echo "Keeping pre-existing cosign (${COSIGN_INSTALL_BIN}); it was not installed by sito."
+    fi
     echo "Removed ${INSTALL_BIN} and ${SERVICE_PATH}."
 
     # Remove the dedicated system user/group when possible. Config and data are
@@ -151,8 +164,29 @@ resolve_latest_version() {
 apply_capabilities() {
     chmod 755 "${INSTALL_BIN}"
     # Grant ambient capabilities to bind privileged ports (53, 443, 853)
-    if command -v setcap >/dev/null 2>&1; then
-        setcap 'cap_net_bind_service=+ep' "${INSTALL_BIN}" || true
+    if ! command -v setcap >/dev/null 2>&1; then
+        echo "Warning: 'setcap' was not found; ${INSTALL_BIN} cannot bind ports 53/443/853" >&2
+        echo "Warning: without privileges. Install libcap (or start the service with the" >&2
+        echo "Warning: CAP_NET_BIND_SERVICE ambient capability) before starting sito." >&2
+        return 0
+    fi
+    if ! setcap 'cap_net_bind_service=+ep' "${INSTALL_BIN}"; then
+        echo "Warning: failed to set cap_net_bind_service on ${INSTALL_BIN}." >&2
+        echo "Warning: the service may fail to bind privileged DNS ports; re-run as root" >&2
+        echo "Warning: and verify with: getcap ${INSTALL_BIN}" >&2
+        return 0
+    fi
+    if command -v getcap >/dev/null 2>&1; then
+        local caps
+        caps="$(getcap "${INSTALL_BIN}" 2>/dev/null || true)"
+        case "${caps}" in
+            *cap_net_bind_service*)
+                ;;
+            *)
+                echo "Warning: getcap did not report cap_net_bind_service for ${INSTALL_BIN}." >&2
+                echo "Warning: verify manually with: getcap ${INSTALL_BIN}" >&2
+                ;;
+        esac
     fi
 }
 
@@ -207,6 +241,31 @@ backup_config_if_present() {
             echo "Error: failed to back up ${CONFIG_FILE} to ${CONFIG_BACKUP}." >&2
             return 1
         fi
+    else
+        # Never let a stale backup from an earlier run be used for rollback.
+        rm -f "${CONFIG_BACKUP}"
+    fi
+}
+
+# Restores the configuration backup with a temp file + rename so a crash or a
+# failed write can never leave a truncated config.toml behind.
+restore_config_atomically() {
+    local dir tmp
+    dir="$(dirname -- "${CONFIG_FILE}")"
+    tmp="$(mktemp "${dir}/.sito-config-restore.XXXXXX")" || return 1
+    if ! cp -pf "${CONFIG_BACKUP}" "${tmp}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    if command -v sync >/dev/null 2>&1; then
+        sync -- "${tmp}" 2>/dev/null || sync || true
+    fi
+    if ! mv -f -- "${tmp}" "${CONFIG_FILE}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    if command -v sync >/dev/null 2>&1; then
+        sync -- "${dir}" 2>/dev/null || sync || true
     fi
 }
 
@@ -224,7 +283,7 @@ rollback_install() {
     fi
     if [ -f "${CONFIG_BACKUP}" ]; then
         echo "Restoring previous configuration from ${CONFIG_BACKUP}..." >&2
-        if ! cp -pf "${CONFIG_BACKUP}" "${CONFIG_FILE}"; then
+        if ! restore_config_atomically; then
             echo "Error: failed to restore ${CONFIG_FILE} from ${CONFIG_BACKUP}." >&2
             return 1
         fi
@@ -333,13 +392,11 @@ if [ -x "${INSTALL_BIN}" ]; then
         echo "Detected existing installation: ${PREV_VERSION}"
         echo "Backing up existing binary to ${BACKUP_BIN}..."
         cp -pf "${INSTALL_BIN}" "${BACKUP_BIN}"
-        backup_config_if_present
         echo "Upgrading sito ${PREV_VERSION} → v${SITO_VERSION}..."
     fi
 fi
 if [ "${IS_UPGRADE}" -eq 0 ]; then
     echo "Fresh install of sito v${SITO_VERSION}..."
-    backup_config_if_present
 fi
 
 # 6. Obtain and verify binary
@@ -452,6 +509,10 @@ install_cosign_if_missing() {
     )
 
     install -m 0755 "${TMP_DIR}/${asset}" "${COSIGN_INSTALL_BIN}"
+    if ! printf 'installed by sito installer %s\n' "${SITO_VERSION:-unknown}" >"${COSIGN_MARKER}"; then
+        echo "Warning: installed cosign but could not write ${COSIGN_MARKER}." >&2
+        echo "Warning: --uninstall will keep ${COSIGN_INSTALL_BIN} because ownership is unproven." >&2
+    fi
     echo "Installed cosign to ${COSIGN_INSTALL_BIN}."
 }
 
@@ -475,6 +536,9 @@ try_download_file() {
 if [ "${USE_LOCAL_BINARY}" -eq 1 ]; then
     echo "Using existing local release binary target/release/sito (verification skipped)..."
     stop_service_for_install
+    # Back up only after the service stopped: a running service can still write
+    # config.toml, so an earlier copy would capture a half-applied state.
+    backup_config_if_present
     install_binary_atomic "target/release/sito"
 else
     install_cosign_if_missing
@@ -552,6 +616,9 @@ else
         exit 1
     fi
     stop_service_for_install
+    # Back up only after the service stopped: a running service can still write
+    # config.toml, so an earlier copy would capture a half-applied state.
+    backup_config_if_present
     install_binary_atomic "${TMP_DIR}/sito"
 fi
 
@@ -748,6 +815,11 @@ EOF
     else
         echo "sito service is active and responding."
     fi
+else
+    echo "Warning: systemd is not available (systemctl not found); no service unit was" >&2
+    echo "Warning: installed and sito was not started. The binary is at ${INSTALL_BIN}." >&2
+    echo "Warning: supervise it with your init system, or install systemd and re-run this" >&2
+    echo "Warning: installer. Use SITO_SYSTEMCTL=<path> to point at a non-standard systemctl." >&2
 fi
 
 INSTALL_COMMITTED=1

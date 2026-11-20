@@ -727,8 +727,162 @@ async fn extract_binary_from_file(archive_path: &Path) -> Result<Vec<u8>, Update
     .map_err(|e| UpdateError::Other(format!("Archive extraction task failed: {e}")))?
 }
 
+/// Lists every extended attribute name on `path`.
+#[cfg(unix)]
+fn list_xattr_names(path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "executable path contains a NUL byte",
+        )
+    })?;
+
+    loop {
+        // SAFETY: `c_path` is a valid NUL-terminated path and a null buffer with
+        // length 0 is the documented way to query the required size.
+        let size = unsafe { libc::listxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            let err = std::io::Error::last_os_error();
+            // Filesystems without xattr support have nothing to preserve.
+            if err.raw_os_error() == Some(libc::ENOTSUP) {
+                return Ok(Vec::new());
+            }
+            return Err(err);
+        }
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut buffer = vec![0u8; size as usize];
+        // SAFETY: the buffer is valid for `buffer.len()` bytes and the path is
+        // NUL-terminated.
+        let written = unsafe {
+            libc::listxattr(
+                c_path.as_ptr(),
+                buffer.as_mut_ptr().cast::<libc::c_char>(),
+                buffer.len(),
+            )
+        };
+        if written < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ERANGE) {
+                // Attributes grew between the size query and the read; retry.
+                continue;
+            }
+            return Err(err);
+        }
+        buffer.truncate(written as usize);
+        return Ok(buffer
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect());
+    }
+}
+
+/// Reads one extended attribute value from `path`.
+#[cfg(unix)]
+fn get_xattr(path: &Path, name: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "executable path contains a NUL byte",
+        )
+    })?;
+    let c_name = CString::new(name).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "extended attribute name contains a NUL byte",
+        )
+    })?;
+
+    loop {
+        // SAFETY: valid path and name pointers; a null buffer queries the size.
+        let size =
+            unsafe { libc::getxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut buffer = vec![0u8; size as usize];
+        // SAFETY: buffer is valid for `buffer.len()` bytes.
+        let written = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+            )
+        };
+        if written < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ERANGE) {
+                continue;
+            }
+            return Err(err);
+        }
+        buffer.truncate(written as usize);
+        return Ok(buffer);
+    }
+}
+
+/// Copies every extended attribute (including `security.capability`) from
+/// `source` to `destination`.
+#[cfg(unix)]
+fn copy_xattrs(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_dest = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination path contains a NUL byte",
+        )
+    })?;
+
+    for name in list_xattr_names(source)? {
+        let value = get_xattr(source, &name)?;
+        let c_name = CString::new(name).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "extended attribute name contains a NUL byte",
+            )
+        })?;
+        // SAFETY: valid NUL-terminated path/name and a value buffer valid for
+        // `value.len()` bytes.
+        let rc = unsafe {
+            libc::setxattr(
+                c_dest.as_ptr(),
+                c_name.as_ptr(),
+                value.as_ptr().cast::<libc::c_void>(),
+                value.len(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Writes the extracted binary next to the running executable and renames it
 /// into place, removing the temporary file on any failure.
+///
+/// When the target already exists its permission bits and extended attributes
+/// (notably `security.capability`, which grants `CAP_NET_BIND_SERVICE`) are
+/// copied onto the replacement before the rename, so an update cannot silently
+/// strip the capability the service needs to bind privileged DNS ports. A
+/// missing target is installed mode 0755.
 async fn install_binary_atomically(
     binary_content: &[u8],
     current_exe: &Path,
@@ -736,6 +890,14 @@ async fn install_binary_atomically(
     let parent_dir = current_exe.parent().ok_or_else(|| {
         UpdateError::Other("Could not resolve parent directory of executable".to_string())
     })?;
+
+    #[cfg(unix)]
+    let existing_metadata = match tokio::fs::metadata(current_exe).await {
+        Ok(metadata) if metadata.is_file() => Some(metadata),
+        Ok(_) => None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
 
     let temp_exe = parent_dir.join(format!(".sito_update_{}", rand::random::<u32>()));
     let _temp_guard = TempFileGuard::new(temp_exe.clone());
@@ -745,8 +907,22 @@ async fn install_binary_atomically(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
+
+        let mode = existing_metadata
+            .as_ref()
+            .map_or(0o755, |metadata| metadata.permissions().mode() & 0o7777);
+        let perms = std::fs::Permissions::from_mode(mode);
         tokio::fs::set_permissions(&temp_exe, perms).await?;
+
+        if existing_metadata.is_some() {
+            let source = current_exe.to_path_buf();
+            let destination = temp_exe.clone();
+            tokio::task::spawn_blocking(move || copy_xattrs(&source, &destination))
+                .await
+                .map_err(|err| {
+                    UpdateError::Other(format!("Extended-attribute copy task failed: {err}"))
+                })??;
+        }
     }
 
     tokio::fs::rename(&temp_exe, current_exe).await?;
@@ -1362,5 +1538,130 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         assert!(leaked.is_empty(), "temp executable leaked: {leaked:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_install_preserves_existing_mode_and_xattrs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_scratch_dir("metadata");
+        let target = dir.join("sito");
+        std::fs::write(&target, b"old-binary").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o751)).unwrap();
+
+        let attr_name = b"user.sito.test";
+        let attr_value = b"preserve-me";
+        let xattr_supported = set_test_xattr(&target, attr_name, attr_value);
+
+        install_binary_atomically(b"new-binary", &target)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-binary");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o751,
+            "the existing executable mode must be preserved"
+        );
+        if xattr_supported {
+            assert_eq!(
+                get_xattr(&target, attr_name).unwrap(),
+                attr_value,
+                "extended attributes must survive the rename"
+            );
+        } else {
+            eprintln!("filesystem does not support user xattrs; skipped xattr assertion");
+        }
+
+        let leaked: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".sito_update_"))
+            .collect();
+        assert!(leaked.is_empty(), "temp executable leaked: {leaked:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_install_uses_0755_when_target_is_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_scratch_dir("fresh-mode");
+        let target = dir.join("sito");
+
+        install_binary_atomically(b"new-binary", &target)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o755,
+            "a fresh install must be executable mode 0755"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_install_preserves_security_capability_when_root() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("not running as root; skipped security.capability preservation test");
+            return;
+        }
+
+        let dir = test_scratch_dir("capability");
+        let target = dir.join("sito");
+        std::fs::write(&target, b"old-binary").unwrap();
+        let status = std::process::Command::new("setcap")
+            .args(["cap_net_bind_service=+ep"])
+            .arg(&target)
+            .status();
+        if !status.is_ok_and(|status| status.success()) {
+            eprintln!("setcap unavailable or failed; skipped capability test");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let before = get_xattr(&target, b"security.capability").unwrap();
+        assert_ne!(before, Vec::<u8>::new());
+
+        install_binary_atomically(b"new-binary", &target)
+            .await
+            .unwrap();
+
+        let after = get_xattr(&target, b"security.capability").unwrap();
+        assert_eq!(
+            before, after,
+            "security.capability must survive the atomic replacement"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn set_test_xattr(path: &Path, name: &[u8], value: &[u8]) -> bool {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let c_name = CString::new(name).unwrap();
+        // SAFETY: valid path/name/value pointers for the given lengths.
+        let rc = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                value.as_ptr().cast::<libc::c_void>(),
+                value.len(),
+                0,
+            )
+        };
+        if rc == 0 {
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        matches!(err.raw_os_error(), Some(libc::ENOTSUP | libc::EPERM))
     }
 }
