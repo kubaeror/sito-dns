@@ -1428,8 +1428,9 @@ timeout; a failure keeps setup pending and DNS gated instead of reporting
 success. OpenAPI declares bearer/cookie security, stable
 tags and the previously missing WebSocket and alias paths, with structural
 drift tests. Authenticated responses are `no-store`/`Vary: Cookie`; the
-querylog WebSocket validates Origin and restricts legacy `?token=` to its own
-path. The updater detects systemd/Docker, refuses in-app apply with CLI
+querylog WebSocket validates Origin. WP-2.11 initially confined the legacy
+`?token=` parameter to that path; WP-2.14 now rejects it entirely (cookie or
+Bearer only). The updater detects systemd/Docker, refuses in-app apply with CLI
 instructions, never claims an unknown version is current, serializes applies,
 verifies the staged binary, backs up/restores the old binary, and enforces
 0600/0700 temp modes plus strict signature-pair policy. Viewer subscription
@@ -1439,7 +1440,7 @@ updater section in `docs/audit6-test-matrix.md` and §26 of
 compatibility facade are absent and deferred; systemd unit/installer E2E and
 atomic installer rollback are WP-2.13; the update lock is process-wide (no
 cross-process file lock); legacy `?token=` WebSocket authentication removal is
-WP-2.14; weighted upstream balancing remains unimplemented.
+implemented by WP-2.14; weighted upstream balancing remains unimplemented.
 
 ### WP-2.12 — Stats retention, PII, and polling
 

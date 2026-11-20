@@ -6,8 +6,10 @@
 > reading it, and the v2 watermark stores the **shared projection**, not the
 > exact per-node document. Before the first v2 start, back up and move
 > `ha_state.toml`/`ha_watermark.toml` aside (see the
-> [2.0 migration guide](2.0-migration.md#82-ha-protocol-v2-upgrade)). Current
-> operator contracts are in the [2.0 claim matrix](2.0-claim-matrix.md).
+> [2.0 migration guide](2.0-migration.md#82-ha-protocol-v2-upgrade)). The 2.0
+> querylog WebSocket also rejects the legacy `?token=` query parameter; use a
+> session cookie or `Authorization: Bearer` header. Current operator contracts
+> are in the [2.0 claim matrix](2.0-claim-matrix.md).
 
 Target release: **1.9.4** on 2026-11-10. This is the Phase 0 **safety-gate**
 patch: it closes the release-blocking P0 and directly exploitable P1 findings

@@ -220,8 +220,8 @@ pub async fn clear_querylog(
 ///
 /// The Origin header is validated before the upgrade: `null` and cross-origin
 /// handshakes are rejected, and a session-authenticated browser request must
-/// send a same-origin `Origin`. Token clients (Bearer or deprecated
-/// `?token=`) are not browser-ambient and may omit it.
+/// send a same-origin `Origin`. Bearer-token clients are not browser-ambient
+/// and may omit it. The legacy `?token=` query parameter is not accepted.
 #[utoipa::path(
     get,
     path = "/api/v1/querylog/stream",

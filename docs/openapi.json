@@ -2991,7 +2991,7 @@
           "QueryLog"
         ],
         "summary": "WebSocket live tail endpoint streaming query log entries in real-time.",
-        "description": "The Origin header is validated before the upgrade: `null` and cross-origin\nhandshakes are rejected, and a session-authenticated browser request must\nsend a same-origin `Origin`. Token clients (Bearer or deprecated\n`?token=`) are not browser-ambient and may omit it.",
+        "description": "The Origin header is validated before the upgrade: `null` and cross-origin\nhandshakes are rejected, and a session-authenticated browser request must\nsend a same-origin `Origin`. Bearer-token clients are not browser-ambient\nand may omit it. The legacy `?token=` query parameter is not accepted.",
         "operationId": "stream_querylog",
         "responses": {
           "101": {

@@ -509,9 +509,9 @@ on the next start (see section 1).
   cannot evict an account whose lockout is still active.
 * Expired tokens are rejected immediately and removed from memory; their
   on-disk snapshot is rewritten by the background pruner within 60 seconds.
-* The legacy `?token=` query parameter is accepted only on a WebSocket upgrade
-  with no `Authorization` header, logs a deprecation warning, and is scheduled
-  for removal in 2.0. Use `Authorization: Bearer` or a session cookie.
+* WebSocket authentication uses only an `Authorization: Bearer` header or the
+  session cookie. The legacy `?token=` query parameter is removed (BC-8); do
+  not put credentials in a URL, where proxies and access logs can capture them.
 
 ## 9. Audit Trail
 

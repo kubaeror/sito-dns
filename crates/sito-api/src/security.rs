@@ -224,9 +224,9 @@ pub(crate) fn same_origin(
 /// Validates the `Origin` header of a WebSocket upgrade before the handshake.
 ///
 /// * A present `Origin` must be same-origin; `Origin: null` is always rejected.
-/// * A missing `Origin` is accepted only for token-authenticated clients
-///   (Bearer or the deprecated query token), which are not browser-ambient.
-///   Session-authenticated upgrades are browser requests and must carry it.
+/// * A missing `Origin` is accepted only for Bearer-token clients, which are
+///   not browser-ambient. Session-authenticated upgrades are browser requests
+///   and must carry it.
 pub(crate) fn validate_websocket_origin(
     headers: &HeaderMap,
     peer: Option<SocketAddr>,

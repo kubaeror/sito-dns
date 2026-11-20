@@ -89,13 +89,13 @@ WP-2.14. Phase 3 verification/release (WP-3.1 through WP-3.4) remains pending.
   backs up/restores the old binary, enforces `0600`/`0700` temp modes and
   always verifies a present signature pair. See §26 of
   `docs/2.0-public-api-diff.md`.
-- WP-2.14 (docs/migration): the 2.0 guide now records BC-8 (legacy WebSocket
-  `?token=` removal) and BC-9 (systemd/Docker update path plus stricter MAC,
-  rewrite and upstream/filter validation), fixes the section map and stale HA
+- WP-2.14 (docs/migration + WebSocket auth): the 2.0 guide records BC-8 and
+  BC-9 (systemd/Docker update path plus stricter MAC, rewrite and
+  upstream/filter validation), fixes the section map and stale HA
   protocol/watermark claims, and adds the current
-  [2.0 claim matrix](docs/2.0-claim-matrix.md). BC-8's code removal is the
-  companion change; until it lands, the deprecated query parameter is the only
-  remaining exception.
+  [2.0 claim matrix](docs/2.0-claim-matrix.md). BC-8 is implemented: the
+  querylog WebSocket accepts only a session cookie or `Authorization: Bearer`
+  credential; the `?token=` query parameter is rejected.
 
 ## [1.9.5] - 2026-11-10
 
