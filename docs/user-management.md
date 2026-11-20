@@ -117,6 +117,22 @@ Role checks are enforced by the API extractors (`RequireViewer`,
 treated as that token's role. A role change applies to future requests
 immediately and revokes all existing sessions of the affected account.
 
+### Re-authentication for sensitive changes
+
+A stolen browser session must not be able to change a password, change a role,
+create an Admin account, or mint an Admin-scoped token. When the caller
+authenticates with a **user session**, those operations require a fresh,
+session-bound re-authentication ticket from `POST /api/v1/auth/reauth`
+(`X-Reauth-Token`) or, in the web UI, the caller's current password plus a
+current TOTP/backup code when 2FA is enrolled. The ticket is single-use and is
+consumed only after the mutation succeeds.
+
+Requests authenticated with an **Admin API token** are deliberately exempt:
+a bearer token is a standalone privileged credential, not a session that can be
+hijacked by a browser-side attacker, and it is already protected as a secret.
+Changing a password still always requires a user session (API tokens are
+rejected with `403`).
+
 ## 3. Create, List, and Delete Accounts
 
 Requires an Admin session or an Admin-scoped API token.
@@ -144,6 +160,8 @@ Rules enforced by the API:
   characters, and not the bootstrap password `adminadmin`.
 * Roles: `viewer`, `operator`, or `admin` (case-insensitive).
 * Creating a username that already exists returns `409 Conflict`.
+* Creating an **Admin** account from a user session also requires
+  `X-Reauth-Token` (Admin API tokens are exempt, see above).
 
 Delete an account:
 
@@ -172,10 +190,15 @@ Admin-managed until explicitly revoked.
 
 ```bash
 curl -sS -X PUT "$SITO/api/v1/auth/users/alice" \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Cookie: sito_session=<admin-session-id>" \
+  -H "X-Reauth-Token: <reauth-token>" \
   -H 'Content-Type: application/json' \
   -d '{"role":"viewer"}'
 ```
+
+Every role change from a user session requires the re-authentication ticket;
+Admin API tokens are exempt. The UI users form asks for the caller's current
+password (and TOTP/backup code when enabled) instead of a ticket.
 
 A role change revokes all sessions belonging to the target account **and all
 API tokens it owns**, so the new role (and the loss of old privileges) is
@@ -213,23 +236,27 @@ reported as successful before it is durable.
 ## 5. Change a Password
 
 Requires an authenticated **user session**. API tokens are rejected with
-`403 Forbidden` so a leaked token cannot rotate an account password.
+`403 Forbidden` so a leaked token cannot rotate an account password. Every
+role (Viewer, Operator, Admin) may change its own password.
 
-Self-service (current password required):
+Self-service (current password required; `totp_code` is also required when TOTP
+is enabled):
 
 ```bash
 curl -sS -X POST "$SITO/api/v1/auth/change-password" \
   -H "Cookie: sito_session=<session-id>" \
   -H 'Content-Type: application/json' \
-  -d '{"current_password":"CorrectHorse1","new_password":"NewCorrectHorse2"}'
+  -d '{"current_password":"CorrectHorse1","totp_code":"123456","new_password":"NewCorrectHorse2"}'
 ```
 
-Administrator override for another account (audited at `warn` level). This also
-requires a user session; API tokens cannot change passwords:
+Administrator override for another account (audited at `warn` level) requires a
+user session **and** a fresh session-bound re-authentication ticket. Non-Admin
+callers receive `403 Forbidden`:
 
 ```bash
 curl -sS -X POST "$SITO/api/v1/auth/change-password" \
   -H "Cookie: sito_session=<admin-session-id>" \
+  -H "X-Reauth-Token: <reauth-token>" \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice","new_password":"NewCorrectHorse2"}'
 ```
@@ -265,6 +292,11 @@ curl -sS -X POST "$SITO/api/v1/auth/tokens" \
   -H 'Content-Type: application/json' \
   -d '{"name":"grafana","scope":"viewer"}'
 ```
+
+Creating a token with `"scope":"admin"` from a user session additionally
+requires `X-Reauth-Token`; Admin API tokens are exempt. The `/account` page
+shows the same fields and asks for the current password (plus TOTP/backup code
+when enabled). Lower-scoped tokens do not require a second proof.
 
 The response contains `id`, `name`, `scope`, and the plaintext `token`
 (`sito_...`). Store it in a secret manager; it cannot be retrieved again.

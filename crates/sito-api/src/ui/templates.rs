@@ -353,6 +353,8 @@ pub struct WizardTemplate<'a> {
     pub setup_required: bool,
     /// Setup token supplied by the requester (never revealed on its own).
     pub setup_token: &'a str,
+    /// Optional re-authentication ticket supplied by an Admin.
+    pub reauth_token: &'a str,
 }
 
 #[cfg(test)]

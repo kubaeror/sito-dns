@@ -777,6 +777,7 @@ async fn test_wizard_custom_config_and_presets() {
 
     let custom_form = WizardCompleteForm {
         setup_token: None,
+        reauth_token: None,
         admin_user: Some("customadmin".to_string()),
         admin_password: Some("custompassword123".to_string()),
         confirm_password: Some("custompassword123".to_string()),
@@ -1109,6 +1110,72 @@ async fn test_wizard_completion_requires_setup_token_when_provisioned() {
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert!(!ctx.auth_mgr.setup_token_required());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// WP-2.10: when the printed setup token is required, an Admin session is no
+/// longer exempt; it must present the token or a fresh reauth ticket.
+#[tokio::test]
+async fn test_wizard_admin_recovery_requires_setup_token_or_reauth() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_wizard_recovery_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let mut ctx = mock_context(&temp_dir).await;
+    ctx.auth_mgr = Arc::new(crate::auth::AuthManager::with_storage(&temp_dir, 24, 5).unwrap());
+    assert!(ctx.auth_mgr.setup_token_required());
+
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("bootstrap admin login failed");
+    };
+    let headers = session_headers(&session);
+
+    let base_form = || WizardCompleteForm {
+        setup_token: None,
+        reauth_token: None,
+        admin_user: Some("admin".to_string()),
+        admin_password: Some("Str0ngPassword!".to_string()),
+        ..Default::default()
+    };
+
+    // An Admin session alone is not enough while the setup token is pending.
+    let resp = wizard_complete_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        crate::auth::MaybeConnectInfo(None),
+        headers.clone(),
+        Form(base_form()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(ctx.auth_mgr.setup_token_required());
+
+    // A fresh ticket bound to the Admin session is accepted instead.
+    let ticket = ctx
+        .auth_mgr
+        .reauth("admin", "adminadmin", None, &session.id, "")
+        .await
+        .expect("reauth ticket");
+    let mut form = base_form();
+    form.reauth_token = Some(ticket.token);
+    let resp = wizard_complete_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        crate::auth::MaybeConnectInfo(None),
+        headers,
+        Form(form),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(!ctx.auth_mgr.setup_token_required());
+    assert!(matches!(
+        ctx.auth_mgr
+            .login("admin", "Str0ngPassword!", "127.0.0.2")
+            .await,
+        LoginResult::Success(_)
+    ));
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -2017,11 +2084,14 @@ async fn test_users_create_role_delete_flow() {
     // Weak passwords and invalid roles are rejected by the shared policy.
     let resp = users_create_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Form(CreateUserForm {
             username: "bob".to_string(),
             password: "short".to_string(),
             role: "viewer".to_string(),
+            reauth_password: None,
+            reauth_code: None,
         }),
     )
     .await;
@@ -2030,11 +2100,14 @@ async fn test_users_create_role_delete_flow() {
 
     let resp = users_create_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Form(CreateUserForm {
             username: "  alice  ".to_string(),
             password: "AlicePassword1".to_string(),
             role: "operator".to_string(),
+            reauth_password: None,
+            reauth_code: None,
         }),
     )
     .await;
@@ -2051,11 +2124,14 @@ async fn test_users_create_role_delete_flow() {
     // Duplicate creation is a conflict and does not overwrite the account.
     let resp = users_create_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Form(CreateUserForm {
             username: "alice".to_string(),
             password: "OtherPassword1".to_string(),
             role: "viewer".to_string(),
+            reauth_password: None,
+            reauth_code: None,
         }),
     )
     .await;
@@ -2064,10 +2140,13 @@ async fn test_users_create_role_delete_flow() {
 
     let resp = users_role_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Path("alice".to_string()),
         Form(UpdateUserRoleForm {
             role: "viewer".to_string(),
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
         }),
     )
     .await;
@@ -2104,10 +2183,13 @@ async fn test_users_last_admin_protected() {
 
     let resp = users_role_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Path("admin".to_string()),
         Form(UpdateUserRoleForm {
             role: "viewer".to_string(),
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
         }),
     )
     .await;
@@ -2150,6 +2232,7 @@ async fn test_account_password_change() {
         headers.clone(),
         Form(AccountPasswordForm {
             current_password: "wrong-password".to_string(),
+            code: None,
             new_password: "NewAdminPassword1".to_string(),
         }),
     )
@@ -2171,6 +2254,7 @@ async fn test_account_password_change() {
         headers.clone(),
         Form(AccountPasswordForm {
             current_password: "p".repeat(MAX_LOGIN_PASSWORD_BYTES + 1),
+            code: None,
             new_password: "NewAdminPassword1".to_string(),
         }),
     )
@@ -2193,6 +2277,7 @@ async fn test_account_password_change() {
         headers,
         Form(AccountPasswordForm {
             current_password: "  adminadmin  ".to_string(),
+            code: None,
             new_password: "NewAdminPassword1".to_string(),
         }),
     )
@@ -2204,6 +2289,225 @@ async fn test_account_password_change() {
             .await,
         LoginResult::Success(_)
     ));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// WP-2.10: a TOTP-enrolled account must supply a current code to change its
+/// password from the account page.
+#[tokio::test]
+async fn test_account_password_change_requires_totp_code() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_account_pw_totp_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    ctx.auth_mgr
+        .create_user("alice", "AlicePassword1", Role::Operator)
+        .await;
+    let setup = ctx.auth_mgr.init_totp_setup("alice").await.expect("setup");
+    assert!(
+        ctx.auth_mgr
+            .confirm_totp_setup("alice", &setup.backup_codes[0])
+            .await
+    );
+
+    let LoginResult::TotpRequired { partial_token } = ctx
+        .auth_mgr
+        .login("alice", "AlicePassword1", "127.0.0.1")
+        .await
+    else {
+        panic!("TOTP challenge expected");
+    };
+    let crate::auth::manager::TotpVerifyResult::Success(session) = ctx
+        .auth_mgr
+        .verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.1")
+        .await
+    else {
+        panic!("TOTP verification failed");
+    };
+    let headers = session_headers(&session);
+
+    let missing = account_password_handler(
+        State(ctx.clone()),
+        headers.clone(),
+        Form(AccountPasswordForm {
+            current_password: "AlicePassword1".to_string(),
+            code: None,
+            new_password: "AlicePassword2".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    let wrong = account_password_handler(
+        State(ctx.clone()),
+        headers.clone(),
+        Form(AccountPasswordForm {
+            current_password: "AlicePassword1".to_string(),
+            code: Some("000000".to_string()),
+            new_password: "AlicePassword2".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        ctx.auth_mgr
+            .verify_user_password("alice", "AlicePassword1")
+            .await
+    );
+
+    let changed = account_password_handler(
+        State(ctx.clone()),
+        headers,
+        Form(AccountPasswordForm {
+            current_password: "AlicePassword1".to_string(),
+            code: Some(setup.backup_codes[2].clone()),
+            new_password: "AlicePassword2".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(changed.status(), StatusCode::SEE_OTHER);
+    assert!(
+        ctx.auth_mgr
+            .verify_user_password("alice", "AlicePassword2")
+            .await
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// WP-2.10: role changes and Admin creation from the users page require the
+/// caller's password (and TOTP code when enabled).
+#[tokio::test]
+async fn test_users_role_change_requires_reauth() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_users_reauth_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    ctx.auth_mgr
+        .create_user("alice", "AlicePassword1", Role::Viewer)
+        .await;
+
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+    let headers = session_headers(&session);
+
+    let no_proof = users_role_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers.clone(),
+        Path("alice".to_string()),
+        Form(UpdateUserRoleForm {
+            role: "operator".to_string(),
+            reauth_password: None,
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(no_proof.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(ctx.auth_mgr.role_of("alice"), Some(Role::Viewer));
+
+    let changed = users_role_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers.clone(),
+        Path("alice".to_string()),
+        Form(UpdateUserRoleForm {
+            role: "operator".to_string(),
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(changed.status(), StatusCode::SEE_OTHER);
+    assert_eq!(ctx.auth_mgr.role_of("alice"), Some(Role::Operator));
+
+    // Creating an Admin account requires the same proof.
+    let no_proof = users_create_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers.clone(),
+        Form(CreateUserForm {
+            username: "newadmin".to_string(),
+            password: "NewAdminPass1".to_string(),
+            role: "admin".to_string(),
+            reauth_password: None,
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(no_proof.status(), StatusCode::BAD_REQUEST);
+    assert!(!ctx.auth_mgr.has_user("newadmin"));
+
+    let created = users_create_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers,
+        Form(CreateUserForm {
+            username: "newadmin".to_string(),
+            password: "NewAdminPass1".to_string(),
+            role: "admin".to_string(),
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    assert_eq!(ctx.auth_mgr.role_of("newadmin"), Some(Role::Admin));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// WP-2.10: minting an Admin-scoped token from the account page requires
+/// re-authentication; lower scopes do not.
+#[tokio::test]
+async fn test_account_admin_token_requires_reauth() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_admin_token_reauth_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+    let headers = session_headers(&session);
+
+    let no_proof = account_token_create_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers.clone(),
+        Form(CreateAccountTokenForm {
+            name: "admin-scoped".to_string(),
+            scope: "admin".to_string(),
+            reauth_password: None,
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(no_proof.status(), StatusCode::BAD_REQUEST);
+    assert!(ctx.auth_mgr.list_tokens().is_empty());
+
+    let created = account_token_create_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers,
+        Form(CreateAccountTokenForm {
+            name: "admin-scoped".to_string(),
+            scope: "admin".to_string(),
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    assert_eq!(ctx.auth_mgr.list_tokens().len(), 1);
+    assert_eq!(ctx.auth_mgr.list_tokens()[0].scope, Role::Admin);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -2224,10 +2528,13 @@ async fn test_account_tokens_create_and_revoke() {
 
     let resp = account_token_create_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Form(CreateAccountTokenForm {
             name: "  ci-deploy  ".to_string(),
             scope: "viewer".to_string(),
+            reauth_password: None,
+            reauth_code: None,
         }),
     )
     .await;
@@ -2336,10 +2643,13 @@ async fn test_account_token_scope_capped_at_user_role() {
 
     let resp = account_token_create_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Form(CreateAccountTokenForm {
             name: "escalation".to_string(),
             scope: "admin".to_string(),
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
         }),
     )
     .await;
@@ -2351,10 +2661,13 @@ async fn test_account_token_scope_capped_at_user_role() {
 
     let resp = account_token_create_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers,
         Form(CreateAccountTokenForm {
             name: "read-only".to_string(),
             scope: "viewer".to_string(),
+            reauth_password: None,
+            reauth_code: None,
         }),
     )
     .await;

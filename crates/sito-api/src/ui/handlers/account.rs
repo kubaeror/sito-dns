@@ -82,6 +82,9 @@ pub async fn account_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
 #[derive(Deserialize)]
 pub struct AccountPasswordForm {
     pub current_password: String,
+    /// Current TOTP or backup code; required when TOTP is enabled.
+    #[serde(default)]
+    pub code: Option<String>,
     pub new_password: String,
 }
 
@@ -130,6 +133,37 @@ pub async fn account_password_handler(
             ProblemDetails::bad_request("Current password is incorrect"),
         );
     }
+    // A password change is credential-equivalent: when a second factor is
+    // enrolled, a stolen session alone must not be able to rotate it.
+    if ctx.auth_mgr.totp_enabled(&user.username) {
+        let code = form
+            .code
+            .as_deref()
+            .map(str::trim)
+            .filter(|code| !code.is_empty());
+        let Some(code) = code else {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request(
+                    "A current TOTP or backup code is required to change your password",
+                ),
+            );
+        };
+        if !ctx
+            .auth_mgr
+            .verify_second_factor(&user.username, code)
+            .await
+        {
+            return account_problem_page(
+                &ctx,
+                &user,
+                &csrf,
+                ProblemDetails::bad_request("Invalid or expired TOTP or backup code"),
+            );
+        }
+    }
     if let Err(err) = ctx
         .auth_mgr
         .update_user_password_checked(&user.username, &form.new_password)
@@ -156,10 +190,17 @@ pub async fn account_password_handler(
 pub struct CreateAccountTokenForm {
     pub name: String,
     pub scope: String,
+    /// Caller's current password; required to mint an Admin-scoped token.
+    #[serde(default)]
+    pub reauth_password: Option<String>,
+    /// Caller's TOTP or backup code when TOTP is enabled.
+    #[serde(default)]
+    pub reauth_code: Option<String>,
 }
 
 pub async fn account_token_create_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Form(form): Form<CreateAccountTokenForm>,
 ) -> Response {
@@ -205,6 +246,25 @@ pub async fn account_token_create_handler(
             ProblemDetails::forbidden("A token scope may not exceed your own role"),
         );
     }
+    // An Admin-scoped token is the Admin credential in bearer form; a stolen
+    // session must prove the account's own password (and second factor) first.
+    let proof = if scope == Role::Admin {
+        match ui_reauth(
+            &ctx,
+            &user,
+            &headers,
+            peer_addr,
+            form.reauth_password.as_deref(),
+            form.reauth_code.as_deref(),
+        )
+        .await
+        {
+            Ok(proof) => Some(proof),
+            Err(problem) => return account_problem_page(&ctx, &user, &csrf, problem),
+        }
+    } else {
+        None
+    };
 
     let (_meta, token) = match ctx
         .auth_mgr
@@ -221,6 +281,9 @@ pub async fn account_token_create_handler(
             );
         }
     };
+    if let Some(proof) = proof {
+        proof.consume(&ctx);
+    }
     tracing::info!(user = %user.username, token = %token.id, "User created an API token from the web UI");
     // The plaintext token is shown only in this response and is never stored
     // or logged; reloading the page lists metadata only.

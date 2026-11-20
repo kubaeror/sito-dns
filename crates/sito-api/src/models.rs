@@ -597,6 +597,10 @@ pub struct ChangePasswordRequest {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_password: Option<String>,
+    /// Current TOTP or backup code; required for self-service when TOTP is
+    /// enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp_code: Option<String>,
     pub new_password: String,
 }
 

@@ -374,6 +374,7 @@ mod tests {
             csrf_token: "",
             setup_required: true,
             setup_token: "test-token",
+            reauth_token: "",
         };
         assert!(wiz_tmpl.render().unwrap().contains("Welcome to sito DNS"));
     }

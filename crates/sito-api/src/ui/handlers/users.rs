@@ -79,10 +79,17 @@ pub struct CreateUserForm {
     pub username: String,
     pub password: String,
     pub role: String,
+    /// Caller's current password; required when creating an Admin.
+    #[serde(default)]
+    pub reauth_password: Option<String>,
+    /// Caller's TOTP or backup code when TOTP is enabled.
+    #[serde(default)]
+    pub reauth_code: Option<String>,
 }
 
 pub async fn users_create_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Form(form): Form<CreateUserForm>,
 ) -> Response {
@@ -100,6 +107,26 @@ pub async fn users_create_handler(
         }) {
         Ok(role) => role,
         Err(problem) => return users_problem_page(&ctx, &user, &csrf, problem),
+    };
+
+    // Creating an Admin is a privilege escalation primitive; prove the caller's
+    // own credential before doing it. Admin API tokens do not reach the UI.
+    let proof = if role == Role::Admin {
+        match ui_reauth(
+            &ctx,
+            &user,
+            &headers,
+            peer_addr,
+            form.reauth_password.as_deref(),
+            form.reauth_code.as_deref(),
+        )
+        .await
+        {
+            Ok(proof) => Some(proof),
+            Err(problem) => return users_problem_page(&ctx, &user, &csrf, problem),
+        }
+    } else {
+        None
     };
 
     if ctx.auth_mgr.has_user(username) {
@@ -123,6 +150,9 @@ pub async fn users_create_handler(
             ProblemDetails::internal_error(format!("Failed to persist the user store: {e}")),
         );
     }
+    if let Some(proof) = proof {
+        proof.consume(&ctx);
+    }
     tracing::info!(
         actor = %user.username,
         target = %username,
@@ -135,10 +165,17 @@ pub async fn users_create_handler(
 #[derive(Deserialize)]
 pub struct UpdateUserRoleForm {
     pub role: String,
+    /// Caller's current password; every UI role change requires it.
+    #[serde(default)]
+    pub reauth_password: Option<String>,
+    /// Caller's TOTP or backup code when TOTP is enabled.
+    #[serde(default)]
+    pub reauth_code: Option<String>,
 }
 
 pub async fn users_role_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Path(username): Path<String>,
     Form(form): Form<UpdateUserRoleForm>,
@@ -159,10 +196,24 @@ pub async fn users_role_handler(
             );
         }
     };
+    let proof = match ui_reauth(
+        &ctx,
+        &user,
+        &headers,
+        peer_addr,
+        form.reauth_password.as_deref(),
+        form.reauth_code.as_deref(),
+    )
+    .await
+    {
+        Ok(proof) => proof,
+        Err(problem) => return users_problem_page(&ctx, &user, &csrf, problem),
+    };
     if let Err(err) = ctx.auth_mgr.set_user_role_checked(&username, role).await {
         let problem = user_mutation_problem(&username, "demote", err);
         return users_problem_page(&ctx, &user, &csrf, problem);
     }
+    proof.consume(&ctx);
     tracing::info!(
         actor = %user.username,
         target = %username,

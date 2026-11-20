@@ -25,6 +25,7 @@
           @submit="if (!confirm($el.dataset.confirm)) { $event.preventDefault(); }"
           data-confirm="Complete setup and apply the configuration?">
       <input type="hidden" name="setup_token" value="{{ setup_token }}">
+      <input type="hidden" name="reauth_token" value="{{ reauth_token }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <!-- Section 1: Administrator Account -->
       <div style="margin-bottom: 24px;">

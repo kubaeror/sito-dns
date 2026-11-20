@@ -11,6 +11,10 @@ use super::*;
 pub struct SetupTokenQuery {
     #[serde(default)]
     pub setup_token: Option<String>,
+    /// Optional re-authentication ticket for an Admin recovering first-boot
+    /// setup without the printed setup token.
+    #[serde(default)]
+    pub reauth_token: Option<String>,
 }
 
 pub async fn wizard_page(
@@ -35,6 +39,7 @@ pub async fn wizard_page(
     // Only echo a token the requester already supplied; never reveal the
     // stored setup token in the rendered page on its own.
     let setup_token = params.setup_token.unwrap_or_default();
+    let reauth_token = params.reauth_token.unwrap_or_default();
 
     HtmlTemplate(WizardTemplate {
         is_authenticated: auth_user.is_some(),
@@ -45,6 +50,7 @@ pub async fn wizard_page(
         csrf_token: &csrf,
         setup_required,
         setup_token: &setup_token,
+        reauth_token: &reauth_token,
     })
     .into_response()
 }
@@ -53,6 +59,9 @@ pub async fn wizard_page(
 pub struct WizardCompleteForm {
     /// One-time first-boot setup token (required while setup is pending).
     pub setup_token: Option<String>,
+    /// Alternative proof for an Admin session: a fresh re-authentication
+    /// ticket bound to that session.
+    pub reauth_token: Option<String>,
 
     // 1. Administrator account
     pub admin_user: Option<String>,
@@ -476,7 +485,6 @@ pub async fn wizard_complete_handler(
     // are recoverable only with the setup token.
     let bootstrapping = is_first_run || setup_token_required;
     let auth_user = get_session_user(&ctx, &headers);
-    let is_admin = auth_user.as_ref().is_some_and(|u| u.role == Role::Admin);
 
     // WP-0.7 (P1-16): completing the wizard mutates the administrator password.
     // It must never be reachable after setup, even for a valid Admin session;
@@ -488,10 +496,12 @@ pub async fn wizard_complete_handler(
         );
     }
 
-    // Bootstrap completion requires the one-time setup token (authenticated
-    // admins and in-memory test managers without a provisioned token are
-    // exempt). The requirement was captured under the completion lock.
-    if setup_token_required && !is_admin {
+    // Bootstrap completion requires the one-time setup token. An Admin session
+    // may instead present a fresh re-authentication ticket (recovery edge:
+    // the printed token was lost but the Admin can still prove their
+    // credential). The requirement was captured under the completion lock.
+    let mut reauth_proof: Option<(String, String, String)> = None;
+    if setup_token_required {
         let config = ctx.config.load();
         let trusted_proxies = config.get_web_config().trusted_proxies.clone();
         drop(config);
@@ -501,20 +511,45 @@ pub async fn wizard_complete_handler(
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty());
-        match ctx.auth_mgr.validate_setup_token(candidate, &client_ip) {
-            crate::auth::SetupTokenStatus::Valid => {}
-            crate::auth::SetupTokenStatus::RateLimited => {
-                return error_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "Too many invalid setup token attempts. Try again later.",
-                );
+
+        let mut authenticated = false;
+        if candidate.is_some() {
+            match ctx.auth_mgr.validate_setup_token(candidate, &client_ip) {
+                crate::auth::SetupTokenStatus::Valid => authenticated = true,
+                crate::auth::SetupTokenStatus::RateLimited => {
+                    return error_response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Too many invalid setup token attempts. Try again later.",
+                    );
+                }
+                _ => {}
             }
-            _ => {
-                return error_response(
-                    StatusCode::FORBIDDEN,
-                    "First-boot setup token required (see server logs).",
-                );
+        }
+
+        if !authenticated
+            && let Some(auth_user) = auth_user.as_ref().filter(|u| u.role == Role::Admin)
+        {
+            let ticket = form
+                .reauth_token
+                .as_deref()
+                .or_else(|| headers.get("x-reauth-token").and_then(|v| v.to_str().ok()))
+                .map(str::trim)
+                .filter(|token| !token.is_empty());
+            if let (Some(ticket), Some(session_id)) = (ticket, current_session_id(&ctx, &headers))
+                && ctx
+                    .auth_mgr
+                    .check_reauth_token(ticket, &auth_user.username, &session_id)
+            {
+                reauth_proof = Some((ticket.to_string(), session_id, auth_user.username.clone()));
+                authenticated = true;
             }
+        }
+
+        if !authenticated {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "First-boot setup token required (see server logs), or a fresh re-authentication ticket for an Admin session.",
+            );
         }
     }
 
@@ -609,6 +644,7 @@ pub async fn wizard_complete_handler(
         credential_undo,
         report,
         filtering,
+        reauth_proof,
     )
     .await
 }
@@ -733,6 +769,7 @@ async fn finish_wizard_setup(
     credential_undo: WizardCredentialUndo,
     report: crate::config_apply::AppliedReport,
     filtering: sito_core::config::FilteringConfig,
+    reauth_proof: Option<(String, String, String)>,
 ) -> Response {
     if !report.restart_required.is_empty() {
         tracing::warn!(
@@ -763,8 +800,19 @@ async fn finish_wizard_setup(
     }
 
     // All credential and configuration writes succeeded: only now retire the
-    // setup token and let the server leave setup mode.
+    // setup token (and any re-authentication ticket used instead) and let the
+    // server leave setup mode.
     ctx.auth_mgr.consume_setup_token();
+    if let Some((token, session_id, username)) = reauth_proof
+        && !ctx
+            .auth_mgr
+            .consume_reauth_token(&token, &username, &session_id)
+    {
+        tracing::warn!(
+            user = %username,
+            "Re-authentication ticket was already consumed or expired after wizard completion"
+        );
+    }
     ctx.set_setup_pending(false);
 
     // Queue the blocklist fetch/compile off the request path. When the DNS

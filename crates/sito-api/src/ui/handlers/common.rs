@@ -184,3 +184,80 @@ pub(crate) fn admin_or_forbidden(
     }
     Ok((user, csrf))
 }
+
+/// Maps a failed re-authentication onto the UI error contract.
+pub(crate) fn reauth_problem(err: ReauthError) -> ProblemDetails {
+    match err {
+        ReauthError::InvalidCredentials => ProblemDetails::bad_request(
+            "Re-authentication failed: invalid password or second factor",
+        ),
+        ReauthError::SecondFactorRequired => ProblemDetails::bad_request(
+            "A current TOTP or backup code is required to re-authenticate",
+        ),
+        ReauthError::RateLimited => {
+            ProblemDetails::too_many_requests("Too many attempts. Please wait.")
+        }
+        ReauthError::LockedOut { remaining_seconds } => ProblemDetails::too_many_requests(format!(
+            "Account locked out due to repeated failures. Try again in {remaining_seconds}s."
+        )),
+    }
+}
+
+/// A re-authentication ticket issued to a UI form, retired after the sensitive
+/// mutation it authorized.
+pub(crate) struct UiReauthProof {
+    username: String,
+    token: String,
+    session_id: String,
+}
+
+impl UiReauthProof {
+    /// Consumes the ticket once the mutation completed successfully.
+    pub(crate) fn consume(self, ctx: &ServerContext) {
+        if !ctx
+            .auth_mgr
+            .consume_reauth_token(&self.token, &self.username, &self.session_id)
+        {
+            tracing::warn!(
+                user = %self.username,
+                "Re-authentication ticket was already consumed or expired after a sensitive UI change"
+            );
+        }
+    }
+}
+
+/// Runs the existing re-authentication flow for a UI form that collected the
+/// caller's current password (and TOTP code when enabled).
+pub(crate) async fn ui_reauth(
+    ctx: &ServerContext,
+    user: &AuthUser,
+    headers: &HeaderMap,
+    peer_addr: Option<std::net::SocketAddr>,
+    password: Option<&str>,
+    code: Option<&str>,
+) -> Result<UiReauthProof, ProblemDetails> {
+    let session_id = current_session_id(ctx, headers).ok_or_else(|| {
+        ProblemDetails::forbidden("Re-authentication requires an authenticated user session")
+    })?;
+    let password = password
+        .map(str::trim)
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| {
+            ProblemDetails::bad_request("Current password is required to re-authenticate")
+        })?;
+    let client_ip = {
+        let config = ctx.config.load();
+        let trusted_proxies = &config.get_web_config().trusted_proxies;
+        resolve_client_ip(peer_addr, headers, trusted_proxies)
+    };
+    let ticket = ctx
+        .auth_mgr
+        .reauth(&user.username, password, code, &session_id, &client_ip)
+        .await
+        .map_err(reauth_problem)?;
+    Ok(UiReauthProof {
+        username: user.username.clone(),
+        token: ticket.token,
+        session_id,
+    })
+}
