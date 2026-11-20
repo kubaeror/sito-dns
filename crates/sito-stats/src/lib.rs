@@ -279,9 +279,9 @@ mod tests {
 
     /// Representative multi-day retention sweep: 72 consecutive expired hours
     /// are aggregated in one call, one hour at a time, with no double counting
-    /// and no rows left in the detailed log. This covers the 90-day-scale
-    /// algorithm without a CI-hostile 1M-row soak (see the retention module
-    /// docs for that documented residual).
+    /// and no rows left in the detailed log. This is representative multi-day
+    /// coverage, not a 90-day/1M-row scale test (see the retention module docs
+    /// for that documented residual).
     #[tokio::test]
     async fn test_retention_handles_multiple_hours_across_days() {
         let db = StatsDb::in_memory().await.unwrap();
@@ -2177,6 +2177,63 @@ mod tests {
         assert!(
             payload.contains("blake3:"),
             "the scrub must hash the raw IP while removing the name"
+        );
+    }
+
+    /// Important review fix: a sweep that captured `rollup_client_names=true`
+    /// before a live true -> false apply must not re-insert names after the
+    /// scrub. Both the hour-chunked retention path and the keep-aggregates
+    /// clear path consult the live policy at write time.
+    #[tokio::test]
+    async fn test_live_policy_overrides_captured_rollup_name_policy() {
+        let db = StatsDb::in_memory_with_rollup_client_names(true)
+            .await
+            .unwrap();
+        let old_ts = chrono::Utc::now().timestamp_millis() - 100 * 86_400_000;
+        let mut old = retention_entry(old_ts, "race-cleanup.example", "allowed", None);
+        old.client_ip = "10.7.7.10".into();
+        old.client_name = Some("leaked-cleanup-name".into());
+        db.insert_batch(&[old]).await.unwrap();
+
+        // The live apply has already flipped the policy and scrubbed.
+        db.set_rollup_client_names(false).await.unwrap();
+
+        // Simulate the scheduler's captured policy from before the flip.
+        let report = db
+            .cleanup_retention_with_policy(90, 365, true)
+            .await
+            .unwrap();
+        assert_eq!(report.aggregated_hours, 1);
+
+        let cleanup_payload: String =
+            sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            !cleanup_payload.contains("leaked-cleanup-name"),
+            "an in-flight cleanup chunk must not undo the live name scrub: {cleanup_payload}"
+        );
+        assert!(!cleanup_payload.contains("10.7.7.10"));
+        assert!(cleanup_payload.contains("blake3:"));
+
+        // Same guard on the keep-aggregates whole-range clear path.
+        let recent = chrono::Utc::now().timestamp_millis();
+        let mut recent_entry = retention_entry(recent, "race-clear.example", "allowed", None);
+        recent_entry.client_ip = "10.7.7.11".into();
+        recent_entry.client_name = Some("leaked-clear-name".into());
+        db.insert_batch(&[recent_entry]).await.unwrap();
+        db.delete_query_logs_with_policy(true, true).await.unwrap();
+
+        let payloads: Vec<String> = sqlx::query_scalar("SELECT top_clients FROM stats_hourly")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            payloads
+                .iter()
+                .all(|payload| !payload.contains("leaked-clear-name")),
+            "the keep-aggregates clear must also honour the live policy: {payloads:?}"
         );
     }
 

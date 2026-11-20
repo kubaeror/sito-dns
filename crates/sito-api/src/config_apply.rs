@@ -341,7 +341,7 @@ async fn commit_staged(
         tracing::error!(
             error = %e,
             enabled = current_names,
-            "Failed to re-apply stats.rollup_client_names to existing rollups"
+            "Failed to re-apply stats.rollup_client_names to existing rollups; names may remain until a later scrub or restart"
         );
     }
     prune_stale_upstream_metrics(ctx, &previous, candidate);

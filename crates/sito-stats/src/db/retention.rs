@@ -406,9 +406,14 @@ impl StatsDb {
         mut rollup: HourRollup,
         rollup_client_names: bool,
     ) -> HourRollup {
+        // The caller's bool is the policy captured when the sweep was
+        // scheduled. The live atomic is authoritative at write time: a
+        // `set_rollup_client_names(false)` that lands while a sweep is in
+        // flight must not be undone by this chunk re-inserting names.
+        let allow_names = rollup_client_names && self.rollup_client_names_enabled();
         for client in &mut rollup.clients {
             client.0 = self.hash_client_ip(&client.0);
-            if !rollup_client_names {
+            if !allow_names {
                 client.1 = None;
             }
         }
@@ -423,13 +428,19 @@ impl StatsDb {
         rollup: HourRollup,
         rollup_client_names: bool,
     ) -> HourRollup {
-        let mut rollup = self.normalize_hour_rollup(rollup, rollup_client_names);
+        // Read the live policy once at merge time, inside the caller's write
+        // transaction (retention chunks and the keep-aggregates clear both
+        // hold `BEGIN IMMEDIATE`). A concurrent policy flip either happens
+        // before this read (so names are stripped here) or after the commit
+        // (so the scrub that follows the flip sees this row).
+        let allow_names = rollup_client_names && self.rollup_client_names_enabled();
+        let mut rollup = self.normalize_hour_rollup(rollup, allow_names);
         let (existing_domains, existing_clients, existing_upstreams) = existing;
 
         let mut existing_clients: Vec<ClientTop> = decode_tops(existing_clients.as_deref());
         for client in &mut existing_clients {
             client.0 = self.hash_client_ip(&client.0);
-            if !rollup_client_names {
+            if !allow_names {
                 client.1 = None;
             }
         }

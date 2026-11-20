@@ -830,7 +830,8 @@ applies the hot settings and reports the restart-only fields that remain.
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
 | `privacy.anonymize_querylog` | Query-log writer updated. |
-| `stats.retention_days`, `stats.rollup_retention_days`, `stats.rollup_client_names` | Re-read at each retention sweep: a bounded catch-up on startup (within 5 minutes) and every 24 h thereafter. |
+| `stats.retention_days`, `stats.rollup_retention_days` | Re-read at each retention sweep: a bounded catch-up on startup (within 5 minutes) and every 24 h thereafter. |
+| `stats.rollup_client_names` | Applied immediately on a live config apply: existing rollups are scrubbed when switched off, and in-flight retention/merge writes consult the live policy so a captured `true` cannot re-insert names. Forward-only for raw `query_log` rows. |
 
 ### 16.2 Requires a restart
 

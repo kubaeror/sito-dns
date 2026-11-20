@@ -1395,7 +1395,8 @@ and the three WP commits (`a385e76`, `7d7d6ec`, `dfd7b7e`) on
   a transaction and backdated rows must be re-aggregated.
 - **P2-62 (histogram contention):** retained the per-verdict/per-upstream
   mutex and documented the bounded critical section, read-mostly maps and hot
-  `allowed` benchmark rather than sharding.
+  `allowed` single-threaded cost; the concurrent-update test is the
+  contention/losslessness evidence rather than the benchmark.
 
 ### WP-2.13 — Ops, Docker, systemd, installer, release
 

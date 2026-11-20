@@ -22,10 +22,10 @@
 //! upstream labels pass through the same bounded interner as the other metric
 //! families). Sharding by label would add memory/indirection without removing
 //! the per-label serialization that the exposition requires, so the per-label
-//! mutex is kept deliberately. `metrics_bench` measures the contended
-//! `observe_query_duration("allowed", ...)` path, and
-//! `test_histogram_concurrent_updates_are_not_lost` pins the correctness
-//! invariant.
+//! mutex is kept deliberately. `metrics_bench` records the single-threaded
+//! per-update cost of `observe_query_duration("allowed", ...)`; the actual
+//! contention evidence is `test_histogram_concurrent_updates_are_not_lost`,
+//! which pins losslessness for same-label writers.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
