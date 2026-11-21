@@ -617,6 +617,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// WP-3.2: `/api/v1` is the only mounted API. `/api/v2` is absent (404)
+    /// and `/api/v1/status` keeps its canonical authentication behavior.
+    #[tokio::test]
+    async fn test_api_surface_has_no_v2_and_keeps_v1_status_canonical() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use utoipa::OpenApi;
+
+        let temp_dir = crate::test_support::temp_dir("sito_api_surface_v2");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .update_user_password("admin", "TestPassword123!")
+            .await;
+        ctx.set_setup_pending(false);
+        let token = ctx
+            .auth_mgr
+            .create_token("viewer", Role::Viewer, None)
+            .await
+            .expect("token")
+            .1
+            .token;
+        let app = create_router(ctx);
+
+        for path in ["/api/v2", "/api/v2/status", "/api/v2/stats"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must not be mounted"
+            );
+        }
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::OK);
+
+        let openapi = serde_json::to_value(ApiDoc::openapi()).expect("valid OpenAPI JSON");
+        let paths = openapi["paths"].as_object().expect("paths object");
+        assert!(
+            paths.keys().all(|path| !path.starts_with("/api/v2")),
+            "the OpenAPI document must not advertise an API v2"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_health_unavailable_when_ha_is_broken() {
