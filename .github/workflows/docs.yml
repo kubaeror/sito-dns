@@ -17,6 +17,8 @@ on:
       - 'scripts/check_migration_guide.py'
       - 'scripts/test_check_migration_guide.py'
       - 'scripts/check_markdown_links.py'
+      - 'scripts/check_test_matrix.py'
+      - 'scripts/test_check_test_matrix.py'
   workflow_call:
   workflow_dispatch:
 
@@ -98,6 +100,16 @@ jobs:
       - name: Check internal Markdown links and anchors
         if: always()
         run: python3 scripts/check_markdown_links.py --github
+
+      # Every backticked test/check name in the P0/P1 evidence matrix must
+      # resolve to a test, script or workflow in the tree.
+      - name: Verify the P0/P1 test-matrix names resolve
+        if: always()
+        run: python3 scripts/check_test_matrix.py
+
+      - name: Test the test-matrix checker fixtures
+        if: always()
+        run: python3 scripts/test_check_test_matrix.py
 
       - name: Lint GitHub Actions workflows
         if: always() && steps.changed.outputs.workflows == 'true'

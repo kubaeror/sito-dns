@@ -2018,6 +2018,172 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
+    /// WP-3.2: apply the exact four migration files shipped by tag `v1.9.3`
+    /// (kept under `tests/fixtures/v1.9.3-migrations/`) and verify the current
+    /// `StatsDb` upgrades the database additively while the 1.9.3 shape stays
+    /// readable. No new sqlx version may become visible to a 1.9.3 binary.
+    #[tokio::test]
+    async fn test_exact_v1_9_3_schema_stays_readable_after_additive_upgrade() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-v193-exact-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        // Apply exactly the four 1.9.3 files through a Migrator so the
+        // `_sqlx_migrations` checksums match what a real 1.9.3 binary writes.
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("v1.9.3-migrations");
+        let migrator = sqlx::migrate::Migrator::new(fixture_dir.as_path())
+            .await
+            .unwrap();
+        assert_eq!(migrator.migrations.len(), 4);
+        migrator.run(&pool).await.unwrap();
+
+        // Seed raw rollup and query-log rows through the old columns only.
+        let now = chrono::Utc::now().timestamp_millis();
+        let hour = ((now - 100 * 86_400_000) / 3_600_000) * 3_600_000;
+        sqlx::query(
+            "INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients) \
+             VALUES (?, 5, 1, 0, ?, ?)",
+        )
+        .bind(hour)
+        .bind(r#"[["legacy193.example",5,1]]"#)
+        .bind(r#"[["10.19.3.9","legacy193-host",5,1,123]]"#)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO query_log (ts, client_ip, client_name, qname, qtype, rcode, verdict, proto) \
+             VALUES (?, '10.19.3.9', 'legacy193-host', 'legacy193.example', 1, 0, 'allowed', 'udp')",
+        )
+        .bind(now - 1_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        // No new sqlx migration version is visible: a 1.9.3 binary still sees
+        // exactly the four files it shipped.
+        let versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            versions,
+            vec![
+                20_260_905_000_000i64,
+                20_260_906_000_000,
+                20_260_913_000_000,
+                20_260_922_000_000,
+            ],
+            "the exact v1.9.3 migration set must stay unchanged"
+        );
+
+        // The additive metadata table and the client-IP index exist after the
+        // upgrade, without a migration row.
+        let has_meta: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='stats_meta'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(has_meta, 1);
+        let has_index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+             AND name='idx_ql_client_ip_ts'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(has_index, 1);
+
+        // One-time backfill hashed the raw IP and dropped the name.
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            !payload.contains("10.19.3.9"),
+            "raw IP must be hashed: {payload}"
+        );
+        assert!(
+            !payload.contains("legacy193-host"),
+            "client name must be dropped: {payload}"
+        );
+        assert!(payload.contains("blake3:"));
+
+        // The v1.9.3 column set is still present and old-column access works.
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('query_log')")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        for column in [
+            "id",
+            "ts",
+            "client_ip",
+            "client_name",
+            "qname",
+            "qtype",
+            "rcode",
+            "verdict",
+            "rule",
+            "list_source",
+            "upstream",
+            "elapsed_us",
+            "dnssec",
+            "proto",
+        ] {
+            assert!(
+                columns.iter().any(|name| name == column),
+                "v1.9.3 query_log column {column} disappeared"
+            );
+        }
+        let old_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(old_rows, 1);
+        sqlx::query(
+            "INSERT INTO query_log (ts, client_ip, client_name, qname, qtype, rcode, verdict, proto) \
+             VALUES (?, '10.19.3.10', NULL, 'old193-code.example', 1, 0, 'allowed', 'udp')",
+        )
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (ts, qname): (i64, String) =
+            sqlx::query_as("SELECT ts, qname FROM query_log ORDER BY id DESC LIMIT 1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(ts, now);
+        assert_eq!(qname, "old193-code.example");
+
+        // `top_upstreams` was added by the 1.9.3 migration itself and keeps its
+        // default for rows written before this upgrade.
+        let upstreams: String =
+            sqlx::query_scalar("SELECT top_upstreams FROM stats_hourly LIMIT 1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(upstreams, "[]");
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
     async fn create_legacy_db(path: &std::path::Path) -> sqlx::SqlitePool {
         let url = format!("sqlite://{}?mode=rwc", path.display());
         let pool = sqlx::sqlite::SqlitePoolOptions::new()

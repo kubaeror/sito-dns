@@ -15,21 +15,26 @@ python3 scripts/test_check_config_reference.py
 python3 scripts/check_migration_guide.py --github
 python3 scripts/test_check_migration_guide.py
 python3 scripts/check_markdown_links.py
+python3 scripts/check_test_matrix.py
+python3 scripts/test_check_test_matrix.py
 bash scripts/check-error-swallowing.sh
 bash scripts/check-file-size.sh
 bash scripts/check-function-size.sh
 python3 scripts/test_rust_size.py
 ```
 
-Blank/deferred rows are explained in `docs/release-notes-1.9.4.md` and
-`progress.md`. A test name without a crate prefix is a unit test in the crate
-named by the command.
+Blank/deferred rows are explained in `docs/release-notes-1.9.4.md` and the
+per-work-package status notes in `docs/audit6-followup-plan.md`. A test name
+without a crate prefix is a unit test in the crate named by the command. The
+backticked test and script names are mechanically checked with
+`python3 scripts/check_test_matrix.py` (fixtures in
+`scripts/test_check_test_matrix.py`).
 
 | ID | Named test / check | Focused command |
 |---|---|---|
 | P0-1 | `test_fresh_bootstrap_certificate_requires_renewal`, `test_legacy_self_signed_bootstrap_requires_renewal`, `test_acme_bootstrap_issuance_all_transports_and_renewal` | `cargo test -p sito-transport test_fresh_bootstrap_certificate_requires_renewal`; `cargo test -p sito-test --test m11_acme test_legacy_self_signed_bootstrap_requires_renewal` |
 | P0-2 | `test_parent_delegation_nsec_cannot_prove_nxdomain_below_cut`, `test_parent_delegation_nsec3_cannot_prove_nxdomain_below_cut`, `test_parent_delegation_nsec3_nodata_only_denies_ds`, `test_ds_nodata_at_delegation_is_secure` | `cargo test -p sito-dnssec parent_delegation` |
-| P1-1 | `test_forged_covering_rrsig_still_probes_unsigned_delegation`, `test_signed_cname_to_stripped_target_without_ds_denial_is_bogus`, `test_m11_cd1_bypasses_post_fetch_indeterminate`, `test_dname_unknown_rdata_fails_closed`; DNAME handling remains a documented residual (see `docs/audit6.md`) | `cargo test -p sito-dnssec forged_covering_rrsig`; `cargo test -p sito-dnssec test_dname_unknown_rdata_fails_closed`; `cargo test -p sito-test --test m11_dnssec_security test_m11_cd1_bypasses_post_fetch_indeterminate` |
+| P1-1 | `test_forged_covering_rrsig_still_probes_unsigned_delegation`, `test_signed_cname_to_stripped_target_without_ds_denial_is_bogus`, `test_m11_cd1_bypasses_post_fetch_indeterminate`, `test_dname_unknown_rdata_fails_closed`; DNAME handling remains a documented, fail-closed residual (see `docs/audit6.md` and the [Phase 3 review](phase3-security-review.md#4-p1-1-dname-residual-and-rc1-risk-acceptance)) | `cargo test -p sito-dnssec forged_covering_rrsig`; `cargo test -p sito-dnssec test_dname_unknown_rdata_fails_closed`; `cargo test -p sito-test --test m11_dnssec_security test_m11_cd1_bypasses_post_fetch_indeterminate` |
 | P1-2 | `test_m11_blocked_key_fetch_is_bounded_and_servfails`, `test_m11_eight_hop_chain_is_bounded_end_to_end` | `cargo test -p sito-test --test m11_dnssec_security test_m11_blocked_key_fetch_is_bounded_and_servfails` |
 | P1-3 | `test_slave_goes_not_ready_when_master_stops_sending_frames` | `cargo test -p sito-test --features ha --test m11_ha_partition test_slave_goes_not_ready_when_master_stops_sending_frames` |
 | P1-4 | `test_restart_with_locally_modified_shared_config_does_not_early_ack_synced`, `test_watermark_without_digest_forces_full_apply` | `cargo test -p sito-test --features ha --test m11_ha_partition test_restart_with_locally_modified_shared_config_does_not_early_ack_synced` |
@@ -47,7 +52,7 @@ named by the command.
 | P1-16 | `test_wizard_forbidden_after_setup_even_for_admin`, `test_wizard_completion_requires_setup_token_when_provisioned` | `cargo test -p sito-api --all-features test_wizard_forbidden_after_setup_even_for_admin` |
 | P1-17 | `contrib/tests/test-installer.sh` atomic replacement/rollback cases | `bash contrib/tests/test-installer.sh` |
 | P1-18 | `test_invalidate_domain_removes_exact_and_subdomains_only`, `test_root_name_is_cacheable_and_invalidation_flushes` | `cargo test -p sito-cache invalidate_domain` |
-| P1-19 | `test_rollup_pii_hashes_client_ip_and_omits_names_by_default`, `test_rollup_retention_deletes_expired_domains_and_rows`, `test_delete_query_logs_default_clears_rollups`, `test_delete_query_logs_keep_aggregates_preserves_rollups`, `test_migration_from_v19_schema_hashes_rollups_and_stays_old_compatible`, `test_stats_files_are_private_and_loose_permissions_are_repaired`, `test_b3_ipv6_literal_is_hashed_not_treated_as_digest`, `test_backfill_neutralizes_malformed_rollup_payload`, `test_rollup_client_names_true_to_false_scrubs_existing_names`, `test_backfill_preserves_names_when_enabled`, `test_salt_persists_and_corrupt_salt_is_rejected`, `test_clear_query_log_vacuums_and_secure_delete_is_on`, `test_set_rollup_client_names_scrubs_live_rollups`, `test_live_apply_scrubs_rollup_client_names`, `test_live_policy_overrides_captured_rollup_name_policy`, `test_name_scrub_waits_for_in_flight_rollup_writer` | `cargo test -p sito-stats rollup_pii`; `cargo test -p sito-stats rollup_retention_deletes`; `cargo test -p sito-stats delete_query_logs`; `cargo test -p sito-stats migration_from_v19`; `cargo test -p sito-stats stats_files_are_private`; `cargo test -p sito-stats b3_ipv6_literal`; `cargo test -p sito-stats backfill`; `cargo test -p sito-stats rollup_client_names`; `cargo test -p sito-stats live_policy_overrides`; `cargo test -p sito-stats name_scrub_waits`; `cargo test -p sito-stats salt_persists`; `cargo test -p sito-stats clear_query_log`; `cargo test -p sito-api test_live_apply_scrubs_rollup_client_names` |
+| P1-19 | `test_rollup_pii_hashes_client_ip_and_omits_names_by_default`, `test_rollup_retention_deletes_expired_domains_and_rows`, `test_delete_query_logs_default_clears_rollups`, `test_delete_query_logs_keep_aggregates_preserves_rollups`, `test_migration_from_v19_schema_hashes_rollups_and_stays_old_compatible`, `test_exact_v1_9_3_schema_stays_readable_after_additive_upgrade`, `test_stats_files_are_private_and_loose_permissions_are_repaired`, `test_b3_ipv6_literal_is_hashed_not_treated_as_digest`, `test_backfill_neutralizes_malformed_rollup_payload`, `test_rollup_client_names_true_to_false_scrubs_existing_names`, `test_backfill_preserves_names_when_enabled`, `test_salt_persists_and_corrupt_salt_is_rejected`, `test_clear_query_log_vacuums_and_secure_delete_is_on`, `test_set_rollup_client_names_scrubs_live_rollups`, `test_live_apply_scrubs_rollup_client_names`, `test_live_policy_overrides_captured_rollup_name_policy`, `test_name_scrub_waits_for_in_flight_rollup_writer` | `cargo test -p sito-stats rollup_pii`; `cargo test -p sito-stats rollup_retention_deletes`; `cargo test -p sito-stats delete_query_logs`; `cargo test -p sito-stats migration_from_v19`; `cargo test -p sito-stats exact_v1_9_3`; `cargo test -p sito-stats stats_files_are_private`; `cargo test -p sito-stats b3_ipv6_literal`; `cargo test -p sito-stats backfill`; `cargo test -p sito-stats rollup_client_names`; `cargo test -p sito-stats live_policy_overrides`; `cargo test -p sito-stats name_scrub_waits`; `cargo test -p sito-stats salt_persists`; `cargo test -p sito-stats clear_query_log`; `cargo test -p sito-api test_live_apply_scrubs_rollup_client_names` |
 | P1-20 | `test_login_rejects_oversized_credentials_before_lockout`, `test_login_lockout_key_is_a_digest`, `test_active_lockout_is_not_evicted_at_capacity` | `cargo test -p sito-api test_login_rejects_oversized_credentials_before_lockout` |
 | P1-21 | `scripts/test-verify-release-gate.sh`, `scripts/test-release-workflow.sh`, `scripts/test-release-attestation-gate.sh` | `bash scripts/test-verify-release-gate.sh` |
 | P1-22 | `test_update_signature_policy_fails_closed`, `test_signature_policy_required_without_verifier_fails`, installer signature-policy cases | `cargo test -p sito test_update_signature_policy_fails_closed`; `bash contrib/tests/test-installer.sh` |
@@ -85,7 +90,7 @@ function over 200 lines fails the checker.
 | D12 challenge readiness | `test_acme_readiness_no_80_no_443` | `cargo test -p sito-api test_acme_readiness_no_80_no_443` |
 | IPv4-mapped rate key | `test_ipv4_mapped_ipv6_uses_ipv4_24_bucket` | `cargo test -p sito-transport test_ipv4_mapped_ipv6_uses_ipv4_24_bucket` |
 | Filter-unavailable metric | `test_render_prometheus_golden_output`, `test_filter_metrics_are_reported` | `cargo test -p sito-stats filter_metrics` |
-| DNAME | `test_dname_unknown_rdata_fails_closed` (wire decode as `Unknown`, strict Bogus/SERVFAIL, no AD); handling remains a documented residual | `cargo test -p sito-dnssec test_dname_unknown_rdata_fails_closed` |
+| DNAME | `test_dname_unknown_rdata_fails_closed` (wire decode as `Unknown`, strict Bogus/SERVFAIL, no AD, answer stripped); handling remains a documented, fail-closed residual | `cargo test -p sito-dnssec test_dname_unknown_rdata_fails_closed` |
 
 ## Deferred D3 — policy/transport/docs cleanup
 
@@ -240,7 +245,7 @@ evidence and the exact commands are recorded in
 | HA fake master frames/heartbeats/partition | `test_slave_goes_not_ready_when_master_stops_sending_frames`, `test_delayed_same_version_fork_ack_after_newer_publish_is_divergence` | `cargo test -p sito-test --test m11_ha_partition` |
 | DNSSEC signed-zone/key/denial fixtures | `signed_zone_fixture_exposes_anchor_keys_and_denial_records`, `test_m11_policy_change_rejects_in_flight_cache_insert` | `cargo test -p sito-test --test fixtures_contract signed_zone`; `cargo test -p sito-test --test m11_dnssec_security` |
 | Domain normalization property tests | `normalization_is_idempotent_and_never_panics`, `lowercase_and_one_trailing_dot_are_equivalent`, `idn_labels_round_trip_through_punycode`, `wildcard_labels_are_preserved_exactly`, `suffix_matching_is_reflexive_transitive_and_strict_only_for_children` | `cargo test -p sito-core --test domain_properties` |
-| ABP parser property tests | `arbitrary_lines_never_panic`, `parsed_canonical_matches_recomputed_canonical`, `modifier_order_does_not_change_the_canonical_form`, `badfilter_suffix_is_recognised_and_excluded_from_the_canonical_form`, `long_lines_are_skipped_without_materialising_a_rule`, `byte_budget_rejects_without_returning_partial_rules` | `cargo test -p sito-filter --test parser_properties` |
+| ABP parser property tests | `arbitrary_lines_never_panic`, `parsed_canonical_matches_independent_oracle`, `modifier_order_does_not_change_the_canonical_form`, `badfilter_suffix_is_recognised_and_excluded_from_the_canonical_form`, `long_lines_are_skipped_without_materialising_a_rule`, `byte_budget_rejects_without_returning_partial_rules` | `cargo test -p sito-filter --test parser_properties` |
 | 20-run parallel stability | harness/m11/HA/cache plus the changed `sito --lib` and `sito-transport` suites, 20 consecutive runs, no port collisions or timing flakes | see `docs/test-harness.md#stability-evidence` |
 
 ## WP-1.9 — fuzz, benchmarks and CI gates
@@ -253,7 +258,7 @@ the named checks below prove the mechanism and the fast gates.
 | Finding / acceptance | Named test / check | Focused command |
 |---|---|---|
 | P2-64 — fuzz harness exists with five targets | `scripts/check-fuzz-targets.py` (manifest, target sources, seed corpus, gitignore); `cargo fuzz build` in the `fuzz-build` job | `python3 scripts/check-fuzz-targets.py`; `python3 scripts/test_check_fuzz_targets.py`; `cargo fuzz build` |
-| P2-64 — nightly fuzz with corpus and timeout | `.github/workflows/fuzz.yml` (nightly 600 s/target, `-timeout=10`, dictionary, crash artifacts); 24 h manual `fuzz_seconds=21600 shards=4` (four 6-hour GitHub-hosted shards per target) documented in `docs/release-verification.md` | dispatch `fuzz.yml`; see `fuzz/README.md` |
+| P2-64 — nightly fuzz with corpus and timeout | `.github/workflows/fuzz.yml` (nightly 600 s/target, `-timeout=10`, dictionary, crash artifacts); 24 h manual `fuzz_seconds=17280 shards=5` (five 4.8-hour GitHub-hosted shards per target) documented in `docs/release-verification.md` | dispatch `fuzz.yml`; see `fuzz/README.md` |
 | P2-64 — target behavior is covered locally | `dns_wire`, `abp_parser`, `dnssec_response`, `ha_bundle`, `config_toml` targets and `fuzz/corpus/*/seed-*` | `cargo fuzz run <target> -- -max_total_time=60` |
 | Benchmark gate fails on >10% regression | `scripts/test_check_bench_regression.py` (within/exact/above tolerance, missing, save/round-trip, CLI exit codes); `scripts/check-bench-regression.py`; `bench.yml` on GitHub-hosted `ubuntu-24.04` | `python3 scripts/test_check_bench_regression.py`; `BENCH_ENVIRONMENT=github-ubuntu-24.04 python3 scripts/check-bench-regression.py` |
 | Criterion benches for pipeline/filter/cache/stats/metrics | `crates/sito-test/benches/pipeline_bench.rs`, `crates/sito-filter/benches/lookup.rs`, `crates/sito-cache/benches/cache_bench.rs`, `crates/sito-stats/benches/stats_bench.rs`, `crates/sito-stats/benches/metrics_bench.rs` | `BENCH_ENVIRONMENT=github-ubuntu-24.04 cargo bench --workspace --all-features --locked --no-run` |
@@ -575,7 +580,7 @@ every focused command must include `--features ha` or it runs zero tests.
 | H-17: bracketed IPv6 master URLs parse into host/port and a `wss://[::1]` slave synchronizes | `test_parse_ws_url_ipv6_and_invalid_forms`, `test_ha_master_slave_end_to_end_ipv6_loopback` | `cargo test -p sito-ha test_parse_ws_url_ipv6_and_invalid_forms`; `cargo test -p sito-ha test_ha_master_slave_end_to_end_ipv6_loopback` |
 | H-18: CA-only, pin+CA SAN mismatch, wrong CA, expired leaf and client-chain mismatch are all rejected; a configured pin/CA is always enforced | `test_server_ca_only_verification_and_wrong_ca`, `test_pin_plus_ca_enforces_san`, `test_client_cert_chain_must_match_configured_ca`, `test_expired_server_certificate_is_rejected` | `cargo test -p sito-ha test_server_ca_only_verification_and_wrong_ca`; `cargo test -p sito-ha test_pin_plus_ca_enforces_san` |
 | H-19: a clean master close reconnects with a fixed 1 s delay and resets the error backoff | `test_clean_close_reconnect_is_fixed_and_resets_error_backoff`, `test_backoff_advancement_and_reset` | `cargo test -p sito-ha test_clean_close_reconnect_is_fixed_and_resets_error_backoff` |
-| H-20: a v1 or future `Hello`/`ConfigPush` is rejected with `protocol_mismatch`; the listener stays alive for the next connection | `test_master_rejects_v1_slave_and_keeps_listening`, `test_slave_rejects_v1_master_and_accepts_next_valid_push`, `test_master_rejects_oversized_websocket_hello` | `cargo test -p sito-ha test_master_rejects_v1_slave_and_keeps_listening`; `cargo test -p sito-ha test_slave_rejects_v1_master_and_accepts_next_valid_push` |
+| H-20: a v1 or future `Hello`/`ConfigPush` is rejected with `protocol_mismatch`; the listener stays alive for the next connection | `test_master_rejects_v1_slave_and_keeps_listening`, `test_slave_rejects_v1_master_and_accepts_next_valid_push`, `test_master_rejects_oversized_websocket_hello`; WP-3.2 wrapper `scripts/test-ha-v1-compat.sh` | `cargo test -p sito-ha test_master_rejects_v1_slave_and_keeps_listening`; `cargo test -p sito-ha test_slave_rejects_v1_master_and_accepts_next_valid_push`; `bash scripts/test-ha-v1-compat.sh` |
 | H-21: v1 `ha_state.toml`/`ha_watermark.toml` are refused with migration instructions instead of being read or reset; moving them aside after backup starts a clean sequence | `test_restore_preserves_term_and_rejects_v1_state`, `test_v1_watermark_is_rejected_by_protocol_v2`, `protocol_v2_state_and_bundle_reject_v1_shapes` | `cargo test -p sito-ha test_restore_preserves_term_and_rejects_v1_state`; `cargo test -p sito-ha test_v1_watermark_is_rejected_by_protocol_v2`; `cargo test -p sito-ha-types protocol_v2_state_and_bundle_reject_v1_shapes` |
 | H-22: rejection is observable through the log, `protocol_mismatch` close reason, the slave readiness reason and `sito_ha_protocol_rejections_total` | `test_master_rejects_v1_slave_and_keeps_listening`, `test_slave_rejects_v1_master_and_accepts_next_valid_push`, `test_ha_protocol_rejection_counter_renders_only_when_used` | `cargo test -p sito-ha test_slave_rejects_v1_master_and_accepts_next_valid_push`; `cargo test -p sito-stats test_ha_protocol_rejection_counter_renders_only_when_used` |
 | H-23: limits are explicit in code/docs: 1 MiB message/frame, 4 MiB per-slave queue, 10 s send and handshake deadlines, 64 global/8 per-IP concurrent session budgets | `MAX_WS_MESSAGE_SIZE`, `MAX_SLAVE_QUEUE_BYTES`, `WS_SEND_TIMEOUT`, `MAX_SLAVE_CONNECTIONS`, `MAX_HANDSHAKES_PER_IP`; see `docs/runbook-ha.md#7-ha-protocol-v2-upgrade-and-downgrade` | `cargo test -p sito-ha test_broadcast_respects_per_slave_queue_byte_budget`; `cargo test -p sito-ha test_listener_global_connection_limit_and_release` |
@@ -586,10 +591,9 @@ WP-2.13 secures the shipped deployment defaults and makes the installer and
 self-updater preserve the service's ability to bind privileged DNS ports. The
 static compose/systemd checks are shipped alongside the files; the installer E2E
 runs unprivileged against a temporary sandbox. Release-image vulnerability
-scanning remains linux/amd64-only, the real release image is smoke-tested with
-`--version`/`check-config` rather than a live DNS query, and the root-gated HA
-ownership test remains a manual/weekly operator step; those three residuals are
-tracked for WP-3.1.
+scanning remains linux/amd64-only and the root-gated HA ownership test remains a
+manual/weekly operator step. Phase 3 added a live DNS/health smoke of the
+attested release image to the release workflow before publication.
 
 | Finding / acceptance | Named test / check | Focused command |
 |---|---|---|
@@ -598,7 +602,7 @@ tracked for WP-3.1.
 | P2-69: the installer has a behavioral fresh/upgrade/rollback/uninstall E2E, not just shellcheck | `contrib/tests/test-installer.sh`; CI `contrib` job | `bash contrib/tests/test-installer.sh` |
 | P2-70: release images are scanned for HIGH/CRITICAL and cosign-signed; scan coverage is linux/amd64 only (residual, WP-3.1) | `scripts/test-release-workflow.sh`, `scripts/test-release-attestation-gate.sh`, release workflow `docker-build-push` | `bash scripts/test-release-workflow.sh`; `bash scripts/test-release-attestation-gate.sh` |
 | P2-82: systemd unit and installer fallback read `EnvironmentFile=-/etc/sito/sito.env` and apply `UMask=0077`, `PrivateTmp`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictSUIDSGID`, `LockPersonality`, `SystemCallArchitectures=native` | `scripts/test-systemd-hardening.sh`; `test_m9_release_configuration_and_systemd` | `bash scripts/test-systemd-hardening.sh`; `cargo test -p sito-test --test m9_acceptance test_m9_release_configuration_and_systemd` |
-| P2-83: `sito update` preserves the existing executable mode and extended attributes (including `security.capability`); 0755 is only the absent-target fallback | `test_install_preserves_existing_mode_and_xattrs`, `test_install_preserves_security_capability_when_root`, `test_install_uses_0755_when_target_is_absent`, `test_temp_exe_removed_when_rename_fails` | `cargo test -p sito-api --lib updater` |
+| P2-83: `sito update` preserves the existing executable mode and extended attributes (including `security.capability`); 0755 is only the absent-target fallback; a failed rename restores the backup and removes the temporary files | `test_install_preserves_existing_mode_and_xattrs`, `test_install_preserves_security_capability_when_root`, `test_install_uses_0755_when_target_is_absent`, `test_replace_restores_backup_when_rename_fails` | `cargo test -p sito-api --lib updater` |
 | P3-20: uninstall removes installer-managed cosign (marker), keeps a pre-existing user cosign, warns without systemd, removes the unit unconditionally, and makes setcap/getcap outcomes visible | `contrib/tests/test-installer.sh` capability/no-systemd/cosign cases | `bash contrib/tests/test-installer.sh` |
 | P3-21: root-gated HA certificate ownership test exists and documents the manual `sudo` run; CI wiring is deferred to WP-3.1 | `scripts/test-ha-ownership-root.sh`; see the WP-2.13 status in `docs/audit6-followup-plan.md` | `sudo bash scripts/test-ha-ownership-root.sh` |
 | P3-22: build contexts exclude root and nested Cargo targets, including `fuzz/target` | `.dockerignore`; `scripts/test-compose-defaults.sh` | `bash scripts/test-compose-defaults.sh` |
@@ -606,3 +610,21 @@ tracked for WP-3.1.
 | P3-24: `.dockerignore` explicitly excludes `fuzz/target/` and `**/target/` | `scripts/test-compose-defaults.sh` | `bash scripts/test-compose-defaults.sh` |
 | P3-25: HA Compose no longer hardcodes the LAN topology; master/slave/slave-2 IPs, subnet, gateway and parent are `SITO_HA_*` variables with documented defaults | `scripts/test-compose-defaults.sh` | `bash scripts/test-compose-defaults.sh` |
 | P3-26: release archives are built from real binaries, contain `contrib/install.sh` and `contrib/systemd/sito.service`, and the release image runs `--version`/`check-config`; a live start/healthcheck/DNS smoke is deferred to WP-3.1 | `.github/workflows/artifact-e2e.yml` archive assertions; `.github/workflows/release.yml` image smoke | `bash scripts/test-release-workflow.sh`; artifact E2E workflow |
+
+## Phase 3 — 1.9.x migration and compatibility (WP-3.2)
+
+WP-3.2 is acceptance evidence, not a new feature. SQLite is compatibility-only:
+the 2.0 tree keeps the existing additive `stats_meta`/index startup pass and
+adds no schema migration command or `SITO_DB_AUTO_MIGRATE` switch. `/api/v1` is
+canonical; `/api/v2` and an API v1 facade stay absent. 1.9.5 is the latest
+1.9.x data-directory test; 1.9.3 is covered by an exact-schema fixture.
+
+| Acceptance criterion | Named test / check | Focused command |
+|---|---|---|
+| A real 1.9.5 data dir answers a local rewrite, migrates config v1 -> v2 with a 0600 backup, runs 2.0 on the same migrated stats DB, and rolls back to 1.9.5 | `scripts/test-migration-1.9.5.sh` | `bash scripts/test-migration-1.9.5.sh` |
+| The exact four `v1.9.3` migration files still produce a readable database with no new sqlx version after the current `StatsDb` opens it | `test_exact_v1_9_3_schema_stays_readable_after_additive_upgrade` | `cargo test -p sito-stats exact_v1_9_3` |
+| `/api/v2` is absent (404) and `/api/v1/status` keeps its canonical 401/200 auth behavior; OpenAPI advertises no v2 | `test_api_surface_has_no_v2_and_keeps_v1_status_canonical` | `cargo test -p sito-api test_api_surface_has_no_v2` |
+| HA protocol v2 rejects v1 peers, bundles, state and watermarks | `scripts/test-ha-v1-compat.sh`; `test_master_rejects_v1_slave_and_keeps_listening`, `test_slave_rejects_v1_master_and_accepts_next_valid_push`, `test_restore_preserves_term_and_rejects_v1_state`, `test_v1_bundle_is_rejected_by_protocol_v2`, `test_v1_watermark_is_rejected_by_protocol_v2` | `bash scripts/test-ha-v1-compat.sh` |
+
+HA remains a coordinated cluster upgrade; there is no two-node v1/v2 E2E
+because the runbook requires both nodes on protocol v2 before the upgrade.

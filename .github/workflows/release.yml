@@ -521,6 +521,90 @@ jobs:
             -v "${PWD}/config.example.toml:/etc/sito/config.toml:ro" \
             "${image}" --version
 
+          # Live smoke test: start the published image with a self-contained
+          # config, wait for a local rewrite, and require the image healthcheck
+          # to turn healthy. This runs the exact attested digest, not a rebuild.
+          tmp="$(mktemp -d)"
+          container="sito-release-smoke"
+          cleanup() {
+            docker rm -f "${container}" >/dev/null 2>&1 || true
+            rm -rf "${tmp}"
+          }
+          trap cleanup EXIT
+          mkdir -p "${tmp}/data" "${tmp}/etc"
+          chmod 0777 "${tmp}" "${tmp}/data" "${tmp}/etc"
+          cat >"${tmp}/etc/config.toml" <<'EOF'
+          config_version = 2
+
+          [server]
+          role = "master"
+          instance_name = "release-smoke"
+          data_dir = "/var/lib/sito"
+          log_level = "info"
+          log_format = "json"
+
+          [dns]
+          bind = ["0.0.0.0"]
+          port = 5353
+          dot_port = 0
+          doh_port = 0
+          doq_port = 0
+          doh3_port = 0
+
+          [web]
+          enabled = false
+
+          [filtering]
+          enabled = false
+
+          [upstream]
+          servers = ["1.1.1.1"]
+
+          [[rewrites.entries]]
+          domain = "smoke.test"
+          type = "A"
+          answer = "192.0.2.1"
+
+          [[rewrites.entries]]
+          domain = "localhost"
+          type = "A"
+          answer = "127.0.0.1"
+          EOF
+          sed -i 's/^ *//' "${tmp}/etc/config.toml"
+          docker run --rm \
+            -v "${tmp}/etc:/etc/sito" \
+            -v "${tmp}/data:/var/lib/sito" \
+            "${image}" reset-admin --password release-smoke-password >/dev/null
+          docker run -d --name "${container}" \
+            -p 15353:5353/udp \
+            -v "${tmp}/etc:/etc/sito" \
+            -v "${tmp}/data:/var/lib/sito" \
+            "${image}" >/dev/null
+          answered=0
+          for _ in $(seq 1 40); do
+            if ! docker inspect -f '{{.State.Running}}' "${container}" 2>/dev/null | grep -qx true; then
+              echo "::error::release image exited before answering"
+              docker logs "${container}" || true
+              exit 1
+            fi
+            if python3 -c 'import socket,struct,sys; qname=b"\x08smoke\x04test\x00"; q=struct.pack("!HHHHHH",0x5252,0x0100,1,0,0,0)+qname+struct.pack("!HH",1,1); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(1.0); s.sendto(q,("127.0.0.1",15353)); d,_=s.recvfrom(4096); sys.exit(0 if struct.unpack("!H",d[:2])[0]==0x5252 and b"\xc0\x00\x02\x01" in d else 1)'
+            then
+              answered=1
+              break
+            fi
+            sleep 1
+          done
+          [ "${answered}" = "1" ] || { echo "::error::release image did not answer smoke.test"; docker logs "${container}" || true; exit 1; }
+          health="unknown"
+          for _ in $(seq 1 90); do
+            health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${container}")"
+            [ "${health}" = "healthy" ] && break
+            [ "${health}" = "unhealthy" ] && { echo "::error::release image healthcheck is unhealthy"; docker logs "${container}" || true; exit 1; }
+            sleep 1
+          done
+          [ "${health}" = "healthy" ] || { echo "::error::release image health status is ${health}"; docker logs "${container}" || true; exit 1; }
+          echo "release image answered smoke.test; healthcheck: ${health}"
+
   publish-release:
     name: Publish GitHub Release
     # The release is staged as a draft by sbom-and-release. Publish it only

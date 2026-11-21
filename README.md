@@ -14,25 +14,27 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 
 `sito` is designed as a modern, rock-solid alternative to AdGuard Home and Pi-hole. Engineered in Rust (edition 2024), it combines sub-millisecond p99 latency, comprehensive ad/tracker/malware blocking (using AdGuard/ABP rule syntax), multi-protocol encryption (DoT, DoH H2, DoQ, DoH3), and automated master/slave high availability.
 
-> **Development status:** the `main` line is currently **2.0.0-alpha.1**
-> (Phase 2 core hardening; WP-2.1 through WP-2.13 are delivered on this tree).
-> The latest stable release remains **1.9.5**; the quickstart below
-> intentionally pins the published stable installer and container image. Alpha
-> builds are not published as stable artifacts.
+> **Development status:** the `main` line is the **2.0.0-rc.1 candidate**
+> (workspace version `2.0.0-rc.1`; Phase 2 core hardening and Phase 3
+> verification are delivered on this tree). The
+> latest stable release remains **1.9.5**; the quickstart below intentionally
+> pins the published stable installer and container image. Alpha/rc builds are
+> not published as stable artifacts.
 >
-> Phase 3 verification and release (WP-3.1 through WP-3.4) is still pending.
-> Deferred work includes `/api/v2` and the API v1 compatibility facade, the
-> SQLite schema/PII migration (`sito db migrate`), installer/Docker
-> auto-migration, a default-deny DNS client ACL, weighted upstream balancing, a
-> second proof for user/token deletion, edit-time read-only HA enforcement, and
-> the optional external parental/service data. The current evidence matrix is
+> Remaining release work is the rc.1 tag/publication; the 24-hour fuzz campaign
+> is explicitly deferred by the operator. Deferred work includes `/api/v2`
+> and the API v1 compatibility facade, the SQLite schema/PII migration
+> (`sito db migrate`), installer/Docker auto-migration, a default-deny DNS
+> client ACL, weighted upstream balancing, a second proof for user/token
+> deletion, edit-time read-only HA enforcement, and the optional external
+> parental/service data. The current evidence matrix is
 > [`docs/2.0-claim-matrix.md`](docs/2.0-claim-matrix.md).
 
 ---
 
 ## 📊 Feature Comparison: sito vs. AdGuard Home vs. Pi-hole
 
-| Feature / Capability | **sito** (2.0 alpha) | **AdGuard Home** | **Pi-hole (FTL)** |
+| Feature / Capability | **sito** (2.0 rc) | **AdGuard Home** | **Pi-hole (FTL)** |
 |---|---|---|---|
 | **Language & Runtime** | **Rust (edition 2024, zero GC, zero Node.js)** | Go (GC overhead under load) | C (FTL) + PHP Web UI |
 | **Max Cache Throughput** | **≥ 500,000 QPS** (v1.0 reference run: 584k) | ~100,000 QPS | ~50,000 QPS |
@@ -49,13 +51,12 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 
 > Throughput, latency, and memory figures are from the **v1.0.0**
 > reference-hardware run recorded in [docs/benchmarks.md](docs/benchmarks.md).
-> They are historical reference numbers, not a measurement of the 2.0 alpha
-> line. Pull requests only compile the Criterion benches; the nightly
-> `bench.yml` comparison fails above its tolerance once a dedicated
-> `BENCH_RUNNER_LABEL` runner and a baseline generated on it are provisioned.
-> The committed baseline is a development-host baseline, so that nightly gate
-> is currently inactive — see
-> [docs/ci.md](docs/ci.md#benchmark-baseline).
+> They are historical reference numbers, not a measurement of the 2.0 rc line.
+> Pull requests only compile the Criterion benches; the nightly `bench.yml`
+> comparison is active on GitHub-hosted `ubuntu-24.04` against the committed
+> `github-ubuntu-24.04` baseline and fails above its tolerance. A local
+> comparison on different hardware is reference-only (`--reference-only`) and is
+> not the gate — see [docs/ci.md](docs/ci.md#benchmark-baseline).
 
 ---
 
@@ -112,7 +113,7 @@ Client Query ──▶ [sito-transport] (UDP / TCP / DoT / DoH / DoQ / DoH3)
 
 ### Option 1: Automated One-Line Installer (Linux)
 The examples below install the latest **stable** release (1.9.5). The
-`2.0.0-alpha.1` development line is not published as a stable artifact yet.
+`2.0.0-rc.1` release-candidate line is not published as a stable artifact yet.
 ```bash
 # Download and inspect the pinned installer, then run it for the same version.
 curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/v1.9.5/contrib/install.sh -o sito-install.sh
@@ -188,8 +189,8 @@ Docker can forward the port, and publish it only on loopback:
 `-p 127.0.0.1:8080:8080`. Use an SSH tunnel or a TLS reverse proxy for remote
 access. See [Docker Compose deployment](docs/installation.md#4-docker-compose-deployment).
 
-### Option 3: Manual Binary Build (2.0 alpha)
-This builds the current `2.0.0-alpha.1` development line, which uses config v2
+### Option 3: Manual Binary Build (2.0 rc)
+This builds the current `2.0.0-rc.1` release-candidate line, which uses config v2
 and rejects a v1 `config.toml` until it is migrated. For a stable production
 install, use the pinned 1.9.5 installer or image above and follow the
 [2.0 migration guide](docs/2.0-migration.md) when moving to 2.0.
@@ -219,7 +220,7 @@ a master, but rejects `[ha]` and `server.role = "slave"` and answers
 ### 🧙 First-Time Setup Wizard
 On a fresh installation without a configuration file, **sito** starts in **setup-pending mode** on port `8080` (DNS listener ports 53/853/443 remain closed until initial setup is confirmed).
 
-Open **`http://<server-ip>:8080`** from a trusted LAN host (or through an SSH tunnel; the LAN-only firewall in the installation guide does not open 8080) to launch the 6-section configuration wizard. **On 2.0 alpha the default `web.bind` is `127.0.0.1`, so the setup-pending wizard is loopback-only**: use `ssh -L 8080:127.0.0.1:8080 user@server` and browse `http://127.0.0.1:8080`, or explicitly configure a non-loopback `web.bind` for the setup window (see the installation guide's setup-pending note):
+Open **`http://<server-ip>:8080`** from a trusted LAN host (or through an SSH tunnel; the LAN-only firewall in the installation guide does not open 8080) to launch the 6-section configuration wizard. **On 2.0 the default `web.bind` is `127.0.0.1`, so the setup-pending wizard is loopback-only**: use `ssh -L 8080:127.0.0.1:8080 user@server` and browse `http://127.0.0.1:8080`, or explicitly configure a non-loopback `web.bind` for the setup window (see the installation guide's setup-pending note):
 * **Administrator Account:** Set a custom admin username and a password. The wizard rejects the bootstrap password `adminadmin`, passwords shorter than 8 characters, and passwords containing whitespace or control characters. The bootstrap account cannot log in while setup is pending.
 * **DNS Listeners:** Configure IPv4/IPv6 bindings, UDP/TCP, DoT, and DoH ports.
 * **Upstream Resolvers:** Select presets (Cloudflare, Quad9, Google) with live latency testing.
@@ -252,7 +253,7 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 
 ## 📖 Comprehensive Documentation
 
-* **[2.0 Migration Guide](docs/2.0-migration.md):** Stable 1.9.5 → 2.0 alpha upgrade, breaking-change IDs, config/API/DB/HA boundary, and rollback.
+* **[2.0 Migration Guide](docs/2.0-migration.md):** Stable 1.9.5 → 2.0 rc upgrade, breaking-change IDs, config/API/DB/HA boundary, and rollback.
 * **[Installation Guide](docs/installation.md):** Step-by-step setup for Linux systemd, Docker, Docker Compose, and HA macvlan.
 * **[Configuration Reference](docs/configuration-reference.md):** Exhaustive documentation of every TOML configuration key, default and hot-reload/restart behavior. See also [Config v2](docs/config-v2.md) and the [2.0 public API diff](docs/2.0-public-api-diff.md).
 * **[Benchmarking Report](docs/benchmarks.md):** Empirical benchmark results vs. Plan Section 16.1 and ADR-0008 contracts.
@@ -263,7 +264,7 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 * **[High-Availability Runbook](docs/runbook-ha.md):** Deployment architectures, mTLS certificates, failover, and slave promotion.
 * **[Current 2.0 Claim Matrix](docs/2.0-claim-matrix.md):** Phase 2 claims mapped to the implementation, named tests and current documentation.
 * **[1.9.5 Release Notes](docs/release-notes-1.9.5.md):** Release-engineering patch: multi-platform artifact E2E and container image publication. See the [1.9.4 release notes](docs/release-notes-1.9.4.md#known-issues) for known issues.
-* **[Changelog](CHANGELOG.md):** Release notes for v1.9.5, the 2.0 alpha line, and complete history of phases M0 through M9.
+* **[Changelog](CHANGELOG.md):** Release notes for v1.9.5, the 2.0 line, and complete history of phases M0 through M9.
 * **[Historical documentation index](docs/history/README.md):** Which audits/plans are historical leads versus current evidence.
 
 ---

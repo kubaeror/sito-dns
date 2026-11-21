@@ -5,9 +5,11 @@ name: Fuzz
 # owns the nightly smoke and the 24-hour release-checklist run.
 #
 # GitHub-hosted jobs are capped at 6 hours. The 24-hour checklist therefore
-# runs as four parallel 6-hour shards per target (24 target-hours aggregate)
-# on `ubuntu-24.04`; no self-hosted runner is required. The shard count is an
-# input so the same workflow can run the short nightly smoke.
+# runs as five parallel 4.8-hour (17,280 s) shards per target (24 target-hours
+# aggregate) on `ubuntu-24.04`; no self-hosted runner is required. Each job
+# leaves ~72 minutes of its 360-minute ceiling for checkout/build/setup/upload.
+# The shard count is an input so the same workflow can run the short nightly
+# smoke.
 on:
   schedule:
     # Nightly smoke, offset from the weekly quality run.
@@ -15,11 +17,11 @@ on:
   workflow_dispatch:
     inputs:
       fuzz_seconds:
-        description: Seconds per shard (max 21600; use 21600 with shards=4 for ~24h)
+        description: Seconds per shard (max 17280; use 17280 with shards=5 for ~24h)
         type: string
         default: '600'
       shards:
-        description: Parallel shards (1 for the nightly smoke; 4 for the 24h checklist)
+        description: Parallel shards (1 for the nightly smoke; 5 for the 24h checklist)
         type: string
         default: '1'
 
@@ -70,7 +72,9 @@ jobs:
               {"target": "ha_bundle", "dictionary": "fuzz/dictionaries/ha_bundle.dict"},
               {"target": "config_toml", "dictionary": "fuzz/dictionaries/config_toml.dict"},
           ]
-          print(json.dumps([dict(t, shard=i) for t in targets for i in range(shards)]))
+          # GitHub requires a mapping here; a bare sequence fails with
+          # "A sequence was not expected" before any fuzz job can start.
+          print(json.dumps({"include": [dict(t, shard=i) for t in targets for i in range(shards)]}))
           ')
           echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
 
@@ -80,8 +84,9 @@ jobs:
     # GitHub-hosted runner only; the 24h run is split into shards because
     # GitHub-hosted jobs have a 6-hour ceiling.
     runs-on: ubuntu-24.04
-    # The fuzz budget is at most 6h; the job ceiling leaves a little room for
-    # checkout/build/upload. A 24h checklist dispatch uses four such shards.
+    # The fuzz budget is at most 288 min (17,280 s); the 360-minute job ceiling
+    # leaves 72 min for checkout/build/setup/upload. A 24h checklist dispatch
+    # uses five such shards.
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -115,12 +120,12 @@ jobs:
             echo "::error::fuzz_seconds must be at least 30"
             exit 1
           fi
-          if [ "${seconds}" -gt 21600 ]; then
-            echo "::error::fuzz_seconds must be <= 21600 (GitHub-hosted job ceiling); use more shards for a longer aggregate campaign"
+          if [ "${seconds}" -gt 17280 ]; then
+            echo "::error::fuzz_seconds must be <= 17280 (4.8h shard; leaves setup time under the 6h GitHub-hosted job ceiling); use five shards for the 24h campaign"
             exit 1
           fi
           echo "seconds=${seconds}" >> "${GITHUB_OUTPUT}"
-          if [ "${seconds}" -ge 19800 ]; then
+          if [ "${seconds}" -ge 17280 ]; then
             echo "::notice::this shard is part of the 24-hour release-checklist campaign"
           fi
       - name: Fuzz ${{ matrix.target }} shard ${{ matrix.shard }}

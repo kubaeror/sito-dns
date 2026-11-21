@@ -19,7 +19,7 @@ published.
 | `build-binaries` | All three release archives build (x86_64, aarch64, armv7) and `contrib/install.sh` passes shellcheck. | `verify-tag`, `release-gate` |
 | `sbom-and-release` | `SHA256SUMS`, the SPDX SBOM, and cosign keyless signatures are generated and staged as a draft GitHub release. | `verify-tag`, `release-gate`, `build-binaries` |
 | `artifact-e2e` | The staged draft is downloadable (it needs a write-capable token); checksums, the cosign identity (`release.yml@refs/tags/*`), `sito --version`, and `sito check-config` all pass. | `sbom-and-release` |
-| `docker-build-push` | The multi-arch image is pushed; its digest, platform list, tags, provenance, and SBOM are verified; the digest is scanned by a digest-pinned Trivy (fixed HIGH/CRITICAL gate; unfixed findings are ignored) and signed/verified with cosign keyless signing. | `verify-tag`, `release-gate`, `build-binaries`, `sbom-and-release`, `artifact-e2e` |
+| `docker-build-push` | The multi-arch image is pushed; its digest, platform list, tags, provenance, and SBOM are verified; the digest is scanned by a digest-pinned Trivy (fixed HIGH/CRITICAL gate; unfixed findings are ignored) and signed/verified with cosign keyless signing. The attested digest is also started with a self-contained config: a local rewrite must answer and the image healthcheck must turn `healthy`. | `verify-tag`, `release-gate`, `build-binaries`, `sbom-and-release`, `artifact-e2e` |
 | `publish-release` | The staged draft is flipped to published and verified not to be a draft; stable tags are marked latest and prereleases stay prereleases. | `sbom-and-release`, `artifact-e2e`, `docker-build-push` |
 
 Consequences:
@@ -233,22 +233,23 @@ release, run the 24-hour checklist on the release candidate commit:
 ```bash
 gh workflow run fuzz.yml \
   --ref <release-commit-or-branch> \
-  -f fuzz_seconds=21600 \
-  -f shards=4
+  -f fuzz_seconds=17280 \
+  -f shards=5
 gh run list --workflow fuzz.yml --limit 1
 gh run watch <run-id> --exit-status
 ```
 
 The workflow runs on GitHub-hosted `ubuntu-24.04` only. GitHub-hosted jobs stop
-after 6 hours, so the 24-hour checklist is four parallel 6-hour shards per
-target (≈24 target-hours aggregate); no self-hosted runner is required.
+after 6 hours, so the 24-hour checklist is five parallel 4.8-hour shards per
+target (≈24 target-hours aggregate); each job keeps 72 minutes of headroom for
+checkout/build/setup/upload. No self-hosted runner is required.
 
 Record in the release checklist:
 
 - run URL and commit SHA;
 - all five matrix targets (`dns_wire`, `abp_parser`, `dnssec_response`,
   `ha_bundle`, `config_toml`) completed with no crash, timeout or OOM;
-- `fuzz_seconds=21600` × `shards=4` (≈24 target-hours aggregate) and the
+- `fuzz_seconds=17280` × `shards=5` (≈24 target-hours aggregate) and the
   per-input timeout of 10 s;
 - the checked-in seed-corpus size before the run and the corpus size reported
   by the job after the run (a growing corpus is expected; a crash is not);
@@ -298,6 +299,27 @@ concrete migration step for every `BC-<n>` ID in
 [`docs/2.0-public-api-diff.md`](2.0-public-api-diff.md) in
 [`docs/2.0-migration.md`](2.0-migration.md). Record the command output with the
 release checklist, alongside the fuzz and benchmark evidence.
+
+## Post-release monitoring (first 24–72 hours)
+
+A prerelease is not finished when the workflow turns green. Watch these signals
+after publishing `v2.0.0-rc.1` and keep the previous stable binary/config
+backup ready for rollback:
+
+| Area | Signal | Where | Rollback trigger |
+| --- | --- | --- | --- |
+| DNS availability | Query error/SERVFAIL rate, listener readiness, `/health` 503s | Prometheus, `/api/v1/status`, `sito healthcheck` | Sustained SERVFAIL/503 growth not explained by an upstream outage |
+| DNSSEC | `sito_dnssec_bogus_total`, secure/insecure counts, validation fetch failures | Prometheus, query log | Bogus rate jumps on names that validated before 2.0 |
+| ACME/TLS | Certificate expiry, renewal failures, readiness reasons, all-transport reload | `/api/v1/status`, ACME logs | Certificate near expiry or a transport serving a stale pair |
+| HA | `protocol_mismatch`, divergence, lag, `queued` vs `connected_no_delivery`, slave `Synced` | `/api/v1/ha/status`, `/api/v1/ha/slaves`, metrics | A slave cannot reach `Synced` or divergence persists after a resync |
+| Filtering | Zero-yield lists, reload errors, `degraded_groups`, rule count | `/api/v1/integrations/lists`, status page, logs | A list reload empties blocking or a group loses its previous snapshot |
+| Runtime | 429/503 rate, cache hit ratio, upstream RTT/errors, query-log drops | Prometheus, dashboard | A sustained latency/error regression or dropped query-log batches |
+| Supply chain | Image digest/signature, archive checksums, SBOM | `docs/release-verification.md` above | A published artifact does not verify |
+
+The Grafana dashboard (`contrib/grafana/sito-dashboard.json`) and
+[`docs/runbook-ha.md`](runbook-ha.md) contain the panel and recovery
+procedures. Record the monitoring window, the on-call observer, any anomaly,
+and the decision (continue, patch, or roll back) in the release checklist.
 
 ## If verification fails
 

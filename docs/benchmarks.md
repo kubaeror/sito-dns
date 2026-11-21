@@ -4,7 +4,7 @@ This document records the benchmarking results, throughput analysis, and
 resource consumption profile from the original reference-hardware run against
 the performance contracts in **ADR-0008 (Performance Budget)**. The absolute
 numbers below were captured on that hardware at **v1.0.0** and are historical:
-they are **not** re-measured for every 1.9.x or 2.0 alpha change and are not a
+they are **not** re-measured for every 1.9.x or 2.0 change and are not a
 claim about the current development line.
 
 Current performance gates:
@@ -13,13 +13,13 @@ Current performance gates:
   `cargo bench --workspace --all-features --locked --no-run`.
 - The nightly `bench.yml` workflow runs the Criterion suite on GitHub-hosted
   `ubuntu-24.04` and compares it with `benches/baseline.json`; more than 10%
-  slower fails. The baseline must be generated on that same runner class
-  (`update_baseline=true`, download the artifact, commit it); the checker fails
-  closed on an environment mismatch. The current alpha baseline is still the
-  WP-1.9 development-host reference (`local-dev-x86_64-20cpu`), so the nightly
-  gate is **inactive until the one-time GitHub-hosted regeneration**. This is an
-  explicit residual, not a hidden threshold. See
-  [docs/ci.md](ci.md#benchmark-baseline).
+  slower fails. The committed baseline records
+  `environment: github-ubuntu-24.04` (generated 2026-11-12), so the nightly
+  thresholded gate is **active**. The checker fails closed on an environment
+  mismatch. A local comparison on different hardware must use
+  `--reference-only` and is not the release gate; regenerate the baseline only
+  through the GitHub-hosted `update_baseline=true` workflow and commit the
+  downloaded artifact. See [docs/ci.md](ci.md#benchmark-baseline).
 - The 24-hour fuzz run and a green benchmark comparison are release-checklist
   items, not PR gates; see
   [docs/release-verification.md](release-verification.md#fuzz-evidence-24-hour-release-checklist).
@@ -143,7 +143,12 @@ cargo bench -p sito-cache --bench cache_bench
 cargo bench -p sito-stats --bench stats_bench
 cargo bench -p sito-stats --bench metrics_bench
 
-# Regenerate the environment-specific baseline on the dedicated runner
+# Local comparison on different hardware: reference-only, never the gate
+python3 scripts/check-bench-regression.py --reference-only
+
+# Regenerate the environment-specific baseline through the GitHub-hosted
+# workflow (dispatch bench.yml with update_baseline=true, download the artifact,
+# and commit benches/baseline.json). A local save is not the release gate.
 scripts/save-bench-baseline.sh
 ```
 

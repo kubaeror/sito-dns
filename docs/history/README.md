@@ -36,7 +36,7 @@ tests at `HEAD` remain authoritative.
 Start here:
 
 - [2.0 migration guide](../2.0-migration.md) — upgrade steps, breaking-change
-  IDs and the Phase 1/Phase 2 boundary.
+  IDs, the Phase 2 delivered set and the rc.1 upgrade/rollback path.
 - [Config v2](../config-v2.md) — schema freeze, unknown-key policy, migration
   report and restart-only matrix.
 - [2.0 public API diff](../2.0-public-api-diff.md) — source-level changes and
@@ -45,8 +45,9 @@ Start here:
   legacy key, defaults and hot-reload/restart behavior.
 - [HA runbook](../runbook-ha.md) — replication, readiness, promotion and
   certificate rotation.
-- [Security review](../security-audit.md) — implemented controls and accepted
-  limitations.
+- [Security review](../security-audit.md) and the
+  [Phase 3 security review](../phase3-security-review.md) — implemented
+  controls, acceptance evidence and accepted limitations.
 - [P0/P1 test evidence](../audit6-test-matrix.md) and
   [reviewed best-effort error handling](../audit6-best-effort.md) — the
   regression evidence behind the safety claims.
@@ -54,9 +55,10 @@ Start here:
   [release verification](../release-verification.md) — gates, fuzz, benchmarks
   and release evidence.
 - [Test harness](../test-harness.md) — deterministic clock, ports and fixtures.
-- [Installation](../installation.md), [benchmarks](../benchmarks.md) and the
-  [1.9.5 release notes](../release-notes-1.9.5.md) — stable-line operational
-  context.
+- [Installation](../installation.md), [benchmarks](../benchmarks.md), the
+  [1.9.5 release notes](../release-notes-1.9.5.md) and the
+  [2.0.0-rc.1 release notes](../release-notes-2.0.0-rc.1.md) — operational
+  context for the stable line and the release candidate.
 
 ## Historical documents
 
