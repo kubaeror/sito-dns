@@ -129,7 +129,7 @@ expect_absent "${FUZZ}" 'pull_request' "fuzzing is not a pull-request trigger"
 expect_absent "${BENCH}" 'pull_request' "the thresholded benchmark gate is not a pull-request trigger"
 expect_match "${FUZZ}" 'fuzz_seconds' "the fuzz workflow accepts a manual duration"
 expect_match "${FUZZ}" 'shards' "the fuzz workflow supports GitHub-hosted shards"
-expect_match "${FUZZ}" '21600' "the fuzz workflow caps each shard at the 6-hour GitHub-hosted limit"
+expect_match "${FUZZ}" '17280' "the fuzz workflow caps each shard below the 6-hour GitHub-hosted limit"
 expect_match "${BENCH}" 'scripts/check-bench-regression\.py' "the bench workflow runs the regression gate"
 expect_match "${BENCH}" 'BENCH_TOLERANCE' "the bench tolerance is configurable"
 expect_match "${BENCH}" 'ubuntu-24\.04' "the bench workflow uses GitHub-hosted runners"
@@ -153,6 +153,10 @@ if [ -n "${unpinned}" ]; then
 else
     echo "ok - every third-party action is SHA-pinned"
 fi
+
+# The fuzz matrix shape, job timeout headroom and documented 24h recipe are
+# checked by the fuzz-specific policy test.
+python3 "${ROOT}/scripts/test-fuzz-workflow.py"
 
 if [ "${failures}" -ne 0 ]; then
     echo "${failures} release workflow check(s) failed" >&2

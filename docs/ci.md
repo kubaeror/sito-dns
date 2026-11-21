@@ -15,7 +15,7 @@ benchmarks, the action pin policy, and the monthly runner-minute budget.
 | **Container** | `container.yml` | `workflow_call` from CI and Weekly, `push` to `main` on container paths, `workflow_dispatch` | Validates both Compose files, builds/smoke-tests the development `Dockerfile`, and builds `Dockerfile.release` with stub binaries. |
 | **Security** | `security.yml` | `workflow_call` from CI and Weekly, `push` to `main`, `workflow_dispatch` | Runs `cargo-deny check`. |
 | **Weekly Quality** | `weekly.yml` | Sunday at 03:00 UTC (`schedule`), `workflow_dispatch` | Release-mode tests plus the reusable Container and Security workflows. Benchmarks moved to `bench.yml`. |
-| **Fuzz** | `fuzz.yml` | Nightly at 04:17 UTC (`schedule`), `workflow_dispatch` (`fuzz_seconds`, `shards`) | Builds and runs the five cargo-fuzz targets with their checked-in corpus and dictionary on GitHub-hosted `ubuntu-24.04`. Default smoke is 600 s per target; the 24-hour release checklist is `fuzz_seconds=21600` with `shards=4` (four 6-hour shards per target, ≈24 target-hours aggregate). Uploads corpus/artifacts on failure. |
+| **Fuzz** | `fuzz.yml` | Nightly at 04:17 UTC (`schedule`), `workflow_dispatch` (`fuzz_seconds`, `shards`) | Builds and runs the five cargo-fuzz targets with their checked-in corpus and dictionary on GitHub-hosted `ubuntu-24.04`. Default smoke is 600 s per target; the 24-hour release checklist is `fuzz_seconds=17280` with `shards=5` (five 4.8-hour shards per target, ≈24 target-hours aggregate). Uploads corpus/artifacts on failure. |
 | **Bench** | `bench.yml` | Nightly at 05:42 UTC (`schedule`), `workflow_dispatch` (`update_baseline`) | Runs the workspace Criterion suite and fails when a benchmark is more than 10% slower than `benches/baseline.json`. `update_baseline=true` writes and uploads a replacement baseline. |
 | **Release** | `release.yml` | Push of a `v*` tag only | Verifies the tag, builds and signs the three release archives, stages a draft GitHub release, verifies the artifacts, publishes the multi-arch container image, and finally publishes the release. |
 | **Artifact E2E** | `artifact-e2e.yml` | `workflow_call` from Release, `workflow_dispatch` with a tag | Re-downloads a staged draft or published release and verifies checksums, signatures, and execution of every architecture in the release runtime image. |
@@ -271,7 +271,7 @@ on every code change. See `crates/sito-stats/tests/prometheus_exposition.rs`.
 | Evidence | PR | Nightly | Release checklist |
 |---|---|---|---|
 | Fuzz targets compile | `fuzz-build` | Builds again before running | Required |
-| Fuzz execution | Not run | 600 s per target, 1 shard (`fuzz.yml`, 04:17 UTC) | 4 shards × 21,600 s per target (≈24 target-hours) on GitHub-hosted runners |
+| Fuzz execution | Not run | 600 s per target, 1 shard (`fuzz.yml`, 04:17 UTC) | 5 shards × 17,280 s per target (≈24 target-hours) on GitHub-hosted runners |
 | Benchmark compile | `bench-build` | Runs the full suite | Required |
 | Benchmark threshold | Not run | `bench.yml` compares to `benches/baseline.json`; >10% fails | Required |
 | Coverage | `coverage`, 85% line floor | Same lane on code changes | Required through green `ci-gate` ancestry |
@@ -457,11 +457,11 @@ a deliberate split:
   on a pinned nightly toolchain. This catches manifest/target/API drift without
   spending fuzzing time.
 - **Nightly:** `.github/workflows/fuzz.yml` runs every target for 600 s with its
-  checked-in corpus and dictionary, a 10 s per-input timeout, and a 26-hour job
+  checked-in corpus and dictionary, a 10 s per-input timeout, and a 6-hour job
   ceiling. A crash/timeout fails the workflow and uploads `fuzz/artifacts/` and
   the corpus.
-- **Release checklist:** dispatch `fuzz.yml` with `fuzz_seconds=21600` and
-  `shards=4` on GitHub-hosted runners (four 6-hour shards per target, ≈24
+- **Release checklist:** dispatch `fuzz.yml` with `fuzz_seconds=17280` and
+  `shards=5` on GitHub-hosted runners (five 4.8-hour shards per target, ≈24
   target-hours aggregate), then record the run URL, commit, target list,
   shard count and corpus size in `docs/release-verification.md`. The 24-hour
   clean run is a D14 release gate, not a flaky PR job.
