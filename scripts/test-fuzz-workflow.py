@@ -57,27 +57,20 @@ def check(condition: bool, message: str) -> None:
         failures.append(message)
 
 
-def load_workflow() -> dict:
+def matrix_generator(text: str) -> str:
+    """Extract the inline Python generator from the ``id: matrix`` step.
+
+    The workflow stays readable without a YAML parser dependency: the step is
+    located by its id, then the single-quoted ``python3 -c`` payload is sliced
+    out. The payload itself contains no single quotes.
+    """
     try:
-        import yaml
-    except ImportError:  # pragma: no cover - depends on the host image
-        raise SystemExit(
-            "PyYAML is required for scripts/test-fuzz-workflow.py "
-            "(python3 -m pip install pyyaml)"
-        )
-    return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-
-
-def matrix_generator(jobs: dict) -> str:
-    prepare = jobs.get("prepare", {})
-    for step in prepare.get("steps", []):
-        if step.get("id") == "matrix":
-            run = step.get("run", "")
-            marker = "python3 -c '"
-            if marker not in run:
-                raise SystemExit("prepare matrix step no longer runs python3 -c")
-            return run.split(marker, 1)[1].rsplit("'", 1)[0]
-    raise SystemExit("prepare matrix step with id 'matrix' not found")
+        step = text.index("id: matrix")
+        start = text.index("python3 -c '", step) + len("python3 -c '")
+        end = text.index("'", start)
+    except ValueError as exc:
+        raise SystemExit("prepare matrix step no longer runs python3 -c") from exc
+    return text[start:end]
 
 
 def run_generator(code: str, shards: int) -> object:
@@ -103,9 +96,8 @@ def run_generator(code: str, shards: int) -> object:
 
 def main() -> int:
     text = WORKFLOW.read_text(encoding="utf-8")
-    jobs = load_workflow().get("jobs", {})
 
-    generator = matrix_generator(jobs)
+    generator = matrix_generator(text)
     for shards in (1, 5):
         matrix = run_generator(generator, shards)
         check(
@@ -154,12 +146,15 @@ def main() -> int:
         return 1
     max_seconds = int(guard.group(1))
 
-    timeout = jobs.get("fuzz", {}).get("timeout-minutes")
+    timeout_match = re.search(
+        r"(?ms)^  fuzz:\n.*?^    timeout-minutes: (\d+)$", text
+    )
     check(
-        isinstance(timeout, int),
+        timeout_match is not None,
         "fuzz job has an integer timeout-minutes",
     )
-    if isinstance(timeout, int):
+    if timeout_match is not None:
+        timeout = int(timeout_match.group(1))
         check(
             timeout > max_seconds / 60 + MIN_SETUP_MARGIN_MINUTES,
             f"timeout-minutes {timeout} exceeds {max_seconds / 60:g} min of "

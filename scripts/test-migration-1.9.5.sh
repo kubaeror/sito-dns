@@ -166,7 +166,7 @@ PY
 wait_for_dns() {
   local pid="$1" logfile="$2" label="$3"
   local i
-  for i in $(seq 1 120); do
+  for _ in $(seq 1 120); do
     if ! kill -0 "$pid" 2>/dev/null; then
       printf '\n%s exited before answering:\n' "$label" >&2
       cat "$logfile" >&2 || true
