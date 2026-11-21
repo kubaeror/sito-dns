@@ -2,12 +2,12 @@
 
 This guide covers deploying **sito** on Linux hosts using the automated one-line installer, manual systemd service configuration, Docker, or Docker Compose.
 
-> **Development status:** the `main` line is currently **2.0.0-alpha.1**
-> (Phase 2 core hardening; WP-2.1 through WP-2.13 are delivered). The published
+> **Development status:** the `main` line is the **2.0.0-rc.1 candidate**
+> (Phase 2 core hardening and Phase 3 verification are delivered). The published
 > stable release remains **1.9.5**, and the pinned examples below intentionally
-> target it. Alpha builds are not published as stable artifacts. Phase 3
-> verification/release and the deferred items listed in the
-> [2.0 claim matrix](2.0-claim-matrix.md) remain outstanding.
+> target it. Pre-release builds are not published as stable artifacts. The
+> rc.1 tag is created after the final gate; deferred items are listed in the
+> [2.0 claim matrix](2.0-claim-matrix.md).
 
 ---
 
@@ -15,12 +15,12 @@ This guide covers deploying **sito** on Linux hosts using the automated one-line
 
 **Read this before the host is reachable from an untrusted network.** These are
 LAN defaults, not internet-safe defaults. The stable 1.9.5 line and the 2.0
-alpha line differ in the admin default:
+release-candidate line differ in the admin default:
 
 * **1.9.5 (stable):** `web.bind` defaults to `0.0.0.0`, the admin UI is served
   over plain HTTP, and port `8080` accepts setup and login requests from every
   reachable source. There is no TLS in the admin listener itself.
-* **2.0.0-alpha.1 (development):** `web.bind` defaults to `127.0.0.1` (the
+* **2.0.0-rc.1 (release candidate):** `web.bind` defaults to `127.0.0.1` (the
   config v2 safe default). Existing v1 configurations migrated without
   `--adopt-safe-defaults` keep their old bind, including `0.0.0.0`.
 * **Both lines:** `dns.bind` defaults to `["0.0.0.0", "::"]` and there is no
@@ -129,10 +129,10 @@ The installer automatically:
    not open 8080, and points at the tunnel or a temporary LAN-scoped rule for
    first-time setup.
 
-### 1.1 The 2.0 alpha line
+### 1.1 The 2.0 release-candidate line
 
 The one-line installer and published container tags above install the **stable
-1.9.5** release. The `2.0.0-alpha.1` development line is built from source
+1.9.5** release. The `2.0.0-rc.1` release-candidate line is built from source
 (or from a prerelease image when one is published):
 
 ```bash
@@ -207,7 +207,7 @@ sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito
 >   LAN-only firewall in this guide does not open 8080; use the SSH tunnel
 >   (`ssh -L 8080:127.0.0.1:8080 user@server`) or the temporary LAN-scoped rule
 >   while completing setup.
-> * **2.0 alpha (config v2):** the safe default is
+> * **2.0 rc (config v2):** the safe default is
 >   `web.bind = "127.0.0.1"`, so the setup-pending wizard is **loopback-only too**.
 >   Use an SSH tunnel/port-forward (`ssh -L 8080:127.0.0.1:8080 user@server`),
 >   or explicitly configure a non-loopback `web.bind` for the setup window if
@@ -219,7 +219,7 @@ sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito
 > If you prefer to supply configuration up-front, create `/etc/sito/config.toml`:
 
 ```toml
-# Current 2.0 alpha / config v2. A 1.9.x file is v1 and must be migrated:
+# Current 2.0 rc / config v2. A 1.9.x file is v1 and must be migrated:
 #   sito config migrate --from v1 --to v2 --backup
 config_version = 2
 
@@ -667,7 +667,7 @@ have bound with its mTLS key, and a slave must have reached `Synced`. A healthy
 DNS response alone no longer masks an HA failure. See `docs/runbook-ha.md`
 (certificate ownership) if the probe reports an unreadable key.
 
-Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard (or use the SSH tunnel above when the LAN-only firewall is enabled). **On 2.0 alpha the default `web.bind` is `127.0.0.1`, so the setup-pending wizard is loopback-only**: open `http://127.0.0.1:8080` through the SSH tunnel above, or explicitly configure a non-loopback `web.bind` for the setup window. See the setup-pending reachability note above. While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
+Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard (or use the SSH tunnel above when the LAN-only firewall is enabled). **On 2.0 the default `web.bind` is `127.0.0.1`, so the setup-pending wizard is loopback-only**: open `http://127.0.0.1:8080` through the SSH tunnel above, or explicitly configure a non-loopback `web.bind` for the setup window. See the setup-pending reachability note above. While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
 
 If the wizard is skipped with `--no-setup` **on a first boot with no `config.toml`**, a random administrator password is generated and printed once, and the panel binds to loopback. When a config file already exists, `--no-setup` neither creates nor rotates credentials. If credentials are lost later, stop the service so the running process cannot keep serving the old credentials, reset the account, then start it again:
 

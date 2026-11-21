@@ -99,8 +99,8 @@ rollback procedure.
 
 ## Verification
 
-See [`docs/release-verification.md`](release-verification.md). The Phase 3
-security review is committed with the rc.1 evidence.
+See [`docs/release-verification.md`](release-verification.md) and the
+[Phase 3 security review](phase3-security-review.md).
 
 - Workspace all-features **1,819 passed / 0 failed / 1 ignored**; default
   **1,711 passed / 0 failed / 1 ignored** on the merged Phase 2 tree; the

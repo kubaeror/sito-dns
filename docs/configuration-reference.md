@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v2.0.0-alpha.1**.
+This document is the exhaustive configuration reference for **sito v2.0.0-rc.1**.
 
 > **Config v2 is frozen at WP-1.3.** `config_version = 2` is the default and
 > the only version accepted by startup, `check-config`, API writes, restore and
@@ -186,7 +186,7 @@ allow_bootstrap_cert = false
 > [!NOTE]
 > `[dns.tls]` (cert/key/sni_certs) and the legacy `[web] acme_enabled`,
 > `acme_email`, `acme_domains`, `acme_staging`, `acme_cache_dir` keys are
-> accepted as **deprecated aliases** for one 2.0 alpha. They take precedence
+> accepted as **deprecated aliases** for the 2.0 line. They take precedence
 > exactly as they did in 1.9; `sito config migrate` rewrites them to typed
 > `[tls]`/`[acme]`. New configuration must use the typed sections.
 

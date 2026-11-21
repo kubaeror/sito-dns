@@ -45,8 +45,9 @@ Start here:
   legacy key, defaults and hot-reload/restart behavior.
 - [HA runbook](../runbook-ha.md) — replication, readiness, promotion and
   certificate rotation.
-- [Security review](../security-audit.md) — implemented controls and accepted
-  limitations; the Phase 3 acceptance review is added with the rc.1 evidence.
+- [Security review](../security-audit.md) and the
+  [Phase 3 security review](../phase3-security-review.md) — implemented
+  controls, acceptance evidence and accepted limitations.
 - [P0/P1 test evidence](../audit6-test-matrix.md) and
   [reviewed best-effort error handling](../audit6-best-effort.md) — the
   regression evidence behind the safety claims.

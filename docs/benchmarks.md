@@ -4,7 +4,7 @@ This document records the benchmarking results, throughput analysis, and
 resource consumption profile from the original reference-hardware run against
 the performance contracts in **ADR-0008 (Performance Budget)**. The absolute
 numbers below were captured on that hardware at **v1.0.0** and are historical:
-they are **not** re-measured for every 1.9.x or 2.0 alpha change and are not a
+they are **not** re-measured for every 1.9.x or 2.0 change and are not a
 claim about the current development line.
 
 Current performance gates:

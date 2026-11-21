@@ -178,7 +178,7 @@ work, not part of the delivered Phase 2 tree. The CLI above is the supported
 manual path. The full narrative migration guide is
 [`docs/2.0-migration.md`](2.0-migration.md).
 
-## 6. Deprecated aliases (one 2.0 alpha)
+## 6. Deprecated aliases (2.0 line)
 
 These v1 spellings remain accepted in v2 and are rewritten by migration:
 
