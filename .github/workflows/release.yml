@@ -541,7 +541,7 @@ jobs:
           instance_name = "release-smoke"
           data_dir = "/var/lib/sito"
           log_level = "info"
-          log_format = "text"
+          log_format = "json"
 
           [dns]
           bind = ["0.0.0.0"]
@@ -564,6 +564,11 @@ jobs:
           domain = "smoke.test"
           type = "A"
           answer = "192.0.2.1"
+
+          [[rewrites.entries]]
+          domain = "localhost"
+          type = "A"
+          answer = "127.0.0.1"
           EOF
           sed -i 's/^ *//' "${tmp}/etc/config.toml"
           docker run --rm \
