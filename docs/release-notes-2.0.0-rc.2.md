@@ -109,12 +109,16 @@ See [`docs/release-verification.md`](release-verification.md) and the
 - fmt, clippy `-D warnings`, `cargo deny`, machete, pinned-nightly udeps and
   the size/docs/OpenAPI/release-workflow checks pass.
 - Fuzz workflow fixed (the previous matrix was invalid and every scheduled run
-  failed before fuzzing). A five-target 60 s GitHub Actions smoke passed:
-  <https://github.com/kubaeror/sito-dns/actions/runs/44954171674>. **The 24-hour
-  campaign is explicitly deferred by the operator and is not claimed as
-  completed for this RC.**
-- Thresholded benchmark run on GitHub-hosted `ubuntu-24.04`: success,
-  <https://github.com/kubaeror/sito-dns/actions/runs/44954195766>.
+  failed before fuzzing). A five-target 60 s GitHub Actions smoke passed on the
+  final `main` commit: <https://github.com/kubaeror/sito-dns/actions/runs/44961095631>.
+  **The 24-hour campaign is explicitly deferred by the operator and is not
+  claimed as completed for this RC.**
+- Thresholded benchmark comparison on GitHub-hosted `ubuntu-24.04` for the
+  final `main` commit: success after a rerun,
+  <https://github.com/kubaeror/sito-dns/actions/runs/44961097837>. A preceding
+  run on the same commit reported four microbenchmark regressions (including
+  the known noisy per-label metrics histograms); the rerun passed the same
+  10% gate. No rebaseline was performed.
 - Installer fresh/upgrade/rollback/uninstall E2E; real Docker
   **1.9.5 → config v1→v2 → 2.0 rc.2 → healthcheck/DNS → rollback** E2E; real
   1.9.5 data-dir migration E2E; exact 1.9.3 schema fixture; HA v1 rejection.
