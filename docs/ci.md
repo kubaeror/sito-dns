@@ -266,6 +266,12 @@ The Prometheus exposition parser check is not a separate job: it is an
 integration test in `sito-stats`, so `cargo test` in the `test` lane runs it
 on every code change. See `crates/sito-stats/tests/prometheus_exposition.rs`.
 
+Before Phase 3 the scheduled `fuzz.yml` matrix was invalid and scheduled runs
+did not execute. The workflow now builds a target × shard matrix in a
+`prepare` job; the nightly smoke uses one shard, and the 24-hour checklist uses
+`shards=4` with `fuzz_seconds=21600`. The 24-hour campaign remains deferred for
+rc.1 and is not a PR gate.
+
 ### PR vs nightly/release split
 
 | Evidence | PR | Nightly | Release checklist |
@@ -303,19 +309,14 @@ prints a warning and must never be used by the nightly gate.
 `bench.yml` runs on GitHub-hosted `ubuntu-24.04` only — no self-hosted runner
 label is required. It passes `--environment "github-ubuntu-24.04"`, so a
 baseline from a different host fails immediately with an instruction to
-regenerate rather than producing a false-green or false-red comparison. To
-generate a GitHub-hosted baseline, dispatch `bench.yml` with
+regenerate rather than producing a false-green or false-red comparison. The
+committed baseline records `environment: github-ubuntu-24.04` and the nightly
+thresholded gate is **active**. To regenerate it, dispatch `bench.yml` with
 `update_baseline=true`, download the `bench-<run_id>` artifact, and commit its
-`benches/baseline.json`. The committed alpha baseline is still the WP-1.9
-development-host reference until that one-time dispatch is done.
-
-The committed alpha baseline records
-`environment.description = "local-dev-x86_64-20cpu"`. Run the one-time
-`update_baseline=true` dispatch on GitHub-hosted `ubuntu-24.04`, download the
-artifact, and commit the resulting `benches/baseline.json` to activate the
-nightly gate. Until that is done the comparison fails closed with an explicit
-environment-mismatch error — a visible residual, never a false green. Do not
-regenerate the baseline to make a real regression pass.
+`benches/baseline.json`. A local comparison on different hardware must use
+`--reference-only` and is not the release gate. Do not regenerate the baseline
+to make a real regression pass; a re-baseline needs a reviewed reason and the
+GitHub-hosted artifact.
 
 ## Required check and branch protection
 
