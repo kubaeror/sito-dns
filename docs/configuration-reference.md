@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v2.0.0-rc.1**.
+This document is the exhaustive configuration reference for **sito v2.0.0-rc.2**.
 
 > **Config v2 is frozen at WP-1.3.** `config_version = 2` is the default and
 > the only version accepted by startup, `check-config`, API writes, restore and

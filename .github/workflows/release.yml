@@ -587,7 +587,7 @@ jobs:
               docker logs "${container}" || true
               exit 1
             fi
-            if python3 -c 'import socket,struct,sys; qname=b"\x08smoke\x04test\x00"; q=struct.pack("!HHHHHH",0x5252,0x0100,1,0,0,0)+qname+struct.pack("!HH",1,1); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(1.0); s.sendto(q,("127.0.0.1",15353)); d,_=s.recvfrom(4096); sys.exit(0 if struct.unpack("!H",d[:2])[0]==0x5252 and b"\xc0\x00\x02\x01" in d else 1)'
+            if python3 -c 'import socket,struct,sys; qname=b"\x05smoke\x04test\x00"; q=struct.pack("!HHHHHH",0x5252,0x0100,1,0,0,0)+qname+struct.pack("!HH",1,1); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(1.0); s.sendto(q,("127.0.0.1",15353)); d,_=s.recvfrom(4096); sys.exit(0 if struct.unpack("!H",d[:2])[0]==0x5252 and b"\xc0\x00\x02\x01" in d else 1)'
             then
               answered=1
               break

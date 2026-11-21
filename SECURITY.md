@@ -11,7 +11,7 @@ We release security patches and vulnerability fixes for the **current minor rele
 | Release Line | Supported Status | Notes |
 |---|---|---|
 | `1.9.x` (1.9.5 stable) | :white_check_mark: Supported | Published stable release; security fixes and critical backports |
-| `2.0.0-rc.1` (release candidate, tag pending) | :construction: Release candidate | Phase 3 verification at the rc.1 candidate; the workspace version is `2.0.0-rc.1`. Not a published stable artifact until the tag/release workflow completes. Security reports are triaged against this line. |
+| `2.0.0-rc.2` (release candidate, tag pending) | :construction: Release candidate | Phase 3 verification at the rc.1 candidate; the workspace version is `2.0.0-rc.2`. Not a published stable artifact until the tag/release workflow completes. Security reports are triaged against this line. |
 | Prior minor release (`1.8.x`) | :white_check_mark: Supported | Critical security fixes only |
 | Older releases | :x: Unsupported | Upgrade recommended |
 

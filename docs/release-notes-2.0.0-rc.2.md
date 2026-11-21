@@ -1,11 +1,13 @@
-# sito 2.0.0-rc.1
+# sito 2.0.0-rc.2
 
-**Release candidate (prerelease).** This is the first 2.0 release candidate
-after the Phase 2 core-hardening work packages. It is not a stable/latest
-release: the published stable line remains **1.9.5**, and the `latest` Docker
+**Release candidate (prerelease).** This is the second 2.0 release candidate
+after the Phase 2 core-hardening work packages. It supersedes the unpublished
+rc.1 pipeline attempt (`rc.1` was never published; its staged draft was deleted
+after the release workflow's new image smoke used a malformed test query). It is
+not a stable/latest release: the published stable line remains **1.9.5**, and the `latest` Docker
 tag must not move. Use an explicit version/tag for evaluation.
 
-- **Source:** `v2.0.0-rc.1`
+- **Source:** `v2.0.0-rc.2`
 - **Config schema:** v2 only (`config_version = 2`); a v1 file must be migrated
 - **Database:** the 1.9.x SQLite schema remains readable/usable; there is no new
   schema migration command in this release
@@ -71,17 +73,17 @@ The installer resolves the latest **stable** release by default, so a
 prerelease must be requested explicitly:
 
 ```bash
-SITO_VERSION=2.0.0-rc.1 bash contrib/install.sh
+SITO_VERSION=2.0.0-rc.2 bash contrib/install.sh
 ```
 
 The shipped Compose default stays pinned to stable `1.9.5`. For the RC, override
 the image explicitly (and pin the digest when you have it):
 
 ```bash
-SITO_IMAGE=ghcr.io/kubaeror/sito-dns:2.0.0-rc.1 docker compose up -d
+SITO_IMAGE=ghcr.io/kubaeror/sito-dns:2.0.0-rc.2 docker compose up -d
 ```
 
-The prerelease image is published as `2.0.0-rc.1` only; it does not move
+The prerelease image is published as `2.0.0-rc.2` only; it does not move
 `latest` or the `2.0` moving tag.
 
 ## Rollback
@@ -103,7 +105,7 @@ See [`docs/release-verification.md`](release-verification.md) and the
 [Phase 3 security review](phase3-security-review.md).
 
 - Workspace all-features **1,821 passed / 0 failed / 1 ignored** and default
-  **1,713 passed / 0 failed / 1 ignored** on the rc.1 candidate.
+  **1,713 passed / 0 failed / 1 ignored** on the rc.2 candidate.
 - fmt, clippy `-D warnings`, `cargo deny`, machete, pinned-nightly udeps and
   the size/docs/OpenAPI/release-workflow checks pass.
 - Fuzz workflow fixed (the previous matrix was invalid and every scheduled run
@@ -114,7 +116,7 @@ See [`docs/release-verification.md`](release-verification.md) and the
 - Thresholded benchmark run on GitHub-hosted `ubuntu-24.04`: success,
   <https://github.com/kubaeror/sito-dns/actions/runs/44954195766>.
 - Installer fresh/upgrade/rollback/uninstall E2E; real Docker
-  **1.9.5 → config v1→v2 → 2.0 rc.1 → healthcheck/DNS → rollback** E2E; real
+  **1.9.5 → config v1→v2 → 2.0 rc.2 → healthcheck/DNS → rollback** E2E; real
   1.9.5 data-dir migration E2E; exact 1.9.3 schema fixture; HA v1 rejection.
 - The release workflow now starts the attested image and requires a local
   rewrite plus Docker `healthy`; tag-time image scan/signature/provenance/SBOM

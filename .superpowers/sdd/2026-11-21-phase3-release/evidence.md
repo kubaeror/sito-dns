@@ -42,3 +42,29 @@ Base: 67269ea (Phase 2 merged to main). Branch: feat/2.0-phase3-release.
 ## WP-3.3 / WP-3.4
 
 - Pending: security review commit; final rc.1 gate; merge to main; tag.
+
+## Final rc.1 gate (2026-11-21)
+
+- all-features: 1,821 passed / 0 failed / 1 ignored
+- default: 1,713 passed / 0 failed / 1 ignored
+- fmt, clippy -D warnings, deny, machete, pinned-nightly udeps,
+  size/error-swallowing, docs/config/migration/link/test-matrix/OpenAPI and
+  release-workflow checks: green.
+- Security: 0 open P0; P1-1 DNAME accepted (fail-closed).
+- Branch PR #29; merge commit on main and tag v2.0.0-rc.1 follow after green
+  ci-gate/cargo-deny on main.
+
+## Release
+
+- PR #29 merged to main at 1cd9b8f4a3f8c17b3f050342b0ea2eb210e17a37
+  (merge commit).
+- main push CI: https://github.com/kubaeror/sito-dns/actions/runs/44959508538
+  SUCCESS (ci-gate); Security 44959508471 SUCCESS (cargo-deny); Container
+  44959508545 SUCCESS.
+- verify-release-gate CI job on the tag: SUCCESS ("Verify release branch and
+  green checks"). Local clean-checkout invocation reached the same check and
+  failed only because the host gh 2.46 lacks `--slurp`; the CI runner has the
+  supported gh and passed the exact script.
+- Tag v2.0.0-rc.1 pushed at 2026-11-22; release workflow run 44961042418:
+  https://github.com/kubaeror/sito-dns/actions/runs/44961042418
+- Final main fuzz smoke: 44961095631; bench: 44961097837 (pending).

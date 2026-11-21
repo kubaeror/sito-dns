@@ -5,14 +5,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [2.0.0-rc.1] - 2026-11-21
+## [2.0.0-rc.2] - 2026-11-22
 
-First 2.0 release candidate (prerelease). Phase 2 core hardening (WP-2.1
+Second 2.0 release candidate (prerelease). Phase 2 core hardening (WP-2.1
 through WP-2.14) is merged to `main`, Phase 3 verification has run, and the
-release is prepared for RC evaluation. The published stable line remains
-**1.9.5**; this prerelease does not move `latest`.
+release is prepared for RC evaluation. It supersedes the unpublished rc.1
+pipeline attempt: rc.1 was never published and its staged draft was deleted
+after the release workflow's new image smoke used a malformed test query. The
+published stable line remains **1.9.5**; this prerelease does not move
+`latest`.
 
-See the full [2.0.0-rc.1 release notes](docs/release-notes-2.0.0-rc.1.md) and
+See the full [2.0.0-rc.2 release notes](docs/release-notes-2.0.0-rc.2.md) and
 the [migration guide](docs/2.0-migration.md). Breaking changes are BC-1 through
 BC-9: config v2, safer new-install defaults, restart-only 409s, generic
 `/health`, internal Rust API changes, HA protocol v2, legacy WebSocket
@@ -24,13 +27,19 @@ operator; a five-target short smoke is recorded instead. SQLite schema/PII
 migration and `/api/v2` remain deferred; `/api/v1` is canonical and the 1.9.x
 SQLite schema remains compatible.
 
+## [2.0.0-rc.1] - 2026-11-21
+
+Not published. The staged draft was deleted after the release workflow's new
+image smoke used a malformed test query; the product gates were green.
+Superseded by `2.0.0-rc.2`.
+
 ## [2.0.0-alpha.1] - 2026-11-12
 
 Phase 2 core hardening prerelease. Phase 1 foundations and the Phase 2 work
 packages (WP-2.1 through WP-2.13) were delivered on the Phase 2 branch; the
 final documentation/migration pass and legacy WebSocket query-token removal
 were WP-2.14. Phase 3 verification/release (WP-3.1 through WP-3.4) followed in
-`2.0.0-rc.1`.
+`2.0.0-rc.2`.
 
 ### Phase 2 core hardening (WP-2.1 through WP-2.13)
 - WP-2.1/2.2: DNSSEC chain state machine, delegation-boundary checks, negative

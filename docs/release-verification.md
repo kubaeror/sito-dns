@@ -303,7 +303,7 @@ release checklist, alongside the fuzz and benchmark evidence.
 ## Post-release monitoring (first 24–72 hours)
 
 A prerelease is not finished when the workflow turns green. Watch these signals
-after publishing `v2.0.0-rc.1` and keep the previous stable binary/config
+after publishing `v2.0.0-rc.2` and keep the previous stable binary/config
 backup ready for rollback:
 
 | Area | Signal | Where | Rollback trigger |
