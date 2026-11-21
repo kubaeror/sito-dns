@@ -25,9 +25,20 @@ NEW_NAME="sito-upgrade-new"
 ADMIN_PASSWORD="upgrade-test-password"
 ANSWER_HEX="192.0.2.9"
 
+# The container writes users.toml, stats.db and HA keys as uid/gid 65532 mode
+# 0600. The invoking user cannot read them directly; use passwordless sudo
+# (the CI runner has it) for the snapshot and rollback copies.
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo -n "$@"
+    fi
+}
+
 cleanup() {
     docker rm -f "${OLD_NAME}" "${NEW_NAME}" >/dev/null 2>&1 || true
-    rm -rf "${TMP}"
+    as_root rm -rf "${TMP}"
 }
 trap cleanup EXIT
 
@@ -50,7 +61,7 @@ import sys
 port = int(sys.argv[1])
 expected = bytes(int(part) for part in sys.argv[2].split("."))
 name = b"legacy.test"
-qname = b"".join(bytes([len(label)]) + label.encode() for label in name.split(b".")) + b"\x00"
+qname = b"".join(bytes([len(label)]) + label for label in name.split(b".")) + b"\x00"
 query = struct.pack("!HHHHHH", 0x4242, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", 1, 1)
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.settimeout(1.0)
@@ -97,7 +108,7 @@ role = "master"
 instance_name = "upgrade-test"
 data_dir = "/var/lib/sito"
 log_level = "info"
-log_format = "text"
+log_format = "json"
 
 [dns]
 bind = ["0.0.0.0"]
@@ -124,6 +135,13 @@ enabled = false
 domain = "legacy.test"
 type = "A"
 answer = "192.0.2.9"
+
+# The image healthcheck probes a local name; answer it locally so the test does
+# not depend on outbound DNS from the sandbox.
+[[rewrites.entries]]
+domain = "localhost"
+type = "A"
+answer = "127.0.0.1"
 EOF
 
 echo "==> seeding the v1 admin and starting ${OLD_IMAGE}"
@@ -148,15 +166,15 @@ docker rm "${OLD_NAME}" >/dev/null
 
 echo "==> snapshotting the v1 data dir for rollback"
 mkdir -p "${TMP}/pre"
-cp -a "${TMP}/etc" "${TMP}/pre/etc"
-cp -a "${TMP}/data" "${TMP}/pre/data"
+as_root cp -a "${TMP}/etc" "${TMP}/pre/etc"
+as_root cp -a "${TMP}/data" "${TMP}/pre/data"
 
 echo "==> migrating config v1 -> v2 with ${NEW_IMAGE}"
 docker run --rm \
     -v "${TMP}/etc:/etc/sito" \
     -v "${TMP}/data:/var/lib/sito" \
     "${NEW_IMAGE}" config migrate --from v1 --to v2 --backup --json >/dev/null
-grep -q '^config_version = 2' "${TMP}/etc/config.toml" || fail "config was not migrated to v2"
+as_root grep -q '^config_version = 2' "${TMP}/etc/config.toml" || fail "config was not migrated to v2"
 [ -f "${TMP}/etc/config.toml.v1.bak" ] || fail "missing config.toml.v1.bak"
 mode="$(stat -c '%a' "${TMP}/etc/config.toml.v1.bak")"
 [ "${mode}" = "600" ] || fail "config backup mode is ${mode}, expected 600"
@@ -165,6 +183,15 @@ docker run --rm \
     -v "${TMP}/data:/var/lib/sito" \
     "${NEW_IMAGE}" check-config --config /etc/sito/config.toml >/dev/null
 echo "    v2 config validates; v1 backup is 0600"
+
+# Documented HA v2 upgrade step: v1 state/watermark files are refused by
+# design. This test has HA disabled, but 1.9.5 still writes ha_state.toml.
+# Move them aside (after the backup above) before the first v2 start.
+for f in ha_state.toml ha_watermark.toml; do
+    if as_root test -e "${TMP}/data/${f}"; then
+        as_root mv "${TMP}/data/${f}" "${TMP}/data/${f}.v1.pre-2.0"
+    fi
+done
 
 echo "==> starting the candidate ${NEW_IMAGE} on the upgraded data dir"
 docker run -d --name "${NEW_NAME}" \
@@ -190,9 +217,9 @@ docker stop -t 30 "${NEW_NAME}" >/dev/null
 docker rm "${NEW_NAME}" >/dev/null
 
 echo "==> rolling back config/data and restarting ${OLD_IMAGE}"
-rm -rf "${TMP:?}/etc" "${TMP:?}/data"
-cp -a "${TMP}/pre/etc" "${TMP}/etc"
-cp -a "${TMP}/pre/data" "${TMP}/data"
+as_root rm -rf "${TMP:?}/etc" "${TMP:?}/data"
+as_root cp -a "${TMP}/pre/etc" "${TMP}/etc"
+as_root cp -a "${TMP}/pre/data" "${TMP}/data"
 docker run -d --name "${OLD_NAME}" \
     -p "${HOST_PORT}:5353/udp" \
     -v "${TMP}/etc:/etc/sito" \
