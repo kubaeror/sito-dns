@@ -99,18 +99,27 @@ rollback procedure.
 
 ## Verification
 
-This section is completed by the release checklist before the tag is published.
-See [`docs/release-verification.md`](release-verification.md) and
-[`docs/phase3-security-review.md`](phase3-security-review.md).
+See [`docs/release-verification.md`](release-verification.md). The Phase 3
+security review is committed with the rc.1 evidence.
 
-- Workspace tests, fmt, clippy, deny, docs/config/migration/link checks.
-- Installer fresh/upgrade/rollback/uninstall E2E and Docker 1.9.5→2.0→rollback
-  upgrade E2E.
-- Five-target short fuzz smoke; the 24-hour campaign is explicitly deferred by
-  the operator and is not claimed as completed for this RC.
-- Thresholded benchmark run on the release candidate commit.
-- Image scan/signature/provenance/SBOM verification and a live
-  healthcheck/DNS smoke of the attested image.
+- Workspace all-features **1,819 passed / 0 failed / 1 ignored**; default
+  **1,711 passed / 0 failed / 1 ignored** on the merged Phase 2 tree; the
+  rc.1 final gate is recorded on the release PR.
+- fmt, clippy `-D warnings`, `cargo deny`, machete, pinned-nightly udeps and
+  the size/docs/OpenAPI/release-workflow checks pass.
+- Fuzz workflow fixed (the previous matrix was invalid and every scheduled run
+  failed before fuzzing). A five-target 60 s GitHub Actions smoke passed:
+  <https://github.com/kubaeror/sito-dns/actions/runs/44954171674>. **The 24-hour
+  campaign is explicitly deferred by the operator and is not claimed as
+  completed for this RC.**
+- Thresholded benchmark run on GitHub-hosted `ubuntu-24.04`: success,
+  <https://github.com/kubaeror/sito-dns/actions/runs/44954195766>.
+- Installer fresh/upgrade/rollback/uninstall E2E; real Docker
+  **1.9.5 → config v1→v2 → 2.0 rc.1 → healthcheck/DNS → rollback** E2E; real
+  1.9.5 data-dir migration E2E; exact 1.9.3 schema fixture; HA v1 rejection.
+- The release workflow now starts the attested image and requires a local
+  rewrite plus Docker `healthy`; tag-time image scan/signature/provenance/SBOM
+  verification remains mandatory before publication.
 
 ## Known issues and residuals
 
