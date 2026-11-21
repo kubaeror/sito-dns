@@ -651,7 +651,12 @@ verifying the graph; both suppressions remain in place.
 
 ## 12. Verification evidence
 
-Run on `67269ea` on 2026-11-21; the final rc.1 gate re-runs the workspace checks on the release commit:
+Run on `67269ea` on 2026-11-21; the final rc.1 gate re-ran the workspace checks
+on the release candidate and recorded **1,821 all-features / 1,713 default**
+tests, 0 failures, 1 ignored, plus fmt/clippy/deny and the docs/config/migration,
+test-matrix, OpenAPI and release-workflow checks.
+
+Initial review run:
 
 | Command | Result |
 |---|---|
