@@ -269,7 +269,7 @@ on every code change. See `crates/sito-stats/tests/prometheus_exposition.rs`.
 Before Phase 3 the scheduled `fuzz.yml` matrix was invalid and scheduled runs
 did not execute. The workflow now builds a target × shard matrix in a
 `prepare` job; the nightly smoke uses one shard, and the 24-hour checklist uses
-`shards=4` with `fuzz_seconds=21600`. The 24-hour campaign remains deferred for
+`shards=5` with `fuzz_seconds=17280`. The 24-hour campaign remains deferred for
 rc.1 and is not a PR gate.
 
 ### PR vs nightly/release split
