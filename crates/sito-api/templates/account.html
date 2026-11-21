@@ -101,6 +101,13 @@
         <label class="form-label" for="current-password">Current Password</label>
         <input type="password" id="current-password" name="current_password" class="form-input" required autocomplete="current-password">
       </div>
+      {% if totp_enabled %}
+      <div class="form-group">
+        <label class="form-label" for="password-change-code">TOTP or Backup Code</label>
+        <input type="text" id="password-change-code" name="code" class="form-input" required autocomplete="one-time-code" inputmode="numeric">
+        <div class="form-help">Required because two-factor authentication is enabled.</div>
+      </div>
+      {% endif %}
       <div class="form-group">
         <label class="form-label" for="new-password">New Password</label>
         <input type="password" id="new-password" name="new_password" class="form-input" required autocomplete="new-password">
@@ -175,6 +182,20 @@
         </select>
       </div>
     </div>
+    {% if can_create_admin_token %}
+    <div class="form-help" style="margin-bottom: 10px;">Creating an <strong>Admin</strong>-scoped token requires re-authentication. Viewer/Operator tokens do not.</div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label" for="token-password">Current Password</label>
+        <input type="password" id="token-password" name="reauth_password" class="form-input" autocomplete="current-password">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="token-code">TOTP or Backup Code</label>
+        <input type="text" id="token-code" name="reauth_code" class="form-input" autocomplete="one-time-code" inputmode="numeric">
+        <div class="form-help">Required to mint an Admin token when 2FA is enabled.</div>
+      </div>
+    </div>
+    {% endif %}
     <div style="display: flex; justify-content: flex-end;">
       <button type="submit" class="btn btn-primary">Create Token</button>
     </div>

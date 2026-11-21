@@ -151,12 +151,23 @@ impl StatsDb {
         &self,
         keep_aggregates: bool,
     ) -> Result<u64, StatsError> {
-        self.delete_query_logs_with_policy(keep_aggregates, self.rollup_client_names)
+        self.delete_query_logs_with_policy(keep_aggregates, self.rollup_client_names_enabled())
             .await
     }
 
     /// Clears the query log with an explicit rollup client-name policy (the
     /// API passes the live configuration so a hot-reloaded setting applies).
+    ///
+    /// `keep_aggregates = true` folds the whole `query_log` range into hourly
+    /// rollups in one transaction before deleting it; that operator-requested
+    /// path is deliberately not hour-bounded and is documented as the
+    /// whole-range memory/lock residual (P2-61). The default
+    /// `keep_aggregates = false` deletes both tables atomically without
+    /// aggregating.
+    ///
+    /// `rollup_client_names` is the caller's captured policy, not an override:
+    /// a live `false` from [`StatsDb::set_rollup_client_names`] is
+    /// authoritative and strips client names in this path too.
     pub async fn delete_query_logs_with_policy(
         &self,
         keep_aggregates: bool,
@@ -732,7 +743,7 @@ impl StatsDb {
             r"
             SELECT upstream,
                    COUNT(*) as total,
-                   SUM(CASE WHEN rcode IS NOT NULL AND rcode != 0 THEN 1 ELSE 0 END) as errors,
+                   SUM(CASE WHEN rcode IS NOT NULL AND rcode NOT IN (0, 3) THEN 1 ELSE 0 END) as errors,
                    SUM(COALESCE(elapsed_us, 0)) as elapsed_sum
             FROM query_log
             WHERE ts >= ? AND upstream IS NOT NULL

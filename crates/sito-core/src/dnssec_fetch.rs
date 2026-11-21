@@ -16,5 +16,15 @@ use crate::error::UpstreamError;
 #[async_trait]
 pub trait DnssecKeyFetcher: Send + Sync {
     /// Resolves a single question (`name`, `rtype`) and returns the message.
-    async fn query(&self, name: &Name, rtype: RecordType) -> Result<Message, UpstreamError>;
+    ///
+    /// `deadline` is an absolute wall-clock bound shared by every fetch made
+    /// for one client query. Implementations must not wait past it: a stalled
+    /// upstream or a black-holed DS/DNSKEY lookup must yield
+    /// [`UpstreamError::Timeout`] instead of pinning the query.
+    async fn query(
+        &self,
+        name: &Name,
+        rtype: RecordType,
+        deadline: std::time::Instant,
+    ) -> Result<Message, UpstreamError>;
 }

@@ -181,11 +181,19 @@ pub fn evaluate_nsec3_denial(
     let mut next_closer: Option<Name> = None;
     let mut closest: Option<Name> = None;
     loop {
-        if relevant.iter().any(|record| matches(record, &candidate)) {
+        // RFC 5155 §7.1: an NSEC3 at the zone apex must have the SOA bit set.
+        // An exact match whose bitmap does not describe the apex (SOA clear)
+        // cannot prove the closest encloser; accepting it would let a
+        // mismatched bitmap complete an NXDOMAIN proof.
+        let matched = relevant.iter().any(|record| {
+            matches(record, &candidate)
+                && (candidate != *signer_zone || record.rdata.type_set().contains(RecordType::SOA))
+        });
+        if matched {
             closest = Some(candidate);
             break;
         }
-        if candidate.is_root() {
+        if candidate == *signer_zone || candidate.is_root() {
             break;
         }
         next_closer = Some(candidate.clone());
@@ -944,6 +952,169 @@ mod tests {
                 "parent-side delegation NSEC3 must not prove NXDOMAIN for {qname}"
             );
         }
+    }
+
+    fn sha1_hash(name: &Name) -> Vec<u8> {
+        Nsec3HashAlgorithm::SHA1
+            .hash(&[], name, 0)
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    }
+
+    fn nsec3_owner(name: &Name, zone: &Name) -> Name {
+        let label = BASE32_DNSSEC.encode(&sha1_hash(name));
+        Name::from_ascii(format!("{label}.{}", zone.to_ascii())).expect("NSEC3 owner")
+    }
+
+    /// An NSEC3 that matches `name` exactly, with a one-step hash range.
+    fn exact_nsec3(name: &Name, zone: &Name, types: &[RecordType]) -> (Name, NSEC3) {
+        (
+            nsec3_owner(name, zone),
+            NSEC3::new(
+                Nsec3HashAlgorithm::SHA1,
+                false,
+                0,
+                Vec::new(),
+                increment(&sha1_hash(name)),
+                types.iter().copied(),
+            ),
+        )
+    }
+
+    /// An NSEC3 whose hash range strictly covers `name`.
+    fn covering_nsec3(name: &Name, zone: &Name) -> (Name, NSEC3) {
+        let hash = sha1_hash(name);
+        let label = BASE32_DNSSEC.encode(&decrement(&hash));
+        (
+            Name::from_ascii(format!("{label}.{}", zone.to_ascii())).expect("NSEC3 owner"),
+            NSEC3::new(
+                Nsec3HashAlgorithm::SHA1,
+                false,
+                0,
+                Vec::new(),
+                increment(&hash),
+                [RecordType::SOA, RecordType::RRSIG],
+            ),
+        )
+    }
+
+    #[test]
+    fn test_nxdomain_missing_closest_encloser_is_incomplete() {
+        // RFC 5155 §8.3: the proof must start with an exact-match NSEC3 for
+        // the closest encloser. Covering the next closer and wildcard names
+        // alone proves nothing about which encloser exists.
+        let zone = Name::from_ascii("example.").unwrap();
+        let qname = Name::from_ascii("missing.example.").unwrap();
+        let wildcard = Name::from_ascii("*.example.").unwrap();
+
+        let (q_owner, q_rdata) = covering_nsec3(&qname, &zone);
+        let (w_owner, w_rdata) = covering_nsec3(&wildcard, &zone);
+        let records = [
+            Nsec3Record {
+                owner: &q_owner,
+                rdata: &q_rdata,
+            },
+            Nsec3Record {
+                owner: &w_owner,
+                rdata: &w_rdata,
+            },
+        ];
+        assert_eq!(
+            evaluate_nsec3_denial(&records, &qname, RecordType::A, true, &zone),
+            Nsec3Denial::Incomplete
+        );
+    }
+
+    #[test]
+    fn test_nxdomain_missing_next_closer_cover_is_incomplete() {
+        // RFC 5155 §8.3: the closest encloser alone does not deny the next
+        // closer name; a covering NSEC3 is required.
+        let zone = Name::from_ascii("example.").unwrap();
+        let qname = Name::from_ascii("missing.example.").unwrap();
+        let wildcard = Name::from_ascii("*.example.").unwrap();
+
+        let (e_owner, e_rdata) = exact_nsec3(
+            &zone,
+            &zone,
+            &[RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3],
+        );
+        let (w_owner, w_rdata) = covering_nsec3(&wildcard, &zone);
+        // The fixture must leave the next closer (here: the qname) uncovered.
+        let encloser = Nsec3Record {
+            owner: &e_owner,
+            rdata: &e_rdata,
+        };
+        let wildcard_cover = Nsec3Record {
+            owner: &w_owner,
+            rdata: &w_rdata,
+        };
+        assert!(!covers(&encloser, &qname));
+        assert!(!covers(&wildcard_cover, &qname));
+
+        let records = [encloser, wildcard_cover];
+        assert_eq!(
+            evaluate_nsec3_denial(&records, &qname, RecordType::A, true, &zone),
+            Nsec3Denial::Incomplete
+        );
+    }
+
+    #[test]
+    fn test_apex_closest_encloser_without_soa_is_incomplete() {
+        // RFC 5155 §7.1: an NSEC3 at the zone apex must have the SOA bit set.
+        // A closest-encloser record whose bitmap does not describe the apex
+        // must not complete an NXDOMAIN proof.
+        let zone = Name::from_ascii("example.").unwrap();
+        let qname = Name::from_ascii("missing.example.").unwrap();
+        let wildcard = Name::from_ascii("*.example.").unwrap();
+
+        let (q_owner, q_rdata) = covering_nsec3(&qname, &zone);
+        let (w_owner, w_rdata) = covering_nsec3(&wildcard, &zone);
+        let (bad_owner, bad_rdata) = exact_nsec3(&zone, &zone, &[RecordType::A, RecordType::RRSIG]);
+        let (good_owner, good_rdata) = exact_nsec3(
+            &zone,
+            &zone,
+            &[RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3],
+        );
+        let q_record = Nsec3Record {
+            owner: &q_owner,
+            rdata: &q_rdata,
+        };
+        let w_record = Nsec3Record {
+            owner: &w_owner,
+            rdata: &w_rdata,
+        };
+        let bad = Nsec3Record {
+            owner: &bad_owner,
+            rdata: &bad_rdata,
+        };
+        let good = Nsec3Record {
+            owner: &good_owner,
+            rdata: &good_rdata,
+        };
+
+        // Control: the same proof with the apex SOA bit is complete.
+        assert_eq!(
+            evaluate_nsec3_denial(
+                &[good, q_record, w_record],
+                &qname,
+                RecordType::A,
+                true,
+                &zone
+            ),
+            Nsec3Denial::Secure
+        );
+        assert_eq!(
+            evaluate_nsec3_denial(
+                &[bad, q_record, w_record],
+                &qname,
+                RecordType::A,
+                true,
+                &zone
+            ),
+            Nsec3Denial::Incomplete,
+            "an apex NSEC3 without the SOA bit must not prove the closest encloser"
+        );
     }
 
     #[test]

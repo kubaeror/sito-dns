@@ -20,6 +20,58 @@ use crate::key::CacheKey;
 /// TTL (seconds) clamped onto records served from stale cache per RFC 8767 §5.
 const STALE_SERVE_TTL: u32 = 30;
 
+/// Lifespan (seconds) of a cached strict-mode DNSSEC `Bogus` SERVFAIL.
+///
+/// A Bogus decision is fail-closed and carries no answer data, but it is still
+/// a transient judgement about current chain/key material. Keeping the window
+/// short bounds how long a transient validation failure can suppress a name
+/// after the underlying problem clears. RFC 2308 negative caching does not
+/// apply because SERVFAIL is not a cacheable RCODE there, so this entry is
+/// created only through
+/// [`DnsCache::insert_validation_failure_at_epochs`].
+pub const DNSSEC_BOGUS_CACHE_TTL: u32 = 5;
+
+/// Maximum lifespan (seconds) of a cached `Indeterminate` validation result.
+///
+/// In log-only mode an inconclusive (or Bogus) answer is recorded as
+/// `Indeterminate`. It is never served to a validating client and must not
+/// linger for the full record TTL, because the resolver's validation state can
+/// change independently of the answer data. The insert caps both the entry
+/// lifespan and its record TTLs to this window.
+pub const DNSSEC_INDETERMINATE_CACHE_TTL: u32 = 30;
+
+/// Lifespan bound for a fail-closed (`Bogus`) or inconclusive
+/// (`Indeterminate`) entry, or `None` for an ordinary validation status.
+///
+/// The insert path clamps to this value, and the read/re-clamp paths apply the
+/// same bound defensively so the short windows are cache invariants rather
+/// than a convention enforced only at the call site.
+fn failure_lifespan_cap(status: ValidationStatus) -> Option<u32> {
+    match status {
+        ValidationStatus::Bogus => Some(DNSSEC_BOGUS_CACHE_TTL),
+        ValidationStatus::Indeterminate => Some(DNSSEC_INDETERMINATE_CACHE_TTL),
+        ValidationStatus::Secure | ValidationStatus::Insecure | ValidationStatus::Unchecked => None,
+    }
+}
+
+/// Whether a status-less getter may return an entry with this status.
+///
+/// This is an allow-list: only statuses that are authenticated answers
+/// (`Secure`/`Insecure`) or, when validation is inactive, a genuinely
+/// unvalidated answer (`Unchecked`) are returnable. `Bogus` is a fail-closed
+/// SERVFAIL and `Indeterminate` is unservable/inconclusive (in log-only mode it
+/// can still carry the answer data), so both the fresh and stale status-less
+/// getters hide them. A caller that needs to inspect them — pipeline gates,
+/// stale-serving tests and other inspection code — uses the corresponding
+/// status-aware getter. (The background prefetch never reads stale entries: it
+/// re-resolves and consults the fresh status-aware getter.)
+fn statusless_servable(status: ValidationStatus) -> bool {
+    matches!(
+        status,
+        ValidationStatus::Secure | ValidationStatus::Insecure | ValidationStatus::Unchecked
+    )
+}
+
 /// Builds a moka cache with the given capacity in megabytes.
 fn build_cache(size_mb: u64) -> Cache<CacheKey, Arc<CacheEntry>> {
     Cache::builder()
@@ -168,6 +220,13 @@ impl DnsCache {
     /// scan would be pure overhead. Cache-only callers that keep the epoch
     /// (for example a future policy-only reload) must use
     /// [`Self::update_config`] to retain the re-clamp contract.
+    ///
+    /// A runtime apply therefore treats every cache-policy change — including
+    /// a TTL-only change such as `max_ttl` — as an epoch change: old entries
+    /// are unservable immediately and are reclaimed lazily, while new inserts
+    /// are clamped with the newly published config. This trades warm entries
+    /// for an O(1) apply; [`Self::update_config`] is the warm-entry path for
+    /// direct cache users.
     pub async fn update_config_for_generation(&self, config: CacheConfig) {
         let size_changed = self.config.load().size_mb != config.size_mb;
         self.config.store(Arc::new(config.clone()));
@@ -294,6 +353,12 @@ impl DnsCache {
     }
 
     /// Retrieve a response for the given query from cache, adjusting TTLs according to elapsed time.
+    ///
+    /// This is the shaped, status-less form: it never returns a fail-closed
+    /// `Bogus` SERVFAIL or an inconclusive `Indeterminate` entry. Use
+    /// [`Self::get_for_query_with_status`] when the validation status is needed
+    /// (for example to apply the pipeline's status gate) or when inspecting
+    /// entries that the status-less form hides.
     pub async fn get(&self, name: &Name, qtype: RecordType, qclass: DNSClass) -> Option<Message> {
         self.get_by_key(&CacheKey::new(name, qtype, qclass))
             .await
@@ -301,16 +366,22 @@ impl DnsCache {
     }
 
     /// Retrieve a response for `query`, honouring its DO/CD/ECS cache key.
+    ///
+    /// Like [`Self::get`], this status-less form hides `Bogus` and
+    /// `Indeterminate` entries; only
+    /// [`Self::get_for_query_with_status`] exposes them.
     pub async fn get_for_query(&self, query: &Message) -> Option<Message> {
-        self.get_for_query_with_status(query)
+        self.get_by_key(&CacheKey::for_query(query)?)
             .await
             .map(|(message, _)| message)
     }
 
     /// Retrieve a response and its recorded DNSSEC validation status.
     ///
-    /// The pipeline uses the status to decide whether the entry may be served
-    /// when validation is active (see [`ValidationStatus`]).
+    /// This is the raw, unfiltered inspection form: unlike [`Self::get`] and
+    /// [`Self::get_for_query`] it also returns `Bogus`/`Indeterminate` entries,
+    /// because the pipeline needs the status to decide whether they may be
+    /// served. Callers must apply that gate themselves.
     pub async fn get_for_query_with_status(
         &self,
         query: &Message,
@@ -338,6 +409,7 @@ impl DnsCache {
     async fn get_by_key(&self, key: &CacheKey) -> Option<(Message, ValidationStatus)> {
         self.get_by_key_with_status(key)
             .await
+            .filter(|(_, status, _)| statusless_servable(*status))
             .map(|(message, status, _)| (message, status))
     }
 
@@ -377,10 +449,16 @@ impl DnsCache {
             return None;
         }
 
-        let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
-        let max_stale_secs = entry
+        // Defense in depth for the fail-closed/inconclusive windows: even an
+        // entry that reached the cache without the insert-time clamp (for
+        // example one copied by a resize from an older generation) must not
+        // outlive the status-bound lifespan.
+        let lifespan_secs = entry
             .max_lifespan_secs
-            .saturating_add(config.serve_stale_hours.saturating_mul(3600));
+            .min(failure_lifespan_cap(entry.validation_status).unwrap_or(u32::MAX));
+        let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
+        let max_stale_secs =
+            lifespan_secs.saturating_add(config.serve_stale_hours.saturating_mul(3600));
 
         if elapsed_secs >= max_stale_secs {
             trace!(
@@ -391,10 +469,10 @@ impl DnsCache {
             return None;
         }
 
-        if elapsed_secs >= entry.max_lifespan_secs {
+        if elapsed_secs >= lifespan_secs {
             trace!(
                 "Cache entry for {} expired for normal queries (elapsed: {}s, lifespan: {}s)",
-                key.qname, elapsed_secs, entry.max_lifespan_secs
+                key.qname, elapsed_secs, lifespan_secs
             );
             return None;
         }
@@ -423,10 +501,26 @@ impl DnsCache {
             }
         }
 
+        // Defense in depth for the fail-closed/inconclusive windows: an entry
+        // copied from an older generation may carry raw record TTLs that were
+        // never clamped at insert time. Record TTLs may outlive neither the
+        // status-bound window nor the entry's own remaining lifespan.
+        if let Some(cap) = failure_lifespan_cap(entry.validation_status) {
+            let record_cap = cap.min(lifespan_secs.saturating_sub(elapsed_secs));
+            for record in response
+                .answers
+                .iter_mut()
+                .chain(response.authorities.iter_mut())
+                .chain(response.additionals.iter_mut())
+            {
+                record.ttl = record.ttl.min(record_cap);
+            }
+        }
+
         debug!(
             "Cache hit for {} (remaining min TTL: {}s)",
             key.qname,
-            entry.max_lifespan_secs.saturating_sub(elapsed_secs)
+            lifespan_secs.saturating_sub(elapsed_secs)
         );
         Some((response, entry.validation_status, entry.policy_epoch))
     }
@@ -437,7 +531,19 @@ impl DnsCache {
     /// revalidated, so it must never claim `AD` and must not carry RRSIGs,
     /// DNSKEYs or denial records that would let a client treat it as
     /// authentic.
-    /// TTLs are clamped to 30 seconds as recommended by RFC 8767 section 5.
+    ///
+    /// Fail-closed (`Bogus`) and inconclusive (`Indeterminate`) entries are
+    /// never returned: a `Bogus` entry is a fail-closed SERVFAIL with no
+    /// reusable answer data, and an `Indeterminate` entry is unservable to a
+    /// validating client (in log-only mode it can still carry the answer data,
+    /// which is exactly why the stale path must not hand it out). Use
+    /// [`Self::get_stale_for_query_with_status`] to inspect those entries.
+    /// `Unchecked` is still returned; it is valid when local validation is
+    /// inactive, and the status-aware pipeline gate decides whether it may be
+    /// served.
+    ///
+    /// TTLs are clamped to 30 seconds as recommended by RFC 8767 section 5,
+    /// and never exceed the configured `max_ttl`.
     pub async fn get_stale(
         &self,
         name: &Name,
@@ -446,23 +552,37 @@ impl DnsCache {
     ) -> Option<Message> {
         self.get_stale_by_key(&CacheKey::new(name, qtype, qclass))
             .await
+            .filter(|(_, status, _)| statusless_servable(*status))
             .map(|(message, _, _)| message)
     }
 
     /// Retrieve a stale response for `query`, honouring its DO/CD/ECS cache key.
+    ///
+    /// Like [`Self::get_stale`], this status-less form hides `Bogus` and
+    /// `Indeterminate` entries; only the status-aware
+    /// [`Self::get_stale_for_query_with_status`] exposes them.
     pub async fn get_stale_for_query(&self, query: &Message) -> Option<Message> {
         self.get_stale_for_query_with_status(query)
             .await
+            .filter(|(_, status)| statusless_servable(*status))
             .map(|(message, _)| message)
     }
 
     /// Retrieve a stale response together with the validation status recorded
     /// when it was cached.
     ///
-    /// The pipeline uses the status to apply the same
-    /// [`ValidationStatus::Unchecked`] gate as fresh cache hits: stale data is
-    /// not revalidated, so an entry cached without local validation must not
-    /// be served while validation is active.
+    /// This is the unfiltered inspection form: it is the only stale getter
+    /// that exposes `Bogus`/`Indeterminate` entries (the status-less getters
+    /// hide them).
+    ///
+    /// Callers must **not** apply the fresh-path gate here. The fresh gate may
+    /// serve a cached `Bogus` entry because that entry is a complete,
+    /// fail-closed SERVFAIL response. On the stale path a `Bogus` entry is
+    /// rejected while validation is active: a stale validation failure is not
+    /// replayed, and the resolver instead synthesizes a fresh SERVFAIL from the
+    /// upstream attempt that just failed. `Indeterminate` and `Unchecked` are
+    /// likewise rejected while validation is active — only `Secure`/`Insecure`
+    /// are servable there. This method itself does not filter on the status.
     pub async fn get_stale_for_query_with_status(
         &self,
         query: &Message,
@@ -519,14 +639,19 @@ impl DnsCache {
         // Never serve stale data as authenticated (RFC 8767 §5.1 / RFC 6840).
         clear_dnssec_material(&mut response);
 
+        // RFC 8767 §5 recommends a short stale TTL (30 s). The configured
+        // `max_ttl` is still an upper bound for anything this resolver serves:
+        // a policy that caps positive answers below 30 s must not have stale
+        // data handed out with a longer TTL.
+        let stale_ttl = STALE_SERVE_TTL.min(config.max_ttl);
         for record in &mut response.answers {
-            record.ttl = STALE_SERVE_TTL;
+            record.ttl = stale_ttl;
         }
         for record in &mut response.authorities {
-            record.ttl = STALE_SERVE_TTL;
+            record.ttl = stale_ttl;
         }
         for record in &mut response.additionals {
-            record.ttl = STALE_SERVE_TTL;
+            record.ttl = stale_ttl;
         }
 
         debug!(
@@ -562,6 +687,16 @@ impl DnsCache {
             if entry.filter_epoch != self.filter_epoch() {
                 return false;
             }
+            // Prefetch exists to refresh usable data before it expires. A
+            // Bogus SERVFAIL is fail-closed and an Indeterminate answer is
+            // unservable to validating clients; re-resolving them in the
+            // background would defeat the short negative-cache window.
+            if matches!(
+                entry.validation_status,
+                ValidationStatus::Bogus | ValidationStatus::Indeterminate
+            ) {
+                return false;
+            }
             let elapsed_secs = entry.stored_at.elapsed().as_secs() as u32;
             if elapsed_secs < entry.max_lifespan_secs {
                 let remaining = entry.max_lifespan_secs - elapsed_secs;
@@ -587,6 +722,11 @@ impl DnsCache {
     /// * NoError responses without an RRset of the queried type are treated as
     ///   NODATA and require an SOA in the authority section (RFC 2308);
     ///   negative answers without an SOA are not cached.
+    ///
+    /// The stored copy always has `AD=0`: the caller's response is not
+    /// mutated, and an `Unchecked` entry may not claim authentication it never
+    /// received. Use [`Self::insert_with_status`] with [`ValidationStatus::Secure`]
+    /// to preserve an authenticated answer's AD bit.
     pub async fn insert(&self, query: &Message, response: &Message) {
         self.insert_with_status(query, response, ValidationStatus::Unchecked)
             .await;
@@ -595,8 +735,12 @@ impl DnsCache {
     /// Insert a response together with its DNSSEC validation status.
     ///
     /// The extra parameter lets the pipeline distinguish a validated insecure
-    /// answer from one that was never validated, which the plain [`insert`]
-    /// convenience method cannot express.
+    /// answer from one that was never validated, which the plain
+    /// [`Self::insert`] convenience method cannot express.
+    ///
+    /// The stored copy keeps `AD` only for [`ValidationStatus::Secure`]; every
+    /// other status is stored with `AD=0` so a forged upstream bit cannot be
+    /// replayed from the cache. The caller's message is not mutated.
     pub async fn insert_with_status(
         &self,
         query: &Message,
@@ -650,6 +794,17 @@ impl DnsCache {
 
         let config = self.config.load();
         if !config.enabled {
+            return false;
+        }
+        // A Bogus decision is fail-closed: the response must be a SERVFAIL
+        // with no answer data, which only the dedicated failure insert can
+        // produce. Allowing it here would let ordinary answer data be served
+        // behind a Bogus status.
+        if validation_status == ValidationStatus::Bogus {
+            trace!(
+                "Not caching Bogus status for {} through the normal insert path",
+                key.qname
+            );
             return false;
         }
 
@@ -735,7 +890,7 @@ impl DnsCache {
             config.min_ttl
         };
 
-        let max_lifespan_secs = if is_negative {
+        let mut max_lifespan_secs = if is_negative {
             // RFC 2308 requires a SOA record owned by an ancestor of the query
             // name (or of a CNAME target on the chain) to derive the negative
             // TTL. A SOA for an unrelated zone is out of bailiwick and must not
@@ -812,7 +967,34 @@ impl DnsCache {
             }
         };
 
-        let serialized_len = encode_message(response).map_or(256, |b| b.len());
+        // Log-only mode records an inconclusive/Bogus answer as
+        // `Indeterminate`. It is unservable to a validating client, and the
+        // resolver's validation state can change independently of the answer,
+        // so neither the entry nor any record TTL may outlive the short
+        // DNSSEC_INDETERMINATE_CACHE_TTL window.
+        if validation_status == ValidationStatus::Indeterminate {
+            let cap = max_lifespan_secs.min(DNSSEC_INDETERMINATE_CACHE_TTL);
+            max_lifespan_secs = cap;
+            for ttl in answer_ttls
+                .iter_mut()
+                .chain(authority_ttls.iter_mut())
+                .chain(additional_ttls.iter_mut())
+            {
+                *ttl = (*ttl).min(cap);
+            }
+        }
+
+        // The stored envelope must not claim authentication that the resolver
+        // did not prove. Only a `Secure` decision may keep the AD bit; an
+        // upstream- or caller-supplied AD on an `Unchecked`/`Insecure` answer
+        // is forged from the cache's point of view. Clone so the caller's
+        // message is never mutated.
+        let mut message = response.clone();
+        if validation_status != ValidationStatus::Secure {
+            message.metadata.authentic_data = false;
+        }
+
+        let serialized_len = encode_message(&message).map_or(256, |b| b.len());
         let estimated_bytes = (serialized_len + key.qname.len() + 128) as u32;
 
         // Re-check immediately before the insert. The caller captured the
@@ -839,7 +1021,7 @@ impl DnsCache {
         }
 
         let entry = CacheEntry {
-            message: response.clone(),
+            message,
             stored_at: Instant::now(),
             max_lifespan_secs,
             answer_ttls,
@@ -855,6 +1037,151 @@ impl DnsCache {
         trace!(
             "Caching response for {} with lifespan {}s (weight: {}B)",
             key.qname, max_lifespan_secs, estimated_bytes
+        );
+        self.cache.load_full().insert(key, Arc::new(entry)).await;
+        true
+    }
+
+    /// Insert a fail-closed DNSSEC validation failure as a cache entry.
+    ///
+    /// Strict `Validate` mode turns a Bogus result into a SERVFAIL with no
+    /// answer data. SERVFAIL is not cacheable under RFC 2308, so the normal
+    /// insert path rejects it; this method stores the fail-closed response
+    /// explicitly so repeated queries for a Bogus name do not keep hitting
+    /// upstreams for the short [`DNSSEC_BOGUS_CACHE_TTL`] window.
+    ///
+    /// The response must be a `SERVFAIL` with empty answer, authority and
+    /// additional sections and a question matching `query`, and it must not
+    /// assert `AD` (a fail-closed decision proves nothing). The entry has no
+    /// record TTLs and a lifespan of `ttl_secs` clamped to
+    /// [`DNSSEC_BOGUS_CACHE_TTL`] (`Bogus`) or
+    /// [`DNSSEC_INDETERMINATE_CACHE_TTL`] (`Indeterminate`); callers may pass a
+    /// shorter TTL but never extend the window. Other statuses are rejected.
+    ///
+    /// `Indeterminate` is accepted only so tests can construct the log-only
+    /// shape through this dedicated path; production log-only answers use the
+    /// normal [`Self::insert_with_status`] path, which applies the same
+    /// lifespan cap. Both epochs must still be current.
+    ///
+    /// Returns `true` when the entry was stored.
+    pub async fn insert_validation_failure_at_epochs(
+        &self,
+        query: &Message,
+        response: &Message,
+        validation_status: ValidationStatus,
+        policy_epoch: PolicyEpoch,
+        filter_epoch: u64,
+        ttl_secs: u32,
+    ) -> bool {
+        let Some(window_cap) = failure_lifespan_cap(validation_status) else {
+            return false;
+        };
+        let lifespan_secs = ttl_secs.min(window_cap);
+        let Some(key) = CacheKey::for_query(query) else {
+            return false;
+        };
+        let config = self.config.load();
+        if !config.enabled {
+            return false;
+        }
+        let Some(first_query) = query.queries.first() else {
+            return false;
+        };
+        if response.metadata.message_type != MessageType::Response {
+            return false;
+        }
+        if response.metadata.truncation {
+            return false;
+        }
+        // A validation failure is a fail-closed decision: it must never assert
+        // the authenticated-data bit. The shaping paths clear AD, and this
+        // check keeps a future caller from storing an AD=1 failure.
+        if response.metadata.authentic_data {
+            warn!(
+                qname = %key.qname,
+                "Refusing to cache a validation failure that asserts AD"
+            );
+            return false;
+        }
+        if response.metadata.response_code != ResponseCode::ServFail {
+            trace!(
+                "Not caching validation failure for {} without a SERVFAIL response",
+                key.qname
+            );
+            return false;
+        }
+        if !response.answers.is_empty() {
+            warn!(
+                qname = %key.qname,
+                "Refusing to cache a validation failure that carries answer data"
+            );
+            return false;
+        }
+        if !response.authorities.is_empty() || !response.additionals.is_empty() {
+            warn!(
+                qname = %key.qname,
+                "Refusing to cache a validation failure that carries authority or additional data"
+            );
+            return false;
+        }
+        let Some(response_question) = response.queries.first() else {
+            trace!(
+                "Not caching validation failure without a question section for {}",
+                key.qname
+            );
+            return false;
+        };
+        let matches = response_question.name() == first_query.name()
+            && response_question.query_type() == first_query.query_type()
+            && response_question.query_class() == first_query.query_class();
+        if !matches {
+            warn!(
+                qname = %key.qname,
+                "Refusing to cache validation failure with a mismatched question section"
+            );
+            return false;
+        }
+
+        // Same generation contract as a normal insert: a failure decision
+        // belongs to the policy/filter snapshot that produced it.
+        if policy_epoch != self.policy_epoch() {
+            debug!(
+                qname = %key.qname,
+                policy_epoch = %policy_epoch,
+                current = %self.policy_epoch(),
+                "Discarding validation-failure insert from an older DNSSEC policy generation"
+            );
+            return false;
+        }
+        if filter_epoch != self.filter_epoch() {
+            debug!(
+                qname = %key.qname,
+                filter_epoch,
+                current = self.filter_epoch(),
+                "Discarding validation-failure insert from an older filter generation"
+            );
+            return false;
+        }
+
+        let serialized_len = encode_message(response).map_or(256, |b| b.len());
+        let estimated_bytes = (serialized_len + key.qname.len() + 128) as u32;
+        let entry = CacheEntry {
+            message: response.clone(),
+            stored_at: Instant::now(),
+            max_lifespan_secs: lifespan_secs,
+            answer_ttls: Vec::new(),
+            authority_ttls: Vec::new(),
+            additional_ttls: Vec::new(),
+            validation_status,
+            policy_epoch: policy_epoch.get(),
+            filter_epoch,
+            hits: Arc::new(AtomicU32::new(0)),
+            estimated_bytes,
+        };
+
+        trace!(
+            "Caching DNSSEC {:?} SERVFAIL for {} with lifespan {}s (requested {}, weight: {}B)",
+            validation_status, key.qname, lifespan_secs, ttl_secs, estimated_bytes
         );
         self.cache.load_full().insert(key, Arc::new(entry)).await;
         true
@@ -930,6 +1257,67 @@ impl DnsCache {
         backdated.stored_at = stored_at;
         cache.insert(key, Arc::new(backdated)).await;
     }
+
+    /// Returns the cached entry's status-bound lifespan for `query`.
+    ///
+    /// Test hook for cross-crate integration tests: it exposes the
+    /// `max_lifespan_secs` the insert path stored so a caller can assert the
+    /// short DNSSEC failure window without clock manipulation. Hidden from
+    /// docs and absent from normal builds (it requires the `test-hooks`
+    /// feature); the crate's own unit tests get it via `cfg(test)`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub async fn cached_entry_lifespan_secs_for_test(&self, query: &Message) -> Option<u32> {
+        let key = CacheKey::for_query(query)?;
+        self.cache
+            .load_full()
+            .get(&key)
+            .await
+            .map(|entry| entry.max_lifespan_secs)
+    }
+
+    /// Inserts a pre-built entry for `query`, bypassing the insert validation
+    /// and clamp paths (test only).
+    ///
+    /// This reproduces an entry copied from an older cache generation whose
+    /// raw record TTL vectors were never clamped to the status window, so the
+    /// defensive read-path clamp can be observed directly.
+    #[cfg(test)]
+    pub(crate) async fn insert_raw_entry_for_test(
+        &self,
+        query: &Message,
+        response: &Message,
+        validation_status: ValidationStatus,
+        record_ttl: u32,
+        lifespan_secs: u32,
+    ) {
+        let Some(key) = CacheKey::for_query(query) else {
+            return;
+        };
+        let mut message = response.clone();
+        for record in message
+            .answers
+            .iter_mut()
+            .chain(message.authorities.iter_mut())
+            .chain(message.additionals.iter_mut())
+        {
+            record.ttl = record_ttl;
+        }
+        let entry = CacheEntry {
+            message,
+            stored_at: Instant::now(),
+            max_lifespan_secs: lifespan_secs,
+            answer_ttls: response.answers.iter().map(|_| record_ttl).collect(),
+            authority_ttls: response.authorities.iter().map(|_| record_ttl).collect(),
+            additional_ttls: response.additionals.iter().map(|_| record_ttl).collect(),
+            validation_status,
+            policy_epoch: self.policy_epoch().get(),
+            filter_epoch: self.filter_epoch(),
+            hits: Arc::new(AtomicU32::new(0)),
+            estimated_bytes: 256,
+        };
+        self.cache.load_full().insert(key, Arc::new(entry)).await;
+    }
 }
 
 /// Returns `entry` with its TTL vectors and lifespan re-clamped to `config`.
@@ -998,6 +1386,37 @@ fn reclamp_entry(entry: &CacheEntry, config: &CacheConfig) -> CacheEntry {
             .min()
             .unwrap_or(config.min_ttl);
         reclamped.max_lifespan_secs = min_record_ttl;
+    }
+
+    // Preserve the fail-closed/longevity bounds across a policy reload. A
+    // raised `min_ttl` or a classification change must not extend a Bogus
+    // SERVFAIL or an inconclusive `Indeterminate` answer beyond either its
+    // original lifespan or its short status window. The original lifespan is
+    // an upper bound because the re-clamp has no way to know how much of the
+    // window the entry was already intended to consume.
+    match reclamped.validation_status {
+        ValidationStatus::Bogus => {
+            reclamped.max_lifespan_secs = reclamped
+                .max_lifespan_secs
+                .min(entry.max_lifespan_secs)
+                .min(DNSSEC_BOGUS_CACHE_TTL);
+        }
+        ValidationStatus::Indeterminate => {
+            let cap = reclamped
+                .max_lifespan_secs
+                .min(entry.max_lifespan_secs)
+                .min(DNSSEC_INDETERMINATE_CACHE_TTL);
+            reclamped.max_lifespan_secs = cap;
+            for ttl in reclamped
+                .answer_ttls
+                .iter_mut()
+                .chain(reclamped.authority_ttls.iter_mut())
+                .chain(reclamped.additional_ttls.iter_mut())
+            {
+                *ttl = (*ttl).min(cap);
+            }
+        }
+        ValidationStatus::Secure | ValidationStatus::Insecure | ValidationStatus::Unchecked => {}
     }
 
     reclamped

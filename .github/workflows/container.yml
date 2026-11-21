@@ -39,6 +39,10 @@ jobs:
         run: |
           docker compose -f docker-compose.yml config >/dev/null
           docker compose -f docker-compose.ha.yml config >/dev/null
+      - name: Check shipped compose and systemd defaults
+        run: |
+          bash scripts/test-compose-defaults.sh
+          bash scripts/test-systemd-hardening.sh
 
   smoke:
     name: smoke

@@ -19,6 +19,12 @@ criterion.workspace = true
 hickory-proto.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
 
+[features]
+# Test-only accessors used by cross-crate integration tests. Not enabled by
+# default; release builds must use an explicit feature set without `test-hooks`
+# (the release workflow and Dockerfile are checked by test-release-workflow.sh).
+test-hooks = []
+
 [[bench]]
 name = "cache_bench"
 harness = false

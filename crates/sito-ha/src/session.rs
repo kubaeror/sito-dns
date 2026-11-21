@@ -244,4 +244,42 @@ mod tests {
             other => panic!("expected a timeout error, got {other:?}"),
         }
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_master_send_timeout_names_role_and_context() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        // One-byte pipe plus a configuration push that cannot fit: the master
+        // send path must hit the shared deadline and name the role/context.
+        let (local, _remote) = tokio::io::duplex(1);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            local,
+            Role::Server,
+            Some(crate::transport::ws_config()),
+        )
+        .await;
+
+        let push = HaMessage::ConfigPush {
+            version: 2,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            term: 0,
+            hash_blake3: "h".to_string(),
+            signature_ed25519: "s".to_string(),
+            payload_b64: "p".to_string(),
+            payload_hash_blake3: "h".to_string(),
+        };
+        let err = send_ha_message(&mut ws, &push, "master", "configuration push")
+            .await
+            .expect_err("a stalled slave must time out the master send");
+        match err {
+            HaError::Timeout(text) => assert_eq!(
+                text,
+                format!(
+                    "HA master configuration push send timed out after {:?}",
+                    crate::transport::WS_SEND_TIMEOUT
+                )
+            ),
+            other => panic!("expected a timeout error, got {other:?}"),
+        }
+    }
 }

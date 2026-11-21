@@ -63,12 +63,28 @@ pub struct SlaveStatsSummary {
 /// Outcome of publishing a configuration bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishOutcome {
-    /// The bundle was persisted and queued for at least one connected slave.
-    Published { version: u64, term: u64 },
+    /// The bundle was persisted and at least one connected slave was observed.
+    ///
+    /// This is a *queue outcome*, not delivery confirmation: `slaves_queued`
+    /// counts direct channel enqueues, `slaves_coalesced` counts deferred
+    /// fallback deliveries (slow/full queue), and `slaves_connected` is the
+    /// number of connected slaves observed during the publish. Both queue
+    /// counters may be zero when every connected channel was already closed;
+    /// such a publish must not be reported as `NoSlaves` or as delivered.
+    Published {
+        version: u64,
+        term: u64,
+        slaves_connected: usize,
+        slaves_queued: usize,
+        slaves_coalesced: usize,
+    },
     /// The bundle was persisted but no slave is currently connected.
     NoSlaves,
     /// The signed envelope exceeds the WebSocket message limit and was not
     /// persisted or broadcast.
+    ///
+    /// Retrying the same document cannot shrink it, so this is not scheduled
+    /// for automatic retry; the caller must change the configuration.
     TooLarge { bytes: usize, limit: usize },
 }
 
@@ -104,7 +120,10 @@ mod tests {
             PublishOutcome::NoSlaves,
             PublishOutcome::Published {
                 version: 1,
-                term: 2
+                term: 2,
+                slaves_connected: 1,
+                slaves_queued: 1,
+                slaves_coalesced: 0,
             }
         );
         assert_eq!(

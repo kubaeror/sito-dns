@@ -17,7 +17,12 @@ version = 2
 # into the shipped binary and has no safe upgrade. `cargo-deny`'s advisory DB
 # detects it in CI even though a stale local DB may not. Remove this entry once
 # askama moves off basic-toml.
-ignore = ["RUSTSEC-2026-0374"]
+#
+# RUSTSEC-2026-0543: `chrono` is unmaintained (announced 2026-11-16); it is used
+# by `croner` for schedule parsing and by the dev-only `prometheus-parse`. There
+# is no safe upgrade yet. `chrono` stays isolated behind those crates; revisit
+# when `croner`/`prometheus-parse` move to a maintained time crate.
+ignore = ["RUSTSEC-2026-0374", "RUSTSEC-2026-0543"]
 
 [licenses]
 allow = [

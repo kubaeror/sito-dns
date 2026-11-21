@@ -74,12 +74,18 @@ trust_anchors = []
 
 [upstream]
 # Upstream schemes supported: tls:// (DoT), https:// (DoH), quic:// (DoQ)
-# and plain host/IP (udp:// optional).
+# and plain host/IP (udp:// optional). Scheme names are case-insensitive.
+# Only https:// and quic:// accept a URL path; udp://, tls:// and bare
+# host:port targets reject one.
 servers = ["tls://dns.quad9.net", "https://cloudflare-dns.com/dns-query"]
+# Required when any target is a hostname; an empty list is rejected if a
+# hostname needs resolving (IP-literal targets may leave it empty).
 bootstrap = ["9.9.9.9", "149.112.112.112"]
 strategy = "failover"
+# Overall per-query budget in ms. Must be 1..=60000.
 timeout_ms = 5000
 probe_domain = "example.com"
+# Persistent connections per endpoint. Must be 1..=64.
 pool_size = 4
 # Hostname-configured upstreams may not resolve to private/reserved addresses
 # unless this is true. IP literals are always accepted.

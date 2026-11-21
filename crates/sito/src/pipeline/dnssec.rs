@@ -36,14 +36,70 @@ impl PipelineContext<'_> {
         )
         .await;
         if let Some(ref m) = self.pipeline.metrics {
-            if matches!(outcome, sito_dnssec::ValidationOutcome::Bogus { .. }) {
+            // `sito_dnssec_bogus_total` is per-query and honours the client's
+            // `ignore_stats` policy. The validator's cumulative counters below
+            // are node-wide shared state (a single validator is used for every
+            // client), so they cannot be attributed to one client and are
+            // published unconditionally.
+            if !self.policy.ignore_stats
+                && matches!(outcome, sito_dnssec::ValidationOutcome::Bogus { .. })
+            {
                 m.inc_dnssec_bogus(upstream_name);
             }
             m.set_dnssec_key_cache(
                 validator.metrics.key_cache_hits(),
                 validator.metrics.key_cache_misses(),
             );
+            m.set_dnssec_validations(
+                validator.metrics.get_validations("secure"),
+                validator.metrics.get_validations("insecure"),
+                validator.metrics.get_validations("bogus"),
+                validator.metrics.get_validations("indeterminate"),
+            );
+            m.set_dnssec_fetch_failures(
+                validator.metrics.fetch_budget_exhausted(),
+                validator.metrics.fetch_deadline_exceeded(),
+            );
         }
         Some(outcome)
+    }
+
+    /// Validates an upstream response, then shapes and caches it under the
+    /// decision it produced.
+    ///
+    /// Strict-mode Bogus is stored through the fail-closed failure insert as a
+    /// SERVFAIL; log-only Bogus keeps the answer and is cached as unservable
+    /// `Indeterminate` by the normal insert. Returns the metric/log label for
+    /// the decision.
+    pub(super) async fn validate_and_cache_upstream(
+        &mut self,
+        upstream_resp: &mut Message,
+        upstream_name: &str,
+    ) -> Option<&'static str> {
+        let dnssec_outcome = self
+            .validate_upstream_response(upstream_resp, upstream_name)
+            .await;
+        let dnssec_str = dnssec_outcome
+            .as_ref()
+            .map(sito_dnssec::ValidationOutcome::as_str);
+        let cache_status = validation_status(dnssec_outcome.as_ref());
+        // Strict mode converts Bogus into a fail-closed SERVFAIL with no
+        // answer data. Cache that decision explicitly: it is not an RFC 2308
+        // negative answer. LogOnly keeps the answer and is cached as
+        // unservable `Indeterminate` by the normal path.
+        let strict_bogus = matches!(
+            dnssec_outcome.as_ref(),
+            Some(sito_dnssec::ValidationOutcome::Bogus { .. })
+        ) && self.dnssec_mode == sito_dnssec::DnssecMode::Validate;
+
+        // Shape before caching so the stored entry never carries
+        // upstream-only EDNS options; a DO=0 client never receives DNSSEC
+        // records and the stripped form is what is cached.
+        if strict_bogus {
+            self.shape_and_insert_bogus(upstream_resp).await;
+        } else {
+            self.shape_and_insert(upstream_resp, cache_status).await;
+        }
+        dnssec_str
     }
 }

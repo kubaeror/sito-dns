@@ -12,6 +12,7 @@ use tracing::{debug, info, trace, warn};
 use sito_core::client::ClientContext;
 use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
+use crate::admission::{AdmissionController, DEFAULT_MAX_CONNECTIONS_PER_IP};
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
 
@@ -66,17 +67,20 @@ pub async fn start_tcp_listener<H: QueryHandler>(
     let local_addr = listener.local_addr()?;
     info!("TCP listener started on {}", local_addr);
 
-    let semaphore = Arc::new(Semaphore::new(config.max_connections));
-    let per_ip_limiter = crate::admission::PerIpConnectionLimiter::new(
-        crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP,
+    let admission = AdmissionController::new(
+        config.max_connections,
+        DEFAULT_MAX_CONNECTIONS_PER_IP,
+        config.rate_limiter.clone().unwrap_or_else(|| {
+            Arc::new(RateLimiter::new(
+                config.rate_limit_per_ip,
+                RateLimiter::burst_for_rate(config.rate_limit_per_ip),
+            ))
+        }),
+        config.max_connections.max(1),
     );
-    let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
-        Arc::new(RateLimiter::new(
-            config.rate_limit_per_ip,
-            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
-        ))
-    });
-    rate_limiter.spawn_pruner(shutdown_rx.clone());
+    admission.spawn_pruner(shutdown_rx.clone());
+
+    let max_connections = config.max_connections;
 
     let handle = tokio::spawn(async move {
         let mut accept_backoff = crate::admission::AcceptBackoff::default();
@@ -102,36 +106,31 @@ pub async fn start_tcp_listener<H: QueryHandler>(
                         }
                     };
 
-                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-                        warn!(
-                            "TCP max connections ({}) reached; rejecting connection from {}",
-                            config.max_connections, peer_addr
-                        );
-                        continue;
-                    };
-                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(peer_addr.ip()) else {
-                        warn!(
-                            "TCP per-IP connection limit ({}) reached; rejecting connection from {}",
-                            crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP, peer_addr
-                        );
-                        continue;
+                    let permit = match admission.try_acquire_connection(peer_addr.ip()) {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            warn!(
+                                "TCP connection from {} rejected: {} (max connections {})",
+                                peer_addr, e, max_connections
+                            );
+                            continue;
+                        }
                     };
 
                     // Rate limiting is per query (see handle_tcp_connection):
                     // the connection cap above already bounds connection setup.
                     let handler = Arc::clone(&handler);
                     let idle_timeout = config.idle_timeout;
-                    let connection_limiter = Arc::clone(&rate_limiter);
+                    let admission = Arc::clone(&admission);
 
                     tokio::spawn(async move {
                         let _permit = permit; // Holds connection slot until task ends
-                        let _per_ip_permit = per_ip_permit;
                         if let Err(e) = handle_tcp_connection(
                             stream,
                             peer_addr,
                             handler,
                             idle_timeout,
-                            connection_limiter,
+                            admission,
                         )
                         .await
                         {
@@ -151,7 +150,7 @@ async fn handle_tcp_connection<H: QueryHandler>(
     peer_addr: SocketAddr,
     handler: Arc<H>,
     idle_timeout: Duration,
-    rate_limiter: Arc<RateLimiter>,
+    admission: Arc<AdmissionController>,
 ) -> std::io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
@@ -250,6 +249,17 @@ async fn handle_tcp_connection<H: QueryHandler>(
             break;
         }
 
+        // Per-query budget: charge the source prefix before allocating or
+        // reading the body. A denied peer never forces a body buffer; the
+        // connection is closed instead of draining an unbounded frame.
+        if let Err(e) = admission.check_rate(client_ip) {
+            debug!(
+                "TCP query from client {} rejected before body read: {}",
+                client_ip, e
+            );
+            break;
+        }
+
         let mut msg_buf = vec![0u8; read_len];
         match timeout(idle_timeout, reader.read_exact(&mut msg_buf)).await {
             Ok(Ok(_)) => {}
@@ -261,16 +271,6 @@ async fn handle_tcp_connection<H: QueryHandler>(
                 debug!("TCP read body timeout for {}", peer_addr);
                 break;
             }
-        }
-
-        // Per-query budget: the accept-time check alone lets one connection
-        // issue unlimited queries.
-        if !rate_limiter.check(client_ip) {
-            debug!(
-                "TCP per-query rate limit exceeded for client {}; dropping query",
-                client_ip
-            );
-            continue;
         }
 
         let query = match decode_message(&msg_buf) {

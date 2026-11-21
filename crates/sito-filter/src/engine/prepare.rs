@@ -108,9 +108,9 @@ impl HostsFilterEngine {
 
     /// Stages the current live filter state without compiling anything.
     ///
-    /// Used by deferred applies (wizard first boot) where the list fetch is
-    /// queued after the request returns; the snapshot still carries a coherent
-    /// filter value for the new configuration.
+    /// Used by deferred applies (clients/upstream/rewrite saves) where the
+    /// loaded rules are intentionally reused; the snapshot still carries a
+    /// coherent filter value for the new configuration.
     pub async fn prepare_current(&self) -> PreparedFilterSnapshot {
         self.prepare_current_with_groups(None).await
     }
@@ -174,8 +174,11 @@ impl HostsFilterEngine {
         self.config.store(Arc::new(config));
         self.group_defs.store(Arc::new(group_defs));
         self.snapshot.store(snapshot);
-        self.group_snapshots.store(group_snapshots);
+        // Bump the generation before publishing group snapshots: a concurrent
+        // public `set_group_rules` caller captures the generation before it
+        // clones the list map, and must observe this publication as newer.
         self.list_generation.fetch_add(1, Ordering::SeqCst);
+        self.group_snapshots.store(group_snapshots);
         let rule_count = status.rule_count;
         self.set_status(status);
         drop(guard);
@@ -201,6 +204,9 @@ impl HostsFilterEngine {
             status: ArcSwap::new(Arc::new(self.status())),
             group_defs: ArcSwap::new(Arc::new(group_defs)),
             group_snapshots: ArcSwap::new(self.group_snapshots()),
+            group_publish_lock: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            group_rebuild_gate: std::sync::Mutex::new(None),
             compile_observer: std::sync::RwLock::new(
                 sito_core::sync::read_or_recover(&self.compile_observer).clone(),
             ),

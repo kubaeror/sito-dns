@@ -84,9 +84,30 @@ impl ServiceRegistry {
     }
 
     /// Number of services in the registry.
+    ///
+    /// This counts service ids, not blockable rules: a registry whose service
+    /// entries all have empty rule arrays has a non-zero service count but
+    /// blocks nothing. Use [`Self::rule_count`] for emptiness/truncation
+    /// guards.
     #[must_use]
     pub fn service_count(&self) -> usize {
         self.services.len()
+    }
+
+    /// Number of usable domain rules across every service.
+    ///
+    /// This is the effective blocking coverage of the registry: regex/wildcard
+    /// rules and malformed domains were dropped at parse time and are not
+    /// counted.
+    #[must_use]
+    pub fn rule_count(&self) -> usize {
+        self.services.values().map(HashSet::len).sum()
+    }
+
+    /// Whether a service id is present in this registry.
+    #[must_use]
+    pub fn contains_service(&self, service: &str) -> bool {
+        self.services.contains_key(&service.to_ascii_lowercase())
     }
 
     /// Parse service definitions from a JSON string.

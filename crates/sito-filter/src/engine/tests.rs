@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use sito_core::config::FilterListConfig;
+use sito_core::config::{FilterListConfig, MAX_REFRESH_HOURS};
 use std::str::FromStr;
 
 #[tokio::test]
@@ -304,6 +304,7 @@ async fn test_disk_cache_offline_fallback() {
         &crate::subscription::ListMetadata {
             content_len: Some(cached_content.len() as u64),
             line_count: Some(cached_content.lines().count()),
+            url: Some("http://127.0.0.1:1".to_string()),
             ..Default::default()
         },
     )
@@ -460,13 +461,205 @@ fn test_per_list_refresh_schedule() {
     );
 
     // One hour later only the fast list is due.
-    let later = now + Duration::from_secs(3601);
+    let later = now
+        .checked_add(Duration::from_secs(3601))
+        .expect("bounded test duration");
     let (_sleep, due) = refresh_schedule(&config, &mut next_due, later);
     assert_eq!(due, vec!["fast".to_string()]);
 
     // Disabled lists are never scheduled.
     assert!(!next_due.contains_key("off"));
     assert!(next_due.contains_key("slow"));
+}
+
+/// WP-2.3: huge configured intervals must clamp to the one-year cap instead of
+/// building a `Duration` that overflows `Instant::checked_add`.
+#[test]
+fn test_refresh_schedule_clamps_huge_hours() {
+    let huge = FilteringConfig {
+        refresh_interval_hours: u64::MAX,
+        lists: vec![FilterListConfig {
+            name: "huge".to_string(),
+            url: "https://example.com/huge.txt".to_string(),
+            enabled: true,
+            refresh_hours: Some(u64::MAX),
+        }],
+        ..Default::default()
+    };
+
+    let now = Instant::now();
+    let mut next_due = FnvHashMap::default();
+    let (sleep_for, due) = refresh_schedule(&huge, &mut next_due, now);
+    assert!(due.is_empty(), "nothing is due on the first pass: {due:?}");
+    assert!(sleep_for > Duration::ZERO, "the sleep must be positive");
+    assert!(
+        sleep_for <= Duration::from_secs(MAX_REFRESH_HOURS * 3600),
+        "the sleep must stay within the one-year cap, got {sleep_for:?}"
+    );
+    assert!(
+        next_due["huge"] > now,
+        "the scheduled deadline must be in the future"
+    );
+
+    // The global interval alone is capped too.
+    let global_only = FilteringConfig {
+        refresh_interval_hours: u64::MAX,
+        ..Default::default()
+    };
+    let (sleep_for, due) = refresh_schedule(&global_only, &mut next_due, now);
+    assert_eq!(due, Vec::<String>::new());
+    assert!(sleep_for > Duration::ZERO);
+    assert!(sleep_for <= Duration::from_secs(MAX_REFRESH_HOURS * 3600));
+}
+
+/// WP-2.3: the interval helper clamps zero (defense in depth) and over-cap
+/// values for both the global and per-list paths.
+#[test]
+fn test_refresh_interval_is_bounded() {
+    let capped = Duration::from_secs(MAX_REFRESH_HOURS * 3600);
+    assert_eq!(refresh_interval(0), Duration::from_secs(3600));
+    assert_eq!(refresh_interval(1), Duration::from_secs(3600));
+    assert_eq!(refresh_interval(MAX_REFRESH_HOURS), capped);
+    assert_eq!(refresh_interval(u64::MAX), capped);
+}
+
+/// WP-2.3: a huge interval clamps to the one-year cap, so the deadline is
+/// always representable and there is no one-hour fallback literal left.
+#[test]
+fn test_refresh_deadline_is_bounded() {
+    let now = Instant::now();
+    assert_eq!(
+        refresh_deadline(now, 1),
+        Some(
+            now.checked_add(Duration::from_secs(3600))
+                .expect("bounded test duration")
+        )
+    );
+
+    let capped = Duration::from_secs(MAX_REFRESH_HOURS * 3600);
+    let clamped =
+        refresh_deadline(now, u64::MAX).expect("the clamped interval must be representable");
+    assert_eq!(
+        clamped,
+        now.checked_add(capped).expect("bounded test duration"),
+        "u64::MAX hours must clamp to the one-year cap"
+    );
+    assert!(clamped > now, "the deadline must be in the future");
+}
+
+/// A per-list override wins over the global interval; a list without one uses
+/// the global interval. The helper ignores `enabled` (the schedule loop filters
+/// enabled lists itself), and `reschedule_due` falls back to the global
+/// interval for a name that is no longer configured.
+#[test]
+fn test_effective_hours_per_list_and_global() {
+    let config = FilteringConfig {
+        refresh_interval_hours: 12,
+        lists: vec![
+            FilterListConfig {
+                name: "fast".to_string(),
+                url: "https://example.com/fast.txt".to_string(),
+                enabled: true,
+                refresh_hours: Some(1),
+            },
+            FilterListConfig {
+                name: "default".to_string(),
+                url: "https://example.com/default.txt".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            },
+            FilterListConfig {
+                name: "off".to_string(),
+                url: "https://example.com/off.txt".to_string(),
+                enabled: false,
+                refresh_hours: Some(5),
+            },
+        ],
+        ..Default::default()
+    };
+    let list = |name: &str| {
+        config
+            .lists
+            .iter()
+            .find(|l| l.name == name)
+            .expect("test list must exist")
+    };
+
+    assert_eq!(
+        effective_hours(list("fast"), config.refresh_interval_hours),
+        1,
+        "per-list wins"
+    );
+    assert_eq!(
+        effective_hours(list("default"), config.refresh_interval_hours),
+        12,
+        "a list without an override uses the global interval"
+    );
+    assert_eq!(
+        effective_hours(list("off"), config.refresh_interval_hours),
+        5,
+        "the helper ignores enabled; refresh_schedule only iterates enabled lists"
+    );
+
+    // A due name that is no longer configured uses the global interval.
+    let now = Instant::now();
+    let mut next_due = FnvHashMap::default();
+    reschedule_due(&config, &mut next_due, &["removed".to_string()], now);
+    assert_eq!(
+        next_due["removed"],
+        refresh_deadline(now, 12).expect("bounded test duration"),
+        "an unknown due name falls back to the global interval"
+    );
+}
+
+/// WP-2.3: a due list reschedules to a bounded future instant, using its own
+/// interval when set and the global interval otherwise.
+#[test]
+fn test_due_lists_reschedule_with_bounded_interval() {
+    let config = FilteringConfig {
+        refresh_interval_hours: 2,
+        lists: vec![
+            FilterListConfig {
+                name: "override".to_string(),
+                url: "https://example.com/override.txt".to_string(),
+                enabled: true,
+                refresh_hours: Some(u64::MAX),
+            },
+            FilterListConfig {
+                name: "default".to_string(),
+                url: "https://example.com/default.txt".to_string(),
+                enabled: true,
+                refresh_hours: None,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let now = Instant::now();
+    let past = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+    let mut next_due = FnvHashMap::default();
+    next_due.insert("override".to_string(), past);
+    next_due.insert("default".to_string(), past);
+
+    let (sleep_for, due) = refresh_schedule(&config, &mut next_due, now);
+    assert_eq!(due.len(), 2, "both past-due lists must be reported");
+    assert_eq!(sleep_for, Duration::ZERO, "due lists must wake immediately");
+
+    reschedule_due(&config, &mut next_due, &due, now);
+    assert_eq!(
+        next_due["default"],
+        now.checked_add(Duration::from_hours(2))
+            .expect("bounded test duration"),
+        "a list without an override uses the global interval"
+    );
+    assert!(next_due["override"] > now);
+    assert!(
+        next_due["override"]
+            <= now
+                .checked_add(Duration::from_secs(MAX_REFRESH_HOURS * 3600))
+                .expect("bounded test duration"),
+        "an over-cap per-list interval must clamp to one year"
+    );
 }
 
 #[tokio::test]
@@ -950,6 +1143,321 @@ async fn test_stale_group_rebuild_is_discarded() {
 
 fn parse_line_for_test(line: &str) -> Rule {
     crate::parser::parse_line(line, "test", 1).expect("valid test rule")
+}
+
+/// P2-24: `set_group_rules` captures the list generation before cloning the
+/// list map. A reload that finishes before the rebuild must make the rebuild
+/// discard its stale compilation instead of publishing it under the newer
+/// generation.
+#[tokio::test]
+async fn test_set_group_rules_discards_reload_interleaved_after_clone() {
+    let temp_dir = std::env::temp_dir().join(format!("sito_group_set_race_{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    let groups = || {
+        vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: vec!["school".to_string()],
+            custom_rules: Vec::new(),
+        }]
+    };
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    // Seed the initial list state and publish the baseline group snapshot.
+    {
+        let mut initial = FnvHashMap::default();
+        initial.insert(
+            "school".to_string(),
+            vec![parse_line_for_test("||old.example^")],
+        );
+        *engine.list_rules.lock().unwrap() = initial;
+    }
+    engine.set_group_rules(groups());
+    assert!(
+        engine
+            .group_snapshot("kids")
+            .expect("baseline group snapshot")
+            .evaluate("old.example", RecordType::A, &client)
+            .is_blocked()
+    );
+
+    // Gate `set_group_rules` after it cloned the list map and before it
+    // rebuilds, so the test can slip a completed reload in between.
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *engine.group_rebuild_gate.lock().unwrap() = Some(Box::new(move || {
+        let _ = reached_tx.send(());
+        let _ = resume_rx.recv_timeout(Duration::from_secs(5));
+    }));
+
+    std::thread::scope(|scope| {
+        let raced = scope.spawn(|| engine.set_group_rules(groups()));
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("set_group_rules must reach the interleaving gate");
+
+        // Simulate the reload winning the race: store fresh list rules, bump
+        // the generation, and let the reload rebuild the group snapshots.
+        let mut newer = FnvHashMap::default();
+        newer.insert(
+            "school".to_string(),
+            vec![parse_line_for_test("||new.example^")],
+        );
+        *engine.list_rules.lock().unwrap() = newer.clone();
+        engine.list_generation.fetch_add(1, Ordering::SeqCst);
+        engine
+            .rebuild_group_snapshots(&newer)
+            .expect("the reload rebuild must publish");
+        // The reload owns the group status from here on.
+        let mut reload_status = engine.status();
+        reload_status.degraded_groups = vec!["reload-degraded".to_string()];
+        engine.set_status(reload_status);
+
+        resume_tx.send(()).unwrap();
+        raced.join().expect("set_group_rules thread must not panic");
+    });
+
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("reload group snapshot");
+    assert!(
+        snapshot
+            .evaluate("new.example", RecordType::A, &client)
+            .is_blocked(),
+        "the reloaded rules must stay published"
+    );
+    assert!(
+        snapshot
+            .evaluate("old.example", RecordType::A, &client)
+            .is_allowed(),
+        "the list map cloned before the reload must not be published afterwards"
+    );
+    assert_eq!(
+        engine.status().degraded_groups,
+        vec!["reload-degraded".to_string()],
+        "a discarded rebuild must not overwrite the reload's degraded groups"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A group whose referenced list is not loaded keeps its previous snapshot and
+/// is reported degraded instead of silently disappearing.
+#[tokio::test]
+async fn test_missing_list_group_retains_previous_snapshot_and_is_degraded() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_group_missing_list_{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    let groups = || {
+        vec![GroupRuleSet {
+            name: "kids".to_string(),
+            lists: vec!["school".to_string()],
+            custom_rules: Vec::new(),
+        }]
+    };
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    {
+        let mut lists = FnvHashMap::default();
+        lists.insert(
+            "school".to_string(),
+            vec![parse_line_for_test("||keep.example^")],
+        );
+        *engine.list_rules.lock().unwrap() = lists;
+    }
+    engine.set_group_rules(groups());
+    assert!(
+        engine
+            .group_snapshot("kids")
+            .expect("initial group snapshot")
+            .evaluate("keep.example", RecordType::A, &client)
+            .is_blocked()
+    );
+
+    // The referenced list is no longer loaded (removed/disabled).
+    engine.list_rules.lock().unwrap().remove("school");
+    engine.set_group_rules(groups());
+
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("the previous group snapshot must survive a missing list");
+    assert!(
+        snapshot
+            .evaluate("keep.example", RecordType::A, &client)
+            .is_blocked(),
+        "the retained group snapshot must stay active"
+    );
+    assert!(
+        engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "a missing-list group must be reported degraded"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A group whose custom rules are all invalid keeps its previous snapshot and
+/// is reported degraded.
+#[tokio::test]
+async fn test_invalid_only_custom_rules_retain_previous_snapshot() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_group_invalid_only_{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: Vec::new(),
+        custom_rules: vec!["||keep-group.example^".to_string()],
+    }]);
+    assert!(
+        engine
+            .group_snapshot("kids")
+            .expect("initial group snapshot")
+            .evaluate("keep-group.example", RecordType::A, &client)
+            .is_blocked()
+    );
+
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: Vec::new(),
+        custom_rules: vec!["||bad.example^$dnsrewrite=garbage!!".to_string()],
+    }]);
+
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("the previous group snapshot must survive invalid-only rules");
+    assert!(
+        snapshot
+            .evaluate("keep-group.example", RecordType::A, &client)
+            .is_blocked(),
+        "the retained snapshot must stay active"
+    );
+    assert!(
+        engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "a group with invalid-only custom rules must be reported degraded"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A group without configured sources stays absent and is not degraded.
+#[tokio::test]
+async fn test_group_with_no_sources_is_absent_and_not_degraded() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_group_no_sources_{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "empty".to_string(),
+        lists: Vec::new(),
+        custom_rules: Vec::new(),
+    }]);
+
+    assert!(
+        engine.group_snapshot("empty").is_none(),
+        "a source-less group must not be published"
+    );
+    assert!(
+        !engine
+            .status()
+            .degraded_groups
+            .contains(&"empty".to_string()),
+        "a source-less group is inactive, not degraded"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A missing list marks the group degraded even when its custom rules still
+/// compile, so the inactive list reference stays observable.
+#[tokio::test]
+async fn test_missing_list_with_custom_rules_is_degraded_but_published() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_group_missing_list_custom_{}",
+        std::process::id()
+    ));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: vec!["missing".to_string()],
+        custom_rules: vec!["||custom.example^".to_string()],
+    }]);
+
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("the custom rules must still be published");
+    assert!(
+        snapshot
+            .evaluate("custom.example", RecordType::A, &client)
+            .is_blocked()
+    );
+    assert!(
+        engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "the unloaded list reference must mark the group degraded"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Blank `lists` entries are not sources and must not mark a group with valid
+/// custom rules degraded.
+#[tokio::test]
+async fn test_blank_list_with_custom_rules_is_not_degraded() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_group_blank_list_custom_{}",
+        std::process::id()
+    ));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(FilteringConfig::default(), temp_dir.clone());
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: vec![String::new()],
+        custom_rules: vec!["||custom.example^".to_string()],
+    }]);
+
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("the custom rules must be published");
+    assert!(
+        snapshot
+            .evaluate("custom.example", RecordType::A, &client)
+            .is_blocked()
+    );
+    assert!(
+        !engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "a blank list name is not a source and must not degrade the group"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
 #[tokio::test]
@@ -1837,7 +2345,74 @@ async fn test_group_snapshots_honor_compile_budget() {
 
     assert!(
         engine.group_snapshot("kids").is_none(),
-        "a group whose regex compile exceeds the budget must not be published"
+        "a group whose regex compile exceeds the budget must not be published without a previous snapshot"
+    );
+    assert!(
+        engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "a group dropped by the compile budget must be reported degraded"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Variant of [`test_group_snapshots_honor_compile_budget`]: a group that was
+/// published before must keep its previous snapshot when the new rules cannot
+/// be compiled within the budget.
+#[tokio::test]
+async fn test_group_snapshots_honor_compile_budget_retains_previous() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_group_budget_previous_{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let engine = HostsFilterEngine::new(
+        FilteringConfig {
+            regex_compile_budget_ms: Some(1),
+            ..Default::default()
+        },
+        temp_dir.clone(),
+    );
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: Vec::new(),
+        custom_rules: vec!["||keep-group.example^".to_string()],
+    }]);
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    assert!(
+        engine
+            .group_snapshot("kids")
+            .expect("the cheap group must publish initially")
+            .evaluate("keep-group.example", RecordType::A, &client)
+            .is_blocked()
+    );
+
+    let custom_rules: Vec<String> = (0..2048)
+        .map(|i| format!("/^group-{i}\\..*\\.example$/"))
+        .collect();
+    engine.set_group_rules(vec![GroupRuleSet {
+        name: "kids".to_string(),
+        lists: Vec::new(),
+        custom_rules,
+    }]);
+
+    let snapshot = engine
+        .group_snapshot("kids")
+        .expect("the previous group snapshot must survive the compile budget failure");
+    assert!(
+        snapshot
+            .evaluate("keep-group.example", RecordType::A, &client)
+            .is_blocked(),
+        "the retained snapshot must stay active"
+    );
+    assert!(
+        engine
+            .status()
+            .degraded_groups
+            .contains(&"kids".to_string()),
+        "the retained group must be reported degraded"
     );
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;

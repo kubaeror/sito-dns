@@ -319,9 +319,17 @@ async fn test_m7_doh_alt_svc_header_advertisement() {
 #[tokio::test]
 async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
     let registry = AntiBypassRegistry::try_bundled().expect("bundled DoH resolver list must load");
-    assert!(
-        registry.domain_count() > 0,
-        "Bundled resolvers must not be empty"
+    let metadata = sito_filter::anti_bypass::AntiBypassMetadata::try_bundled()
+        .expect("bundled DoH resolver metadata must load");
+    assert_eq!(
+        registry.domain_count() as u64,
+        metadata.exact_domains + metadata.wildcard_domains,
+        "Bundled resolver domain count must match its metadata header"
+    );
+    assert_eq!(
+        registry.ip_count() as u64,
+        metadata.ips,
+        "Bundled resolver IP count must match its metadata header"
     );
 
     // Verify known resolvers are detected

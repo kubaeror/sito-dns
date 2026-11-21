@@ -1,9 +1,10 @@
 //! Query log endpoints and WebSocket streaming per section 12.1.
 
-use crate::auth::client_ip::resolve_client_ip;
+use crate::auth::client_ip::{admin_scheme_config, resolve_client_ip};
 use crate::auth::{MaybeConnectInfo, RequireOperator, RequireViewer};
 use crate::error::ProblemDetails;
 use crate::models::GenericMessageResponse;
+use crate::security::validate_websocket_origin;
 use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -113,7 +114,8 @@ impl IntoResponse for QueryLogHandlerError {
         (status = 429, description = "Rate limited", body = ProblemDetails,
             headers(("Retry-After", description = "Seconds to wait before retrying")))
     ),
-    tag = "QueryLog"
+    tag = "QueryLog",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_querylog(
     _viewer: RequireViewer,
@@ -163,7 +165,8 @@ pub async fn get_querylog(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "QueryLog"
+    tag = "QueryLog",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn delete_querylog(
     _operator: RequireOperator,
@@ -191,13 +194,67 @@ pub async fn delete_querylog(
     .into_response())
 }
 
+/// POST alias for `DELETE /api/v1/querylog` (older UI clients).
+#[utoipa::path(
+    post,
+    path = "/api/v1/querylog/clear",
+    params(ClearQueryLogParams),
+    responses(
+        (status = 200, description = "Query log cleared successfully", body = GenericMessageResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden")
+    ),
+    tag = "QueryLog",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+)]
+pub async fn clear_querylog(
+    operator: RequireOperator,
+    headers: HeaderMap,
+    State(ctx): State<ServerContext>,
+    Query(params): Query<ClearQueryLogParams>,
+) -> Result<Response, ProblemDetails> {
+    delete_querylog(operator, headers, State(ctx), Query(params)).await
+}
+
 /// WebSocket live tail endpoint streaming query log entries in real-time.
+///
+/// The Origin header is validated before the upgrade: `null` and cross-origin
+/// handshakes are rejected, and a session-authenticated browser request must
+/// send a same-origin `Origin`. Bearer-token clients are not browser-ambient
+/// and may omit it. The legacy `?token=` query parameter is not accepted.
+#[utoipa::path(
+    get,
+    path = "/api/v1/querylog/stream",
+    responses(
+        (status = 101, description = "WebSocket upgrade accepted; query log entries stream as JSON text frames"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden (including cross-origin/Origin: null)")
+    ),
+    tag = "QueryLog",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+)]
 pub async fn stream_querylog(
     ws: WebSocketUpgrade,
-    _viewer: RequireViewer,
+    RequireViewer(viewer): RequireViewer,
     State(ctx): State<ServerContext>,
-) -> Response {
-    ws.on_upgrade(move |socket| handle_live_tail(socket, ctx))
+    MaybeConnectInfo(peer): MaybeConnectInfo,
+    headers: HeaderMap,
+) -> Result<Response, ProblemDetails> {
+    let config = ctx.config.load();
+    let trusted_proxies = config.get_web_config().trusted_proxies.clone();
+    let scheme = admin_scheme_config(config.web.as_ref());
+    drop(config);
+
+    validate_websocket_origin(
+        &headers,
+        peer,
+        &trusted_proxies,
+        &scheme,
+        viewer.token_id.is_some(),
+    )
+    .map_err(ProblemDetails::forbidden)?;
+
+    Ok(ws.on_upgrade(move |socket| handle_live_tail(socket, ctx)))
 }
 
 async fn handle_live_tail(mut socket: WebSocket, ctx: ServerContext) {

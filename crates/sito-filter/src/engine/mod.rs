@@ -20,7 +20,7 @@ use arc_swap::ArcSwap;
 use fnv::{FnvHashMap, FnvHashSet};
 use hickory_proto::rr::{Name, RecordType};
 use sito_core::client::ClientContext;
-use sito_core::config::FilteringConfig;
+use sito_core::config::{FilterListConfig, FilteringConfig, MAX_REFRESH_HOURS};
 use sito_core::engine::FilterEngine;
 use sito_core::verdict::{BlockReason, RewriteAction, RuleRef, Verdict};
 use sito_proto::normalize_domain;
@@ -84,8 +84,11 @@ pub struct FilterStatus {
     /// Regex/wildcard patterns dropped from the active snapshot because they
     /// could not be compiled.
     pub dropped_regex_patterns: usize,
-    /// Groups whose snapshot was published without part of its rule class
-    /// (regex/wildcard or substring/prefix) after a budget/limit failure.
+    /// Groups that could not be published with their full rule set: a
+    /// budget/limit failure (only a non-regex subset was published), a
+    /// missing/unloaded referenced list, an invalid-only rule set, or a
+    /// group that could not be published at all. The previous snapshot is
+    /// retained when one is available.
     pub degraded_groups: Vec<String>,
     /// Lists whose newest content was rejected (parse/limit/empty) while a
     /// previous snapshot was retained.
@@ -230,28 +233,104 @@ fn count_loaded_lists(fetched: &[String], failed: &[String]) -> usize {
     fetched.iter().filter(|name| !failed.contains(name)).count()
 }
 
+/// Converts a configured refresh interval in hours into a safe [`Duration`].
+///
+/// Clamps to `1..=MAX_REFRESH_HOURS`. Config validation already rejects `0`
+/// and values above the cap; the runtime clamp is defense in depth for configs
+/// constructed without validation, and keeps the hour-to-second multiplication
+/// from overflowing.
+fn refresh_interval(hours: u64) -> Duration {
+    Duration::from_secs(hours.clamp(1, MAX_REFRESH_HOURS).saturating_mul(3600))
+}
+
+/// Returns the next refresh deadline, or `None` when the clamped interval
+/// (at most one year) cannot be added to the platform `Instant`.
+///
+/// The interval is already clamped to `1..=MAX_REFRESH_HOURS` by
+/// [`refresh_interval`], so `None` only happens when the platform's `Instant`
+/// cannot represent the resulting deadline; callers skip such lists rather
+/// than scheduling them in the past (which would hot-loop the refresh task).
+fn refresh_deadline(now: Instant, hours: u64) -> Option<Instant> {
+    now.checked_add(refresh_interval(hours))
+}
+
+/// Returns the effective refresh interval in hours for `list`.
+///
+/// A per-list `refresh_hours` overrides `global_hours`. This helper does not
+/// consider `list.enabled`: callers decide which lists to schedule, and
+/// `refresh_schedule` only iterates enabled lists while `reschedule_due`
+/// looks a due list up by name.
+fn effective_hours(list: &FilterListConfig, global_hours: u64) -> u64 {
+    list.refresh_hours.unwrap_or(global_hours)
+}
+
+/// Reschedules the given due lists from `now` using their per-list interval,
+/// falling back to the global `refresh_interval_hours`.
+///
+/// A list whose deadline cannot be represented is dropped from `next_due`
+/// instead of being stored as due now, so the scheduler does not spin on it.
+fn reschedule_due(
+    config: &FilteringConfig,
+    next_due: &mut FnvHashMap<String, Instant>,
+    due: &[String],
+    now: Instant,
+) {
+    for name in due {
+        let global_hours = config.refresh_interval_hours;
+        let hours = config
+            .lists
+            .iter()
+            .find(|l| &l.name == name)
+            .map_or(global_hours, |l| effective_hours(l, global_hours));
+        if let Some(deadline) = refresh_deadline(now, hours) {
+            next_due.insert(name.clone(), deadline);
+        } else {
+            next_due.remove(name);
+            warn!(
+                list = %name,
+                "No representable refresh deadline; removing the list from the refresh schedule"
+            );
+        }
+    }
+}
+
 /// Computes the next refresh wake-up and the list names that are due.
 ///
 /// Lists without `refresh_hours` use the global `refresh_interval_hours`.
+/// Lists whose deadline cannot be represented are not scheduled at all; when
+/// no list is schedulable the bounded global interval is used, so the refresh
+/// task never falls into a zero-length sleep loop.
 fn refresh_schedule(
     config: &FilteringConfig,
     next_due: &mut FnvHashMap<String, Instant>,
     now: Instant,
 ) -> (Duration, Vec<String>) {
-    let global = Duration::from_secs(config.refresh_interval_hours.max(1).saturating_mul(3600));
+    let global = refresh_interval(config.refresh_interval_hours);
     next_due.retain(|name, _| config.lists.iter().any(|l| l.enabled && &l.name == name));
 
     let mut due = Vec::new();
     let mut soonest: Option<Instant> = None;
     for list in config.lists.iter().filter(|l| l.enabled) {
-        let interval = list.refresh_hours.map_or(global, |hours| {
-            Duration::from_secs(hours.max(1).saturating_mul(3600))
-        });
-        let entry = next_due.entry(list.name.clone()).or_insert(now + interval);
-        if *entry <= now {
+        let entry = if let Some(entry) = next_due.get(&list.name).copied() {
+            entry
+        } else {
+            let hours = effective_hours(list, config.refresh_interval_hours);
+            let Some(deadline) = refresh_deadline(now, hours) else {
+                // An unrepresentable deadline must not be stored as a past
+                // instant: that would make the list due on every pass.
+                warn!(
+                    list = %list.name,
+                    "No representable refresh deadline; skipping the list this cycle"
+                );
+                continue;
+            };
+            next_due.insert(list.name.clone(), deadline);
+            deadline
+        };
+        if entry <= now {
             due.push(list.name.clone());
         }
-        soonest = Some(soonest.map_or(*entry, |s| s.min(*entry)));
+        soonest = Some(soonest.map_or(entry, |s| s.min(entry)));
     }
 
     let sleep_for = if due.is_empty() {
@@ -421,6 +500,15 @@ pub struct HostsFilterEngine {
     group_defs: ArcSwap<Vec<GroupRuleSet>>,
     /// Compiled per-group rule sets, keyed by group name.
     group_snapshots: ArcSwap<FnvHashMap<String, Arc<FilterSnapshot>>>,
+    /// Serializes the generation re-check and publication of group snapshots.
+    /// A stale rebuild must not overwrite a newer snapshot published by a
+    /// reload that bumped the generation after the rebuild's check.
+    group_publish_lock: std::sync::Mutex<()>,
+    /// Test-only hook run by `set_group_rules` after it captures the list
+    /// generation and clones `list_rules`, just before the rebuild. Lets tests
+    /// interleave a concurrent reload deterministically.
+    #[cfg(test)]
+    group_rebuild_gate: std::sync::Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Optional sink for compile durations (wired to the metrics registry by
     /// the server binary; the filter crate cannot depend on sito-stats).
     compile_observer: std::sync::RwLock<Option<CompileObserver>>,

@@ -14,6 +14,7 @@ use sqlx::{Connection, Pool, Row, Sqlite, SqliteConnection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -58,8 +59,9 @@ const RETENTION_ROWS_PER_CHUNK: i64 = 5_000;
 const SALT_FILE_NAME: &str = "stats-salt";
 
 /// How long dashboard aggregates may be served from memory before a fresh
-/// scan is allowed. Keeps 5 s UI polling from repeatedly scanning SQLite.
-const DASHBOARD_CACHE_TTL: Duration = Duration::from_secs(45);
+/// scan is allowed. Keeps 5 s UI polling from repeatedly scanning SQLite while
+/// bounding how stale a dashboard can be.
+const DASHBOARD_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Rows per transaction in the one-time legacy rollup PII backfill.
 const ROLLUP_PII_BACKFILL_BATCH: i64 = 1_000;
@@ -239,6 +241,8 @@ pub struct ClientStats {
 pub struct UpstreamStats {
     pub upstream: String,
     pub total_queries: i64,
+    /// Queries whose response was an upstream error. NXDOMAIN (rcode 3) is a
+    /// normal negative answer, not an error, and is excluded.
     pub error_queries: i64,
     pub avg_elapsed_us: i64,
     pub share_percentage: f64,
@@ -293,9 +297,10 @@ pub struct StatsDb {
     db_path: Option<PathBuf>,
     /// Per-install key for hashing rollup client identifiers.
     salt: Arc<[u8; 32]>,
-    /// Default policy used by the compatibility retention wrapper and
-    /// one-time rollup backfill.
-    rollup_client_names: bool,
+    /// Live policy used by the compatibility retention wrapper, rollup merge
+    /// and one-time rollup backfill. Shared across clones so a hot config
+    /// apply changes the policy for every handle without a restart.
+    rollup_client_names: Arc<AtomicBool>,
     cache: Arc<StatsCache>,
 }
 
@@ -451,7 +456,7 @@ async fn collect_hour_rollups(
                 (ts / 3600000) * 3600000 AS hour,
                 upstream,
                 COUNT(*) AS total,
-                SUM(CASE WHEN rcode IS NOT NULL AND rcode != 0 THEN 1 ELSE 0 END) AS errors,
+                SUM(CASE WHEN rcode IS NOT NULL AND rcode NOT IN (0, 3) THEN 1 ELSE 0 END) AS errors,
                 SUM(COALESCE(elapsed_us, 0)) AS elapsed_sum,
                 ROW_NUMBER() OVER (
                     PARTITION BY (ts / 3600000) * 3600000

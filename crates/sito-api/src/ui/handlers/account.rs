@@ -82,11 +82,15 @@ pub async fn account_page(State(ctx): State<ServerContext>, headers: HeaderMap) 
 #[derive(Deserialize)]
 pub struct AccountPasswordForm {
     pub current_password: String,
+    /// Current TOTP or backup code; required when TOTP is enabled.
+    #[serde(default)]
+    pub code: Option<String>,
     pub new_password: String,
 }
 
 pub async fn account_password_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Form(form): Form<AccountPasswordForm>,
 ) -> Response {
@@ -106,17 +110,44 @@ pub async fn account_password_handler(
             ProblemDetails::bad_request("Current password is required"),
         );
     }
-    if !ctx
-        .auth_mgr
-        .verify_user_password(&user.username, form.current_password.trim())
-        .await
+    // Same pre-Argon2 cap as login and reauth; keep the new-password policy
+    // untouched (it already rejects values above the same length).
+    if form.current_password.trim().len() > MAX_LOGIN_PASSWORD_BYTES {
+        return account_problem_page(
+            &ctx,
+            &user,
+            &csrf,
+            ProblemDetails::bad_request(format!(
+                "Current password must be at most {MAX_LOGIN_PASSWORD_BYTES} bytes"
+            )),
+        );
+    }
+    if let Some(code) = form.code.as_deref()
+        && code.trim().len() > MAX_TOTP_CODE_BYTES
     {
         return account_problem_page(
             &ctx,
             &user,
             &csrf,
-            ProblemDetails::bad_request("Current password is incorrect"),
+            ProblemDetails::bad_request(format!(
+                "TOTP code must be at most {MAX_TOTP_CODE_BYTES} bytes"
+            )),
         );
+    }
+    // Reuse the re-authentication flow so a stolen session cannot brute-force
+    // the current password or second factor without hitting the shared login
+    // lockout and IP throttle.
+    if let Err(problem) = ui_reauth(
+        &ctx,
+        &user,
+        &headers,
+        peer_addr,
+        Some(&form.current_password),
+        form.code.as_deref(),
+    )
+    .await
+    {
+        return account_problem_page(&ctx, &user, &csrf, problem);
     }
     if let Err(err) = ctx
         .auth_mgr
@@ -144,10 +175,17 @@ pub async fn account_password_handler(
 pub struct CreateAccountTokenForm {
     pub name: String,
     pub scope: String,
+    /// Caller's current password; required to mint an Admin-scoped token.
+    #[serde(default)]
+    pub reauth_password: Option<String>,
+    /// Caller's TOTP or backup code when TOTP is enabled.
+    #[serde(default)]
+    pub reauth_code: Option<String>,
 }
 
 pub async fn account_token_create_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Form(form): Form<CreateAccountTokenForm>,
 ) -> Response {
@@ -192,6 +230,21 @@ pub async fn account_token_create_handler(
             &csrf,
             ProblemDetails::forbidden("A token scope may not exceed your own role"),
         );
+    }
+    // An Admin-scoped token is the Admin credential in bearer form; a stolen
+    // session must prove the account's own password (and second factor) first.
+    if scope == Role::Admin
+        && let Err(problem) = ui_reauth(
+            &ctx,
+            &user,
+            &headers,
+            peer_addr,
+            form.reauth_password.as_deref(),
+            form.reauth_code.as_deref(),
+        )
+        .await
+    {
+        return account_problem_page(&ctx, &user, &csrf, problem);
     }
 
     let (_meta, token) = match ctx
@@ -401,14 +454,14 @@ pub async fn account_totp_enable_handler(
     };
     if !ctx
         .auth_mgr
-        .check_reauth_token(&form.reauth_token, &user.username, &session_id)
+        .take_reauth_token(&form.reauth_token, &user.username, &session_id)
     {
         return account_problem_page(
             &ctx,
             &user,
             &csrf,
             ProblemDetails::unauthorized(
-                "Re-authentication is missing or expired. Start the enrollment again.",
+                "Re-authentication is missing, expired, or already used. Start the enrollment again.",
             ),
         );
     }
@@ -427,15 +480,6 @@ pub async fn account_totp_enable_handler(
             )),
         };
         return account_problem_page(&ctx, &user, &csrf, problem);
-    }
-    if !ctx
-        .auth_mgr
-        .consume_reauth_token(&form.reauth_token, &user.username, &session_id)
-    {
-        tracing::warn!(
-            user = %user.username,
-            "Re-authentication ticket was already consumed or expired after enabling TOTP from the web UI"
-        );
     }
     tracing::info!(user = %user.username, "User enabled TOTP 2FA from the web UI");
     // Enabling TOTP revokes every session for the account by design.
@@ -459,80 +503,20 @@ pub async fn account_totp_disable_handler(
         Ok(value) => value,
         Err(response) => return *response,
     };
-    let Some(session_id) = current_session_id(&ctx, &headers) else {
-        return account_problem_page(
-            &ctx,
-            &user,
-            &csrf,
-            ProblemDetails::forbidden("TOTP management requires an authenticated user session"),
-        );
-    };
-    let client_ip = {
-        let config = ctx.config.load();
-        let trusted_proxies = config.get_web_config().trusted_proxies;
-        resolve_client_ip(peer_addr, &headers, &trusted_proxies)
-    };
-
     // Mirror the REST disable handler: a fresh re-authentication proves the
     // current password and, when TOTP is enabled, a current TOTP/backup code.
-    match ctx
-        .auth_mgr
-        .reauth(
-            &user.username,
-            &form.password,
-            form.code.as_deref(),
-            &session_id,
-            &client_ip,
-        )
-        .await
+    // The shared lockout applies and the ticket is consumed at authorization.
+    if let Err(problem) = ui_reauth(
+        &ctx,
+        &user,
+        &headers,
+        peer_addr,
+        Some(&form.password),
+        form.code.as_deref(),
+    )
+    .await
     {
-        Ok(ticket) => {
-            if !ctx
-                .auth_mgr
-                .consume_reauth_token(&ticket.token, &user.username, &session_id)
-            {
-                tracing::warn!(
-                    user = %user.username,
-                    "Re-authentication ticket was already consumed or expired after disabling TOTP from the web UI"
-                );
-            }
-        }
-        Err(ReauthError::InvalidCredentials) => {
-            return account_problem_page(
-                &ctx,
-                &user,
-                &csrf,
-                ProblemDetails::bad_request(
-                    "Re-authentication failed: invalid password or second factor",
-                ),
-            );
-        }
-        Err(ReauthError::SecondFactorRequired) => {
-            return account_problem_page(
-                &ctx,
-                &user,
-                &csrf,
-                ProblemDetails::bad_request("A TOTP or backup code is required to disable 2FA"),
-            );
-        }
-        Err(ReauthError::RateLimited) => {
-            return account_problem_page(
-                &ctx,
-                &user,
-                &csrf,
-                ProblemDetails::too_many_requests("Too many attempts. Please wait."),
-            );
-        }
-        Err(ReauthError::LockedOut { remaining_seconds }) => {
-            return account_problem_page(
-                &ctx,
-                &user,
-                &csrf,
-                ProblemDetails::too_many_requests(format!(
-                    "Account locked out due to repeated failures. Try again in {remaining_seconds}s."
-                )),
-            );
-        }
+        return account_problem_page(&ctx, &user, &csrf, problem);
     }
 
     if let Err(err) = ctx.auth_mgr.try_disable_totp(&user.username).await {

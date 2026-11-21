@@ -30,7 +30,6 @@ pub async fn upstreams_page(State(ctx): State<ServerContext>, headers: HeaderMap
 #[derive(Deserialize)]
 pub struct AddUpstreamForm {
     pub address: String,
-    pub weight: u32,
 }
 
 pub async fn upstreams_add_handler(

@@ -118,9 +118,9 @@ materializes `web.bind = "0.0.0.0"` and lists it in
 explicit v1 bind is copied unchanged. Pass `--adopt-safe-defaults` to write the
 loopback default instead; the report lists every changed field.
 
-`dns.bind` remains `["0.0.0.0", "::"]` because a default-deny DNS client ACL
-is not part of this work package. Keep the startup warning and restrict the
-DNS ports with a host firewall.
+`dns.bind` remains `["0.0.0.0", "::"]` because a default-deny DNS client ACL is
+deferred, not part of Phase 2 core hardening. Keep the startup warning and
+restrict the DNS ports with a host firewall.
 
 ## 5. Migration
 
@@ -173,8 +173,9 @@ not supported in place.
 ```
 
 Automated migration by the installer/Docker entrypoint (only when
-`config_version = 1`) and `--no-migrate` belong to WP-2.13; the CLI above is
-the supported manual path in Phase 1. The full narrative migration guide is
+`config_version = 1`) and `--no-migrate` remain unimplemented; they are deferred
+work, not part of the delivered Phase 2 tree. The CLI above is the supported
+manual path. The full narrative migration guide is
 [`docs/2.0-migration.md`](2.0-migration.md).
 
 ## 6. Deprecated aliases (one 2.0 alpha)
@@ -200,8 +201,8 @@ Some settings are read once at process start. An admin write that changes one
 of them returns **409 Conflict** with `restart_required` and is **not
 persisted**. Edit `config.toml` and restart, or use the installer.
 
-`GET /api/v1/config/restart-required` (the existing API version; `/api/v2` is
-Phase 2 work) is a read-only preview:
+`GET /api/v1/config/restart-required` on the canonical `/api/v1` API
+(`/api/v2` is absent) is a read-only preview:
 
 ```json
 {
@@ -266,10 +267,13 @@ schema also fails the fixture test.
 ## 10. Deferred fields
 
 - `clients.trust_arp` is **not** added in config v2. D10 defines the trust
-  table, but the optional ARP-trust knob is deferred to WP-2.5 and will be an
-  optional v2 field with default `false`.
-- `/api/v2` and the API v1 compatibility facade are Phase 2 work (WP-2.11);
-  the Phase 1 preview deliberately uses `/api/v1/config/restart-required`.
-- Installer/Docker auto-migration is WP-2.13. The full narrative migration
-  guide is [`docs/2.0-migration.md`](2.0-migration.md). This document does not
-  change their contracts.
+  table, but the optional ARP-trust knob remains unimplemented; if it lands it
+  will be an optional v2 field with default `false`.
+- `/api/v2` and the API v1 compatibility facade are absent and deferred beyond
+  Phase 2. `/api/v1` is canonical, including
+  `/api/v1/config/restart-required`.
+- Installer/Docker config auto-migration and `--no-migrate` remain
+  unimplemented and deferred. The full narrative migration guide is
+  [`docs/2.0-migration.md`](2.0-migration.md).
+- The SQLite schema/PII migration (`sito db migrate`,
+  `SITO_DB_AUTO_MIGRATE`) remains unimplemented and deferred.

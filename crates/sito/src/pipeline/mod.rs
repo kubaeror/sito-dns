@@ -23,7 +23,7 @@ use sito_dnssec::DnssecValidator;
 use sito_filter::{AntiBypassRegistry, DnsRewriteRule, FilterSnapshot, HostsFilterEngine};
 use sito_proto::wire::{synthesize_cname_response, synthesize_records_response};
 use sito_proto::{ResponseShaper, synthesize_blocked_response};
-use sito_rewrites::RewriteTable;
+use sito_rewrites::{RewriteLookup, RewriteTable};
 use sito_runtime::RuntimeState;
 use sito_transport::QueryHandler;
 use sito_upstream::UpstreamManager;

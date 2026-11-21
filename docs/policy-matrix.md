@@ -30,7 +30,7 @@ Incoming Request
 ```
 
 ### Invariants:
-1. **Explicit Identity Beats IP:** A client ID provided in the DoH path (`/dns-query/kids-phone`) or DoT SNI (`kids-phone.dns.lan`) always overrides the client's source IP address.
+1. **Explicit Identity Beats IP:** A client ID supplied via the DoH path (`/dns-query/kids-phone`) or DoT SNI (`kids-phone.dns.lan`) overrides the client's source IP address only when it is registry-authenticated by a configured shared secret. A raw path/SNI label without a matching secret is display-only and never grants policy identity or satisfies `$client`.
 2. **Graceful Fallback:** Unidentified clients are routed to the `default` group. Unidentified clients discovered via RouterOS or ARP are recorded in `unidentified_clients` for administrative discovery without interrupting resolution.
 3. **RouterOS Lease Sync:** Queries the RouterOS REST API periodically (default 300s). Router outages or network partitions trigger warnings and gracefully degrade, retaining existing leases.
 
@@ -50,11 +50,25 @@ When a client is resolved, its effective group policy is compiled lazily at quer
 
 ### Schedule Evaluation (`croner`):
 - Evaluated lazily at query timestamp in the client's configured timezone.
-  `clients.timezone` defaults to `"local"` (the host's system timezone,
-  DST-aware), not UTC; `"UTC"` and fixed offsets such as `"+02:00"` are also
-  accepted. IANA zone names are not supported (no tzdb dependency).
+  `clients.timezone` defaults to `"local"` (the host's system timezone), not
+  UTC; `"UTC"` and fixed offsets such as `"+02:00"` are also accepted.
+- DST handling is runtime-dependent: `"local"`/`"system"` follows the host
+  platform's local-time conversion, so wall-clock times around a DST transition
+  (skipped or repeated hours) follow the host's rules. Fixed offsets never
+  shift for DST. IANA zone names (e.g. `Europe/Warsaw`) are not supported (no
+  tzdb dependency); deployments that need a specific IANA zone must set an
+  explicit UTC or fixed offset and accept the DST behaviour of that offset.
 - Supports both standard 5-field cron (`min hour dom month dow`) and 6-field cron with seconds (`sec min hour dom month dow`).
 - Supports interval ranges (e.g. `0 0 15-21 * * MON-FRI` for 15:00:00 through 21:59:59).
+- Ranges do not wrap around. An overnight window must be split into explicit
+  comma-separated ranges, e.g. `0 22-23,0-6 * * *` for 22:00 through 06:59.
+  Reversed **numeric** ranges such as `0 22-6 * * *` or `0 0 * * 5-1` are
+  rejected at load time with a field-attributed error, not silently interpreted
+  as always/never active. Named day-of-week ranges (e.g. `FRI-MON`) are left to
+  `croner`, which owns their interpretation.
+- `schedule_enabled = true` with no `schedule` leaves the group always active;
+  it does not disable filtering. A configured `schedule` is ignored unless
+  `schedule_enabled = true`.
 - Syntax errors in configuration are rejected at load time via `sito check-config` with the exact 1-indexed field number that failed validation.
 
 ---
@@ -104,6 +118,8 @@ The pipeline guarantees strict deterministic resolution order ratifying [ADR-000
 │ Stage 4: Safe Search System Rewrites                                    │
 │ - Google, Bing, DuckDuckGo CNAME rewrite                                │
 │ - YouTube strict/moderate CNAME rewrite                                 │
+│ - A/AAAA/HTTPS queries only; provider targets pass through (no         │
+│   self-CNAME)                                                           │
 └───────────────────────────────┬─────────────────────────────────────────┘
                                 │ (no safe search rewrite)
                                 ▼
@@ -115,6 +131,43 @@ The pipeline guarantees strict deterministic resolution order ratifying [ADR-000
 │ - DNSSEC validation & cache insertion                                   │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Global and Group Rule Overlay (WP-2.4)
+
+Global rules (`filtering.lists` / `filtering.custom_rules`) and a client's
+group rules (`clients.groups.<name>.*`) are evaluated per tier and combined
+with one deterministic rank. `$important` rules form a separate tier evaluated
+before local rewrites and standard rules, so an important verdict always
+outranks a standard one.
+
+| Rank (within one tier) | Verdict | Notes |
+|---|---|---|
+| 3 | `Allow` | Standard `@@`, or `@@...$important` in the important tier |
+| 2 | `Rewrite` | `$dnsrewrite` |
+| 1 | `Block` | `\|\|...^` or `\|\|...^$important` |
+| 0 | no match (`Allow(None)`) | A group no-match never erases a global verdict |
+
+Tie rule: equally ranked verdicts resolve in favour of the **group overlay**;
+a group no-match (`Allow(None)`) is ignored. An important allow short-circuits
+stages 2-5 above and resolves from cache/upstream.
+
+Key examples (pinned by parsed-rule end-to-end tests in
+`crates/sito/src/pipeline/tests.rs`):
+
+| Global rule | Group rule | Effect |
+|---|---|---|
+| `\|\|host.example^` (standard block) | `\|\|host.example^$dnsrewrite=192.0.2.10` | Group clients get the rewritten A with zero upstream queries; default clients are blocked. |
+| `\|\|host.example^$important` | `\|\|host.example^$dnsrewrite=192.0.2.10` | Blocked for everyone: `$important` outranks the standard rewrite. |
+| `\|\|host.example^$important` | `@@\|\|host.example^$important` | Group clients resolve from upstream; default clients stay blocked. |
+| `@@\|\|host.example^$important` | `\|\|host.example^$important` | Allowed for everyone: global important allow outranks the group important block. |
+
+Scope modifiers compose with the same table:
+
+- `$denyallow=allowed.host.example` on a global block still blocks the owner,
+  while the allow-listed subdomain falls through to normal resolution.
+- `$client=name` matches only a registry-authenticated identity. An
+  unauthenticated DoH path or SNI label carrying the same text never satisfies
+  it.
 
 ---
 

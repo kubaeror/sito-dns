@@ -239,6 +239,85 @@ mod tests {
     }
 
     #[test]
+    fn test_truncate_for_framing_over_limit_returns_tc1() {
+        let qname = Name::from_str("huge.example.").unwrap();
+        let mut response = Message::new(1, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        for i in 0..6000u32 {
+            response.answers.push(Record::from_rdata(
+                qname.clone(),
+                300,
+                RData::A(A(Ipv4Addr::new(10, 2, (i / 256) as u8, (i % 256) as u8))),
+            ));
+        }
+
+        let encoded = encode_message(&response).unwrap();
+        // Hickory's encoder itself caps at 65535 bytes and pre-sets TC, so pad
+        // the wire buffer to produce the >65535-byte input that the framing
+        // fallback must still handle. The decoder reads the header-declared
+        // sections and ignores trailing padding.
+        let mut oversized = encoded;
+        oversized.resize(0x1_0000, 0);
+        assert!(
+            oversized.len() > 0xFFFF,
+            "test input must exceed the 65535-byte framing limit (got {})",
+            oversized.len()
+        );
+
+        let truncated = truncate_for_framing(&oversized).expect("oversized frame is truncatable");
+        assert!(truncated.len() <= 0xFFFF);
+        let decoded = decode_message(&truncated).unwrap();
+        assert!(
+            decoded.metadata.truncation,
+            "the framing fallback must set TC=1"
+        );
+        assert_eq!(decoded.queries.len(), 1, "the question must be preserved");
+        assert!(
+            decoded.answers.is_empty(),
+            "the answer section must be dropped to fit the frame"
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_framing_under_limit_is_still_framable() {
+        let qname = Name::from_str("small.example.").unwrap();
+        let mut response = Message::new(2, MessageType::Response, OpCode::Query);
+        response
+            .queries
+            .push(Query::query(qname.clone(), RecordType::A));
+        response.answers.push(Record::from_rdata(
+            qname,
+            300,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 2))),
+        ));
+
+        let encoded = encode_message(&response).unwrap();
+        assert!(encoded.len() <= 0xFFFF);
+
+        // The helper always builds the TC=1 fallback shape; transport only
+        // calls it after a frame-prefix check failed. An under-limit input must
+        // therefore still yield a decodable, frameable message.
+        let truncated = truncate_for_framing(&encoded).expect("decodable input");
+        assert!(truncated.len() <= 0xFFFF);
+        let decoded = decode_message(&truncated).unwrap();
+        assert!(decoded.metadata.truncation);
+        assert_eq!(decoded.queries.len(), 1);
+        assert_eq!(
+            decoded.answers.len(),
+            0,
+            "the answer section must be dropped in the fallback shape"
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_framing_rejects_undecodable_input() {
+        assert!(truncate_for_framing(&[]).is_none());
+        assert!(truncate_for_framing(b"not a dns message").is_none());
+    }
+
+    #[test]
     fn test_synthesize_blocked_zero_ip_a_record() {
         let mut query = Message::new(1234, MessageType::Query, OpCode::Query);
         query.metadata.recursion_desired = true;

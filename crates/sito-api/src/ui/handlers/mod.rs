@@ -15,7 +15,10 @@ use serde::Deserialize;
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use crate::auth::manager::{LoginResult, ReauthError, TotpMutationError, UserMutationError};
+use crate::auth::manager::{
+    LoginResult, MAX_LOGIN_PASSWORD_BYTES, MAX_TOTP_CODE_BYTES, ReauthError, TotpMutationError,
+    UserMutationError,
+};
 use crate::auth::rbac::AuthUser;
 use crate::auth::resolve_client_ip;
 use crate::auth::session::{
@@ -24,7 +27,7 @@ use crate::auth::session::{
 use crate::auth::token::Role;
 use crate::config_apply::{
     ApplyHooks, ConfigFileApplyOutcome, FilterApply, apply_and_persist_config_locked,
-    apply_config_document_event,
+    apply_config_document_event, filter_apply_for,
 };
 use crate::error::ProblemDetails;
 use crate::handlers::auth_handlers::{

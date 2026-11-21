@@ -142,6 +142,7 @@ impl DnsPipeline {
         query_id: u16,
         domain_str: &str,
         qtype: RecordType,
+        ignore_stats: bool,
     ) -> Option<QueryOutcome> {
         if !self.anti_bypass.matches_domain(domain_str) {
             return None;
@@ -150,7 +151,7 @@ impl DnsPipeline {
             qname = %domain_str,
             "Query blocked by Anti-DoH bypass rule (resolver domain)"
         );
-        if let Some(ref m) = self.metrics {
+        if !ignore_stats && let Some(ref m) = self.metrics {
             m.inc_doh_bypass_blocked();
         }
         Some(Self::blocked_outcome(
@@ -175,6 +176,7 @@ impl DnsPipeline {
         domain_str: &str,
         qtype: RecordType,
         origin: &'static str,
+        ignore_stats: bool,
     ) -> Option<QueryOutcome> {
         if !answers_contain_bypass_ip(&self.anti_bypass, answers) {
             return None;
@@ -184,7 +186,7 @@ impl DnsPipeline {
             origin,
             "Query blocked by Anti-DoH bypass (resolved IP)"
         );
-        if let Some(ref m) = self.metrics {
+        if !ignore_stats && let Some(ref m) = self.metrics {
             m.inc_doh_bypass_blocked();
         }
         Some(Self::blocked_outcome(
@@ -532,8 +534,8 @@ impl DnsPipeline {
 
     /// Cache lookup honouring the stored validation status.
     ///
-    /// While local validation is active, only an authenticated
-    /// `Secure`/`Insecure` decision may be served. `Unchecked` (CD=1 or
+    /// While local validation is active, `Secure`/`Insecure` decisions and a
+    /// fail-closed `Bogus` SERVFAIL may be served. `Unchecked` (CD=1 or
     /// validation disabled) and `Indeterminate` (inconclusive, or Bogus in
     /// log-only mode) entries force an upstream re-resolution so strict mode
     /// can fail closed. `Insecure` answers are served with AD=0; DO=0 clients
@@ -569,6 +571,7 @@ impl DnsPipeline {
         query_id: u16,
         domain_str: String,
         bypass_check_needed: bool,
+        ignore_stats: bool,
         config: &Config,
         runtime_snapshot: &sito_runtime::RuntimeSnapshot,
         effective_upstream: &Arc<UpstreamManager>,
@@ -582,6 +585,7 @@ impl DnsPipeline {
                 &domain_str,
                 qtype,
                 "cache",
+                ignore_stats,
             )
         {
             return outcome;
@@ -593,13 +597,18 @@ impl DnsPipeline {
         {
             let bg_upstream = Arc::clone(effective_upstream);
             let bg_cache = Arc::clone(&self.cache);
+            let bg_metrics = self.metrics.clone();
             // Start from the cache query so ECS policy and DO are identical to
             // the entry being refreshed.
             let mut bg_query = cache_query.clone();
             // Never propagate a client's CD=1 flag into the background refresh:
             // the shared cache must always be validated when DNSSEC is enabled
             // so a CD=1 query cannot poison cached answers for CD=0 clients.
+            // The *insert* still uses the original triggering key (below) so a
+            // CD=1 hit refreshes the CD=1 entry instead of writing a fresh
+            // CD=0 entry that the triggering client can never see.
             bg_query.metadata.checking_disabled = false;
+            let bg_cache_query = cache_query.clone();
             // Same ordering rule as the query path: read the epoch before the
             // validator so a reload always wins against an in-flight refresh.
             let bg_policy_epoch = Self::cache_epoch_for(runtime_snapshot);
@@ -621,6 +630,11 @@ impl DnsPipeline {
                 let Ok(mut resp) = bg_upstream.resolve(&bg_resolve_query).await else {
                     return;
                 };
+                // A strict-mode Bogus decision is a fail-closed SERVFAIL.
+                // Capture it before `validation_status` folds every Bogus
+                // occurrence into `Indeterminate` (log-only) so the failure
+                // insert is used only for the strict path.
+                let mut strict_bogus = false;
                 let bg_status = if let Some(validator) = bg_validator {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -637,6 +651,24 @@ impl DnsPipeline {
                         DNSSEC_VALIDATION_DEADLINE,
                     )
                     .await;
+                    strict_bogus = dnssec_mode == sito_dnssec::DnssecMode::Validate
+                        && matches!(outcome, sito_dnssec::ValidationOutcome::Bogus { .. });
+                    // Publish the validator's cumulative counters after the
+                    // background pass. These setters replace the gauge values,
+                    // so the foreground's own update is refreshed rather than
+                    // double counted.
+                    if let Some(metrics) = &bg_metrics {
+                        metrics.set_dnssec_validations(
+                            validator.metrics.get_validations("secure"),
+                            validator.metrics.get_validations("insecure"),
+                            validator.metrics.get_validations("bogus"),
+                            validator.metrics.get_validations("indeterminate"),
+                        );
+                        metrics.set_dnssec_fetch_failures(
+                            validator.metrics.fetch_budget_exhausted(),
+                            validator.metrics.fetch_deadline_exceeded(),
+                        );
+                    }
                     validation_status(Some(&outcome))
                 } else {
                     // No local validation ran: never trust an upstream AD bit.
@@ -652,12 +684,37 @@ impl DnsPipeline {
                     dnssec_mode,
                     edns_udp_size,
                 );
-                if resp.metadata.response_code == ResponseCode::NoError
+                if strict_bogus {
+                    // Parity with the foreground: a strict Bogus refresh is a
+                    // fail-closed SERVFAIL, not an answer. The normal insert
+                    // rejects it (SERVFAIL), which would leave the stale-now
+                    // invalid answer in the cache for the rest of its TTL.
+                    if !super::shaping::cache_bogus_failure(
+                        &bg_cache,
+                        &bg_cache_query,
+                        &mut resp,
+                        bg_policy_epoch,
+                        bg_filter_epoch,
+                    )
+                    .await
+                    {
+                        let qname = bg_query
+                            .queries
+                            .first()
+                            .map(|query| query.name().to_string())
+                            .unwrap_or_default();
+                        warn!(
+                            qname = %qname,
+                            "Background prefetch could not cache the strict Bogus SERVFAIL; \
+                             the previous entry stays until it expires"
+                        );
+                    }
+                } else if resp.metadata.response_code == ResponseCode::NoError
                     || resp.metadata.response_code == ResponseCode::NXDomain
                 {
                     bg_cache
                         .insert_with_status_at_epochs(
-                            &bg_query,
+                            &bg_cache_query,
                             &resp,
                             bg_status,
                             bg_policy_epoch,

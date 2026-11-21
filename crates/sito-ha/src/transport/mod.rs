@@ -13,8 +13,8 @@ pub use mtls::{
 };
 
 /// Maximum accepted WebSocket message/frame size on either end of the HA
-/// replication channel. Bundles are small configuration documents; anything
-/// above this is a protocol error and must not be buffered.
+/// replication channel (1 MiB). Bundles are small configuration documents;
+/// anything above this is a protocol error and must not be buffered.
 pub const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
 
 /// WebSocket protocol limits shared by the master listener and the slave

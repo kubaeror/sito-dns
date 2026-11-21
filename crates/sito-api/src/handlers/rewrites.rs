@@ -12,6 +12,7 @@ use crate::models::{AddRewriteRequest, GenericMessageResponse, RewriteDto};
 use crate::state::ServerContext;
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use rand::RngExt;
 use sito_rewrites::{RewriteEntryConfig, RewritesConfig};
 
@@ -71,6 +72,12 @@ pub(crate) async fn save_rewrite_store_locked(
     ctx: &ServerContext,
     store: &RewriteStore,
 ) -> Result<(), ProblemDetails> {
+    // Single persistence gate for both the JSON API and the UI: reject an
+    // invalid entry before it can be written to disk or applied live.
+    store.cfg.validate().map_err(|error| {
+        ProblemDetails::bad_request(format!("Invalid rewrites configuration: {error}"))
+    })?;
+
     let mut new_cfg = (**ctx.config.load()).clone();
     let mut value = toml::Value::try_from(&store.cfg).map_err(|e| {
         ProblemDetails::internal_error(format!("Failed to serialize rewrites: {e}"))
@@ -113,6 +120,13 @@ fn to_dto(id: String, entry: RewriteEntryConfig) -> RewriteDto {
     }
 }
 
+/// Rejects an invalid rewrite entry before it can be persisted.
+fn validate_rewrite_entry(entry: &RewriteEntryConfig) -> Result<(), ProblemDetails> {
+    entry
+        .validate()
+        .map_err(|error| ProblemDetails::bad_request(format!("Invalid rewrite entry: {error}")))
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/rewrites",
@@ -121,7 +135,8 @@ fn to_dto(id: String, entry: RewriteEntryConfig) -> RewriteDto {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Rewrites"
+    tag = "Rewrites",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn get_rewrites(
     _operator: RequireOperator,
@@ -142,18 +157,19 @@ pub async fn get_rewrites(
     path = "/api/v1/rewrites",
     request_body = AddRewriteRequest,
     responses(
-        (status = 200, description = "DNS rewrite created", body = RewriteDto),
+        (status = 201, description = "DNS rewrite created", body = RewriteDto),
         (status = 400, description = "Bad Request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Rewrites"
+    tag = "Rewrites",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn add_rewrite(
     _operator: RequireOperator,
     State(ctx): State<ServerContext>,
     Json(payload): Json<AddRewriteRequest>,
-) -> Result<Json<RewriteDto>, ProblemDetails> {
+) -> Result<(StatusCode, Json<RewriteDto>), ProblemDetails> {
     let _apply_guard = ctx.lock_config_apply().await;
     let mut store = load_rewrite_store(&ctx);
 
@@ -164,18 +180,22 @@ pub async fn add_rewrite(
         answer: payload.answer.clone(),
         exception_clients: payload.exception_clients.clone(),
     };
+    validate_rewrite_entry(&entry)?;
 
     store.cfg.entries.push(entry);
     store.ids.push(id.clone());
     save_rewrite_store_locked(&ctx, &store).await?;
 
-    Ok(Json(RewriteDto {
-        id,
-        domain: payload.domain,
-        record_type: payload.record_type,
-        answer: payload.answer,
-        exception_clients: payload.exception_clients,
-    }))
+    Ok((
+        StatusCode::CREATED,
+        Json(RewriteDto {
+            id,
+            domain: payload.domain,
+            record_type: payload.record_type,
+            answer: payload.answer,
+            exception_clients: payload.exception_clients,
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -185,11 +205,13 @@ pub async fn add_rewrite(
     params(("id" = String, Path, description = "Stable rewrite ID")),
     responses(
         (status = 200, description = "DNS rewrite updated", body = RewriteDto),
+        (status = 400, description = "Bad Request"),
         (status = 404, description = "Not Found"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Rewrites"
+    tag = "Rewrites",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn update_rewrite(
     _operator: RequireOperator,
@@ -208,6 +230,7 @@ pub async fn update_rewrite(
         answer: payload.answer.clone(),
         exception_clients: payload.exception_clients.clone(),
     };
+    validate_rewrite_entry(&store.cfg.entries[idx])?;
 
     save_rewrite_store_locked(&ctx, &store).await?;
 
@@ -230,7 +253,8 @@ pub async fn update_rewrite(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
-    tag = "Rewrites"
+    tag = "Rewrites",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
 )]
 pub async fn delete_rewrite(
     _operator: RequireOperator,
@@ -343,6 +367,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_and_update_reject_invalid_entries_without_persisting() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_rewrite_validation_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        // An invalid add returns 400 and persists nothing.
+        let err = add_rewrite(
+            operator(),
+            State(ctx.clone()),
+            Json(AddRewriteRequest {
+                domain: "bad..name".to_string(),
+                record_type: "A".to_string(),
+                answer: "10.0.0.1".to_string(),
+                exception_clients: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("an invalid rewrite must be rejected");
+        assert_eq!(err.status, 400);
+        assert!(
+            err.detail.contains("rewrite") && err.detail.contains("domain"),
+            "the error must be explicit: {}",
+            err.detail
+        );
+        assert_eq!(load_rewrite_store(&ctx).cfg.entries, Vec::new());
+        assert!(
+            ctx.config.load().rewrites.is_none(),
+            "nothing may be persisted for an invalid add"
+        );
+
+        let (status, Json(created)) = add_rewrite(
+            operator(),
+            State(ctx.clone()),
+            Json(AddRewriteRequest {
+                domain: "printer.lan".to_string(),
+                record_type: "A".to_string(),
+                answer: "10.0.0.1".to_string(),
+                exception_clients: Vec::new(),
+            }),
+        )
+        .await
+        .expect("valid add");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.answer, "10.0.0.1");
+
+        // An invalid update returns 400 and leaves the stored entry unchanged.
+        let err = update_rewrite(
+            operator(),
+            State(ctx.clone()),
+            Path(created.id.clone()),
+            Json(AddRewriteRequest {
+                domain: "printer.lan".to_string(),
+                record_type: "A".to_string(),
+                answer: "not-an-ip".to_string(),
+                exception_clients: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("an invalid rewrite update must be rejected");
+        assert_eq!(err.status, 400);
+        assert!(
+            err.detail.contains("answer"),
+            "the error must be explicit: {}",
+            err.detail
+        );
+
+        let store = load_rewrite_store(&ctx);
+        assert_eq!(store.cfg.entries.len(), 1);
+        assert_eq!(store.cfg.entries[0].answer, "10.0.0.1");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_stable_ids_survive_delete_and_update() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_rewrite_ids_{}", rand::random::<u64>()));
@@ -361,6 +460,7 @@ mod tests {
         )
         .await
         .unwrap()
+        .1
         .0;
         let b = add_rewrite(
             operator(),
@@ -374,6 +474,7 @@ mod tests {
         )
         .await
         .unwrap()
+        .1
         .0;
 
         // Delete the first entry: the second entry's id must keep working.

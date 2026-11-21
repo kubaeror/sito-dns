@@ -66,6 +66,10 @@ pub struct HaConfig {
     pub slave_token: Option<String>,
 
     /// Allow unpinned TLS connections (insecure; default: false).
+    ///
+    /// This only selects the explicit no-verification mode when neither
+    /// `master_fingerprint` nor `ca` is configured. A configured `ca` is always
+    /// enforced (chain/SAN/validity), and a configured pin is always enforced.
     #[serde(default)]
     pub allow_unpinned_tls: bool,
 
@@ -217,11 +221,12 @@ impl HaConfig {
                 }
                 if url.starts_with("wss://")
                     && self.master_fingerprint.is_none()
+                    && self.ca.is_none()
                     && !self.allow_unpinned_tls
                 {
                     return Err(HaError::Validation {
                         field: "master_fingerprint".to_string(),
-                        reason: "WSS replication requires master_fingerprint for certificate pinning unless allow_unpinned_tls = true".to_string(),
+                        reason: "WSS replication requires master_fingerprint (pin) or ca (chain validation); set allow_unpinned_tls = true only to explicitly disable TLS verification".to_string(),
                     });
                 }
             }
@@ -267,6 +272,32 @@ pinned_slave_fingerprints = ["blake3:11223344"]
         assert_eq!(cfg.master_url.as_deref(), Some("wss://127.0.0.1:8953"));
         assert_eq!(cfg.pinned_slave_fingerprints.len(), 1);
         assert!(cfg.validate("slave").is_ok());
+    }
+
+    #[test]
+    fn test_wss_trust_policy_accepts_pin_ca_or_explicit_unpinned() {
+        let base = HaConfig {
+            master_url: Some("wss://127.0.0.1:8953".to_string()),
+            master_pubkey: Some("00".repeat(32)),
+            ..Default::default()
+        };
+
+        // No pin, no CA, no explicit opt-out: rejected.
+        assert!(base.validate("slave").is_err());
+
+        // A CA alone is a valid trust anchor (chain/SAN validation).
+        let ca_only = HaConfig {
+            ca: Some(std::path::PathBuf::from("/etc/sito/ca.crt")),
+            ..base.clone()
+        };
+        assert!(ca_only.validate("slave").is_ok());
+
+        // Explicit no-verification remains available without pin/CA.
+        let unpinned = HaConfig {
+            allow_unpinned_tls: true,
+            ..base
+        };
+        assert!(unpinned.validate("slave").is_ok());
     }
 
     #[test]

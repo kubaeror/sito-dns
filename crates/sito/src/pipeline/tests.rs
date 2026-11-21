@@ -15,6 +15,7 @@ impl sito_core::DnssecKeyFetcher for BlockingFetcher {
         &self,
         _name: &Name,
         _rtype: RecordType,
+        _deadline: std::time::Instant,
     ) -> Result<Message, sito_core::error::UpstreamError> {
         std::future::pending::<Result<Message, sito_core::error::UpstreamError>>().await
     }
@@ -474,6 +475,263 @@ async fn test_pipeline_rewrite_matches_query_type_without_upstream() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// A local rewrite owner configured for a single type is authoritative for
+/// the name: other query types are answered with NOERROR/NODATA and never
+/// reach upstream. An exception client still falls through.
+#[tokio::test]
+async fn test_local_rewrite_owner_returns_nodata_for_unconfigured_types() {
+    use sito_rewrites::{RewriteEntryConfig, RewriteTable, RewritesConfig};
+    use std::sync::atomic::Ordering;
+
+    let rewrites = RewriteTable::new(RewritesConfig {
+        auto_ptr: false,
+        ttl: 60,
+        entries: vec![RewriteEntryConfig {
+            domain: "printer.lan".to_string(),
+            r#type: "A".to_string(),
+            answer: "192.168.1.50".to_string(),
+            exception_clients: vec!["127.0.0.9".to_string()],
+        }],
+    });
+    let mut config = Config::default();
+    config.dns.dnssec.validate = false;
+    config.filtering.fail_closed = false;
+    let (pipeline, calls, temp_dir) = test_pipeline_with_rewrites(config, rewrites).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let resp = pipeline
+        .handle(rewrite_query("printer.lan.", RecordType::A), client.clone())
+        .await
+        .unwrap();
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(resp.answers.len(), 1);
+    assert!(
+        matches!(resp.answers[0].data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::new(192, 168, 1, 50))
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    for qtype in [RecordType::AAAA, RecordType::TXT, RecordType::HTTPS] {
+        let resp = pipeline
+            .handle(rewrite_query("printer.lan.", qtype), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NoError,
+            "{qtype:?} must be NOERROR/NODATA"
+        );
+        assert!(
+            resp.answers.is_empty(),
+            "{qtype:?} must be NODATA instead of querying upstream: {:?}",
+            resp.answers
+        );
+        assert_eq!(resp.metadata.id, 42, "{qtype:?} must echo the query ID");
+        assert_eq!(resp.queries.len(), 1, "{qtype:?} must echo the question");
+        assert_eq!(
+            resp.queries[0].name(),
+            &Name::from_str("printer.lan.").unwrap(),
+            "{qtype:?} must echo the query name"
+        );
+        assert_eq!(resp.queries[0].query_type(), qtype);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "{qtype:?} must not query upstream"
+        );
+    }
+
+    // An exception client bypasses the local rewrite and resolves upstream.
+    let excepted = ClientContext::new("127.0.0.9".parse().unwrap());
+    let resp = pipeline
+        .handle(rewrite_query("printer.lan.", RecordType::A), excepted)
+        .await
+        .unwrap();
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        matches!(resp.answers[0].data, RData::A(A(ip)) if ip == std::net::Ipv4Addr::new(203, 0, 113, 9)),
+        "an excepted client must reach upstream: {:?}",
+        resp.answers
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Local TXT rewrites split long and multi-byte values into valid
+/// character-strings and survive encode/decode. Empty TXT entries are rejected
+/// by config validation and skipped by table construction (covered in
+/// `sito-rewrites`).
+#[tokio::test]
+async fn test_local_rewrite_txt_values_are_chunked() {
+    use sito_rewrites::{RewriteEntryConfig, RewriteTable, RewritesConfig};
+
+    let ascii = "a".repeat(300);
+    let mut unicode = "b".repeat(254);
+    unicode.push('é');
+    let rewrites = RewriteTable::new(RewritesConfig {
+        auto_ptr: false,
+        ttl: 60,
+        entries: vec![
+            RewriteEntryConfig {
+                domain: "long.lan".to_string(),
+                r#type: "TXT".to_string(),
+                answer: ascii.clone(),
+                exception_clients: Vec::new(),
+            },
+            RewriteEntryConfig {
+                domain: "utf8.lan".to_string(),
+                r#type: "TXT".to_string(),
+                answer: unicode.clone(),
+                exception_clients: Vec::new(),
+            },
+        ],
+    });
+    let mut config = Config::default();
+    config.dns.dnssec.validate = false;
+    config.filtering.fail_closed = false;
+    let (pipeline, _calls, temp_dir) = test_pipeline_with_rewrites(config, rewrites).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    for (domain, expected) in [("long.lan.", ascii), ("utf8.lan.", unicode)] {
+        let resp = pipeline
+            .handle(rewrite_query(domain, RecordType::TXT), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+        let RData::TXT(txt) = &resp.answers[0].data else {
+            panic!("{domain} must answer TXT");
+        };
+        let strings = txt
+            .txt_data
+            .iter()
+            .map(|chunk| String::from_utf8(chunk.to_vec()).expect("valid UTF-8"))
+            .collect::<Vec<_>>();
+        assert!(
+            strings.iter().all(|chunk| chunk.len() <= 255),
+            "{domain} chunks must fit one character-string"
+        );
+        assert_eq!(strings.concat(), expected, "{domain} must round-trip");
+
+        let encoded = sito_proto::encode_message(&resp)
+            .unwrap_or_else(|error| panic!("{domain} TXT response must encode: {error}"));
+        let decoded = sito_proto::decode_message(&encoded)
+            .unwrap_or_else(|error| panic!("{domain} TXT response must decode: {error}"));
+        assert_eq!(decoded.metadata.id, resp.metadata.id);
+        assert_eq!(
+            decoded.answers.len(),
+            1,
+            "{domain} must survive encode/decode"
+        );
+    }
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Safe-search rewriting only applies to address/HTTPS lookups; other query
+/// types must resolve normally.
+#[tokio::test]
+async fn test_safe_search_rewrite_is_limited_to_address_and_https_qtypes() {
+    use sito_clients::{ClientEntryConfig, ClientGroupConfig, ClientsConfig};
+    use sito_rewrites::{RewriteTable, RewritesConfig};
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let (mock_addr, calls) = spawn_mock_upstream(None).await;
+    let mut config = Config::default();
+    config.dns.dnssec.validate = false;
+    config.filtering.enabled = true;
+    config.filtering.fail_closed = false;
+    config.filtering.lists.clear();
+    config.filtering.custom_rules.clear();
+    config.upstream.servers = vec![mock_addr.to_string()];
+
+    let clients = ClientsConfig {
+        entries: vec![ClientEntryConfig {
+            name: "kid".to_string(),
+            ids: vec!["127.0.0.1".to_string()],
+            group: "kids".to_string(),
+            ignore_query_log: false,
+            ignore_stats: false,
+            use_global_upstreams: true,
+            upstreams: None,
+            trusted: false,
+        }],
+        groups: HashMap::from([(
+            "kids".to_string(),
+            ClientGroupConfig {
+                safe_search: true,
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+    let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+    let (pipeline, temp_dir) = build_test_pipeline_with_rewrites(
+        config,
+        upstream,
+        validator,
+        clients,
+        RewriteTable::new(RewritesConfig::default()),
+    )
+    .await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    for qtype in [RecordType::A, RecordType::AAAA, RecordType::HTTPS] {
+        let resp = pipeline
+            .handle(rewrite_query("google.com.", qtype), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            resp.answers.iter().any(|record| {
+                matches!(&record.data, RData::CNAME(cname)
+                    if cname.0.to_ascii().trim_end_matches('.') == "forcesafesearch.google.com")
+            }),
+            "{qtype:?} must be safe-search rewritten: {:?}",
+            resp.answers
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "{qtype:?} must not query upstream"
+        );
+    }
+
+    let mut expected_calls = 0;
+    for qtype in [RecordType::TXT, RecordType::MX, RecordType::CNAME] {
+        let resp = pipeline
+            .handle(rewrite_query("google.com.", qtype), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            !resp.answers.iter().any(|record| {
+                matches!(&record.data, RData::CNAME(cname)
+                    if cname.0.to_ascii().trim_end_matches('.') == "forcesafesearch.google.com")
+            }),
+            "{qtype:?} must not be safe-search rewritten: {:?}",
+            resp.answers
+        );
+        expected_calls += 1;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            expected_calls,
+            "{qtype:?} must resolve upstream"
+        );
+    }
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 /// Collects candidates exactly like [`DnsPipeline::handle`] does and
 /// compares the resulting verdicts with the engine's own `evaluate*`
 /// wrappers. This guards the WP-18 single-collection refactor against
@@ -649,7 +907,7 @@ async fn spawn_mock_upstream(
                     resp.answers.push(Record::from_rdata(
                         question.name().clone(),
                         300,
-                        RData::A(A(std::net::Ipv4Addr::new(203, 0, 113, 9))),
+                        RData::A(A(MOCK_UPSTREAM_A)),
                     ));
                 }
                 let encoded = sito_proto::encode_message(&resp).unwrap();
@@ -1069,6 +1327,411 @@ async fn test_group_rule_does_not_mask_failed_global_source_end_to_end() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// Builds a client entry with every unrelated field at its test default.
+fn policy_entry(name: &str, ip: &str, group: &str) -> sito_clients::ClientEntryConfig {
+    sito_clients::ClientEntryConfig {
+        name: name.to_string(),
+        ids: vec![ip.to_string()],
+        group: group.to_string(),
+        ignore_query_log: false,
+        ignore_stats: false,
+        use_global_upstreams: true,
+        upstreams: None,
+        trusted: false,
+    }
+}
+
+/// Builds a pipeline from global custom rules and a client registry, backed by
+/// the counting mock upstream used by the precedence matrix tests.
+async fn policy_pipeline(
+    global_rules: &[&str],
+    clients: sito_clients::ClientsConfig,
+) -> (
+    DnsPipeline,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::path::PathBuf,
+) {
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+    let (mock_addr, calls) = spawn_mock_upstream(None).await;
+    let mut config = Config::default();
+    config.dns.dnssec.validate = false;
+    config.filtering.enabled = true;
+    config.filtering.fail_closed = false;
+    config.filtering.lists.clear();
+    config.filtering.custom_rules = global_rules
+        .iter()
+        .map(|rule| (*rule).to_string())
+        .collect();
+    config.upstream.servers = vec![mock_addr.to_string()];
+
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+    let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+    let (pipeline, temp_dir) =
+        build_test_pipeline_with_clients(config, upstream, validator, clients).await;
+    (pipeline, calls, temp_dir)
+}
+
+/// A-record addresses in a response, in answer order.
+fn policy_a_values(response: &Message) -> Vec<std::net::Ipv4Addr> {
+    response
+        .answers
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::A(a) => Some(a.0),
+            _ => None,
+        })
+        .collect()
+}
+
+const MOCK_UPSTREAM_A: std::net::Ipv4Addr = std::net::Ipv4Addr::new(203, 0, 113, 9);
+
+/// P2-25: within the standard tier the rank is `Allow > Rewrite > Block` and
+/// the per-group overlay wins ties. A group standard `$dnsrewrite` therefore
+/// overrides a global standard block for group members only.
+#[tokio::test]
+async fn test_policy_group_rewrite_overrides_global_block_end_to_end() {
+    use sito_clients::{ClientGroupConfig, ClientsConfig};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let clients = ClientsConfig {
+        entries: vec![policy_entry("kid", "127.0.0.1", "kids")],
+        groups: HashMap::from([(
+            "kids".to_string(),
+            ClientGroupConfig {
+                custom_rules: vec!["||overlay.example^$dnsrewrite=192.0.2.10".to_string()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let (pipeline, calls, temp_dir) = policy_pipeline(&["||overlay.example^"], clients).await;
+
+    let group = pipeline
+        .handle(
+            rewrite_query("overlay.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(group.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        policy_a_values(&group),
+        vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+        "a group standard rewrite must override the global standard block"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a rewritten query must not reach upstream"
+    );
+
+    let default = pipeline
+        .handle(
+            rewrite_query("overlay.example.", RecordType::A),
+            ClientContext::new("127.0.0.2".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&default),
+        vec![std::net::Ipv4Addr::UNSPECIFIED],
+        "a default client must still get the global standard block"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// `$important` outranks the whole standard tier, so a global important block
+/// beats a group standard `$dnsrewrite` for every client.
+#[tokio::test]
+async fn test_policy_global_important_block_beats_group_rewrite_end_to_end() {
+    use sito_clients::{ClientGroupConfig, ClientsConfig};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let clients = ClientsConfig {
+        entries: vec![policy_entry("kid", "127.0.0.1", "kids")],
+        groups: HashMap::from([(
+            "kids".to_string(),
+            ClientGroupConfig {
+                custom_rules: vec!["||pinned.example^$dnsrewrite=192.0.2.10".to_string()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let (pipeline, calls, temp_dir) =
+        policy_pipeline(&["||pinned.example^$important"], clients.clone()).await;
+
+    for ip in ["127.0.0.1", "127.0.0.2"] {
+        let response = pipeline
+            .handle(
+                rewrite_query("pinned.example.", RecordType::A),
+                ClientContext::new(ip.parse().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            policy_a_values(&response),
+            vec![std::net::Ipv4Addr::UNSPECIFIED],
+            "a global important block must beat a group standard rewrite for {ip}"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "an important block must stop before upstream"
+    );
+
+    // Positive control: without the important block, the same group rule
+    // rewrites locally, so the block above is attributable to the tier, not a
+    // broken rewrite.
+    let (control, control_calls, control_temp_dir) = policy_pipeline(&[], clients).await;
+    let rewritten = control
+        .handle(
+            rewrite_query("pinned.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&rewritten),
+        vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+        "without the important block the group rewrite must apply"
+    );
+    assert_eq!(
+        control_calls.load(Ordering::SeqCst),
+        0,
+        "the positive-control rewrite must not reach upstream"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&control_temp_dir).await;
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// Within the important tier `Allow > Block` and the group overlay wins ties:
+/// a group important exception clears a global important block for its members
+/// while the default client stays blocked.
+#[tokio::test]
+async fn test_policy_group_important_allow_beats_global_important_block_end_to_end() {
+    use sito_clients::{ClientGroupConfig, ClientsConfig};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let clients = ClientsConfig {
+        entries: vec![policy_entry("kid", "127.0.0.1", "kids")],
+        groups: HashMap::from([(
+            "kids".to_string(),
+            ClientGroupConfig {
+                custom_rules: vec!["@@||allowance.example^$important".to_string()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let (pipeline, calls, temp_dir) =
+        policy_pipeline(&["||allowance.example^$important"], clients).await;
+
+    let group = pipeline
+        .handle(
+            rewrite_query("allowance.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&group),
+        vec![MOCK_UPSTREAM_A],
+        "a group important allow must clear the global important block"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let default = pipeline
+        .handle(
+            rewrite_query("allowance.example.", RecordType::A),
+            ClientContext::new("127.0.0.2".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&default),
+        vec![std::net::Ipv4Addr::UNSPECIFIED],
+        "the global important block must still apply to a default client"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A global important exception outranks a group important block: both the
+/// group member and the default client resolve upstream.
+#[tokio::test]
+async fn test_policy_global_important_allow_beats_group_important_block_end_to_end() {
+    use sito_clients::{ClientGroupConfig, ClientsConfig};
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let clients = ClientsConfig {
+        entries: vec![policy_entry("kid", "127.0.0.1", "kids")],
+        groups: HashMap::from([(
+            "kids".to_string(),
+            ClientGroupConfig {
+                custom_rules: vec!["||clearance.example^$important".to_string()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let (pipeline, calls, temp_dir) =
+        policy_pipeline(&["@@||clearance.example^$important"], clients.clone()).await;
+
+    // Use distinct names so the second lookup cannot be served from the cache.
+    for (ip, name) in [
+        ("127.0.0.1", "clearance.example."),
+        ("127.0.0.2", "sub.clearance.example."),
+    ] {
+        let response = pipeline
+            .handle(
+                rewrite_query(name, RecordType::A),
+                ClientContext::new(ip.parse().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            policy_a_values(&response),
+            vec![MOCK_UPSTREAM_A],
+            "a global important allow must beat a group important block for {ip}"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "both clients must resolve upstream"
+    );
+
+    // Positive control: without the global important allow, the same group
+    // important block does block its member, so the allow above is real.
+    let (control, control_calls, control_temp_dir) = policy_pipeline(&[], clients).await;
+    let blocked = control
+        .handle(
+            rewrite_query("clearance.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&blocked),
+        vec![std::net::Ipv4Addr::UNSPECIFIED],
+        "without the global important allow the group important block must apply"
+    );
+    assert_eq!(
+        control_calls.load(Ordering::SeqCst),
+        0,
+        "the positive-control block must stop before upstream"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&control_temp_dir).await;
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// `$denyallow` on a global rule scopes the block: the owner is blocked and
+/// the allow-listed subdomain passes to upstream.
+#[tokio::test]
+async fn test_policy_global_denyallow_scope_end_to_end() {
+    use sito_clients::ClientsConfig;
+    use std::sync::atomic::Ordering;
+
+    let (pipeline, calls, temp_dir) = policy_pipeline(
+        &["||denyallow.example^$denyallow=allowed.denyallow.example"],
+        ClientsConfig::default(),
+    )
+    .await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let denied = pipeline
+        .handle(
+            rewrite_query("denyallow.example.", RecordType::A),
+            client.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&denied),
+        vec![std::net::Ipv4Addr::UNSPECIFIED],
+        "the rule owner must be blocked"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let allowed = pipeline
+        .handle(
+            rewrite_query("allowed.denyallow.example.", RecordType::A),
+            client,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&allowed),
+        vec![MOCK_UPSTREAM_A],
+        "a $denyallow-listed subdomain must pass to upstream"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// `$client=name` only matches a registry-authenticated identity: a raw DoH
+/// path id carrying the same name must not satisfy the rule.
+#[tokio::test]
+async fn test_policy_client_scope_requires_authenticated_identity_end_to_end() {
+    use sito_clients::ClientsConfig;
+    use std::sync::atomic::Ordering;
+
+    let clients = ClientsConfig {
+        entries: vec![policy_entry("laptop", "127.0.0.1", "default")],
+        ..Default::default()
+    };
+    let (pipeline, calls, temp_dir) =
+        policy_pipeline(&["||scoped-client.example^$client=laptop"], clients).await;
+
+    let authenticated = pipeline
+        .handle(
+            rewrite_query("scoped-client.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&authenticated),
+        vec![std::net::Ipv4Addr::UNSPECIFIED],
+        "a registry-authenticated name must satisfy $client"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let raw_id = pipeline
+        .handle(
+            rewrite_query("scoped-client.example.", RecordType::A),
+            ClientContext::with_id("127.0.0.2".parse().unwrap(), "laptop"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        policy_a_values(&raw_id),
+        vec![MOCK_UPSTREAM_A],
+        "a wire-claimed raw id must not satisfy $client"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 async fn build_test_pipeline(
     config: Config,
     upstream: std::sync::Arc<UpstreamManager>,
@@ -1096,14 +1759,33 @@ async fn build_test_pipeline_with_validator(
 /// Builds a pipeline with an explicit client registry, compiling group
 /// rule sets from it (used by the group-only end-to-end test).
 async fn build_test_pipeline_with_clients(
-    mut config: Config,
+    config: Config,
     upstream: std::sync::Arc<UpstreamManager>,
     dnssec: sito_dnssec::DnssecValidator,
     clients: sito_clients::ClientsConfig,
 ) -> (DnsPipeline, std::path::PathBuf) {
+    use sito_rewrites::{RewriteTable, RewritesConfig};
+
+    build_test_pipeline_with_rewrites(
+        config,
+        upstream,
+        dnssec,
+        clients,
+        RewriteTable::new(RewritesConfig::default()),
+    )
+    .await
+}
+
+/// Builds a pipeline with explicit client and rewrite configuration.
+async fn build_test_pipeline_with_rewrites(
+    mut config: Config,
+    upstream: std::sync::Arc<UpstreamManager>,
+    dnssec: sito_dnssec::DnssecValidator,
+    clients: sito_clients::ClientsConfig,
+    rewrites: sito_rewrites::RewriteTable,
+) -> (DnsPipeline, std::path::PathBuf) {
     use sito_clients::{ClientRegistry, ParentalRegistry, ServiceRegistry};
     use sito_filter::HostsFilterEngine;
-    use sito_rewrites::{RewriteTable, RewritesConfig};
     use std::sync::atomic::AtomicUsize;
 
     let temp_dir = std::env::temp_dir().join(format!(
@@ -1140,9 +1822,7 @@ async fn build_test_pipeline_with_clients(
             ParentalRegistry::try_bundled().expect("bundled parental lists must load"),
         ),
         std::sync::Arc::new(ServiceRegistry::try_bundled().expect("bundled services must load")),
-        std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(RewriteTable::new(
-            RewritesConfig::default(),
-        )))),
+        std::sync::Arc::new(ArcSwap::new(std::sync::Arc::new(rewrites))),
         std::sync::Arc::new(AtomicUsize::new(0)),
     );
     (pipeline, temp_dir)
@@ -1167,6 +1847,38 @@ async fn test_pipeline(
             .unwrap(),
     );
     let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+    (pipeline, calls, temp_dir)
+}
+
+/// Builds a pipeline backed by the default successful UDP mock upstream and a
+/// caller-supplied local rewrite table.
+async fn test_pipeline_with_rewrites(
+    mut config: Config,
+    rewrites: sito_rewrites::RewriteTable,
+) -> (
+    DnsPipeline,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::path::PathBuf,
+) {
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+    let (mock_addr, calls) = spawn_mock_upstream(None).await;
+    config.upstream.servers = vec![mock_addr.to_string()];
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+    let validator = sito_dnssec::DnssecValidator::from_config(&config.dns.dnssec);
+    let (pipeline, temp_dir) = build_test_pipeline_with_rewrites(
+        config,
+        upstream,
+        validator,
+        sito_clients::ClientsConfig::default(),
+        rewrites,
+    )
+    .await;
     (pipeline, calls, temp_dir)
 }
 
@@ -1273,6 +1985,294 @@ async fn test_pipeline_upstream_metrics_attribution_and_recovery() {
     );
     assert!(!rendered.contains(r#"upstream="all""#));
     assert!(!rendered.contains("unattributed"));
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// WP-2.7: the pipeline records one RTT and one error/health update per
+/// candidate attempt, so a failed first candidate is visible even though the
+/// second candidate resolves the query.
+#[tokio::test]
+async fn test_pipeline_records_per_attempt_upstream_metrics() {
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.dnssec.validate = false;
+
+    let (live_addr, _live_calls) = spawn_mock_upstream(None).await;
+    // Bound but never read/answered: the first candidate times out.
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let blackhole_addr = blackhole.local_addr().unwrap();
+    config.upstream.servers = vec![blackhole_addr.to_string(), live_addr.to_string()];
+    config.upstream.timeout_ms = 300;
+
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .expect("two IP-literal upstreams must build"),
+    );
+    let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let resp = pipeline
+        .handle(rewrite_query("per-attempt.example.", RecordType::A), client)
+        .await
+        .unwrap();
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+
+    let failed = blackhole_addr.to_string();
+    let winner = live_addr.to_string();
+    let rendered = metrics.render_prometheus();
+    assert!(
+        rendered.contains(&format!(
+            "sito_upstream_errors_total{{upstream=\"{failed}\",kind=\"timeout\"}} 1"
+        )),
+        "the failed attempt must be recorded with its own error kind: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("sito_upstream_health{{upstream=\"{failed}\"}} 0")),
+        "the failed attempt must set its own health to 0: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("sito_upstream_health{{upstream=\"{winner}\"}} 1")),
+        "the winning attempt must set its own health to 1: {rendered}"
+    );
+    for name in [&failed, &winner] {
+        assert!(
+            rendered.contains(&format!(
+                "sito_upstream_rtt_seconds_count{{upstream=\"{name}\"}} 1"
+            )),
+            "each attempt must contribute its own RTT sample: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains(r#"upstream="all""#),
+        "no aggregate/stale label may appear: {rendered}"
+    );
+
+    drop(blackhole);
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// P2-57: every per-query metric family honours the client's `ignore_stats`
+/// policy, not just the query counters. The test renders the exposition after
+/// driving one ignored and one normal client through the same cache, upstream,
+/// stale, anti-DoH and identification paths.
+#[tokio::test]
+async fn test_ignore_stats_gates_all_per_query_metric_families() {
+    use sito_clients::{ClientEntryConfig, ClientsConfig};
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut config = Config::default();
+    config.filtering.enabled = true;
+    config.filtering.custom_rules = vec!["||never-match.invalid^".to_string()];
+    config.filtering.anti_doh_bypass = "block_all".to_string();
+    config.dns.dnssec.validate = false;
+    config.dns.cache.enabled = true;
+    config.dns.cache.min_ttl = 1;
+    config.dns.cache.max_ttl = 1;
+    config.dns.cache.negative_ttl_max = 1;
+    config.dns.cache.serve_stale_hours = 1;
+    config.upstream.timeout_ms = 300;
+
+    let fail = std::sync::Arc::new(AtomicBool::new(false));
+    let (mock_addr, _calls) = spawn_mock_upstream(Some(std::sync::Arc::clone(&fail))).await;
+    let server = mock_addr.to_string();
+    config.upstream.servers = vec![server.clone()];
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+
+    let clients = ClientsConfig {
+        entries: vec![
+            ClientEntryConfig {
+                name: "ignored-client".to_string(),
+                ids: vec!["10.0.0.1".to_string()],
+                group: "default".to_string(),
+                ignore_query_log: false,
+                ignore_stats: true,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            },
+            ClientEntryConfig {
+                name: "normal-client".to_string(),
+                ids: vec!["10.0.0.2".to_string()],
+                group: "default".to_string(),
+                ignore_query_log: false,
+                ignore_stats: false,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            },
+        ],
+        ..Default::default()
+    };
+    let validator = DnssecValidator::from_config(&config.dns.dnssec);
+    let (pipeline, temp_dir) =
+        build_test_pipeline_with_clients(config, upstream, validator, clients).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let ignored = ClientContext::new("10.0.0.1".parse().unwrap());
+    let normal = ClientContext::new("10.0.0.2".parse().unwrap());
+
+    // Miss -> hit for the normal client; the ignored client's miss and
+    // upstream success must not be counted.
+    pipeline
+        .handle(
+            rewrite_query("ignored-ok.example.", RecordType::A),
+            ignored.clone(),
+        )
+        .await
+        .unwrap();
+    pipeline
+        .handle(
+            rewrite_query("normal-ok.example.", RecordType::A),
+            normal.clone(),
+        )
+        .await
+        .unwrap();
+    pipeline
+        .handle(
+            rewrite_query("normal-ok.example.", RecordType::A),
+            normal.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Failure attribution: only the normal client's failure is observable.
+    fail.store(true, Ordering::SeqCst);
+    let ignored_failure = pipeline
+        .handle(
+            rewrite_query("ignored-fail.example.", RecordType::A),
+            ignored.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ignored_failure.metadata.response_code,
+        ResponseCode::ServFail
+    );
+    let normal_failure = pipeline
+        .handle(
+            rewrite_query("normal-fail.example.", RecordType::A),
+            normal.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        normal_failure.metadata.response_code,
+        ResponseCode::ServFail
+    );
+
+    // Seed one stale entry per client and leave the fresh window.
+    for (id, name) in [
+        (21u16, "ignored-stale.example."),
+        (22, "normal-stale.example."),
+    ] {
+        let query = rewrite_query(name, RecordType::A);
+        let mut cached = Message::response(id, OpCode::Query);
+        cached.queries = query.queries.clone();
+        cached.answers.push(Record::from_rdata(
+            Name::from_str(name).unwrap(),
+            1,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, id as u8))),
+        ));
+        pipeline
+            .cache
+            .insert_with_status(&query, &cached, ValidationStatus::Unchecked)
+            .await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    pipeline
+        .handle(
+            rewrite_query("ignored-stale.example.", RecordType::A),
+            ignored.clone(),
+        )
+        .await
+        .unwrap();
+    let stale = pipeline
+        .handle(
+            rewrite_query("normal-stale.example.", RecordType::A),
+            normal.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.metadata.response_code, ResponseCode::NoError);
+
+    // Anti-DoH bypass is blocked before the cache/upstream path for both
+    // clients; only the normal client's counter may move.
+    pipeline
+        .handle(rewrite_query("dns.google.", RecordType::A), ignored)
+        .await
+        .unwrap();
+    pipeline
+        .handle(rewrite_query("dns.google.", RecordType::A), normal)
+        .await
+        .unwrap();
+
+    let rendered = metrics.render_prometheus();
+    let series = |needle: &str| -> u64 {
+        rendered
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(' ')?;
+                (name == needle).then(|| value.parse::<u64>().unwrap())
+            })
+            .unwrap_or_else(|| panic!("missing {needle} in:\n{rendered}"))
+    };
+
+    assert_eq!(
+        metrics.get_queries_and_blocked().0,
+        5,
+        "only the normal client's five queries are counted: {rendered}"
+    );
+    assert_eq!(
+        series(r#"sito_clients_identified_total{method="identified"}"#),
+        5,
+        "identification must be gated: {rendered}"
+    );
+    assert_eq!(
+        series("sito_cache_misses_total"),
+        3,
+        "normal misses: success, failure and stale lookup: {rendered}"
+    );
+    assert_eq!(
+        series("sito_cache_hits_total"),
+        2,
+        "the normal client's repeat and stale serve are the only cache hits: {rendered}"
+    );
+    assert_eq!(
+        series("sito_cache_stale_served_total"),
+        1,
+        "the ignored client's stale serve must not be counted: {rendered}"
+    );
+    assert_eq!(
+        series("sito_doh_bypass_blocked_total"),
+        1,
+        "the ignored client's anti-DoH block must not be counted: {rendered}"
+    );
+    assert_eq!(
+        series(&format!(
+            r#"sito_upstream_rtt_seconds_count{{upstream="{server}"}}"#
+        )),
+        3,
+        "one RTT per normal success/failure/stale attempt: {rendered}"
+    );
+    assert_eq!(
+        series(&format!(
+            r#"sito_upstream_errors_total{{upstream="{server}",kind="bad_response"}}"#
+        )),
+        2,
+        "the normal failure and stale lookup are the only attributed errors: {rendered}"
+    );
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
@@ -1590,6 +2590,618 @@ async fn test_stale_indeterminate_entry_is_not_served_under_validation() {
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
+/// Builds a pipeline whose mock upstream answers every query with a signed A
+/// RRset whose signature inception is beyond the accepted clock skew, so
+/// validation reaches a deterministic `Bogus` decision without a key fetch.
+///
+/// Returns the pipeline, the upstream call counter, the temp dir, and the
+/// qname that the mock answers.
+async fn test_pipeline_with_bogus_signed_upstream(
+    mut config: Config,
+    mode: DnssecMode,
+    clients: sito_clients::ClientsConfig,
+) -> (
+    DnsPipeline,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::path::PathBuf,
+    Name,
+) {
+    use hickory_proto::dnssec::TrustAnchors;
+    use hickory_proto::dnssec::rdata::{DNSSECRData, RRSIG};
+    use hickory_proto::rr::{DNSClass, LowerName, RecordData, RecordSet};
+    use sito_proto::rdata::SOA;
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+    use std::sync::atomic::AtomicUsize;
+
+    let (origin, dnskey, signer) = sito_dnssec::test_util::create_test_signer("bogus.example.");
+    let qname = Name::from_str("bogus.example.").unwrap();
+    let answer = Record::from_rdata(
+        qname.clone(),
+        300,
+        RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 200))),
+    );
+    let mut set = RecordSet::new(qname.clone(), RecordType::A, 300);
+    set.insert(answer.clone(), 0);
+    // Signature window starts after `now + MAX_CLOCK_SKEW`: the validator
+    // fails closed as Bogus without needing DNSKEY/DS fetches.
+    let inception = time::OffsetDateTime::now_utc() + time::Duration::seconds(400);
+    let rrsig =
+        RRSIG::from_rrset(&set, DNSClass::IN, inception, &signer).expect("sign future-dated rrset");
+    let signature = Record::from_rdata(qname.clone(), 300, rrsig.into_rdata());
+    let mut template = Message::new(0, MessageType::Response, OpCode::Query);
+    template.metadata.response_code = ResponseCode::NoError;
+    template.answers = vec![answer, signature];
+    // A negative-style SOA in the authority section makes the "a Bogus
+    // SERVFAIL must not carry authority data" assertions non-vacuous: the
+    // fail-closed writer has to clear it.
+    template.authorities.push(Record::from_rdata(
+        origin.clone(),
+        300,
+        RData::SOA(SOA::new(
+            origin.clone(),
+            origin.clone(),
+            1,
+            7200,
+            3600,
+            1_209_600,
+            3600,
+        )),
+    ));
+    template.additionals.push(Record::from_rdata(
+        origin.clone(),
+        300,
+        RData::DNSSEC(DNSSECRData::DNSKEY(dnskey.clone())),
+    ));
+
+    let mock_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_socket.local_addr().unwrap();
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let call_counter = std::sync::Arc::clone(&calls);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while let Ok((len, src)) = mock_socket.recv_from(&mut buf).await {
+            if let Ok(query) = sito_proto::decode_message(&buf[..len]) {
+                call_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut resp = template.clone();
+                resp.metadata.id = query.metadata.id;
+                resp.queries = query.queries.clone();
+                if let Ok(encoded) = sito_proto::encode_message(&resp) {
+                    let _ = mock_socket.send_to(&encoded, src).await;
+                }
+            }
+        }
+    });
+
+    config.filtering.enabled = false;
+    config.dns.dnssec.mode = match mode {
+        DnssecMode::Validate => "validate",
+        DnssecMode::LogOnly => "log_only",
+        DnssecMode::Disabled => "disabled",
+    }
+    .to_string();
+    config.dns.dnssec.validate = true;
+    config.upstream.servers = vec![mock_addr.to_string()];
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .unwrap(),
+    );
+    let mut anchors = TrustAnchors::empty();
+    anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+    let validator = DnssecValidator::new(mode, Vec::new()).with_trust_anchors(anchors);
+    let (pipeline, temp_dir) =
+        build_test_pipeline_with_clients(config, upstream, validator, clients).await;
+    (pipeline, calls, temp_dir, qname)
+}
+
+/// P2-57: the per-upstream `sito_dnssec_bogus_total` series honours
+/// `ignore_stats`. The validator's cumulative outcome counters are node-wide
+/// and intentionally still include both validations.
+#[tokio::test]
+async fn test_ignore_stats_gates_dnssec_bogus_per_upstream() {
+    use sito_clients::{ClientEntryConfig, ClientsConfig};
+
+    let clients = ClientsConfig {
+        entries: vec![
+            ClientEntryConfig {
+                name: "ignored-client".to_string(),
+                ids: vec!["10.0.0.1".to_string()],
+                group: "default".to_string(),
+                ignore_query_log: false,
+                ignore_stats: true,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            },
+            ClientEntryConfig {
+                name: "normal-client".to_string(),
+                ids: vec!["10.0.0.2".to_string()],
+                group: "default".to_string(),
+                ignore_query_log: false,
+                ignore_stats: false,
+                use_global_upstreams: true,
+                upstreams: None,
+                trusted: false,
+            },
+        ],
+        ..Default::default()
+    };
+    let (pipeline, _calls, temp_dir, qname) =
+        test_pipeline_with_bogus_signed_upstream(Config::default(), DnssecMode::LogOnly, clients)
+            .await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let ignored = ClientContext::new("10.0.0.1".parse().unwrap());
+    let normal = ClientContext::new("10.0.0.2".parse().unwrap());
+
+    // LogOnly keeps the answer and caches it as Indeterminate, which is not
+    // servable to a validating query; both clients reach the validator.
+    let query = do_query(31, &qname);
+    let ignored_resp = pipeline.handle(query.clone(), ignored).await.unwrap();
+    assert_eq!(ignored_resp.metadata.response_code, ResponseCode::NoError);
+    let normal_resp = pipeline.handle(query, normal).await.unwrap();
+    assert_eq!(normal_resp.metadata.response_code, ResponseCode::NoError);
+
+    let rendered = metrics.render_prometheus();
+    let bogus_series: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with("sito_dnssec_bogus_total{"))
+        .collect();
+    assert_eq!(
+        bogus_series.len(),
+        1,
+        "only the normal client may create a per-upstream bogus series: {rendered}"
+    );
+    assert!(
+        bogus_series[0].ends_with(" 1"),
+        "the normal client's bogus answer must be counted once: {}",
+        bogus_series[0]
+    );
+    assert!(
+        rendered.contains(r#"sito_dnssec_validations_total{result="bogus"} 2"#),
+        "the node-wide validator counters are shared state: {rendered}"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A strict-mode Bogus result is a fail-closed SERVFAIL. It is cached as
+/// `ValidationStatus::Bogus` for a short window, and a repeated query within
+/// that window is answered from the cache without another upstream call.
+#[tokio::test]
+async fn test_strict_bogus_servfail_is_cached_and_served_without_upstream() {
+    use std::sync::atomic::Ordering;
+
+    let (pipeline, calls, temp_dir, qname) = test_pipeline_with_bogus_signed_upstream(
+        Config::default(),
+        DnssecMode::Validate,
+        sito_clients::ClientsConfig::default(),
+    )
+    .await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let first_query = do_query(20, &qname);
+    let first = pipeline
+        .handle(first_query.clone(), client.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.metadata.response_code, ResponseCode::ServFail);
+    assert!(
+        first.answers.is_empty(),
+        "a Bogus answer must never be served as data"
+    );
+    assert!(
+        first.authorities.is_empty(),
+        "a Bogus SERVFAIL must not carry authority data"
+    );
+    assert!(
+        first.additionals.is_empty(),
+        "a Bogus SERVFAIL must not carry additional data"
+    );
+    assert!(
+        !first.metadata.authentic_data,
+        "a Bogus SERVFAIL must never assert AD"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let (cached, status) = pipeline
+        .cache
+        .get_for_query_with_status(&first_query)
+        .await
+        .expect("a strict Bogus SERVFAIL must be cached");
+    assert_eq!(status, ValidationStatus::Bogus);
+    assert_eq!(cached.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(cached.answers.len(), 0);
+    assert!(
+        cached.authorities.is_empty(),
+        "the cached Bogus entry must not carry authority data"
+    );
+    assert!(
+        cached.additionals.is_empty(),
+        "the cached Bogus entry must not carry additional data"
+    );
+    assert!(
+        !cached.metadata.authentic_data,
+        "the cached Bogus entry must never assert AD"
+    );
+
+    let second = pipeline.handle(do_query(21, &qname), client).await.unwrap();
+    assert_eq!(second.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(second.answers.len(), 0);
+    assert!(
+        second.authorities.is_empty(),
+        "a replayed Bogus SERVFAIL must not carry authority data"
+    );
+    assert!(
+        second.additionals.is_empty(),
+        "a replayed Bogus SERVFAIL must not carry additional data"
+    );
+    assert!(
+        !second.metadata.authentic_data,
+        "a served Bogus SERVFAIL must never assert AD"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the second identical query must be served from the cached Bogus SERVFAIL"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A background prefetch that receives a strict-mode Bogus result must cache
+/// the same fail-closed SERVFAIL the foreground path stores. Routing it
+/// through the normal insert would be rejected (SERVFAIL is not RFC 2308
+/// cacheable), leaving the now-invalid answer servable until it expires.
+#[tokio::test]
+async fn test_prefetch_strict_bogus_is_cached_as_fail_closed_servfail() {
+    use std::sync::atomic::Ordering;
+
+    let mut config = Config::default();
+    config.dns.cache.prefetch = true;
+    // A 10 s lifespan makes `should_prefetch` true on the second hit
+    // (`remaining <= 10`) while the seeded entry stays fresh long enough for
+    // the background refresh to replace it.
+    config.dns.cache.min_ttl = 10;
+    config.dns.cache.max_ttl = 10;
+    let (pipeline, calls, temp_dir, qname) = test_pipeline_with_bogus_signed_upstream(
+        config,
+        DnssecMode::Validate,
+        sito_clients::ClientsConfig::default(),
+    )
+    .await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    // Seed a servable, near-expiry entry so cache hits trigger the background
+    // refresh instead of a foreground upstream resolution.
+    let seed_query = do_query(30, &qname);
+    let mut seed = Message::response(30, OpCode::Query);
+    seed.queries = seed_query.queries.clone();
+    seed.answers.push(Record::from_rdata(
+        qname.clone(),
+        10,
+        RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 30))),
+    ));
+    pipeline
+        .cache
+        .insert_with_status(&seed_query, &seed, ValidationStatus::Insecure)
+        .await;
+
+    // Two cache hits raise the hit counter to the prefetch threshold; the
+    // second hit spawns the background refresh through the mock upstream.
+    for id in 30..=31 {
+        let resp = pipeline
+            .handle(do_query(id, &qname), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NoError,
+            "the foreground keeps serving the seeded entry"
+        );
+    }
+
+    let mut attempts = 0usize;
+    let (cached, status) = loop {
+        if let Some((message, status)) = pipeline.cache.get_for_query_with_status(&seed_query).await
+            && status == ValidationStatus::Bogus
+        {
+            break (message, status);
+        }
+        attempts += 1;
+        assert!(
+            attempts < 250,
+            "the background prefetch never cached a Bogus SERVFAIL (upstream calls: {})",
+            calls.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(status, ValidationStatus::Bogus);
+    assert_eq!(cached.metadata.response_code, ResponseCode::ServFail);
+    assert!(
+        cached.answers.is_empty(),
+        "a prefetched Bogus entry must not carry answer data"
+    );
+    assert!(
+        cached.authorities.is_empty(),
+        "a prefetched Bogus entry must not carry authority data"
+    );
+    assert!(
+        cached.additionals.is_empty(),
+        "a prefetched Bogus entry must not carry additional data"
+    );
+    assert!(
+        !cached.metadata.authentic_data,
+        "a prefetched Bogus entry must never assert AD"
+    );
+    assert!(
+        ede_option_present(&cached),
+        "the cached Bogus SERVFAIL must preserve the validator's EDE diagnostic"
+    );
+    assert_eq!(
+        pipeline
+            .cache
+            .cached_entry_lifespan_secs_for_test(&seed_query)
+            .await,
+        Some(sito_cache::DNSSEC_BOGUS_CACHE_TTL),
+        "the cached Bogus entry must use the 5 s DNSSEC failure window"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) >= 1,
+        "the prefetch must have re-queried the upstream"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A log-only Bogus refresh must not write a `Bogus` entry: it keeps the
+/// answer and goes through the normal insert as unservable `Indeterminate`.
+#[tokio::test]
+async fn test_prefetch_log_only_bogus_is_cached_as_indeterminate() {
+    use std::sync::atomic::Ordering;
+
+    let mut config = Config::default();
+    config.dns.cache.prefetch = true;
+    config.dns.cache.min_ttl = 10;
+    config.dns.cache.max_ttl = 10;
+    let (pipeline, calls, temp_dir, qname) = test_pipeline_with_bogus_signed_upstream(
+        config,
+        DnssecMode::LogOnly,
+        sito_clients::ClientsConfig::default(),
+    )
+    .await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let seed_query = do_query(40, &qname);
+    let mut seed = Message::response(40, OpCode::Query);
+    seed.queries = seed_query.queries.clone();
+    seed.answers.push(Record::from_rdata(
+        qname.clone(),
+        10,
+        RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 40))),
+    ));
+    pipeline
+        .cache
+        .insert_with_status(&seed_query, &seed, ValidationStatus::Insecure)
+        .await;
+
+    // Two cache hits cross the prefetch threshold and trigger the background
+    // refresh through the mock upstream.
+    for id in 40..=41 {
+        let resp = pipeline
+            .handle(do_query(id, &qname), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    }
+
+    let mut attempts = 0usize;
+    let (cached, status) = loop {
+        if let Some((message, status)) = pipeline.cache.get_for_query_with_status(&seed_query).await
+            && status == ValidationStatus::Indeterminate
+        {
+            break (message, status);
+        }
+        attempts += 1;
+        assert!(
+            attempts < 250,
+            "the background prefetch never cached the log-only Bogus answer \
+             (upstream calls: {})",
+            calls.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(status, ValidationStatus::Indeterminate);
+    assert_ne!(
+        status,
+        ValidationStatus::Bogus,
+        "a log-only Bogus refresh must never be cached as a fail-closed Bogus entry"
+    );
+    assert_eq!(cached.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        !cached.answers.is_empty(),
+        "log-only keeps the answer in the prefetched entry"
+    );
+    assert!(!cached.metadata.authentic_data);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// In log-only mode a Bogus result keeps the answer as an unservable
+/// `Indeterminate` entry: it may be cached, but a validating client forces a
+/// re-resolution instead of receiving the unvalidated data.
+#[tokio::test]
+async fn test_log_only_bogus_is_cached_as_indeterminate_and_not_served() {
+    use std::sync::atomic::Ordering;
+
+    let (pipeline, calls, temp_dir, qname) = test_pipeline_with_bogus_signed_upstream(
+        Config::default(),
+        DnssecMode::LogOnly,
+        sito_clients::ClientsConfig::default(),
+    )
+    .await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let first_query = do_query(22, &qname);
+    let first = pipeline
+        .handle(first_query.clone(), client.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.metadata.response_code, ResponseCode::NoError);
+    assert!(!first.answers.is_empty(), "log-only keeps the answer");
+    assert!(!first.metadata.authentic_data);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let (_, status) = pipeline
+        .cache
+        .get_for_query_with_status(&first_query)
+        .await
+        .expect("the log-only answer must still be cached");
+    assert_eq!(status, ValidationStatus::Indeterminate);
+
+    let second = pipeline.handle(do_query(23, &qname), client).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(
+        !second.metadata.authentic_data,
+        "log-only data must never assert AD"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+#[test]
+fn test_cache_servability_distinguishes_bogus_from_indeterminate() {
+    assert!(
+        cache_entry_servable(ValidationStatus::Bogus, true),
+        "a cached Bogus SERVFAIL is fail-closed and servable"
+    );
+    assert!(!cache_entry_servable(ValidationStatus::Indeterminate, true));
+    assert!(!stale_cache_entry_servable(ValidationStatus::Bogus, true));
+    assert!(!stale_cache_entry_servable(
+        ValidationStatus::Indeterminate,
+        true
+    ));
+    assert!(stale_cache_entry_servable(ValidationStatus::Secure, true));
+    assert!(stale_cache_entry_servable(ValidationStatus::Insecure, true));
+}
+
+/// Sentinel EDE text attached to a cached Bogus entry in the stale-path test.
+const STALE_BOGUS_SENTINEL: &str = "stale-bogus-sentinel";
+
+/// Whether a response carries any RFC 8914 Extended DNS Error option.
+fn ede_option_present(response: &Message) -> bool {
+    response.edns.as_ref().is_some_and(|edns| {
+        edns.options()
+            .options
+            .iter()
+            .any(|(code, _)| u16::from(*code) == 15)
+    })
+}
+
+/// Whether a response carries an RFC 8914 EDE option whose payload contains
+/// `needle` (the two-byte info-code prefix is included in the payload).
+fn ede_contains_text(response: &Message, needle: &str) -> bool {
+    response.edns.as_ref().is_some_and(|edns| {
+        edns.options().options.iter().any(|(code, option)| {
+            u16::from(*code) == 15
+                && matches!(
+                    option,
+                    EdnsOption::Unknown(_, data)
+                        if data
+                            .windows(needle.len())
+                            .any(|window| window == needle.as_bytes())
+                )
+        })
+    })
+}
+
+/// A stale `Bogus` entry is a fail-closed SERVFAIL, not reusable data. Even
+/// when the upstream is down, a validating client must get a freshly
+/// synthesized SERVFAIL rather than a stale cached validation failure.
+///
+/// The cached failure carries a sentinel EDE text. The stale cache lookup can
+/// still see it (proving the entry is present and stale), but the pipeline's
+/// answer must not contain that sentinel, which distinguishes a freshly
+/// synthesized SERVFAIL from a replay of the cached entry.
+#[tokio::test]
+async fn test_stale_bogus_entry_is_not_served_under_validation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.cache.serve_stale_hours = 1;
+    config.dns.cache.min_ttl = 1;
+    config.dns.cache.max_ttl = 1;
+    config.dns.cache.negative_ttl_max = 1;
+    let fail = std::sync::Arc::new(AtomicBool::new(true));
+    let (pipeline, _server, calls, temp_dir) =
+        test_pipeline_with_failure_toggle(config, fail).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    let name = Name::from_str("stale-bogus.example.").unwrap();
+    let query = do_query(19, &name);
+
+    let mut servfail = Message::response(19, OpCode::Query);
+    servfail.queries = query.queries.clone();
+    servfail.metadata.response_code = ResponseCode::ServFail;
+    sito_dnssec::apply_ede(
+        &mut servfail,
+        sito_dnssec::EDE_DNSSEC_BOGUS,
+        STALE_BOGUS_SENTINEL,
+    );
+    assert!(
+        pipeline
+            .cache
+            .insert_validation_failure_at_epochs(
+                &query,
+                &servfail,
+                ValidationStatus::Bogus,
+                pipeline.cache.policy_epoch(),
+                pipeline.cache.filter_epoch(),
+                1,
+            )
+            .await
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    // The entry is still visible to the raw stale lookup, including the
+    // sentinel, so the pipeline must reject it explicitly.
+    let (stale, stale_status) = pipeline
+        .cache
+        .get_stale_for_query_with_status(&query)
+        .await
+        .expect("the stale Bogus entry must still be present for this test");
+    assert_eq!(stale_status, ValidationStatus::Bogus);
+    assert!(
+        ede_contains_text(&stale, STALE_BOGUS_SENTINEL),
+        "the stale lookup must expose the cached sentinel EDE"
+    );
+    assert!(
+        !stale_cache_entry_servable(ValidationStatus::Bogus, true),
+        "a stale Bogus entry must never be servable under validation"
+    );
+
+    let resp = pipeline.handle(query, client).await.unwrap();
+    assert_eq!(
+        resp.metadata.response_code,
+        ResponseCode::ServFail,
+        "a stale Bogus entry must not be served to a validating client"
+    );
+    assert!(
+        resp.answers.is_empty(),
+        "the rejected stale failure must not leak records"
+    );
+    assert!(
+        !ede_contains_text(&resp, STALE_BOGUS_SENTINEL),
+        "the response must be a freshly synthesized SERVFAIL, not the cached stale entry"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
 /// Stale `Insecure` data is an authenticated unsigned decision and remains
 /// RFC 8767-servable, with AD cleared.
 #[tokio::test]
@@ -1874,6 +3486,76 @@ async fn test_prefetch_clears_ad_when_no_validation_ran() {
 
     let resp = pipeline.handle(do_query(4, &name), client).await.unwrap();
     assert!(!resp.metadata.authentic_data);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A prefetch triggered by a CD=1 hit must refresh the CD=1 key that triggered
+/// it. Clearing CD for the upstream/validation request is intentional, but the
+/// insert must not land under the CD=0 key, which the triggering client can
+/// never read.
+#[tokio::test]
+async fn test_prefetch_refreshes_triggering_cd1_key_without_cross_key_insert() {
+    use std::sync::atomic::Ordering;
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.dnssec.mode = "disabled".to_string();
+    config.dns.dnssec.validate = false;
+    config.dns.cache.prefetch = true;
+    config.dns.cache.min_ttl = 10;
+    config.dns.cache.max_ttl = 10;
+    let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    let name = Name::from_str("prefetch-cd1.example.").unwrap();
+
+    let mut cd_query = do_query(30, &name);
+    cd_query.metadata.checking_disabled = true;
+    let plain_query = do_query(31, &name);
+
+    // Seed the CD=1 key with data that differs from the mock upstream, so a
+    // refresh is observable rather than just "an entry still exists".
+    let marker = std::net::Ipv4Addr::new(203, 0, 113, 99);
+    let mut seeded = Message::response(30, OpCode::Query);
+    seeded.queries = cd_query.queries.clone();
+    seeded
+        .answers
+        .push(Record::from_rdata(name.clone(), 10, RData::A(A(marker))));
+    pipeline
+        .cache
+        .insert_with_status(&cd_query, &seeded, ValidationStatus::Unchecked)
+        .await;
+    assert!(
+        pipeline.cache.get_for_query(&plain_query).await.is_none(),
+        "the CD=0 key starts empty"
+    );
+
+    for id in 31..=32 {
+        let mut query = do_query(id, &name);
+        query.metadata.checking_disabled = true;
+        let resp = pipeline.handle(query, client.clone()).await.unwrap();
+        assert_eq!(resp.answers[0].data, RData::A(A(marker)));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        calls.load(Ordering::SeqCst) >= 1,
+        "the prefetch must have re-queried the upstream"
+    );
+
+    let (refreshed, _) = pipeline
+        .cache
+        .get_for_query_with_status(&cd_query)
+        .await
+        .expect("the triggering CD=1 entry must still be present");
+    assert_eq!(
+        refreshed.answers[0].data,
+        RData::A(A(MOCK_UPSTREAM_A)),
+        "the prefetch must replace the triggering CD=1 entry"
+    );
+    assert!(
+        pipeline.cache.get_for_query(&plain_query).await.is_none(),
+        "a CD=1-triggered prefetch must not populate the CD=0 key"
+    );
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
@@ -2364,6 +4046,7 @@ async fn test_pipeline_rejects_qr1_and_multi_question_queries() {
     let mut config = Config::default();
     config.filtering.enabled = false;
     config.dns.dnssec.validate = false;
+    let edns_udp_size = config.dns.edns_udp_size;
     let (pipeline, calls, temp_dir) = test_pipeline(config).await;
     let client = ClientContext::new("127.0.0.1".parse().unwrap());
     let name = Name::from_str("reject.example.").unwrap();
@@ -2388,6 +4071,15 @@ async fn test_pipeline_rejects_qr1_and_multi_question_queries() {
         Name::from_str("second.example.").unwrap(),
         RecordType::AAAA,
     ));
+    // A client OPT with a different payload and a COOKIE option must not be
+    // echoed by the FORMERR path.
+    let mut client_edns = Edns::new();
+    client_edns.set_max_payload(4096);
+    client_edns.set_dnssec_ok(true);
+    client_edns
+        .options_mut()
+        .insert(EdnsOption::Unknown(10, vec![1, 2, 3, 4]));
+    multi.set_edns(client_edns);
     let resp = pipeline
         .handle(multi, client.clone())
         .await
@@ -2400,6 +4092,20 @@ async fn test_pipeline_rejects_qr1_and_multi_question_queries() {
     assert!(
         resp.queries.is_empty(),
         "a multi-question FORMERR must not echo questions"
+    );
+    let edns = resp.edns.expect("EDNS client gets an OPT record");
+    assert_eq!(
+        edns.max_payload(),
+        edns_udp_size,
+        "FORMERR must advertise the configured UDP payload, not the client's"
+    );
+    assert!(
+        edns.options().options.is_empty(),
+        "FORMERR must not echo client EDNS options"
+    );
+    assert!(
+        edns.flags().dnssec_ok,
+        "the DO bit is client-signalled and may be reflected"
     );
 
     let zero = Message::new(11, MessageType::Query, OpCode::Query);
@@ -2497,6 +4203,11 @@ fn test_group_global_precedence_table() {
             "||blocked.example^".to_string(),
         )))
     };
+    let group_block = || {
+        Verdict::Block(BlockReason::Rule(RuleRef::new(
+            "||group-blocked.example^".to_string(),
+        )))
+    };
     let allow = || Verdict::Allow(Some(RuleRef::new("@@||allowed.example^".to_string())));
     let no_match = || Verdict::Allow(None);
     let rewrite = || {
@@ -2522,11 +4233,15 @@ fn test_group_global_precedence_table() {
         combine_standard_verdicts(allow(), Some(rewrite())),
         Verdict::Allow(_)
     ));
-    // Ties go to the group overlay.
-    assert!(matches!(
-        combine_standard_verdicts(block(), Some(block())),
-        Verdict::Block(_)
-    ));
+    // Ties go to the group overlay, so the combined verdict carries the
+    // group rule text (not just "some block").
+    match combine_standard_verdicts(block(), Some(group_block())) {
+        Verdict::Block(BlockReason::Rule(rule)) => assert_eq!(
+            rule.rule_text, "||group-blocked.example^",
+            "an equally ranked tie must keep the group overlay's rule"
+        ),
+        other => panic!("expected the group block to win the tie, got {other:?}"),
+    }
 
     // Important tier: a group `@@...$important` overrides a global
     // `$important` block (the old code returned the global block first).

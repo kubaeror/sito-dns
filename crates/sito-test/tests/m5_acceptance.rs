@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::ServiceExt;
 use utoipa::OpenApi;
 
@@ -558,8 +559,17 @@ async fn test_acceptance_m5_websocket_livetail() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let ws_url = format!("ws://{addr}/api/v1/querylog/stream?token={view_tok}");
-    let (ws_stream, _) = connect_async(&ws_url)
+    let ws_url = format!("ws://{addr}/api/v1/querylog/stream");
+    let mut ws_request = ws_url.into_client_request().expect("valid WebSocket URL");
+    ws_request.headers_mut().insert(
+        header::ORIGIN,
+        format!("http://{addr}").parse().expect("valid Origin"),
+    );
+    ws_request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {view_tok}").parse().expect("valid Bearer"),
+    );
+    let (ws_stream, _) = connect_async(ws_request)
         .await
         .expect("WebSocket handshake failed");
     let (_, mut rx) = ws_stream.split();
@@ -606,6 +616,45 @@ async fn test_acceptance_m5_websocket_livetail() {
     assert_eq!(val["qname"], "streaming.example.org.");
     assert_eq!(val["client_ip"], "10.0.0.42");
     assert_eq!(val["verdict"], "allowed");
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// BC-8: the querylog WebSocket upgrade must not authenticate from `?token=`.
+#[tokio::test]
+async fn test_acceptance_m5_querylog_stream_rejects_query_token() {
+    let temp_dir = std::env::temp_dir().join(format!("sito_m5_ws_token_{}", rand::random::<u64>()));
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+    let (ctx, _cfg_path, _writer) = create_test_context(&temp_dir).await;
+    let view_tok = ctx
+        .auth_mgr
+        .create_token("ws-viewer", Role::Viewer, None)
+        .await
+        .expect("token")
+        .1
+        .token;
+    let app = sito_api::create_router(ctx);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let ws_url = format!("ws://{addr}/api/v1/querylog/stream?token={view_tok}");
+    let mut ws_request = ws_url.into_client_request().expect("valid WebSocket URL");
+    ws_request.headers_mut().insert(
+        header::ORIGIN,
+        format!("http://{addr}").parse().expect("valid Origin"),
+    );
+    let error = connect_async(ws_request)
+        .await
+        .expect_err("a query-token WebSocket handshake must be rejected");
+    let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+        panic!("expected an HTTP rejection, got {error:?}");
+    };
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

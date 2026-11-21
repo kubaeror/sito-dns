@@ -504,6 +504,21 @@ fn test_m9_release_configuration_and_systemd() {
         svc_content.contains("TimeoutStopSec=180"),
         "the unit must allow the bounded shutdown flush to finish"
     );
+    for directive in [
+        "EnvironmentFile=-/etc/sito/sito.env",
+        "UMask=0077",
+        "PrivateTmp=true",
+        "ProtectProc=invisible",
+        "RestrictNamespaces=true",
+        "RestrictSUIDSGID=true",
+        "LockPersonality=true",
+        "SystemCallArchitectures=native",
+    ] {
+        assert!(
+            svc_content.contains(directive),
+            "sito.service is missing hardening directive {directive}"
+        );
+    }
 
     // Verify install.sh script exists and is hardened
     let install_path = Path::new("../../contrib/install.sh");
@@ -559,6 +574,31 @@ fn test_m9_release_configuration_and_systemd() {
     assert!(
         install_content.contains("SITO_INSTALL_LOCAL_BINARY"),
         "install.sh must gate the unverified local-binary install behind an explicit opt-in"
+    );
+    // The embedded `curl | bash` fallback unit must match the packaged unit.
+    for directive in [
+        "EnvironmentFile=-/etc/sito/sito.env",
+        "UMask=0077",
+        "PrivateTmp=true",
+        "ProtectProc=invisible",
+        "RestrictNamespaces=true",
+        "RestrictSUIDSGID=true",
+        "LockPersonality=true",
+        "SystemCallArchitectures=native",
+        "TimeoutStopSec=180",
+    ] {
+        assert!(
+            install_content.contains(directive),
+            "install.sh fallback unit is missing hardening directive {directive}"
+        );
+    }
+    assert!(
+        install_content.contains("ENV_FILE=\"${CONFIG_DIR}/sito.env\""),
+        "install.sh must manage the optional /etc/sito/sito.env file"
+    );
+    assert!(
+        install_content.contains("[ ! -e \"${ENV_FILE}\" ] && [ ! -L \"${ENV_FILE}\" ]"),
+        "install.sh must preserve an existing sito.env on upgrade"
     );
 }
 

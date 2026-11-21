@@ -8,7 +8,7 @@ compile_error!("sito-transport requires a Unix-based operating system (Linux/mac
 
 pub mod acme;
 pub mod acme_http;
-mod admission;
+pub mod admission;
 pub mod doh;
 pub mod doh3;
 pub mod doq;
@@ -30,6 +30,9 @@ pub use acme::{
     write_secret_file,
 };
 pub use acme_http::start_acme_http01_listener;
+pub use admission::{
+    AdmissionController, AdmissionError, ConnectionPermit, RateKey, RequestPermit,
+};
 pub use doh::{DohConfig, start_doh_listener};
 pub use doh3::{Doh3Config, build_quinn_h3_server_config, start_doh3_listener};
 pub use doq::{DoqConfig, build_quinn_server_config, start_doq_listener};
@@ -456,12 +459,86 @@ mod tests {
         let resp = decode_message(&buf).unwrap();
         assert_eq!(resp.metadata.id, 1);
 
-        // Second query on the same connection is dropped by the limiter.
+        // Second query on the same connection is denied before its body; the
+        // server closes the connection (or the read times out) instead of
+        // answering it.
         let second =
             tokio::time::timeout(Duration::from_millis(400), stream.read_exact(&mut len_buf)).await;
         assert!(
-            second.is_err(),
-            "queries beyond the per-IP budget must be dropped"
+            !matches!(second, Ok(Ok(_))),
+            "queries beyond the per-IP budget must not be answered"
+        );
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_rate_check_before_body_read() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_port_number().unwrap();
+
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = TcpConfig {
+            bind_addr: actual_addr,
+            max_connections: 10,
+            // Long idle timeout: only a pre-body rejection can close the
+            // connection promptly. A body read would wait for this timeout.
+            idle_timeout: Duration::from_secs(10),
+            rate_limit_per_ip: 1,
+            // One token, no burst: the first query spends it.
+            rate_limiter: Some(Arc::new(RateLimiter::new(1, 1))),
+        };
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let _handle = start_tcp_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut stream = TcpStream::connect(actual_addr).await.unwrap();
+
+        // Spend the only token with a complete query and read the answer.
+        let mut query = Message::new(31, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("before-body.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let encoded = encode_message(&query).unwrap();
+        stream
+            .write_all(&(encoded.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&encoded).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut len_buf = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut len_buf))
+            .await
+            .expect("the first query must be answered")
+            .unwrap();
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        stream.read_exact(&mut resp_buf).await.unwrap();
+        assert_eq!(decode_message(&resp_buf).unwrap().metadata.id, 31);
+
+        // Announce a body and send none of it. If the server read the body
+        // before the rate check, this would block until the 10 s idle timeout.
+        stream.write_all(&100u16.to_be_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("rate denial must happen before the body read");
+        assert_eq!(
+            read.expect("server should close the connection"),
+            0,
+            "the server must close the connection instead of waiting for a rejected body"
         );
 
         let _ = shutdown_tx.send(true);
@@ -511,7 +588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tcp_large_response_keeps_framing_in_sync() {
+    async fn test_tcp_truncates_oversized_response() {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let port = reserve_port_number().unwrap();
 
@@ -801,6 +878,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dot_rate_check_before_body_read() {
+        use crate::tls::generate_test_cert;
+        use rustls_pki_types::ServerName;
+        use tokio_rustls::TlsConnector;
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_dot_body_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let server_config =
+            load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()]).unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let mut config = DotConfig::new(actual_addr, acceptor_mgr);
+        // Long idle timeout: only a pre-body rejection can close promptly.
+        config.idle_timeout = Duration::from_secs(10);
+        // One token, no burst: the first query spends it.
+        config.rate_limiter = Some(Arc::new(RateLimiter::new(1, 1)));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let _handle = start_dot_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in load_certificates(&cert_file).unwrap() {
+            root_store.add(cert).unwrap();
+        }
+        let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"dot".to_vec()];
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp_stream = TcpStream::connect(actual_addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+        let mut tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
+
+        // Spend the only token with a complete query and read the answer.
+        let mut query = Message::new(41, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("dot-before-body.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let encoded = encode_message(&query).unwrap();
+        tls_stream
+            .write_all(&(encoded.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        tls_stream.write_all(&encoded).await.unwrap();
+        tls_stream.flush().await.unwrap();
+
+        let mut len_buf = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(1), tls_stream.read_exact(&mut len_buf))
+            .await
+            .expect("the first query must be answered")
+            .unwrap();
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        tls_stream.read_exact(&mut resp_buf).await.unwrap();
+        assert_eq!(decode_message(&resp_buf).unwrap().metadata.id, 41);
+
+        // Announce a body and send none of it: admission must reject on the
+        // prefix, before allocating or waiting for the body.
+        tls_stream.write_all(&100u16.to_be_bytes()).await.unwrap();
+        tls_stream.flush().await.unwrap();
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), tls_stream.read(&mut byte))
+            .await
+            .expect("rate denial must happen before the body read");
+        assert_eq!(
+            read.expect("server should close the TLS connection"),
+            0,
+            "the server must close the connection instead of waiting for a rejected body"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A connection permit is acquired at accept time, before the TLS
+    /// handshake: while one pre-handshake connection holds the only slot, a
+    /// second accepted connection must be closed immediately.
+    #[tokio::test]
+    async fn test_dot_connection_permit_held_before_handshake() {
+        use crate::tls::generate_test_cert;
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_dot_permit_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let server_config =
+            load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()]).unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let mut config = DotConfig::new(actual_addr, acceptor_mgr);
+        config.max_connections = 1;
+
+        let handler = Arc::new(|_query: Message, _client: ClientContext| async move { None });
+
+        let _handle = start_dot_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Hold the only connection slot without ever starting a handshake.
+        let held = TcpStream::connect(actual_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut second = TcpStream::connect(actual_addr).await.unwrap();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), second.read(&mut byte))
+            .await
+            .expect("a connection beyond the cap must not wait for a handshake");
+        assert_eq!(
+            read.expect("server should close the excess connection"),
+            0,
+            "the connection permit must be held before the TLS handshake"
+        );
+
+        drop(held);
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_dot_pipelining() {
         use crate::tls::generate_test_cert;
         use rustls_pki_types::ServerName;
@@ -958,6 +1190,161 @@ mod tests {
         let res = tls_stream.read(&mut buf).await;
         // Should return 0 bytes read (EOF)
         assert_eq!(res.unwrap(), 0);
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P1-14/P2-18: a DoT response over 65535 bytes must be returned as a
+    /// valid length-prefixed frame with TC=1, never as an unframable message.
+    #[tokio::test]
+    async fn test_dot_oversized_response_is_truncated() {
+        use crate::tls::generate_test_cert;
+        use rustls_pki_types::ServerName;
+        use tokio_rustls::TlsConnector;
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_dot_huge_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let server_config =
+            load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()]).unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = DotConfig::new(actual_addr, acceptor_mgr);
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            let qname = query.queries[0].name().clone();
+            for i in 0..6000u32 {
+                resp.answers.push(Record::from_rdata(
+                    qname.clone(),
+                    300,
+                    RData::A(A(std::net::Ipv4Addr::from(i))),
+                ));
+            }
+            Some(resp)
+        });
+
+        let _handle = start_dot_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in load_certificates(&cert_file).unwrap() {
+            root_store.add(cert).unwrap();
+        }
+        let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"dot".to_vec()];
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp_stream = TcpStream::connect(actual_addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+        let mut tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
+
+        let mut query = Message::new(91, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("huge-dot.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let encoded = encode_message(&query).unwrap();
+        tls_stream
+            .write_all(&(encoded.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        tls_stream.write_all(&encoded).await.unwrap();
+        tls_stream.flush().await.unwrap();
+
+        let mut len_buf = [0u8; 2];
+        tls_stream.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        tls_stream.read_exact(&mut resp_buf).await.unwrap();
+        let resp = decode_message(&resp_buf).unwrap();
+        assert!(
+            resp.metadata.truncation,
+            "an oversized DoT response must be truncated with TC=1"
+        );
+        assert_eq!(resp.queries.len(), 1, "the question must be preserved");
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P2-18: DoH must reject a TLS client that offers an incompatible ALPN.
+    #[tokio::test]
+    async fn test_doh_alpn_mismatch_rejected() {
+        use crate::tls::generate_test_cert;
+        use rustls_pki_types::ServerName;
+        use tokio_rustls::TlsConnector;
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_doh_alpn_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let server_config = load_server_config(
+            &cert_file,
+            &key_file,
+            &[],
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        )
+        .unwrap();
+        let acceptor_mgr = TlsAcceptorManager::new(server_config);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let config = DohConfig::new(actual_addr, Some(acceptor_mgr));
+
+        let handler = Arc::new(|_query: Message, _client: ClientContext| async move { None });
+        let _handle = start_doh_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in load_certificates(&cert_file).unwrap() {
+            root_store.add(cert).unwrap();
+        }
+        let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        // The DoH listener only speaks h2/http1.1.
+        client_config.alpn_protocols = vec![b"dot".to_vec()];
+
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp_stream = TcpStream::connect(actual_addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+        let connect_res = connector.connect(server_name, tcp_stream).await;
+        assert!(
+            connect_res.is_err(),
+            "a DoH handshake with a mismatched ALPN must fail"
+        );
 
         let _ = shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&temp_dir);

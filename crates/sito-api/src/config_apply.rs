@@ -105,9 +105,24 @@ impl ApplyHooks {
 pub enum FilterApply {
     /// Fetch/compile blocklists before returning (API writes, watcher).
     Sync,
-    /// Apply everything else and let the caller queue the list fetch (wizard
-    /// first boot: the request must not download blocklists synchronously).
+    /// Apply everything else and let the caller queue the list fetch. Valid
+    /// only when `[filtering]` is unchanged (clients, upstreams, rewrites...).
     Deferred,
+}
+
+/// Chooses the filter mode for an apply based on whether `[filtering]` changed.
+///
+/// A deferred apply reuses the already-loaded rule snapshot, so it is only
+/// valid when the filtering configuration is unchanged. Any filtering change
+/// (including a list toggle or custom rule edit) must fetch/compile
+/// synchronously instead of silently keeping stale rules.
+#[must_use]
+pub fn filter_apply_for(previous: &Config, candidate: &Config) -> FilterApply {
+    if previous.filtering == candidate.filtering {
+        FilterApply::Deferred
+    } else {
+        FilterApply::Sync
+    }
 }
 
 /// Result of a successful apply.
@@ -122,27 +137,56 @@ pub struct AppliedReport {
 /// Client-visible summary of an HA publication attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HaPublishReport {
-    /// `published`, `no_slaves` or `failed`.
+    /// `queued`, `connected_no_delivery`, `no_slaves` or `failed`.
+    ///
+    /// `queued` means the bundle was persisted and at least one slave was
+    /// directly enqueued or coalesced; `connected_no_delivery` means slaves are
+    /// connected but every channel was closed, so nothing was queued. Neither
+    /// is delivery proof: delivery is confirmed by the slave ACK.
     pub status: String,
     /// Failure detail, never containing secret material.
     pub error: Option<String>,
     /// RFC3339 timestamp of the first scheduled retry.
     pub retry_at: Option<String>,
+    /// Connected slaves observed during the publish (including closed channels).
+    pub slaves_connected: Option<usize>,
+    /// Slaves with a direct channel enqueue.
+    pub slaves_queued: Option<usize>,
+    /// Slaves scheduled for coalesced/deferred delivery.
+    pub slaves_coalesced: Option<usize>,
 }
 
 impl HaPublishReport {
     #[must_use]
     pub fn from_outcome(outcome: PublishOutcome) -> Self {
         match outcome {
-            PublishOutcome::Published { .. } => Self {
-                status: "published".to_string(),
+            PublishOutcome::Published {
+                slaves_connected,
+                slaves_queued,
+                slaves_coalesced,
+                ..
+            } => Self {
+                // "queued" only when something was actually enqueued. A
+                // connected-but-closed peer is `connected_no_delivery`, not a
+                // delivery claim and not `no_slaves`.
+                status: if slaves_queued + slaves_coalesced > 0 {
+                    "queued".to_string()
+                } else {
+                    "connected_no_delivery".to_string()
+                },
                 error: None,
                 retry_at: None,
+                slaves_connected: Some(slaves_connected),
+                slaves_queued: Some(slaves_queued),
+                slaves_coalesced: Some(slaves_coalesced),
             },
             PublishOutcome::NoSlaves => Self {
                 status: "no_slaves".to_string(),
                 error: None,
                 retry_at: None,
+                slaves_connected: Some(0),
+                slaves_queued: Some(0),
+                slaves_coalesced: Some(0),
             },
             // Callers normally treat this as an apply error before building a
             // report; keep a faithful representation for completeness.
@@ -152,6 +196,9 @@ impl HaPublishReport {
                     "configuration bundle is {bytes} bytes, above the {limit}-byte replication limit"
                 )),
                 retry_at: None,
+                slaves_connected: None,
+                slaves_queued: None,
+                slaves_coalesced: None,
             },
         }
     }
@@ -188,6 +235,9 @@ impl HaPublishReport {
             status: "failed".to_string(),
             error: Some(error.into()),
             retry_at,
+            slaves_connected: None,
+            slaves_queued: None,
+            slaves_coalesced: None,
         }
     }
 }
@@ -327,11 +377,55 @@ async fn commit_staged(
         }
     }
     ctx.querylog_sender.set_anonymize(anonymize);
+    // An apply that changes filter rules or the DNSSEC policy flushes the
+    // response cache inside the runtime publish; refresh the footprint gauge
+    // so it cannot keep reporting reclaimed entries.
+    ctx.publish_cache_size();
+    // P1-19: switching `stats.rollup_client_names` off must scrub names from
+    // already-written rollups now, not only on the next restart.
+    let previous_names = previous.get_stats_config().rollup_client_names;
+    let current_names = candidate.get_stats_config().rollup_client_names;
+    if previous_names != current_names
+        && let Err(e) = ctx.stats_db.set_rollup_client_names(current_names).await
+    {
+        tracing::error!(
+            error = %e,
+            enabled = current_names,
+            "Failed to re-apply stats.rollup_client_names to existing rollups; names may remain until a later scrub or restart"
+        );
+    }
+    prune_stale_upstream_metrics(ctx, &previous, candidate);
 
     Ok(AppliedReport {
         restart_required: restart_required_fields(&previous, candidate),
         ha_publish: None,
     })
+}
+
+/// Drops health/RTT/error series for upstream names that disappeared in a
+/// successful apply. The config is already live here, so these labels cannot
+/// be produced again and would otherwise stay in the exposition forever.
+fn prune_stale_upstream_metrics(ctx: &ServerContext, previous: &Config, candidate: &Config) {
+    let names = |config: &Config| -> std::collections::BTreeSet<String> {
+        config
+            .upstream
+            .servers
+            .iter()
+            .cloned()
+            .chain(
+                config
+                    .upstream
+                    .per_domain
+                    .iter()
+                    .flat_map(|rule| rule.servers.iter().cloned()),
+            )
+            .collect()
+    };
+    let previous_names = names(previous);
+    let current_names = names(candidate);
+    for name in previous_names.difference(&current_names) {
+        ctx.metrics.remove_upstream_health(name);
+    }
 }
 
 /// Applies `candidate` and persists it only after the apply succeeded. A
@@ -705,6 +799,21 @@ async fn stage_config(
 ) -> Result<StagedApply, ProblemDetails> {
     let expected = ctx.runtime.generation();
 
+    // A deferred apply reuses the currently loaded filter rules, so it must
+    // never be used to publish a changed `[filtering]` section. Fail loudly
+    // instead of leaving the runtime snapshot and filter engine disagreeing.
+    match filter_apply {
+        FilterApply::Sync => {}
+        FilterApply::Deferred => {
+            let current = ctx.config.load();
+            if candidate.filtering != current.filtering {
+                return Err(ProblemDetails::internal_error(
+                    "Deferred filter apply cannot change [filtering]; use FilterApply::Sync",
+                ));
+            }
+        }
+    }
+
     // Typed dependent-crate sections are validated by the single validator
     // (`validate_full_config` above); here they are converted for the plan.
     let clients = clients_from_config(candidate)?;
@@ -820,46 +929,6 @@ fn rewrites_from_config(cfg: &Config) -> Result<sito_rewrites::RewritesConfig, P
     }
 }
 
-/// Queues a background blocklist refresh for the given filtering config and
-/// returns its join handle. Used by the wizard so the HTTP request does not
-/// download lists synchronously; the caller can await the handle to know when
-/// the filter engine is ready.
-pub fn queue_filter_refresh(
-    ctx: &ServerContext,
-    filtering: sito_core::config::FilteringConfig,
-) -> tokio::task::JoinHandle<()> {
-    let engine = ctx.filter.clone();
-    let metrics = ctx.metrics.clone();
-    let cache = ctx.cache.clone();
-    let runtime = ctx.runtime.clone();
-    tokio::spawn(async move {
-        // Capture the generation the caller's `filtering` value belongs to
-        // before staging. The helper re-checks both the generation and the
-        // filtering config after acquiring the engine guard: an apply that
-        // committed before this task started makes the refresh stale even
-        // though the generation read here is already the new one.
-        let expected = runtime.generation();
-        match apply_filter_refresh(&engine, &runtime, &filtering, expected).await {
-            Ok(_) => {
-                cache.flush();
-                metrics.set_filter_rules(engine.rule_count());
-                tracing::info!("Background blocklist refresh completed");
-            }
-            Err(ApplyError::GenerationConflict { .. }) => {
-                tracing::debug!(
-                    "Discarding a background blocklist refresh compiled for an older configuration"
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Background blocklist refresh failed; the filter engine keeps its previous \
-                     snapshot: {error}"
-                );
-            }
-        }
-    })
-}
-
 /// Stages and publishes one filter refresh, tied to `expected` (the config
 /// generation the caller captured together with `filtering`).
 ///
@@ -867,6 +936,7 @@ pub fn queue_filter_refresh(
 /// the engine guard is acquired. A refresh whose `filtering` value came from an
 /// older config therefore cannot overwrite the newer generation's filter, even
 /// when its own generation read happened after that apply committed.
+#[cfg(test)]
 pub(crate) async fn apply_filter_refresh(
     engine: &sito_filter::HostsFilterEngine,
     runtime: &sito_runtime::RuntimeState,
@@ -1023,7 +1093,157 @@ pub fn restart_required_field_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sito_core::config::FilterListConfig;
     use std::time::Duration;
+
+    /// The publish report must say "queued", not "delivered", and expose the
+    /// connected/queued/coalesced distinction.
+    #[test]
+    fn test_ha_publish_report_distinguishes_queued_from_connected() {
+        let report = HaPublishReport::from_outcome(PublishOutcome::Published {
+            version: 7,
+            term: 1,
+            slaves_connected: 3,
+            slaves_queued: 1,
+            slaves_coalesced: 1,
+        });
+        assert_eq!(report.status, "queued");
+        assert_eq!(report.slaves_connected, Some(3));
+        assert_eq!(report.slaves_queued, Some(1));
+        assert_eq!(report.slaves_coalesced, Some(1));
+        assert!(report.error.is_none());
+
+        let no_slaves = HaPublishReport::from_outcome(PublishOutcome::NoSlaves);
+        assert_eq!(no_slaves.status, "no_slaves");
+        assert_eq!(no_slaves.slaves_connected, Some(0));
+
+        // Connected peers whose channels are all closed are not a queue claim
+        // and not "no slaves": report the honest no-delivery status.
+        let no_delivery = HaPublishReport::from_outcome(PublishOutcome::Published {
+            version: 8,
+            term: 1,
+            slaves_connected: 2,
+            slaves_queued: 0,
+            slaves_coalesced: 0,
+        });
+        assert_eq!(no_delivery.status, "connected_no_delivery");
+        assert_eq!(no_delivery.slaves_connected, Some(2));
+        assert_eq!(no_delivery.slaves_queued, Some(0));
+    }
+
+    #[test]
+    fn test_filter_apply_for_defers_only_when_filtering_is_unchanged() {
+        let previous = Config::default();
+
+        let mut unrelated = previous.clone();
+        unrelated.dns.cache.min_ttl = unrelated.dns.cache.min_ttl.saturating_add(1);
+        unrelated.upstream.servers = vec!["9.9.9.9".to_string()];
+        assert_eq!(
+            filter_apply_for(&previous, &unrelated),
+            FilterApply::Deferred,
+            "unrelated cache/upstream edits may reuse the loaded rules"
+        );
+
+        let mut filtering = unrelated.clone();
+        filtering
+            .filtering
+            .custom_rules
+            .push("||changed.example^".to_string());
+        assert_eq!(
+            filter_apply_for(&previous, &filtering),
+            FilterApply::Sync,
+            "a filtering change must fetch/compile synchronously"
+        );
+    }
+
+    /// P2-40 regression: an unrelated apply must not fail because a filter
+    /// source went away since the last refresh.
+    #[tokio::test]
+    async fn test_unrelated_apply_succeeds_while_filter_source_is_unavailable() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_deferred_outage");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let list_path = temp_dir.join("outage-list.txt");
+        std::fs::write(&list_path, "||ads.example^\n").unwrap();
+        let mut seed = (**ctx.config.load()).clone();
+        seed.filtering.enabled = true;
+        seed.filtering.lists = vec![FilterListConfig {
+            name: "Local".to_string(),
+            url: format!("file://{}", list_path.display()),
+            enabled: true,
+            refresh_hours: None,
+        }];
+        apply_and_persist_config(&ctx, &seed, FilterApply::Sync, None)
+            .await
+            .expect("seed filter list loads");
+        std::fs::remove_file(&list_path).expect("simulate an unavailable source");
+
+        let mut candidate = seed.clone();
+        candidate.upstream.servers = vec!["9.9.9.9".to_string()];
+        candidate.dns.cache.min_ttl = candidate.dns.cache.min_ttl.saturating_add(5);
+        candidate.dns.dnssec.validate = !seed.dns.dnssec.validate;
+        let filter_apply = filter_apply_for(&ctx.config.load(), &candidate);
+        assert_eq!(filter_apply, FilterApply::Deferred);
+
+        apply_and_persist_config(&ctx, &candidate, filter_apply, None)
+            .await
+            .expect("an unrelated change must apply without refetching the missing list");
+        let live = ctx.config.load();
+        assert_eq!(live.upstream.servers, vec!["9.9.9.9"]);
+        assert_eq!(live.dns.cache.min_ttl, candidate.dns.cache.min_ttl);
+        assert_eq!(live.dns.dnssec.validate, candidate.dns.dnssec.validate);
+
+        let mut filtered = candidate.clone();
+        filtered
+            .filtering
+            .custom_rules
+            .push("||new-filter.example^".to_string());
+        assert_eq!(
+            filter_apply_for(&live, &filtered),
+            FilterApply::Sync,
+            "a filtering change must switch back to a synchronous apply"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A caller that wrongly defers a filtering change must get an explicit
+    /// error instead of a runtime/config pair compiled from different rules.
+    #[tokio::test]
+    async fn test_deferred_apply_rejects_filtering_change() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_deferred_unsafe");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut seed = (**ctx.config.load()).clone();
+        seed.filtering.enabled = true;
+        seed.filtering.custom_rules = vec!["||keep.example^".to_string()];
+        apply_and_persist_config(&ctx, &seed, FilterApply::Sync, None)
+            .await
+            .expect("seed apply");
+        let persisted_before = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+
+        let mut candidate = seed.clone();
+        candidate
+            .filtering
+            .custom_rules
+            .push("||must-not-stick.example^".to_string());
+        let err = apply_and_persist_config(&ctx, &candidate, FilterApply::Deferred, None)
+            .await
+            .expect_err("a deferred filtering change must be rejected");
+        assert_eq!(err.status, 500);
+        assert_eq!(
+            ctx.config.load().filtering.custom_rules,
+            seed.filtering.custom_rules,
+            "the rejected change must not reach the live config"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            persisted_before,
+            "the rejected change must not be persisted"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 
     /// Deferred D4b: `retry_at` must reflect the retry loop that was actually
     /// scheduled, and must be absent when no new loop was started.
@@ -1135,6 +1355,7 @@ mod tests {
                     .is_some(),
                 "cache seed for {change} must succeed"
             );
+            ctx.metrics.set_cache_size_bytes(4_096);
 
             let mut candidate = (**ctx.config.load()).clone();
             match change {
@@ -1157,6 +1378,12 @@ mod tests {
                     .await
                     .is_none(),
                 "changing dnssec {change} must flush cached validation decisions"
+            );
+            assert!(
+                ctx.metrics
+                    .render_prometheus()
+                    .contains("sito_cache_size_bytes 0"),
+                "a flushing apply must publish the reclaimed cache size"
             );
         }
 
@@ -1256,6 +1483,46 @@ mod tests {
             ConfigFileApplyOutcome::SelfWriteIgnored => {}
             other => panic!("the runtime-matching document must be suppressed, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// WP-2.7: a successful apply prunes metrics for upstream names that were
+    /// removed, while keeping series for names that still exist.
+    #[tokio::test]
+    async fn test_config_apply_prunes_removed_upstream_series() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_prune_upstream_metrics");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.upstream.servers = vec!["1.1.1.1".to_string()];
+        ctx.config.store(std::sync::Arc::new(previous.clone()));
+
+        for name in ["1.1.1.1", "9.9.9.9"] {
+            ctx.metrics.observe_upstream_rtt(name, 0.010);
+            ctx.metrics.inc_upstream_errors(name, "timeout");
+            ctx.metrics.set_upstream_health(name, 0.0);
+        }
+
+        let mut candidate = previous;
+        candidate.upstream.servers = vec!["9.9.9.9".to_string()];
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, None)
+            .await
+            .expect("the upstream change must apply");
+
+        let rendered = ctx.metrics.render_prometheus();
+        assert!(
+            !rendered.contains(r#"upstream="1.1.1.1""#),
+            "a removed upstream must be pruned from every metric family: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_upstream_health{upstream="9.9.9.9"}"#),
+            "a retained upstream must keep its series: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_upstream_errors_total{upstream="9.9.9.9",kind="timeout"}"#),
+            "a retained upstream must keep its error series: {rendered}"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -2527,6 +2794,83 @@ acme_enabled = false
                 )
                 .is_blocked(),
             "the new group rule must be enforced immediately"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P1-19: flipping `stats.rollup_client_names` true -> false through the
+    /// live apply pipeline scrubs names from existing rollups without a
+    /// restart.
+    #[tokio::test]
+    async fn test_live_apply_scrubs_rollup_client_names() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_rollup_scrub");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut with_names = (**ctx.config.load()).clone();
+        let mut stats = with_names.get_stats_config();
+        stats.rollup_client_names = true;
+        with_names.stats = Some(toml::Value::try_from(stats).unwrap());
+        apply_and_persist_config(&ctx, &with_names, FilterApply::Deferred, None)
+            .await
+            .unwrap();
+
+        let old_ts = chrono::Utc::now().timestamp_millis() - 100 * 86_400_000;
+        let entry = sito_stats::QueryLogEntry::new(
+            old_ts,
+            "10.7.7.7",
+            Some("live-named-device".to_string()),
+            "live-apply.example",
+            1,
+            Some(0),
+            "allowed",
+            "udp",
+        );
+        ctx.stats_db.insert_batch(&[entry]).await.unwrap();
+        ctx.stats_db.cleanup_detailed_retention(90).await.unwrap();
+
+        let before = ctx
+            .stats_db
+            .get_global_stats(200 * 86_400_000)
+            .await
+            .unwrap();
+        assert!(
+            before
+                .top_clients
+                .iter()
+                .any(|(label, _)| label == "live-named-device"),
+            "the seed rollup must retain the client name: {:?}",
+            before.top_clients
+        );
+
+        let mut scrubbed = with_names.clone();
+        let mut stats = scrubbed.get_stats_config();
+        stats.rollup_client_names = false;
+        scrubbed.stats = Some(toml::Value::try_from(stats).unwrap());
+        apply_and_persist_config(&ctx, &scrubbed, FilterApply::Deferred, None)
+            .await
+            .unwrap();
+
+        let after = ctx
+            .stats_db
+            .get_global_stats(200 * 86_400_000)
+            .await
+            .unwrap();
+        assert!(
+            !after
+                .top_clients
+                .iter()
+                .any(|(label, _)| label == "live-named-device"),
+            "the live apply must scrub the existing name: {:?}",
+            after.top_clients
+        );
+        assert!(
+            after
+                .top_clients
+                .iter()
+                .any(|(label, _)| label.starts_with("blake3:")),
+            "the scrubbed rollup must expose only the hashed identifier: {:?}",
+            after.top_clients
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

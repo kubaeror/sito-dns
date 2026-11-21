@@ -46,13 +46,17 @@
             {% endif %}
           </td>
           <td style="text-align: center; white-space: nowrap;">
-            <form action="{{ u.role_action }}" method="POST" style="display:inline-flex; align-items:center; gap:6px;">
+            <form action="{{ u.role_action }}" method="POST" style="display:inline-flex; align-items:center; gap:6px; flex-wrap: wrap;">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <select name="role" class="form-input" style="width:auto; padding: 4px 8px;" aria-label="Role for {{ u.username }}">
                 <option value="viewer" {% if u.role == "viewer" %}selected{% endif %}>Viewer</option>
                 <option value="operator" {% if u.role == "operator" %}selected{% endif %}>Operator</option>
                 <option value="admin" {% if u.role == "admin" %}selected{% endif %}>Admin</option>
               </select>
+              <input type="password" name="reauth_password" class="form-input" style="width: 150px; padding: 4px 8px;" placeholder="Your password" autocomplete="current-password" required aria-label="Your password to change {{ u.username }}'s role">
+              {% if caller_totp_enabled %}
+              <input type="text" name="reauth_code" class="form-input" style="width: 120px; padding: 4px 8px;" placeholder="TOTP code" autocomplete="one-time-code" inputmode="numeric" required aria-label="Your TOTP code">
+              {% endif %}
               <button type="submit" class="btn btn-secondary btn-sm">Update</button>
             </form>
             <form action="{{ u.delete_action }}" method="POST" style="display:inline; margin-left: 6px;"
@@ -100,6 +104,19 @@
           <option value="admin">Admin</option>
         </select>
       </div>
+    </div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label" for="create-reauth-password">Your Password</label>
+        <input type="password" id="create-reauth-password" name="reauth_password" class="form-input" autocomplete="current-password">
+        <div class="form-help">Required when the new account's role is Admin. Also supply a TOTP or backup code if 2FA is enabled.</div>
+      </div>
+      {% if caller_totp_enabled %}
+      <div class="form-group">
+        <label class="form-label" for="create-reauth-code">TOTP or Backup Code</label>
+        <input type="text" id="create-reauth-code" name="reauth_code" class="form-input" autocomplete="one-time-code" inputmode="numeric">
+      </div>
+      {% endif %}
     </div>
     <div style="display: flex; justify-content: flex-end;">
       <button type="submit" class="btn btn-primary">Create User</button>

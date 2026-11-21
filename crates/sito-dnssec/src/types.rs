@@ -35,6 +35,99 @@ impl ValidationOutcome {
     }
 }
 
+/// Classification of a zone's DNSSEC trust chain.
+///
+/// This is the portable, outcome-free view of the chain used by the planned
+/// `TrustChain` refactor: it records what the chain itself looked like, while
+/// [`ValidationDecision`] is what validation concludes from it. It deliberately
+/// has no `NtaBypass` variant; a bypass is a policy decision, not a chain state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustChainState {
+    /// The chain is signed and terminated at a configured trust anchor.
+    Signed,
+    /// The chain is provably unsigned (no DS at a signed parent).
+    Unsigned,
+    /// The chain could not be classified (missing records, budget exhausted).
+    Unknown,
+    /// The chain is signed but a DS/DNSKEY/signature failed validation.
+    Bogus,
+}
+
+/// Validation conclusion derived from a credential/chain state.
+///
+/// Unlike [`ValidationOutcome`], this carries no `NtaBypass` variant: by the
+/// time a decision is made, an NTA has already been folded into `Insecure`.
+/// `ValidationOutcome` remains the wire/metrics type until call sites are
+/// migrated. The conversions are lossless except for that one mapping:
+/// `NtaBypass` -> `Insecure`. Every other outcome round-trips unchanged,
+/// including the Bogus reason and EDE code; not every mapped outcome is
+/// lossless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationDecision {
+    /// Valid signature chain to a trust anchor (AD=1).
+    Secure,
+    /// Unsigned domain, proof of non-existence of DNSSEC, or NTA bypass.
+    Insecure,
+    /// Signature verification failed, signature expired, or broken chain.
+    Bogus { reason: String, ede_code: u16 },
+    /// Inconclusive validation (missing DNSSEC records).
+    Indeterminate,
+}
+
+impl ValidationDecision {
+    /// Converts a legacy [`ValidationOutcome`] into a decision.
+    ///
+    /// `NtaBypass` is intentionally folded into `Insecure`: both are AD=0 and
+    /// the distinction is tracked by metrics, not by the decision.
+    pub fn from_outcome(outcome: &ValidationOutcome) -> Self {
+        match outcome {
+            ValidationOutcome::Secure => Self::Secure,
+            ValidationOutcome::Insecure | ValidationOutcome::NtaBypass => Self::Insecure,
+            ValidationOutcome::Bogus { reason, ede_code } => Self::Bogus {
+                reason: reason.clone(),
+                ede_code: *ede_code,
+            },
+            ValidationOutcome::Indeterminate => Self::Indeterminate,
+        }
+    }
+
+    /// Converts this decision back into the legacy [`ValidationOutcome`].
+    ///
+    /// Lossless for everything except an original `NtaBypass`, which was
+    /// already collapsed to `Insecure` by [`Self::from_outcome`].
+    pub fn to_outcome(&self) -> ValidationOutcome {
+        match self {
+            Self::Secure => ValidationOutcome::Secure,
+            Self::Insecure => ValidationOutcome::Insecure,
+            Self::Bogus { reason, ede_code } => ValidationOutcome::Bogus {
+                reason: reason.clone(),
+                ede_code: *ede_code,
+            },
+            Self::Indeterminate => ValidationOutcome::Indeterminate,
+        }
+    }
+}
+
+impl From<TrustChainState> for ValidationDecision {
+    fn from(state: TrustChainState) -> Self {
+        match state {
+            TrustChainState::Signed => Self::Secure,
+            TrustChainState::Unsigned => Self::Insecure,
+            TrustChainState::Unknown => Self::Indeterminate,
+            TrustChainState::Bogus => Self::Bogus {
+                reason: "trust chain is bogus".to_string(),
+                ede_code: EDE_DNSSEC_BOGUS,
+            },
+        }
+    }
+}
+
+impl From<ValidationDecision> for ValidationOutcome {
+    fn from(decision: ValidationDecision) -> Self {
+        decision.to_outcome()
+    }
+}
+
 /// RFC 8914 Extended DNS Error (EDE) codes.
 pub const EDE_DNSSEC_BOGUS: u16 = 6;
 pub const EDE_SIGNATURE_EXPIRED: u16 = 7;
@@ -60,7 +153,14 @@ pub fn apply_ede(response: &mut Message, code: u16, extra_text: &str) {
 }
 
 /// Telemetry metrics for DNSSEC validation.
-#[derive(Default)]
+///
+/// These are per-validator absolute snapshots, not process-global totals. A
+/// DNSSEC policy reload builds a new validator whose counters start at zero,
+/// and a validation that started under the old generation can finish late and
+/// publish an older (lower) snapshot after the new validator has published.
+/// The exposition setters replace values rather than add to them, and
+/// Prometheus interprets a decrease as a counter reset.
+#[derive(Debug, Default)]
 pub struct DnssecMetrics {
     pub secure_total: AtomicU64,
     pub insecure_total: AtomicU64,
@@ -74,6 +174,16 @@ pub struct DnssecMetrics {
     /// Cryptographic RRSIG verification attempts made while validating
     /// responses (bounded per response; see `MAX_VERIFICATIONS_PER_RESPONSE`).
     pub signature_verifications: AtomicU64,
+    /// Key-fetch requests refused because the per-query fetch count was
+    /// exhausted. A denial is attributed to exactly one cause: count or
+    /// deadline.
+    pub fetch_budget_exhausted: AtomicU64,
+    /// Key-fetch requests refused because the absolute per-query deadline
+    /// passed before the fetch could start, whether at `try_take` or at an
+    /// early `is_expired` guard. A fetcher's own `UpstreamError::Timeout` is a
+    /// result, not a refusal, and is not counted here; it surfaces through the
+    /// separate upstream/bogus error metrics.
+    pub fetch_deadline_exceeded: AtomicU64,
     pub bogus_by_upstream_reason: DashMap<(String, String), AtomicU64>,
 }
 
@@ -132,6 +242,28 @@ impl DnssecMetrics {
     #[must_use]
     pub fn signature_verifications(&self) -> u64 {
         self.signature_verifications.load(Ordering::Relaxed)
+    }
+
+    /// Records a key-fetch request refused for count-budget exhaustion.
+    pub(crate) fn record_fetch_budget_exhausted(&self) {
+        self.fetch_budget_exhausted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a key-fetch request refused after the absolute deadline.
+    pub(crate) fn record_fetch_deadline_exceeded(&self) {
+        self.fetch_deadline_exceeded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative key-fetch refusals caused by count-budget exhaustion.
+    #[must_use]
+    pub fn fetch_budget_exhausted(&self) -> u64 {
+        self.fetch_budget_exhausted.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative key-fetch refusals caused by the absolute deadline.
+    #[must_use]
+    pub fn fetch_deadline_exceeded(&self) -> u64 {
+        self.fetch_deadline_exceeded.load(Ordering::Relaxed)
     }
 
     pub fn record_bogus(&self, upstream: Option<&str>, reason: &str) {

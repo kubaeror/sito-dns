@@ -13,7 +13,7 @@ pub(super) async fn fetch_zone_chain(
     anchors: &TrustAnchors,
     fetcher: &dyn DnssecKeyFetcher,
     zone: &Name,
-    budget: &mut u8,
+    budget: &mut FetchBudget,
     visited: &mut HashSet<LowerName>,
     response: &mut Message,
 ) -> Option<()> {
@@ -22,15 +22,24 @@ pub(super) async fn fetch_zone_chain(
     let mut fetched_any = false;
 
     loop {
-        if *budget == 0 || depth > 12 {
+        if depth > 12 {
+            break;
+        }
+        if budget.is_expired() {
+            budget.record_deadline_refusal();
             break;
         }
         if !visited.insert(LowerName::from(&current)) {
             break;
         }
 
-        *budget -= 1;
-        let Ok(dnskey_message) = fetcher.query(&current, RecordType::DNSKEY).await else {
+        if !budget.try_take() {
+            break;
+        }
+        let Ok(dnskey_message) = fetcher
+            .query(&current, RecordType::DNSKEY, budget.deadline())
+            .await
+        else {
             break;
         };
         append_dnssec_records(response, &dnskey_message);
@@ -44,11 +53,13 @@ pub(super) async fn fetch_zone_chain(
             break;
         }
 
-        if *budget == 0 {
+        if !budget.try_take() {
             break;
         }
-        *budget -= 1;
-        let Ok(ds_message) = fetcher.query(&current, RecordType::DS).await else {
+        let Ok(ds_message) = fetcher
+            .query(&current, RecordType::DS, budget.deadline())
+            .await
+        else {
             break;
         };
         append_dnssec_records(response, &ds_message);
@@ -66,6 +77,96 @@ pub(super) async fn fetch_zone_chain(
     }
 
     fetched_any.then_some(())
+}
+
+/// Shared fetch context for one client response/query.
+///
+/// A response may carry RRSIGs from several signer zones. Sharing one budget
+/// and one visited set across those signers stops a hostile message from
+/// multiplying cold-start DNSKEY/DS fetches. The budget spans every probe and
+/// signer walk for the response, not one chain walk: a single signer with
+/// early probes can see a shorter walk than the full per-signer allowance. It
+/// is sized to the largest total allowance the old per-signer design gave, so
+/// a single-signer response without probes behaves as before.
+pub(super) struct TrustChain {
+    budget: FetchBudget,
+    visited: HashSet<LowerName>,
+}
+
+impl TrustChain {
+    /// Creates a chain context bounded by one absolute `deadline` and at most
+    /// `remaining` DNSKEY/DS fetches.
+    #[cfg(test)]
+    pub(super) fn new(deadline: Instant, remaining: u8) -> Self {
+        Self {
+            budget: FetchBudget::new(remaining, deadline),
+            visited: HashSet::new(),
+        }
+    }
+
+    /// Creates a chain context whose refusals are recorded in `metrics`.
+    pub(super) fn with_metrics(
+        deadline: Instant,
+        remaining: u8,
+        metrics: Arc<DnssecMetrics>,
+    ) -> Self {
+        Self {
+            budget: FetchBudget::with_metrics(remaining, deadline, metrics),
+            visited: HashSet::new(),
+        }
+    }
+
+    /// The shared budget, exposed for assertions and diagnostics.
+    #[cfg(test)]
+    pub(super) fn budget(&self) -> &FetchBudget {
+        &self.budget
+    }
+
+    /// Extends the trust chain from `signer` towards the anchors, appending
+    /// fetched DNSKEY/DS records to `response`.
+    ///
+    /// Returns true when at least one lookup succeeded. The budget and visited
+    /// zones are shared with every earlier `fetch_path` call on this context.
+    pub(super) async fn fetch_path(
+        &mut self,
+        validator: &DnssecValidator,
+        fetcher: &dyn DnssecKeyFetcher,
+        signer: &Name,
+        response: &mut Message,
+    ) -> bool {
+        let anchors = validator.trust_anchors.load();
+        fetch_zone_chain(
+            &anchors,
+            fetcher,
+            signer,
+            &mut self.budget,
+            &mut self.visited,
+            response,
+        )
+        .await
+        .is_some()
+    }
+
+    /// Probes one unsigned CNAME/delegation hop.
+    ///
+    /// The probe draws from the same budget as every other probe and signer
+    /// walk for this response/query, so a CNAME fan-out can only shorten the
+    /// later walk; it can never add fetches on top of it. Exhaustion fails
+    /// closed, usually through [`UnsignedProbe::Failed`]. When signed evidence
+    /// already exists along the delegation path, the same refusal is reported
+    /// as [`UnsignedProbe::Probed`] because the probe established
+    /// `ShouldBeSigned` before the budget ran out.
+    pub(super) async fn probe_unsigned(
+        &mut self,
+        validator: &DnssecValidator,
+        fetcher: &dyn DnssecKeyFetcher,
+        name: &LowerName,
+        now: u32,
+    ) -> UnsignedProbe {
+        validator
+            .prepare_unsigned_response(name, fetcher, now, &mut self.budget)
+            .await
+    }
 }
 
 /// Delegation status inferred from a DS response.
@@ -452,7 +553,17 @@ impl DnssecValidator {
         name: &LowerName,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
+        budget: &mut FetchBudget,
     ) -> DelegationProof {
+        // The deadline is an absolute per-query bound. Every fetch below is
+        // taken from the shared budget first, but a caller-supplied fetcher
+        // contract violation must not let this probe start work after expiry
+        // either: fail closed instead, recording the deadline refusal for the
+        // same metric as an expired `try_take`.
+        if budget.is_expired() {
+            budget.record_deadline_refusal();
+            return DelegationProof::Unknown;
+        }
         let cached_start = self.chain_cache.closest_signed(name, now);
         let memory_start = self.closest_signed_zone(name, now);
         let start = match (memory_start, cached_start) {
@@ -480,7 +591,7 @@ impl DnssecValidator {
                 // without signatures from it is already a downgrade.
                 return DelegationProof::ShouldBeSigned;
             }
-            match self.keys_for_zone(&start, fetcher, now).await {
+            match self.keys_for_zone(&start, fetcher, now, budget).await {
                 Some((actual_zone, keys)) => (actual_zone, keys),
                 // The zone is known to be signed but its keys cannot be
                 // re-established (offline restart, expired key cache). Fail
@@ -491,7 +602,7 @@ impl DnssecValidator {
             let Some(anchor) = self.closest_anchor_zone(name) else {
                 return DelegationProof::Unknown;
             };
-            match self.seed_anchor_keys(&anchor, fetcher, now).await {
+            match self.seed_anchor_keys(&anchor, fetcher, now, budget).await {
                 Some((keys, _expiry)) => (anchor, keys),
                 None => return DelegationProof::Unknown,
             }
@@ -525,7 +636,7 @@ impl DnssecValidator {
                 if cut == *name {
                     return DelegationProof::ShouldBeSigned;
                 }
-                match self.keys_for_zone(&cut, fetcher, now).await {
+                match self.keys_for_zone(&cut, fetcher, now, budget).await {
                     Some((actual_zone, keys)) if actual_zone == cut => {
                         zone = actual_zone;
                         parent_keys = keys;
@@ -535,8 +646,20 @@ impl DnssecValidator {
                 continue;
             }
 
+            // Every probe fetch draws from the shared budget first; exhaustion
+            // is fail-closed, exactly like a network failure.
+            if !budget.try_take() {
+                return if saw_signed || start_is_signed {
+                    DelegationProof::ShouldBeSigned
+                } else {
+                    DelegationProof::Unknown
+                };
+            }
             let cut_name = Name::from(cut.clone());
-            let Ok(ds_response) = fetcher.query(&cut_name, RecordType::DS).await else {
+            let Ok(ds_response) = fetcher
+                .query(&cut_name, RecordType::DS, budget.deadline())
+                .await
+            else {
                 return if saw_signed || start_is_signed {
                     DelegationProof::ShouldBeSigned
                 } else {
@@ -555,7 +678,7 @@ impl DnssecValidator {
                     // needed to authenticate deeper DS answers. A missing
                     // child key must not downgrade the authenticated DS.
                     match self
-                        .validate_child_dnskeys(&cut, &ds_response, fetcher, now)
+                        .validate_child_dnskeys(&cut, &ds_response, fetcher, now, budget)
                         .await
                     {
                         Some(keys) => {
@@ -634,9 +757,16 @@ impl DnssecValidator {
         zone: &LowerName,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
+        budget: &mut FetchBudget,
     ) -> Option<(Vec<DNSKEY>, u32)> {
+        if !budget.try_take() {
+            return None;
+        }
         let zone_name = Name::from(zone.clone());
-        let message = fetcher.query(&zone_name, RecordType::DNSKEY).await.ok()?;
+        let message = fetcher
+            .query(&zone_name, RecordType::DNSKEY, budget.deadline())
+            .await
+            .ok()?;
         let anchors = self.trust_anchors.load();
         let keys: Vec<DNSKEY> = message
             .answers
@@ -727,14 +857,23 @@ impl DnssecValidator {
         target: &LowerName,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
+        budget: &mut FetchBudget,
     ) -> Option<(LowerName, Vec<DNSKEY>)> {
+        // Never start a key walk (or call the fetcher) after the shared query
+        // deadline has passed; callers treat `None` as fail-closed. Record the
+        // refusal so an early-deadline bailout is visible as
+        // `fetch_deadline_exceeded`, just like an expired `try_take`.
+        if budget.is_expired() {
+            budget.record_deadline_refusal();
+            return None;
+        }
         let cached = self.key_cache.validated_keys(target, now);
         if !cached.is_empty() {
             return Some((target.clone(), cached));
         }
 
         let anchor = self.closest_anchor_zone(target)?;
-        let (mut keys, _) = self.seed_anchor_keys(&anchor, fetcher, now).await?;
+        let (mut keys, _) = self.seed_anchor_keys(&anchor, fetcher, now, budget).await?;
         let mut zone = anchor;
         if zone == *target {
             return Some((zone, keys));
@@ -746,14 +885,20 @@ impl DnssecValidator {
             return None;
         }
         for cut in cuts {
+            if !budget.try_take() {
+                return None;
+            }
             let cut_name = Name::from(cut.clone());
-            let Ok(ds_response) = fetcher.query(&cut_name, RecordType::DS).await else {
+            let Ok(ds_response) = fetcher
+                .query(&cut_name, RecordType::DS, budget.deadline())
+                .await
+            else {
                 return None;
             };
             match ds_response_status(&ds_response, &cut_name, &zone, &keys, now) {
                 DsStatus::Signed(_) => {
                     keys = self
-                        .validate_child_dnskeys(&cut, &ds_response, fetcher, now)
+                        .validate_child_dnskeys(&cut, &ds_response, fetcher, now, budget)
                         .await?;
                     zone = cut;
                 }
@@ -772,6 +917,7 @@ impl DnssecValidator {
         ds_message: &Message,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
+        budget: &mut FetchBudget,
     ) -> Option<Vec<DNSKEY>> {
         let cut_name = Name::from(cut.clone());
         let ds_records: Vec<DS> = ds_message
@@ -792,7 +938,13 @@ impl DnssecValidator {
             return None;
         }
 
-        let message = fetcher.query(&cut_name, RecordType::DNSKEY).await.ok()?;
+        if !budget.try_take() {
+            return None;
+        }
+        let message = fetcher
+            .query(&cut_name, RecordType::DNSKEY, budget.deadline())
+            .await
+            .ok()?;
         let keys: Vec<DNSKEY> = message
             .answers
             .iter()
@@ -894,6 +1046,7 @@ impl DnssecValidator {
         name: &LowerName,
         fetcher: &dyn DnssecKeyFetcher,
         now: u32,
+        budget: &mut FetchBudget,
     ) -> UnsignedProbe {
         if let Some(entry) = self.chain_cache.get(name, now) {
             let stale_unsigned =
@@ -923,7 +1076,7 @@ impl DnssecValidator {
         if self.probe_backoff_active(name, now) {
             return UnsignedProbe::Failed;
         }
-        if self.probe_delegation(name, fetcher, now).await == DelegationProof::Unknown {
+        if self.probe_delegation(name, fetcher, now, budget).await == DelegationProof::Unknown {
             self.record_probe_failure(name, now);
             UnsignedProbe::Failed
         } else {

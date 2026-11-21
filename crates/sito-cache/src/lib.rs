@@ -7,7 +7,9 @@ pub mod cache;
 pub mod entry;
 pub mod key;
 
-pub use cache::{DnsCache, SingleFlightGuard};
+pub use cache::{
+    DNSSEC_BOGUS_CACHE_TTL, DNSSEC_INDETERMINATE_CACHE_TTL, DnsCache, SingleFlightGuard,
+};
 pub use entry::{CacheEntry, PolicyEpoch, ValidationStatus};
 pub use key::CacheKey;
 
@@ -430,6 +432,106 @@ mod tests {
         }
     }
 
+    /// Non-root invalidation must evict every cache-key variant of a name, not
+    /// only the plain one. `invalidate_domain` matches on `CacheKey::qname`, so
+    /// EDNS/DO, CD, ECS and Secure entries must disappear too. The scenario is
+    /// repeated after a resize because invalidation closures are attached to
+    /// the current moka generation.
+    #[tokio::test]
+    async fn test_invalidate_domain_removes_all_key_variants_before_and_after_resize() {
+        let config = make_test_config(10, 3600, 1800);
+        let cache = DnsCache::new(config);
+
+        let qname = Name::from_str("example.com.").unwrap();
+        let other = Name::from_str("other.example.").unwrap();
+
+        for resize_first in [false, true] {
+            if resize_first {
+                // Rebuild the cache generation. Live entries are carried over,
+                // and invalidation must still work on the new generation.
+                cache.resize(8).await;
+            }
+
+            for query in seed_key_variants(&cache, &qname).await {
+                assert!(
+                    cache.get_for_query_with_status(&query).await.is_some(),
+                    "variant key must be cached before invalidation"
+                );
+            }
+            insert_answer(&cache, 63, "other.example.").await;
+
+            cache.invalidate_domain("example.com");
+
+            for (query, _) in key_variant_queries(&qname) {
+                assert!(
+                    cache.get_for_query_with_status(&query).await.is_none(),
+                    "invalidate_domain must evict every key variant for {qname}"
+                );
+            }
+            assert!(
+                cache
+                    .get_for_query_with_status(&query_for(63, &other))
+                    .await
+                    .is_some(),
+                "an unrelated name must survive invalidation"
+            );
+        }
+    }
+
+    /// Builds one query per key dimension: plain, EDNS/DO, CD=1, ECS, and a
+    /// Secure-status insert. Returns the queries with the status to store.
+    fn key_variant_queries(name: &Name) -> Vec<(Message, ValidationStatus)> {
+        let plain = query_for(60, name);
+
+        let mut do_query = query_for(61, name);
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        do_query.set_edns(edns);
+
+        let mut cd_query = query_for(62, name);
+        cd_query.metadata.checking_disabled = true;
+
+        let mut ecs_query = query_for(64, name);
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(
+                "192.0.2.0".parse().unwrap(),
+                24,
+                0,
+            )));
+        ecs_query.set_edns(edns);
+
+        // Secure status is not part of the key, so use a distinct DO+CD
+        // variant to keep this entry addressable independently of the others.
+        let mut secure_query = query_for(65, name);
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        secure_query.set_edns(edns);
+        secure_query.metadata.checking_disabled = true;
+
+        vec![
+            (plain, ValidationStatus::Unchecked),
+            (do_query, ValidationStatus::Unchecked),
+            (cd_query, ValidationStatus::Unchecked),
+            (ecs_query, ValidationStatus::Unchecked),
+            (secure_query, ValidationStatus::Secure),
+        ]
+    }
+
+    async fn seed_key_variants(cache: &DnsCache, name: &Name) -> Vec<Message> {
+        let mut queries = Vec::new();
+        for (query, status) in key_variant_queries(name) {
+            let response = answer_response(
+                query.metadata.id,
+                name,
+                [192, 0, 2, query.metadata.id as u8],
+            );
+            cache.insert_with_status(&query, &response, status).await;
+            queries.push(query);
+        }
+        queries
+    }
+
     /// The cache API supplies Unicode names (`Name::to_string()`), while
     /// cache keys are punycode (`Name::to_ascii()`). Invalidation must normalize
     /// the request through IDNA or an IDN entry can never be evicted.
@@ -496,6 +598,174 @@ mod tests {
             status,
             ValidationStatus::Unchecked,
             "insert() must not turn an unvalidated upstream AD bit into Secure"
+        );
+        // The forged bit must not be replayed from the cache either.
+        let (forged_cached, _) = cache
+            .get_for_query_with_status(&forged_query)
+            .await
+            .expect("cache hit");
+        assert!(
+            !forged_cached.metadata.authentic_data,
+            "an Unchecked entry must be stored and served with AD=0"
+        );
+        assert!(
+            forged.metadata.authentic_data,
+            "the caller's message must not be mutated by insert()"
+        );
+    }
+
+    /// Only a `Secure` decision may keep the AD bit in the stored entry. A
+    /// forged upstream AD on an `Unchecked`/`Insecure` answer must come back
+    /// clear, and the caller's message must never be mutated.
+    #[tokio::test]
+    async fn test_non_secure_inserts_clear_forged_ad() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+
+        for (id, status) in [
+            (80u16, ValidationStatus::Unchecked),
+            (81, ValidationStatus::Insecure),
+        ] {
+            let qname = Name::from_str(&format!("ad-{id}.example.")).unwrap();
+            let query = query_for(id, &qname);
+            let mut response = answer_response(id, &qname, [192, 0, 2, id as u8]);
+            response.metadata.authentic_data = true;
+
+            cache.insert_with_status(&query, &response, status).await;
+
+            let (cached, stored) = cache
+                .get_for_query_with_status(&query)
+                .await
+                .expect("cache hit");
+            assert_eq!(stored, status);
+            assert!(
+                !cached.metadata.authentic_data,
+                "{status:?} must be stored and served with AD=0"
+            );
+            assert!(
+                response.metadata.authentic_data,
+                "the caller's message must not be mutated"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_secure_insert_preserves_ad() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("secure-ad.example.").unwrap();
+        let query = query_for(82, &qname);
+        let mut response = answer_response(82, &qname, [192, 0, 2, 82]);
+        response.metadata.authentic_data = true;
+
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Secure)
+            .await;
+
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("cache hit");
+        assert_eq!(status, ValidationStatus::Secure);
+        assert!(
+            cached.metadata.authentic_data,
+            "a Secure entry must keep its authenticated-data bit"
+        );
+        let statusless = cache
+            .get_for_query(&query)
+            .await
+            .expect("Secure entries are servable by the status-less getter");
+        assert!(statusless.metadata.authentic_data);
+    }
+
+    /// The fresh status-less getters must hide fail-closed (`Bogus`) and
+    /// inconclusive (`Indeterminate`) entries, mirroring the stale getters.
+    /// The status-aware getter remains the unfiltered inspection form.
+    #[tokio::test]
+    async fn test_fresh_statusless_getters_hide_failure_entries() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+
+        let bogus_name = Name::from_str("fresh-bogus-getter.example.").unwrap();
+        let bogus_query = query_for(83, &bogus_name);
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &bogus_query,
+                    &servfail_response(83, &bogus_query),
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await
+        );
+
+        let indeterminate_name = Name::from_str("fresh-indeterminate-getter.example.").unwrap();
+        let indeterminate_query = query_for(84, &indeterminate_name);
+        cache
+            .insert_with_status(
+                &indeterminate_query,
+                &answer_response(84, &indeterminate_name, [192, 0, 2, 84]),
+                ValidationStatus::Indeterminate,
+            )
+            .await;
+
+        let unchecked_name = Name::from_str("fresh-unchecked-getter.example.").unwrap();
+        let unchecked_query = query_for(85, &unchecked_name);
+        cache
+            .insert(
+                &unchecked_query,
+                &answer_response(85, &unchecked_name, [192, 0, 2, 85]),
+            )
+            .await;
+
+        assert_eq!(
+            cache
+                .get_for_query_with_status(&bogus_query)
+                .await
+                .map(|(_, status)| status),
+            Some(ValidationStatus::Bogus),
+            "the status-aware getter must still expose a fresh Bogus entry"
+        );
+        assert_eq!(
+            cache
+                .get_for_query_with_status(&indeterminate_query)
+                .await
+                .map(|(_, status)| status),
+            Some(ValidationStatus::Indeterminate),
+            "the status-aware getter must still expose a fresh Indeterminate entry"
+        );
+
+        assert!(
+            cache
+                .get(&bogus_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "get must not return a fresh Bogus entry"
+        );
+        assert!(
+            cache.get_for_query(&bogus_query).await.is_none(),
+            "get_for_query must not return a fresh Bogus entry"
+        );
+        assert!(
+            cache
+                .get(&indeterminate_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "get must not return a fresh Indeterminate entry"
+        );
+        assert!(
+            cache.get_for_query(&indeterminate_query).await.is_none(),
+            "get_for_query must not return a fresh Indeterminate entry"
+        );
+        assert!(
+            cache
+                .get(&unchecked_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_some(),
+            "Unchecked must remain returnable from the status-less getters"
+        );
+        assert!(
+            cache.get_for_query(&unchecked_query).await.is_some(),
+            "Unchecked must remain returnable from the status-less getters"
         );
     }
 
@@ -884,7 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_serve_stale_fallback() {
-        let mut config = make_test_config(1, 1, 300);
+        let mut config = make_test_config(1, 3600, 300);
         config.serve_stale_hours = 1;
         let cache = DnsCache::new(config);
 
@@ -1109,6 +1379,674 @@ mod tests {
         response
     }
 
+    fn servfail_response(id: u16, query: &Message) -> Message {
+        let mut response = Message::response(id, OpCode::Query);
+        response.queries = query.queries.clone();
+        response.metadata.response_code = ResponseCode::ServFail;
+        response
+    }
+
+    #[tokio::test]
+    async fn test_bogus_validation_failure_is_cached_as_servfail() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("bogus.example.").unwrap();
+        let query = query_for(110, &qname);
+        let response = servfail_response(110, &query);
+
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a strict Bogus SERVFAIL must be cached"
+        );
+
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("fail-closed entry must be a cache hit");
+        assert_eq!(status, ValidationStatus::Bogus);
+        assert_eq!(cached.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(cached.answers.len(), 0);
+        assert_eq!(cached.queries, query.queries);
+    }
+
+    #[tokio::test]
+    async fn test_bogus_validation_failure_rejects_old_policy_epoch() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("bogus-epoch.example.").unwrap();
+        let query = query_for(111, &qname);
+        let response = servfail_response(111, &query);
+
+        let old_epoch = cache.policy_epoch();
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Bogus,
+                    old_epoch,
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a current-epoch Bogus failure must be cached"
+        );
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_some(),
+            "the current-epoch failure must be visible"
+        );
+
+        cache.advance_policy_epoch();
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "advancing the policy epoch must hide the existing failure entry"
+        );
+
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Bogus,
+                    old_epoch,
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a Bogus failure from an old policy generation must be rejected"
+        );
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "the rejected failure must not become visible"
+        );
+
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a failure from the current filter generation must be cached"
+        );
+        let old_filter = cache.filter_epoch();
+        cache.set_filter_epoch(old_filter + 1);
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "advancing the filter epoch must hide the existing failure entry"
+        );
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    old_filter,
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a Bogus failure from an old filter generation must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bogus_validation_failure_expires_after_short_ttl() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("bogus-ttl.example.").unwrap();
+        let query = query_for(112, &qname);
+        let response = servfail_response(112, &query);
+
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await
+        );
+        assert_eq!(DNSSEC_BOGUS_CACHE_TTL, 5, "the Bogus window is 5 s");
+        cache
+            .backdate_entry_for_test(&query, Duration::from_secs(4))
+            .await;
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_some(),
+            "the failure entry must still be fresh before 5 s"
+        );
+
+        cache
+            .backdate_entry_for_test(
+                &query,
+                Duration::from_secs(u64::from(DNSSEC_BOGUS_CACHE_TTL)),
+            )
+            .await;
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "the failure entry must expire after DNSSEC_BOGUS_CACHE_TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validation_failure_ttl_is_clamped_to_status_window() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+
+        // The caller asks for an hour; the cache must enforce the 5 s Bogus
+        // window itself rather than trusting the call site constant.
+        let bogus_name = Name::from_str("bogus-oversized-ttl.example.").unwrap();
+        let bogus_query = query_for(115, &bogus_name);
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &bogus_query,
+                    &servfail_response(115, &bogus_query),
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    3600,
+                )
+                .await
+        );
+        cache
+            .backdate_entry_for_test(&bogus_query, Duration::from_secs(4))
+            .await;
+        assert!(
+            cache
+                .get_for_query_with_status(&bogus_query)
+                .await
+                .is_some(),
+            "the oversized Bogus request must still serve inside 5 s"
+        );
+        cache
+            .backdate_entry_for_test(
+                &bogus_query,
+                Duration::from_secs(u64::from(DNSSEC_BOGUS_CACHE_TTL)),
+            )
+            .await;
+        assert!(
+            cache
+                .get_for_query_with_status(&bogus_query)
+                .await
+                .is_none(),
+            "an oversized Bogus ttl must be clamped to DNSSEC_BOGUS_CACHE_TTL"
+        );
+
+        let indeterminate_name = Name::from_str("indeterminate-oversized-ttl.example.").unwrap();
+        let indeterminate_query = query_for(116, &indeterminate_name);
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &indeterminate_query,
+                    &servfail_response(116, &indeterminate_query),
+                    ValidationStatus::Indeterminate,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    3600,
+                )
+                .await,
+            "the dedicated path accepts Indeterminate so tests can exercise the cap"
+        );
+        cache
+            .backdate_entry_for_test(&indeterminate_query, Duration::from_secs(29))
+            .await;
+        assert!(
+            cache
+                .get_for_query_with_status(&indeterminate_query)
+                .await
+                .is_some(),
+            "the oversized Indeterminate request must still serve inside 30 s"
+        );
+        cache
+            .backdate_entry_for_test(
+                &indeterminate_query,
+                Duration::from_secs(u64::from(DNSSEC_INDETERMINATE_CACHE_TTL)),
+            )
+            .await;
+        assert!(
+            cache
+                .get_for_query_with_status(&indeterminate_query)
+                .await
+                .is_none(),
+            "an oversized Indeterminate ttl must be clamped to DNSSEC_INDETERMINATE_CACHE_TTL"
+        );
+    }
+
+    /// A validation failure is a fail-closed decision: it must never carry the
+    /// authenticated-data bit. The defensive check rejects an AD=1 response
+    /// even if a future caller forgets to clear it.
+    #[tokio::test]
+    async fn test_bogus_validation_failure_rejects_authentic_data() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("bogus-ad.example.").unwrap();
+        let query = query_for(119, &qname);
+        let mut response = servfail_response(119, &query);
+        response.metadata.authentic_data = true;
+
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &response,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a validation failure that asserts AD must never be cached"
+        );
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "the rejected failure must not become visible"
+        );
+    }
+
+    /// The status-less stale getters are used by call paths that cannot apply
+    /// the validation gate themselves, so they must hide fail-closed and
+    /// inconclusive entries. The status-aware getter stays unfiltered for
+    /// inspection (stale-serving tests, debugging) and `Unchecked` remains
+    /// returnable because it is valid when validation is inactive.
+    #[tokio::test]
+    async fn test_stale_statusless_getters_hide_failure_entries() {
+        let mut config = make_test_config(1, 1, 1);
+        config.serve_stale_hours = 1;
+        let cache = DnsCache::new(config);
+
+        let bogus_name = Name::from_str("stale-bogus-getter.example.").unwrap();
+        let bogus_query = query_for(120, &bogus_name);
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &bogus_query,
+                    &servfail_response(120, &bogus_query),
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await
+        );
+        cache
+            .backdate_entry_for_test(
+                &bogus_query,
+                Duration::from_secs(u64::from(DNSSEC_BOGUS_CACHE_TTL)),
+            )
+            .await;
+
+        let indeterminate_name = Name::from_str("stale-indeterminate-getter.example.").unwrap();
+        let indeterminate_query = query_for(121, &indeterminate_name);
+        assert!(
+            cache
+                .insert_validation_failure_at_epochs(
+                    &indeterminate_query,
+                    &servfail_response(121, &indeterminate_query),
+                    ValidationStatus::Indeterminate,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_INDETERMINATE_CACHE_TTL,
+                )
+                .await
+        );
+        cache
+            .backdate_entry_for_test(
+                &indeterminate_query,
+                Duration::from_secs(u64::from(DNSSEC_INDETERMINATE_CACHE_TTL)),
+            )
+            .await;
+
+        // `Unchecked` stays stale-servable: it is a legitimate status when
+        // local validation is inactive, and the status-aware pipeline gate
+        // decides whether it may be used.
+        let unchecked_name = Name::from_str("stale-unchecked-getter.example.").unwrap();
+        let unchecked_query = query_for(122, &unchecked_name);
+        let mut unchecked_response = answer_response(122, &unchecked_name, [192, 0, 2, 122]);
+        unchecked_response.answers[0].ttl = 1;
+        cache.insert(&unchecked_query, &unchecked_response).await;
+        cache
+            .backdate_entry_for_test(&unchecked_query, Duration::from_secs(2))
+            .await;
+
+        // The status-aware getter is the unfiltered inspection form.
+        assert_eq!(
+            cache
+                .get_stale_for_query_with_status(&bogus_query)
+                .await
+                .map(|(_, status)| status),
+            Some(ValidationStatus::Bogus),
+            "the status-aware stale getter must still expose a Bogus entry"
+        );
+        assert_eq!(
+            cache
+                .get_stale_for_query_with_status(&indeterminate_query)
+                .await
+                .map(|(_, status)| status),
+            Some(ValidationStatus::Indeterminate),
+            "the status-aware stale getter must still expose an Indeterminate entry"
+        );
+
+        // Both status-less getters hide fail-closed and inconclusive entries.
+        assert!(
+            cache
+                .get_stale(&bogus_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "get_stale must not return a stale Bogus entry"
+        );
+        assert!(
+            cache.get_stale_for_query(&bogus_query).await.is_none(),
+            "get_stale_for_query must not return a stale Bogus entry"
+        );
+        assert!(
+            cache
+                .get_stale(&indeterminate_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "get_stale must not return a stale Indeterminate entry"
+        );
+        assert!(
+            cache
+                .get_stale_for_query(&indeterminate_query)
+                .await
+                .is_none(),
+            "get_stale_for_query must not return a stale Indeterminate entry"
+        );
+
+        assert!(
+            cache
+                .get_stale(&unchecked_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_some(),
+            "Unchecked must remain returnable from the status-less stale getters"
+        );
+        assert!(
+            cache.get_stale_for_query(&unchecked_query).await.is_some(),
+            "Unchecked must remain returnable from the status-less stale getters"
+        );
+    }
+
+    /// Entries copied from an older cache generation may carry raw record TTL
+    /// vectors that were never clamped to the status-bound window. The fresh
+    /// read path must re-clamp them so the short failure lifespan is a cache
+    /// invariant, not just an insert-time convention.
+    #[tokio::test]
+    async fn test_old_failure_entry_record_ttls_are_capped_on_read() {
+        let cache = DnsCache::new(make_test_config(1, 3600, 1800));
+        let qname = Name::from_str("old-indeterminate.example.").unwrap();
+        let query = query_for(123, &qname);
+        let mut response = answer_response(123, &qname, [192, 0, 2, 123]);
+        response.answers[0].ttl = 3600;
+        response.authorities.push(Record::from_rdata(
+            qname.clone(),
+            3600,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 124))),
+        ));
+        response.additionals.push(Record::from_rdata(
+            qname.clone(),
+            3600,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 125))),
+        ));
+
+        cache
+            .insert_raw_entry_for_test(
+                &query,
+                &response,
+                ValidationStatus::Indeterminate,
+                3600,
+                3600,
+            )
+            .await;
+
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("the injected entry must still be fresh");
+        assert_eq!(status, ValidationStatus::Indeterminate);
+        for record in cached
+            .answers
+            .iter()
+            .chain(cached.authorities.iter())
+            .chain(cached.additionals.iter())
+        {
+            assert!(
+                record.ttl <= DNSSEC_INDETERMINATE_CACHE_TTL,
+                "an uncapped old record TTL must be clamped on read (got {})",
+                record.ttl
+            );
+        }
+
+        // The entry's own remaining lifespan is a second upper bound: even a
+        // record TTL under the status window must not outlive the entry.
+        let short_name = Name::from_str("old-short-indeterminate.example.").unwrap();
+        let short_query = query_for(124, &short_name);
+        cache
+            .insert_raw_entry_for_test(
+                &short_query,
+                &answer_response(124, &short_name, [192, 0, 2, 126]),
+                ValidationStatus::Indeterminate,
+                3600,
+                20,
+            )
+            .await;
+        let (short_cached, _) = cache
+            .get_for_query_with_status(&short_query)
+            .await
+            .expect("the short-lived injected entry must still be fresh");
+        for record in short_cached
+            .answers
+            .iter()
+            .chain(short_cached.authorities.iter())
+            .chain(short_cached.additionals.iter())
+        {
+            assert!(
+                record.ttl <= 20,
+                "a record TTL must not outlive the entry's remaining lifespan (got {})",
+                record.ttl
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validation_failure_rejects_mismatched_question() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("bogus-question.example.").unwrap();
+        let query = query_for(117, &qname);
+        let other = Name::from_str("other-question.example.").unwrap();
+        let mismatched = servfail_response(117, &query_for(117, &other));
+
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &mismatched,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a failure response for a different question must never be cached"
+        );
+        assert!(cache.get_for_query_with_status(&query).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_indeterminate_reclamp_never_extends_past_original_lifespan() {
+        let cache = DnsCache::new(make_test_config(1, 3600, 1800));
+        let qname = Name::from_str("indeterminate-reclamp.example.").unwrap();
+        let query = query_for(118, &qname);
+        let mut response = answer_response(118, &qname, [192, 0, 2, 118]);
+        response.answers[0].ttl = 5;
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Indeterminate)
+            .await;
+
+        // A raised min_ttl must not stretch the 5 s lifespan the entry was
+        // stored with (the re-clamp may tighten, never extend).
+        let mut raised = make_test_config(20, 3600, 1800);
+        raised.min_ttl = 20;
+        cache.update_config(raised).await;
+
+        cache
+            .backdate_entry_for_test(&query, Duration::from_secs(6))
+            .await;
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "a min_ttl increase must not extend an Indeterminate entry past \
+             its original lifespan"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bogus_validation_failure_requires_servfail_without_answers() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("bogus-shape.example.").unwrap();
+        let query = query_for(113, &qname);
+
+        let mut with_answer = servfail_response(113, &query);
+        with_answer.answers.push(Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 113))),
+        ));
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &with_answer,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a failure entry must never carry answer data"
+        );
+
+        let mut with_authority = servfail_response(113, &query);
+        with_authority.authorities.push(Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 113))),
+        ));
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &with_authority,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a failure entry must never carry authority data"
+        );
+
+        let mut with_additional = servfail_response(113, &query);
+        with_additional.additionals.push(Record::from_rdata(
+            qname.clone(),
+            300,
+            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 113))),
+        ));
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &with_additional,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "a failure entry must never carry additional data"
+        );
+
+        let noerror = answer_response(113, &qname, [192, 0, 2, 113]);
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &noerror,
+                    ValidationStatus::Bogus,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "only a SERVFAIL response may be stored as a Bogus failure"
+        );
+
+        assert!(
+            !cache
+                .insert_validation_failure_at_epochs(
+                    &query,
+                    &servfail_response(113, &query),
+                    ValidationStatus::Secure,
+                    cache.policy_epoch(),
+                    cache.filter_epoch(),
+                    DNSSEC_BOGUS_CACHE_TTL,
+                )
+                .await,
+            "only a fail-closed status may create a failure entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_indeterminate_lifespan_and_record_ttls_are_capped() {
+        let cache = DnsCache::new(make_test_config(10, 3600, 1800));
+        let qname = Name::from_str("indeterminate-ttl.example.").unwrap();
+        let query = query_for(114, &qname);
+        let response = answer_response(114, &qname, [192, 0, 2, 114]);
+
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Indeterminate)
+            .await;
+        assert_eq!(
+            DNSSEC_INDETERMINATE_CACHE_TTL, 30,
+            "the Indeterminate window is 30 s"
+        );
+
+        cache
+            .backdate_entry_for_test(&query, Duration::from_secs(29))
+            .await;
+        let (cached, status) = cache
+            .get_for_query_with_status(&query)
+            .await
+            .expect("still fresh before the 30 s cap");
+        assert_eq!(status, ValidationStatus::Indeterminate);
+        assert!(
+            cached.answers[0].ttl <= 1,
+            "record TTLs must be capped by the 30 s lifespan (got {})",
+            cached.answers[0].ttl
+        );
+
+        cache
+            .backdate_entry_for_test(
+                &query,
+                Duration::from_secs(u64::from(DNSSEC_INDETERMINATE_CACHE_TTL)),
+            )
+            .await;
+        assert!(
+            cache.get_for_query_with_status(&query).await.is_none(),
+            "Indeterminate data must not linger past DNSSEC_INDETERMINATE_CACHE_TTL"
+        );
+    }
+
     #[tokio::test]
     async fn test_stale_serve_clears_ad_and_rrsigs() {
         let mut config = make_test_config(1, 1, 300);
@@ -1128,13 +2066,15 @@ mod tests {
             },
         ));
         response.metadata.authentic_data = true;
-        cache.insert(&query, &response).await;
+        cache
+            .insert_with_status(&query, &response, ValidationStatus::Secure)
+            .await;
 
         let fresh = cache
             .get(&qname, RecordType::A, DNSClass::IN)
             .await
             .expect("fresh hit");
-        assert!(fresh.metadata.authentic_data, "fresh entry keeps AD");
+        assert!(fresh.metadata.authentic_data, "fresh Secure entry keeps AD");
 
         tokio::time::sleep(Duration::from_millis(1100)).await;
 
@@ -1604,6 +2544,105 @@ mod tests {
         assert!(
             cache.get_for_query(&query).await.is_none(),
             "a fully expired entry must not be resurrected by a raised min_ttl"
+        );
+    }
+
+    /// RFC 8767 recommends a 30-second stale TTL, but the configured
+    /// `max_ttl` is still a hard ceiling for data this resolver serves.
+    #[tokio::test]
+    async fn test_stale_serve_ttl_is_capped_by_max_ttl() {
+        for (max_ttl, expected) in [(5u32, 5u32), (3600, 30)] {
+            let mut config = make_test_config(1, max_ttl, 300);
+            config.serve_stale_hours = 1;
+            let cache = DnsCache::new(config);
+
+            let qname = Name::from_str(&format!("stale-ttl-{max_ttl}.example.")).unwrap();
+            let query = query_for(130, &qname);
+            let mut response = answer_response(130, &qname, [192, 0, 2, 130]);
+            response.answers[0].ttl = 1;
+            cache.insert(&query, &response).await;
+            cache
+                .backdate_entry_for_test(&query, Duration::from_secs(2))
+                .await;
+
+            let stale = cache
+                .get_stale(&qname, RecordType::A, DNSClass::IN)
+                .await
+                .expect("entry is still inside the stale window");
+            assert_eq!(
+                stale.answers[0].ttl, expected,
+                "stale TTL must be min(RFC 8767 30s, max_ttl={max_ttl})"
+            );
+        }
+    }
+
+    /// P2-22: lowering `serve_stale_hours` on reload must evict entries that
+    /// are now fully past the new stale window, keep entries still inside it,
+    /// and a later raise must not resurrect what was evicted.
+    #[tokio::test]
+    async fn test_update_config_reclamps_serve_stale_window() {
+        let mut config = make_test_config(1, 1, 300);
+        config.serve_stale_hours = 2;
+        let cache = DnsCache::new(config.clone());
+
+        let expired_name = Name::from_str("stale-window-expired.example.").unwrap();
+        let expired_query = query_for(131, &expired_name);
+        let mut expired_response = answer_response(131, &expired_name, [192, 0, 2, 131]);
+        expired_response.answers[0].ttl = 1;
+        cache.insert(&expired_query, &expired_response).await;
+        cache
+            .backdate_entry_for_test(&expired_query, Duration::from_mins(90))
+            .await;
+
+        let kept_name = Name::from_str("stale-window-kept.example.").unwrap();
+        let kept_query = query_for(132, &kept_name);
+        let mut kept_response = answer_response(132, &kept_name, [192, 0, 2, 132]);
+        kept_response.answers[0].ttl = 1;
+        cache.insert(&kept_query, &kept_response).await;
+        cache
+            .backdate_entry_for_test(&kept_query, Duration::from_mins(30))
+            .await;
+
+        // Both are stale-servable under the original two-hour window.
+        assert!(
+            cache
+                .get_stale(&expired_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_stale(&kept_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_some()
+        );
+
+        config.serve_stale_hours = 1;
+        cache.update_config(config.clone()).await;
+
+        assert!(
+            cache
+                .get_stale(&expired_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "an entry past the lowered stale window must be evicted"
+        );
+        assert!(
+            cache
+                .get_stale(&kept_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_some(),
+            "an entry still inside the new stale window must survive"
+        );
+
+        config.serve_stale_hours = 48;
+        cache.update_config(config).await;
+        assert!(
+            cache
+                .get_stale(&expired_name, RecordType::A, DNSClass::IN)
+                .await
+                .is_none(),
+            "raising the stale window must not resurrect an evicted entry"
         );
     }
 

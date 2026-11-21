@@ -21,6 +21,7 @@ pub use chain_cache::{ChainCache, ChainEntry, PolicyChange, PolicyState, ZoneSta
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -81,6 +82,109 @@ impl VerifyBudget {
     }
 }
 
+/// Default wall-clock budget for one DNSSEC key-fetch pass.
+///
+/// Used by [`DnssecValidator::validate_with_key_fetcher`], which exists for
+/// callers that do not have their own per-query deadline. The resolver
+/// pipeline passes its own absolute deadline instead.
+///
+/// This is deliberately the same 5s as `DNSSEC_VALIDATION_DEADLINE` in
+/// `crates/sito/src/pipeline/query.rs`; keep the two in sync so the
+/// compatibility wrapper and the resolver pipeline enforce the same bound.
+pub const DEFAULT_KEY_FETCH_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Per-query budget for DNSSEC DS/DNSKEY fetches.
+///
+/// One budget covers every DS/DNSKEY lookup made for a client response/query,
+/// not one chain walk: the early CNAME/delegation probes, every cold-start
+/// signer walk and the post-fetch probes all draw from it. `remaining` bounds
+/// the total count and `deadline` is the absolute wall-clock bound shared by
+/// every fetch. Once either limit is reached, [`Self::try_take`] refuses
+/// further fetches so validation stops instead of issuing more network I/O.
+/// A signer walk that runs after early probes therefore sees a shorter budget
+/// than the full allowance.
+#[derive(Debug)]
+pub struct FetchBudget {
+    remaining: u8,
+    deadline: Instant,
+    /// Optional validation metrics that receive a counter for every refusal.
+    metrics: Option<Arc<DnssecMetrics>>,
+}
+
+impl FetchBudget {
+    /// Creates a budget with `remaining` fetches allowed until `deadline`.
+    pub fn new(remaining: u8, deadline: Instant) -> Self {
+        Self {
+            remaining,
+            deadline,
+            metrics: None,
+        }
+    }
+
+    /// Creates a budget that records every refusal in `metrics`.
+    ///
+    /// Production validation uses this so an exhausted count budget and an
+    /// expired deadline are visible and distinguishable in telemetry.
+    pub fn with_metrics(remaining: u8, deadline: Instant, metrics: Arc<DnssecMetrics>) -> Self {
+        Self {
+            remaining,
+            deadline,
+            metrics: Some(metrics),
+        }
+    }
+
+    /// The absolute deadline every fetch must respect.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Consumes one fetch slot, returning false when the budget is exhausted
+    /// or the deadline has passed. Callers must stop fetching on false.
+    ///
+    /// A refusal is attributed to exactly one cause: the absolute deadline
+    /// takes precedence over count exhaustion because it invalidates the
+    /// fetch regardless of how much count budget is left.
+    ///
+    /// This counts budget decisions only, not fetcher results. An upstream
+    /// `UpstreamError::Timeout` is a fetcher outcome, not a refusal, and is
+    /// covered by the separate upstream/bogus error metrics instead.
+    pub fn try_take(&mut self) -> bool {
+        if self.is_expired() {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_fetch_deadline_exceeded();
+            }
+            return false;
+        }
+        if self.remaining == 0 {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_fetch_budget_exhausted();
+            }
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    /// Records a refusal at an early `is_expired()` guard, before
+    /// [`Self::try_take`] is reached.
+    ///
+    /// Walk and probe entry points check the deadline up front so a caller
+    /// contract violation (or a deadline that expired between stages) cannot
+    /// start new work. That refusal is the same deadline cause as a
+    /// `try_take` refusal and must be visible in the same metric. Counts
+    /// nothing when no metrics are attached.
+    pub(crate) fn record_deadline_refusal(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_fetch_deadline_exceeded();
+        }
+    }
+
+    /// Whether the absolute deadline has passed.
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+}
+
 /// Hard bound on the validated-key cache; DNSKEYs are re-discoverable.
 const KEY_CACHE_MAX_ENTRIES: usize = 4096;
 /// Hard bound on the known-signed-zone cache; zones are re-discoverable.
@@ -96,6 +200,22 @@ const PROBE_BACKOFF_SECS: u32 = 30;
 /// already covered by cached/in-memory evidence do not consume the budget.
 /// A chain that needs more probes fails closed instead of amplifying fetches.
 const MAX_CNAME_PROBES: usize = 8;
+/// Largest cold-start DNSKEY/DS allowance the old per-signer design gave one
+/// RRSIG signer (`labels * 2 + 1`, capped at 31). A single signer's walk can
+/// never exceed this before reaching the root or its depth bound.
+const MAX_SIGNER_CHAIN_FETCHES: u8 = 31;
+/// Hard cap on DS/DNSKEY fetches one client query may issue across the early
+/// CNAME probes, the cold-start signer walks and the post-fetch probes.
+///
+/// The total is `MAX_SIGNER_CHAIN_FETCHES + 2 * MAX_CNAME_PROBES` (31 + 16),
+/// where the second term is the worst-case probe share: one anchor DNSKEY plus
+/// one DS lookup per probe. It is a single hard cap, not a reservation split:
+/// deep probes draw from the signer share too, so 47 does not guarantee that a
+/// cold-start signer walk still has 31 fetches left after a deep probe fan-out;
+/// it only guarantees the query never exceeds 47. All callers draw from the
+/// same [`FetchBudget`], so a probe fan-out shortens the walk that follows
+/// instead of multiplying the query's fetch work.
+const MAX_FETCHES_PER_QUERY: u8 = MAX_SIGNER_CHAIN_FETCHES + 2 * MAX_CNAME_PROBES as u8;
 /// Accepted clock skew around RRSIG inception/expiration (RFC 4035 5.3.1).
 const MAX_CLOCK_SKEW: u32 = 300;
 /// Minimum accepted RSA modulus size in bits (RFC 8624 3.1).

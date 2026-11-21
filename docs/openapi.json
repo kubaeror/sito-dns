@@ -12,10 +12,21 @@
     "/api/v1/auth/change-password": {
       "post": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
-        "summary": "Change a password. Self-service requires the current password; an Admin may\noverride another account (audited) with `username` set.",
+        "summary": "Change a password. Every authenticated role may change their own password\nafter proving it (plus TOTP when enabled); an Admin overriding another\naccount must present a fresh session-bound re-authentication ticket.",
         "operationId": "change_password",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Session-bound re-authentication ticket; required for an Admin overriding another account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -48,7 +59,7 @@
             }
           },
           "401": {
-            "description": "Missing/wrong current password",
+            "description": "Missing/wrong current password or second factor",
             "content": {
               "application/json": {
                 "schema": {
@@ -81,7 +92,7 @@
     "/api/v1/auth/login": {
       "post": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "User login endpoint.",
         "operationId": "login",
@@ -142,7 +153,7 @@
     "/api/v1/auth/logout": {
       "post": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "Logout endpoint invalidating current session cookie.",
         "operationId": "logout",
@@ -163,7 +174,7 @@
     "/api/v1/auth/reauth": {
       "post": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "Re-authenticate a live session and issue a short-lived ticket for a\nsensitive operation (TOTP enrollment/change).",
         "operationId": "reauth",
@@ -221,6 +232,9 @@
         },
         "security": [
           {
+            "bearer_auth": []
+          },
+          {
             "cookie_auth": []
           }
         ]
@@ -229,7 +243,7 @@
     "/api/v1/auth/tokens": {
       "get": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "List all API tokens.",
         "operationId": "list_tokens",
@@ -279,10 +293,21 @@
       },
       "post": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "Create a new API token.",
         "operationId": "create_token",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Session-bound re-authentication ticket; required to mint an Admin-scoped token from a user session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -348,7 +373,7 @@
     "/api/v1/auth/tokens/{id}": {
       "delete": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "Revoke an API token by ID.",
         "operationId": "delete_token",
@@ -417,7 +442,7 @@
     "/api/v1/auth/totp/disable": {
       "post": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "Disable TOTP 2FA.",
         "description": "Requires a fresh re-authentication ticket (`X-Reauth-Token`) from\n`POST /api/v1/auth/reauth`; that call proves the account password and, when\nTOTP is enabled, the current TOTP or backup code. The legacy request-body\ncredentials remain accepted for client compatibility but are superseded by\nthe re-authentication ticket.",
@@ -487,6 +512,9 @@
         },
         "security": [
           {
+            "bearer_auth": []
+          },
+          {
             "cookie_auth": []
           }
         ]
@@ -495,7 +523,7 @@
     "/api/v1/auth/totp/enable": {
       "post": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "Enable TOTP 2FA by verifying setup code.",
         "operationId": "enable_totp",
@@ -564,6 +592,9 @@
         },
         "security": [
           {
+            "bearer_auth": []
+          },
+          {
             "cookie_auth": []
           }
         ]
@@ -572,7 +603,7 @@
     "/api/v1/auth/totp/setup": {
       "get": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "Initiate TOTP 2FA setup.",
         "operationId": "get_totp_setup",
@@ -621,6 +652,9 @@
         },
         "security": [
           {
+            "bearer_auth": []
+          },
+          {
             "cookie_auth": []
           }
         ]
@@ -629,7 +663,7 @@
     "/api/v1/auth/totp/verify": {
       "post": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "Second login phase: verify TOTP code.",
         "operationId": "verify_totp",
@@ -670,7 +704,7 @@
     "/api/v1/auth/users": {
       "get": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "List local user accounts.",
         "operationId": "list_users",
@@ -720,10 +754,21 @@
       },
       "post": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "Create a local user account.",
         "operationId": "create_user",
+        "parameters": [
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Session-bound re-authentication ticket; required to create an Admin from a user session",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -799,7 +844,7 @@
     "/api/v1/auth/users/{username}": {
       "put": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "Update a user's role.",
         "operationId": "update_user",
@@ -808,6 +853,15 @@
             "name": "username",
             "in": "path",
             "description": "Username",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Session-bound re-authentication ticket; required for session callers",
             "required": true,
             "schema": {
               "type": "string"
@@ -887,7 +941,7 @@
       },
       "delete": {
         "tags": [
-          "crate::handlers::auth_handlers"
+          "Auth"
         ],
         "summary": "Delete a local user account.",
         "operationId": "delete_user",
@@ -967,7 +1021,7 @@
     "/api/v1/cache/flush": {
       "post": {
         "tags": [
-          "crate::handlers::cache"
+          "Cache"
         ],
         "summary": "Flush entire DNS response cache.",
         "operationId": "flush_cache",
@@ -1016,7 +1070,7 @@
     "/api/v1/cache/invalidate": {
       "post": {
         "tags": [
-          "crate::handlers::cache"
+          "Cache"
         ],
         "summary": "Invalidate cache entries matching a domain.",
         "operationId": "invalidate_cache",
@@ -1108,7 +1162,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -1126,7 +1188,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Client created",
             "content": {
               "application/json": {
@@ -1145,7 +1207,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/clients/groups": {
@@ -1174,7 +1244,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -1192,7 +1270,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Client group added",
             "content": {
               "application/json": {
@@ -1218,7 +1296,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/clients/groups/{name}": {
@@ -1258,7 +1344,15 @@
           "404": {
             "description": "Not Found"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "put": {
         "tags": [
@@ -1303,7 +1397,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -1341,7 +1443,15 @@
           "404": {
             "description": "Group not found"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/clients/unidentified": {
@@ -1382,7 +1492,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/clients/{name}": {
@@ -1434,7 +1552,15 @@
           "404": {
             "description": "Not Found"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "put": {
         "tags": [
@@ -1485,7 +1611,15 @@
           "409": {
             "description": "Renaming onto an existing client name"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -1523,13 +1657,21 @@
           "404": {
             "description": "Not Found"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/config": {
       "get": {
         "tags": [
-          "crate::handlers::config"
+          "Config"
         ],
         "summary": "Get current full configuration with secrets masked.",
         "operationId": "get_config",
@@ -1576,7 +1718,7 @@
       },
       "put": {
         "tags": [
-          "crate::handlers::config"
+          "Config"
         ],
         "summary": "Update full configuration atomically after pre-commit validation.",
         "operationId": "update_config",
@@ -1655,7 +1797,7 @@
     "/api/v1/config/backup": {
       "get": {
         "tags": [
-          "crate::handlers::config"
+          "Config"
         ],
         "summary": "Download a complete configuration backup archive (.tar.gz).",
         "operationId": "download_backup",
@@ -1700,7 +1842,7 @@
     "/api/v1/config/reload": {
       "post": {
         "tags": [
-          "crate::handlers::config"
+          "Config"
         ],
         "summary": "Reload configuration from disk without server restart.",
         "operationId": "reload_config",
@@ -1759,7 +1901,7 @@
     "/api/v1/config/restart-required": {
       "get": {
         "tags": [
-          "crate::handlers::config"
+          "Config"
         ],
         "summary": "List the settings that only take effect after a process restart (D11).",
         "operationId": "get_restart_required",
@@ -1808,7 +1950,7 @@
     "/api/v1/config/restore": {
       "post": {
         "tags": [
-          "crate::handlers::config"
+          "Config"
         ],
         "summary": "Upload and validate a backup archive (.tar.gz), generating a confirmation token.",
         "operationId": "prepare_restore",
@@ -1878,7 +2020,7 @@
     "/api/v1/config/restore/confirm": {
       "post": {
         "tags": [
-          "crate::handlers::config"
+          "Config"
         ],
         "summary": "Confirm and apply configuration restoration using confirmation token.",
         "operationId": "confirm_restore",
@@ -1990,7 +2132,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/filtering/lists": {
@@ -2019,7 +2169,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -2037,7 +2195,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Filter list added",
             "content": {
               "application/json": {
@@ -2056,7 +2214,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/filtering/lists/{id}": {
@@ -2107,7 +2273,15 @@
           "404": {
             "description": "Not Found"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -2146,7 +2320,15 @@
           "404": {
             "description": "Not Found"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/filtering/refresh": {
@@ -2172,7 +2354,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/filtering/rules": {
@@ -2198,7 +2388,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "put": {
         "tags": [
@@ -2232,7 +2430,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/filtering/status": {
@@ -2258,13 +2464,21 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/ha/resync": {
       "post": {
         "tags": [
-          "crate::handlers::ha"
+          "HA"
         ],
         "summary": "Trigger manual HA resynchronization.",
         "operationId": "trigger_ha_resync",
@@ -2333,7 +2547,7 @@
     "/api/v1/ha/slaves": {
       "get": {
         "tags": [
-          "crate::handlers::ha"
+          "HA"
         ],
         "summary": "List connected HA replica secondary nodes.",
         "operationId": "get_ha_slaves",
@@ -2385,7 +2599,7 @@
     "/api/v1/ha/status": {
       "get": {
         "tags": [
-          "crate::handlers::ha"
+          "HA"
         ],
         "summary": "Get HA cluster status.",
         "operationId": "get_ha_status",
@@ -2419,6 +2633,97 @@
                 }
               }
             }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/integrations/lists": {
+      "get": {
+        "tags": [
+          "Integrations"
+        ],
+        "operationId": "get_integration_lists",
+        "responses": {
+          "200": {
+            "description": "Runtime state of every curated parental/service category",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/IntegrationListStatusDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/integrations/lists/{category}/refresh": {
+      "post": {
+        "tags": [
+          "Integrations"
+        ],
+        "operationId": "refresh_integration_list",
+        "parameters": [
+          {
+            "name": "category",
+            "in": "path",
+            "description": "Curated category id (case-insensitive)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Category force-refreshed; the >50% shrink guard is bypassed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntegrationListStatusDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Downloaded content could not be applied"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Category is not configured in [integrations.lists]"
+          },
+          "502": {
+            "description": "Source could not be fetched"
           }
         },
         "security": [
@@ -2580,7 +2885,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -2615,7 +2928,90 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/querylog/clear": {
+      "post": {
+        "tags": [
+          "QueryLog"
+        ],
+        "summary": "POST alias for `DELETE /api/v1/querylog` (older UI clients).",
+        "operationId": "clear_querylog",
+        "parameters": [
+          {
+            "name": "keep_aggregates",
+            "in": "query",
+            "description": "Preserve `stats_hourly` rollups (the old “fold into aggregates”\nbehavior). Defaults to `false`: both detailed rows and rollups are\nerased.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Query log cleared successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/querylog/stream": {
+      "get": {
+        "tags": [
+          "QueryLog"
+        ],
+        "summary": "WebSocket live tail endpoint streaming query log entries in real-time.",
+        "description": "The Origin header is validated before the upgrade: `null` and cross-origin\nhandshakes are rejected, and a session-authenticated browser request must\nsend a same-origin `Origin`. Bearer-token clients are not browser-ambient\nand may omit it. The legacy `?token=` query parameter is not accepted.",
+        "operationId": "stream_querylog",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade accepted; query log entries stream as JSON text frames"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden (including cross-origin/Origin: null)"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/rewrites": {
@@ -2644,7 +3040,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -2662,7 +3066,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "DNS rewrite created",
             "content": {
               "application/json": {
@@ -2681,7 +3085,15 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/rewrites/{id}": {
@@ -2722,6 +3134,9 @@
               }
             }
           },
+          "400": {
+            "description": "Bad Request"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -2731,7 +3146,15 @@
           "404": {
             "description": "Not Found"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -2769,7 +3192,15 @@
           "404": {
             "description": "Not Found"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/stats": {
@@ -2837,7 +3268,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/stats/clients": {
@@ -2916,7 +3355,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/stats/upstreams": {
@@ -2995,7 +3442,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/status": {
@@ -3021,13 +3476,21 @@
           "403": {
             "description": "Forbidden"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/system/update/apply": {
       "post": {
         "tags": [
-          "system"
+          "System"
         ],
         "summary": "Download and apply software update.",
         "operationId": "apply_update",
@@ -3069,6 +3532,16 @@
               }
             }
           },
+          "409": {
+            "description": "Another update is running, the version comparison is unknown, or the service is managed by systemd",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Update process failed",
             "content": {
@@ -3079,13 +3552,21 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/system/update/check": {
       "get": {
         "tags": [
-          "system"
+          "System"
         ],
         "summary": "Check for software updates via GitHub Releases.",
         "operationId": "check_update",
@@ -3133,13 +3614,21 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
       }
     },
     "/api/v1/upstream": {
       "get": {
         "tags": [
-          "crate::handlers::upstream"
+          "Upstream"
         ],
         "summary": "Get current upstream DNS configuration.",
         "operationId": "get_upstream_config",
@@ -3186,7 +3675,7 @@
       },
       "put": {
         "tags": [
-          "crate::handlers::upstream"
+          "Upstream"
         ],
         "summary": "Update upstream DNS configuration.",
         "operationId": "update_upstream_config",
@@ -3252,10 +3741,80 @@
         ]
       }
     },
+    "/api/v1/upstream/config": {
+      "get": {
+        "tags": [
+          "Upstream"
+        ],
+        "summary": "Documented GET alias for `/api/v1/upstream`.",
+        "operationId": "redirect_upstream_config_get",
+        "responses": {
+          "308": {
+            "description": "Permanent redirect to /api/v1/upstream",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Canonical upstream-config path"
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Upstream"
+        ],
+        "summary": "Documented PUT alias for `/api/v1/upstream`.",
+        "operationId": "redirect_upstream_config_put",
+        "responses": {
+          "308": {
+            "description": "Permanent redirect to /api/v1/upstream",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Canonical upstream-config path"
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/upstream/test": {
       "post": {
         "tags": [
-          "crate::handlers::upstream"
+          "Upstream"
         ],
         "summary": "Test upstream server latency and availability.",
         "operationId": "test_upstream_servers",
@@ -3507,6 +4066,13 @@
           },
           "new_password": {
             "type": "string"
+          },
+          "totp_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Current TOTP or backup code; required for self-service when TOTP is\nenabled."
           },
           "username": {
             "type": [
@@ -3932,7 +4498,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Groups published without their regex/wildcard (or substring/prefix)\nclass after a budget/limit failure."
+            "description": "Groups that could not be published with their full rule set: a\nbudget/limit failure (only a non-regex subset was published), a\nmissing/unloaded referenced list, an invalid-only rule set, or a\ngroup that could not be published at all. The previous snapshot is\nretained when one is available."
           },
           "degraded_lists": {
             "type": "array",
@@ -4101,9 +4667,33 @@
             ],
             "description": "RFC3339 timestamp of the first background retry, when one is scheduled."
           },
+          "slaves_coalesced": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Slaves scheduled for coalesced/deferred delivery.",
+            "minimum": 0
+          },
+          "slaves_connected": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Connected slaves observed during the publish (including closed channels).",
+            "minimum": 0
+          },
+          "slaves_queued": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Slaves with a direct channel enqueue.",
+            "minimum": 0
+          },
           "status": {
             "type": "string",
-            "description": "`published`, `no_slaves` or `failed`."
+            "description": "`queued`, `connected_no_delivery`, `no_slaves` or `failed`. Neither\n`queued` nor `connected_no_delivery` is delivery proof; delivery is\nconfirmed by the slave ACK."
           }
         }
       },
@@ -4302,6 +4892,56 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "IntegrationListStatusDto": {
+        "type": "object",
+        "description": "Runtime refresh state of one curated parental/service category.\n\nMirrors `sito_clients::RuntimeListStatus`; keep the field names stable for\nAPI clients. Optional fields are omitted when unset.",
+        "required": [
+          "category",
+          "entries",
+          "bundled"
+        ],
+        "properties": {
+          "bundled": {
+            "type": "boolean"
+          },
+          "category": {
+            "type": "string"
+          },
+          "entries": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_attempt_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_refresh_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_url": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -5176,23 +5816,33 @@
           "update_available",
           "release_url",
           "release_notes",
-          "is_docker"
+          "is_docker",
+          "is_systemd",
+          "in_app_update_disabled"
         ],
         "properties": {
           "current_version": {
             "type": "string",
             "description": "Currently running version of sito."
           },
+          "in_app_update_disabled": {
+            "type": "boolean",
+            "description": "True when this deployment must not replace its own binary in place.\n`--check` and the CLI after `systemctl stop` still work."
+          },
           "instructions": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Environment-specific upgrade instructions (e.g. docker compose command)."
+            "description": "Environment-specific upgrade instructions (e.g. docker compose or\nsystemctl commands)."
           },
           "is_docker": {
             "type": "boolean",
             "description": "Whether the server is running inside a Docker/OCI container."
+          },
+          "is_systemd": {
+            "type": "boolean",
+            "description": "Whether the server is running as a systemd service."
           },
           "latest_version": {
             "type": "string",
@@ -5255,7 +5905,9 @@
           },
           "pool_size": {
             "type": "integer",
-            "minimum": 0
+            "description": "Persistent connections per endpoint; bounded to 1..=64 by core\nvalidation (`MAX_UPSTREAM_POOL_SIZE`).",
+            "maximum": 64,
+            "minimum": 1
           },
           "probe_domain": {
             "type": "string"
@@ -5272,7 +5924,9 @@
           "timeout_ms": {
             "type": "integer",
             "format": "int64",
-            "minimum": 0
+            "description": "Overall per-query budget; bounded to 1..=60000 ms by core validation\n(`MAX_UPSTREAM_TIMEOUT_MS`).",
+            "maximum": 60000,
+            "minimum": 1
           }
         }
       },
@@ -5293,7 +5947,8 @@
           },
           "error_queries": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Queries whose response was an upstream error. NXDOMAIN (rcode 3) is a\nnormal negative answer, not an error, and is excluded."
           },
           "share_percentage": {
             "type": "number",
@@ -5388,6 +6043,19 @@
           }
         }
       }
+    },
+    "securitySchemes": {
+      "bearer_auth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "API token in `Authorization: Bearer <token>`"
+      },
+      "cookie_auth": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "sito_session"
+      }
     }
   },
   "tags": [
@@ -5406,6 +6074,10 @@
     {
       "name": "Filtering",
       "description": "Blocklists, allowlists, and custom rules"
+    },
+    {
+      "name": "Integrations",
+      "description": "Curated runtime list status and refresh"
     },
     {
       "name": "Clients",

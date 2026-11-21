@@ -10,12 +10,12 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use tracing::{debug, info, trace, warn};
 
 use sito_core::client::ClientContext;
 use sito_proto::{decode_message, encode_message, truncate_for_framing};
 
+use crate::admission::{AdmissionController, DEFAULT_MAX_CONNECTIONS_PER_IP};
 use crate::handler::QueryHandler;
 use crate::limiter::RateLimiter;
 use crate::tls::TlsAcceptorManager;
@@ -51,6 +51,7 @@ const DOH3_REQUESTS_PER_CONNECTION: usize = 4;
 pub(crate) struct Doh3Limits {
     pub request_timeout: Duration,
     pub handshake_timeout: Duration,
+    pub connection_lifetime: Duration,
 }
 
 impl Default for Doh3Limits {
@@ -58,6 +59,7 @@ impl Default for Doh3Limits {
         Self {
             request_timeout: REQUEST_TIMEOUT,
             handshake_timeout: QUIC_HANDSHAKE_TIMEOUT,
+            connection_lifetime: Duration::from_secs(300),
         }
     }
 }
@@ -178,6 +180,11 @@ pub struct Doh3Config {
     pub idle_timeout: Duration,
     /// When set, requests whose authority/Host does not match are rejected with 421.
     pub dedicated_hostname: Option<String>,
+    /// Maximum lifetime of one HTTP/3 connection, independent of activity.
+    ///
+    /// Bounds how long a peer can hold a connection slot by staying active;
+    /// the default matches the TCP/DoH 300 s lifetime.
+    pub connection_lifetime: Duration,
 }
 
 impl Doh3Config {
@@ -191,6 +198,7 @@ impl Doh3Config {
             rate_limiter: None,
             idle_timeout: Duration::from_secs(30),
             dedicated_hostname: None,
+            connection_lifetime: Duration::from_secs(300),
         }
     }
 
@@ -302,7 +310,11 @@ pub async fn start_doh3_listener<H: QueryHandler + 'static>(
     handler: Arc<H>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-    start_doh3_listener_with_limits(config, handler, shutdown_rx, Doh3Limits::default())
+    let limits = Doh3Limits {
+        connection_lifetime: config.connection_lifetime,
+        ..Doh3Limits::default()
+    };
+    start_doh3_listener_with_limits(config, handler, shutdown_rx, limits)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -330,25 +342,25 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
     let local_addr = endpoint.local_addr()?;
     info!("DoH3 listener started on {}", local_addr);
 
-    let rate_limiter = config.rate_limiter.clone().unwrap_or_else(|| {
-        Arc::new(RateLimiter::new(
-            config.rate_limit_per_ip,
-            RateLimiter::burst_for_rate(config.rate_limit_per_ip),
-        ))
-    });
-    rate_limiter.spawn_pruner(shutdown_rx.clone());
-    let semaphore = Arc::new(Semaphore::new(config.max_connections));
-    let per_ip_limiter = crate::admission::PerIpConnectionLimiter::new(
-        crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP,
-    );
-    let request_semaphore = Arc::new(Semaphore::new(
+    let admission = AdmissionController::new(
+        config.max_connections,
+        DEFAULT_MAX_CONNECTIONS_PER_IP,
+        config.rate_limiter.clone().unwrap_or_else(|| {
+            Arc::new(RateLimiter::new(
+                config.rate_limit_per_ip,
+                RateLimiter::burst_for_rate(config.rate_limit_per_ip),
+            ))
+        }),
         config
             .max_connections
             .saturating_mul(DOH3_REQUESTS_PER_CONNECTION)
             .max(1),
-    ));
+    );
+    admission.spawn_pruner(shutdown_rx.clone());
+    let max_connections = config.max_connections;
     let acceptor_mgr = config.acceptor_mgr.clone();
     let dedicated_hostname = config.dedicated_hostname.clone();
+    let connection_lifetime = limits.connection_lifetime;
 
     let endpoint_accept = endpoint.clone();
     let mut accept_shutdown_rx = shutdown_rx.clone();
@@ -365,31 +377,27 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                     }
                 }
                 Some(incoming) = endpoint_accept.accept() => {
-                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-                        warn!(
-                            "DoH3 max connections ({}) reached; rejecting incoming QUIC connection",
-                            config.max_connections
-                        );
-                        incoming.refuse();
-                        continue;
-                    };
-                    let Some(per_ip_permit) = per_ip_limiter.try_acquire(incoming.remote_address().ip()) else {
-                        warn!(
-                            "DoH3 per-IP connection limit ({}) reached; rejecting connection",
-                            crate::admission::DEFAULT_MAX_CONNECTIONS_PER_IP
-                        );
-                        incoming.refuse();
-                        continue;
+                    let permit = match admission.try_acquire_connection(incoming.remote_address().ip()) {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            warn!(
+                                "DoH3 incoming connection rejected: {} (max connections {})",
+                                e, max_connections
+                            );
+                            incoming.refuse();
+                            continue;
+                        }
                     };
 
                     let handler = Arc::clone(&handler);
-                    let rate_limiter = Arc::clone(&rate_limiter);
-                    let request_semaphore = Arc::clone(&request_semaphore);
+                    let admission = Arc::clone(&admission);
                     let dedicated_hostname = dedicated_hostname.clone();
 
                     connection_tasks.spawn(async move {
                         let _permit = permit;
-                        let _per_ip_permit = per_ip_permit;
+                        let lifetime_exceeded = tokio::time::timeout(
+                            connection_lifetime,
+                            async move {
                         let conn = match tokio::time::timeout(limits.handshake_timeout, incoming).await {
                             Ok(Ok(c)) => c,
                             Ok(Err(e)) => {
@@ -408,8 +416,8 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                         let peer_addr = conn.remote_address();
                         let client_ip = peer_addr.ip();
 
-                        if !rate_limiter.check(client_ip) {
-                            debug!("DoH3 rate limit exceeded for client {}", client_ip);
+                        if let Err(e) = admission.check_rate(client_ip) {
+                            debug!("DoH3 rate limit exceeded for client {}: {}", client_ip, e);
                             conn.close(1u32.into(), b"Rate limit exceeded");
                             return;
                         }
@@ -442,18 +450,20 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                                         break;
                                     };
                             let handler = Arc::clone(&handler);
-                            let rate_limiter = Arc::clone(&rate_limiter);
-                            let request_semaphore = Arc::clone(&request_semaphore);
+                            let admission = Arc::clone(&admission);
                             let sni = sni.clone();
                             let dedicated_hostname = dedicated_hostname.clone();
 
                             request_tasks.spawn(async move {
-                                if !rate_limiter.check(client_ip) {
-                                    debug!("DoH3 rate limit exceeded for client {}", client_ip);
+                                if let Err(e) = admission.check_rate(client_ip) {
+                                    debug!(
+                                        "DoH3 rate limit exceeded for client {}: {}",
+                                        client_ip, e
+                                    );
                                     return;
                                 }
 
-                                let Ok(_request_permit) = request_semaphore.clone().try_acquire_owned() else {
+                                let Ok(_request_permit) = admission.try_acquire_request() else {
                                     debug!(
                                         "DoH3 global request limit reached for client {}",
                                         client_ip
@@ -795,6 +805,16 @@ pub(crate) fn start_doh3_listener_with_limits<H: QueryHandler + 'static>(
                         }
                         request_tasks.abort_all();
                         while request_tasks.join_next().await.is_some() {}
+                            },
+                        )
+                        .await
+                        .is_err();
+                        if lifetime_exceeded {
+                            debug!(
+                                "DoH3 connection reached the {}s lifetime; closing",
+                                connection_lifetime.as_secs()
+                            );
+                        }
                     });
                     crate::admission::reap_finished(&mut connection_tasks);
                 }
@@ -841,6 +861,8 @@ mod tests {
     use super::*;
     use crate::tls::generate_test_cert;
     use base64::Engine;
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
     use sito_proto::rdata::A;
     use sito_proto::{
         Message, MessageType, Name, OpCode, Query, RData, Record, RecordType, ResponseCode,
@@ -1274,6 +1296,7 @@ mod tests {
             Doh3Limits {
                 request_timeout: Duration::from_millis(300),
                 handshake_timeout: Duration::from_secs(5),
+                ..Doh3Limits::default()
             },
         )
         .unwrap();
@@ -1387,6 +1410,7 @@ mod tests {
             Doh3Limits {
                 request_timeout: Duration::from_secs(5),
                 handshake_timeout: Duration::from_secs(5),
+                ..Doh3Limits::default()
             },
         )
         .unwrap();
@@ -1494,6 +1518,162 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    fn doh3_test_acceptor(name: &str) -> (TlsAcceptorManager, String, std::path::PathBuf) {
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_doh3_{name}_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        std::fs::write(&cert_file, &cert_pem).unwrap();
+        std::fs::write(&key_file, &key_pem).unwrap();
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"h3".to_vec()])
+                .unwrap();
+        (TlsAcceptorManager::new(server_config), cert_pem, temp_dir)
+    }
+
+    async fn connect_doh3_with_alpn(
+        actual_addr: SocketAddr,
+        cert_pem: &str,
+        alpn: Vec<Vec<u8>>,
+    ) -> Result<(quinn::Endpoint, quinn::Connection), quinn::ConnectionError> {
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
+        root_store.add(cert_der).unwrap();
+
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        client_tls.alpn_protocols = alpn;
+
+        let quic_client_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap();
+        let client_cfg = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client_cfg);
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await?;
+        Ok((client_endpoint, conn))
+    }
+
+    /// P2-17: an active HTTP/3 connection must be closed at its configured
+    /// lifetime instead of being held open by ongoing traffic.
+    #[tokio::test]
+    async fn test_doh3_connection_lifetime_closes_active_connection() {
+        let (acceptor_mgr, cert_pem, temp_dir) = doh3_test_acceptor("lifetime");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            Some(resp)
+        });
+
+        let config = Doh3Config::new(actual_addr, Some(acceptor_mgr));
+        let _handle = start_doh3_listener_with_limits(
+            config,
+            handler,
+            shutdown_rx,
+            Doh3Limits {
+                connection_lifetime: Duration::from_millis(200),
+                ..Doh3Limits::default()
+            },
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (_client_endpoint, conn) =
+            connect_doh3_with_alpn(actual_addr, &cert_pem, vec![b"h3".to_vec()])
+                .await
+                .unwrap();
+        // Keep the connection active with an open bidirectional stream.
+        let _open_stream = conn.open_bi().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), conn.closed())
+            .await
+            .expect("an active DoH3 connection must be closed at the configured lifetime");
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P2-18: DoH3 requires the `h3` ALPN. A mismatched or missing ALPN must
+    /// not complete the QUIC handshake.
+    #[tokio::test]
+    async fn test_doh3_alpn_mismatch_and_missing_alpn_are_rejected() {
+        let (acceptor_mgr, cert_pem, temp_dir) = doh3_test_acceptor("alpn");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|_query: Message, _client: ClientContext| async move { None });
+        let config = Doh3Config::new(actual_addr, Some(acceptor_mgr));
+        let _handle = start_doh3_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mismatched =
+            connect_doh3_with_alpn(actual_addr, &cert_pem, vec![b"doq".to_vec()]).await;
+        assert!(
+            mismatched.is_err(),
+            "a DoH3 listener must reject a client that offers only doq"
+        );
+
+        let missing = connect_doh3_with_alpn(actual_addr, &cert_pem, Vec::new()).await;
+        assert!(
+            missing.is_err(),
+            "QUIC requires ALPN; a client offering no protocol must be rejected"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// P2-21: shutdown closes the endpoint and awaits connection tasks even
+    /// while an active connection/stream is open.
+    #[tokio::test]
+    async fn test_doh3_shutdown_awaits_connection_tasks() {
+        let (acceptor_mgr, cert_pem, temp_dir) = doh3_test_acceptor("shutdown_await");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let handler = Arc::new(|_query: Message, _client: ClientContext| async move { None });
+        let config = Doh3Config::new(actual_addr, Some(acceptor_mgr));
+        let handle = start_doh3_listener(config, handler, shutdown_rx)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (_client_endpoint, conn) =
+            connect_doh3_with_alpn(actual_addr, &cert_pem, vec![b"h3".to_vec()])
+                .await
+                .unwrap();
+        let (_send, _recv) = conn.open_bi().await.unwrap();
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("the DoH3 listener must await its connection tasks on shutdown")
+            .expect("the DoH3 listener task panicked");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Form-urlencoded `dns` decoding matches the DoH (axum) path: `+` is a
+    /// space, percent-escaped keys/values decode, the last duplicate wins, and
+    /// values containing `=` are not truncated.
     #[test]
     fn test_doh3_get_dns_param_decoding_matches_doh() {
         assert_eq!(decode_dns_query_param("dns=abc"), Some("abc".to_string()));

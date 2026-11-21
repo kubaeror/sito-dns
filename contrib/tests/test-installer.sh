@@ -70,6 +70,9 @@ write_fake_systemctl() {
     cat >"${SANDBOX}/bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >>"${FAKE_SYSTEMCTL_LOG}"
+if [ -n "${FAKE_EVENT_LOG:-}" ]; then
+    echo "systemctl $*" >>"${FAKE_EVENT_LOG}"
+fi
 case "${1:-}" in
     is-active)
         [ "${FAKE_SYSTEMCTL_ACTIVE:-1}" = "1" ]
@@ -127,9 +130,31 @@ if [ "${FAKE_CP_ETXTBSY:-0}" = "1" ] && [ "${dest}" = "${FAKE_CP_EXECUTABLE:-}" 
     echo "cp: cannot create regular file '${dest}': Text file busy" >&2
     exit 1
 fi
+if [ -n "${FAKE_EVENT_LOG:-}" ] && [ -n "${dest}" ]; then
+    echo "cp ${dest}" >>"${FAKE_EVENT_LOG}"
+fi
 exec /bin/cp "$@"
 SH
     chmod +x "${SANDBOX}/bin/cp"
+}
+
+# Fake capability tools: setcap success/failure is controllable and getcap
+# reports the expected capability so the installer's verification path runs.
+write_fake_setcap() {
+    cat >"${SANDBOX}/bin/setcap" <<'SH'
+#!/usr/bin/env bash
+echo "$*" >>"${FAKE_SETCAP_LOG}"
+exit "${FAKE_SETCAP_RC:-0}"
+SH
+    cat >"${SANDBOX}/bin/getcap" <<'SH'
+#!/usr/bin/env bash
+echo "$*" >>"${FAKE_GETCAP_LOG}"
+if [ "${FAKE_GETCAP_EMPTY:-0}" = "1" ]; then
+    exit 0
+fi
+echo "${1:-} cap_net_bind_service=ep"
+SH
+    chmod +x "${SANDBOX}/bin/setcap" "${SANDBOX}/bin/getcap"
 }
 
 reset_sandbox() {
@@ -143,9 +168,13 @@ reset_sandbox() {
         "${SANDBOX}/work/target/release" \
         "${SANDBOX}/logs"
     : >"${SANDBOX}/logs/systemctl.log"
+    : >"${SANDBOX}/logs/events.log"
+    : >"${SANDBOX}/logs/setcap.log"
+    : >"${SANDBOX}/logs/getcap.log"
     write_fake_systemctl
     write_fake_cp
     write_fake_install
+    write_fake_setcap
 }
 
 run_installer() {
@@ -162,10 +191,16 @@ run_installer() {
             SITO_ALLOW_NON_ROOT=1 \
             SITO_INSTALL_BIN="${SANDBOX}/install/sito" \
             SITO_SERVICE_PATH="${SANDBOX}/systemd/sito.service" \
-            SITO_SYSTEMCTL="${SANDBOX}/bin/systemctl" \
+            SITO_SYSTEMCTL="${SITO_SYSTEMCTL_FOR_TEST:-${SANDBOX}/bin/systemctl}" \
             SITO_CONFIG_DIR="${SANDBOX}/etc/sito" \
             SITO_DATA_DIR="${SANDBOX}/var/lib/sito" \
             SITO_INSTALL_COSIGN="${SITO_INSTALL_COSIGN_FOR_TEST:-0}" \
+            SITO_INSTALL_COSIGN_BIN="${SANDBOX}/install/cosign" \
+            FAKE_EVENT_LOG="${SANDBOX}/logs/events.log" \
+            FAKE_SETCAP_LOG="${SANDBOX}/logs/setcap.log" \
+            FAKE_GETCAP_LOG="${SANDBOX}/logs/getcap.log" \
+            FAKE_SETCAP_RC="${FAKE_SETCAP_RC:-0}" \
+            FAKE_GETCAP_EMPTY="${FAKE_GETCAP_EMPTY:-0}" \
             FAKE_SYSTEMCTL_LOG="${SANDBOX}/logs/systemctl.log" \
             FAKE_SYSTEMCTL_ACTIVE="${FAKE_SYSTEMCTL_ACTIVE:-1}" \
             FAKE_SYSTEMCTL_START_EXEC="${FAKE_SYSTEMCTL_START_EXEC:-0}" \
@@ -196,6 +231,11 @@ assert_file_exists "${SANDBOX}/systemd/sito.service"
 assert_eq "sito 1.9.3" "$(installed_version)" "fresh install binary version"
 grep -q 'enable sito' "${SANDBOX}/logs/systemctl.log" || fail "fresh install did not enable the service"
 grep -q 'start sito' "${SANDBOX}/logs/systemctl.log" || fail "fresh install did not start the service"
+assert_file_exists "${SANDBOX}/etc/sito/sito.env"
+assert_eq "600" "$(stat -c '%a' "${SANDBOX}/etc/sito/sito.env")" "fresh install env file mode"
+printf 'RUST_LOG=info\n' >"${SANDBOX}/etc/sito/sito.env"
+grep -q 'cap_net_bind_service=+ep' "${SANDBOX}/logs/setcap.log" || fail "installer did not set cap_net_bind_service"
+grep -q "${SANDBOX}/install/sito" "${SANDBOX}/logs/getcap.log" || fail "installer did not verify capabilities with getcap"
 
 # Hold the installed inode open as an executing process. A `cp -f` replacement
 # now fails with ETXTBSY; the atomic rename must succeed and leave the running
@@ -205,12 +245,21 @@ HOLD_PID=$!
 sleep 0.3
 kill -0 "${HOLD_PID}" 2>/dev/null || fail "could not start the held binary"
 
+printf '[dns]\nport = 0\n[web]\nenabled = false\n' >"${SANDBOX}/etc/sito/config.toml"
 write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.4"
 : >"${SANDBOX}/logs/systemctl.log"
+: >"${SANDBOX}/logs/events.log"
 FAKE_CP_ETXTBSY=1 SITO_VERSION_FOR_TEST=1.9.4 run_installer >"${INSTALLER_OUT}" 2>&1 || \
     fail "live upgrade failed while the old binary was executing"
 assert_eq "sito 1.9.4" "$(installed_version)" "upgraded binary version"
+assert_eq "RUST_LOG=info" "$(cat "${SANDBOX}/etc/sito/sito.env")" "upgrade must preserve sito.env"
 grep -q 'stop sito' "${SANDBOX}/logs/systemctl.log" || fail "upgrade did not stop the service before replacing the binary"
+assert_file_exists "${SANDBOX}/etc/sito/config.toml.bak"
+stop_line="$(grep -n 'systemctl stop sito' "${SANDBOX}/logs/events.log" | head -n 1 | cut -d: -f1)"
+backup_line="$(grep -n 'cp .*config.toml.bak' "${SANDBOX}/logs/events.log" | head -n 1 | cut -d: -f1)"
+[ -n "${stop_line}" ] || fail "upgrade did not log the service stop"
+[ -n "${backup_line}" ] || fail "upgrade did not back up config.toml"
+[ "${stop_line}" -lt "${backup_line}" ] || fail "config backup ran before the service was stopped"
 kill -0 "${HOLD_PID}" 2>/dev/null || fail "upgrade killed the previously executing process"
 kill "${HOLD_PID}" 2>/dev/null || true
 HOLD_PID=""
@@ -246,6 +295,9 @@ cmp -s "${TMP}/config.before" "${SANDBOX}/etc/sito/config.toml" || fail "rollbac
 if grep -q 'mutated by simulated startup migration' "${SANDBOX}/etc/sito/config.toml"; then
     fail "rollback left the startup-migration marker in the live config"
 fi
+if compgen -G "${SANDBOX}/etc/sito/.sito-config-restore.*" >/dev/null; then
+    fail "rollback leaked an atomic config-restore temp file"
+fi
 kill "${HOLD_PID}" 2>/dev/null || true
 HOLD_PID=""
 
@@ -269,11 +321,49 @@ assert_eq "sito 1.9.3" "$(installed_version)" "failed install left the previous 
 run_installer --uninstall >"${INSTALLER_OUT}" 2>&1 || fail "uninstall failed"
 assert_file_missing "${SANDBOX}/install/sito"
 assert_file_missing "${SANDBOX}/install/sito.bak"
+assert_file_missing "${SANDBOX}/etc/sito/config.toml.bak"
 assert_file_missing "${SANDBOX}/systemd/sito.service"
 assert_file_exists "${SANDBOX}/etc/sito"
+assert_file_exists "${SANDBOX}/etc/sito/sito.env"
 assert_file_exists "${SANDBOX}/var/lib/sito"
 grep -q 'stop sito' "${SANDBOX}/logs/systemctl.log" || fail "uninstall did not stop the service"
 grep -q 'disable sito' "${SANDBOX}/logs/systemctl.log" || fail "uninstall did not disable the service"
+
+# ---------------------------------------------------------------------------
+# Capability failures are visible
+# ---------------------------------------------------------------------------
+reset_sandbox
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.3"
+if ! FAKE_SETCAP_RC=1 SITO_VERSION_FOR_TEST=1.9.3 run_installer >"${INSTALLER_OUT}" 2>&1; then
+    fail "a setcap failure aborted the install instead of warning"
+fi
+grep -q 'failed to set cap_net_bind_service' "${INSTALLER_OUT}" || \
+    fail "setcap failure did not produce a visible warning"
+
+reset_sandbox
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.3"
+if ! FAKE_GETCAP_EMPTY=1 SITO_VERSION_FOR_TEST=1.9.3 run_installer >"${INSTALLER_OUT}" 2>&1; then
+    fail "a getcap verification mismatch aborted the install instead of warning"
+fi
+grep -q 'getcap did not report cap_net_bind_service' "${INSTALLER_OUT}" || \
+    fail "getcap verification mismatch did not produce a visible warning"
+
+# ---------------------------------------------------------------------------
+# No systemd: warn, and still remove the unit on uninstall
+# ---------------------------------------------------------------------------
+reset_sandbox
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.3"
+if ! SITO_SYSTEMCTL_FOR_TEST=/nonexistent/systemctl \
+    SITO_VERSION_FOR_TEST=1.9.3 run_installer >"${INSTALLER_OUT}" 2>&1; then
+    fail "install without systemd failed instead of warning"
+fi
+grep -q 'systemd is not available' "${INSTALLER_OUT}" || fail "missing systemd warning was not printed"
+assert_file_exists "${SANDBOX}/install/sito"
+# A stale unit must be removed even when systemctl cannot run.
+: >"${SANDBOX}/systemd/sito.service"
+SITO_SYSTEMCTL_FOR_TEST=/nonexistent/systemctl run_installer --uninstall >"${INSTALLER_OUT}" 2>&1 || \
+    fail "uninstall without systemd failed"
+assert_file_missing "${SANDBOX}/systemd/sito.service"
 
 # ---------------------------------------------------------------------------
 # Signature policy
@@ -313,6 +403,9 @@ case "${name}" in
         ;;
     *.pem)
         [ "${FAKE_CURL_MISSING_PEM:-0}" = "1" ] && exit 22
+        cp "${FAKE_RELEASE_DIR}/${name}" "${out}"
+        ;;
+    cosign-linux-* | cosign_checksums.txt)
         cp "${FAKE_RELEASE_DIR}/${name}" "${out}"
         ;;
     *) exit 22 ;;
@@ -359,6 +452,52 @@ release_install_env() {
     SITO_VERSION_FOR_TEST=1.9.4
     SITO_INSTALL_COSIGN_FOR_TEST=0
 }
+
+# ---------------------------------------------------------------------------
+# cosign ownership marker
+# ---------------------------------------------------------------------------
+make_cosign_assets() {
+    local arch asset
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64 | amd64) asset="cosign-linux-amd64" ;;
+        aarch64 | arm64) asset="cosign-linux-arm64" ;;
+        armv7* | armhf) asset="cosign-linux-arm" ;;
+        *) fail "unsupported test architecture ${arch}" ;;
+    esac
+    printf '#!/bin/sh\nexit 0\n' >"${SANDBOX}/release/${asset}"
+    chmod +x "${SANDBOX}/release/${asset}"
+    (
+        cd "${SANDBOX}/release"
+        sha256sum "${asset}" >cosign_checksums.txt
+    )
+}
+
+reset_sandbox
+make_release_assets
+make_cosign_assets
+write_fake_curl
+release_install_env
+if ! SITO_INSTALL_COSIGN_FOR_TEST=1 FAKE_CURL_MISSING_SIG=1 SIGNATURE_POLICY=0 \
+    run_installer >"${INSTALLER_OUT}" 2>&1; then
+    fail "installer-managed cosign install failed"
+fi
+assert_file_exists "${SANDBOX}/install/cosign"
+assert_file_exists "${SANDBOX}/install/cosign.installed-by-sito"
+run_installer --uninstall >"${INSTALLER_OUT}" 2>&1 || fail "uninstall after cosign install failed"
+assert_file_missing "${SANDBOX}/install/cosign"
+assert_file_missing "${SANDBOX}/install/cosign.installed-by-sito"
+
+# A pre-existing, unmarked cosign belongs to the user and must survive.
+reset_sandbox
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.3"
+SITO_INSTALL_LOCAL_BINARY_FOR_TEST=1 SITO_VERSION_FOR_TEST=1.9.3 \
+    run_installer >"${INSTALLER_OUT}" 2>&1 || fail "pre-existing cosign setup failed"
+printf 'user cosign\n' >"${SANDBOX}/install/cosign"
+chmod +x "${SANDBOX}/install/cosign"
+run_installer --uninstall >"${INSTALLER_OUT}" 2>&1 || fail "uninstall with pre-existing cosign failed"
+assert_file_exists "${SANDBOX}/install/cosign"
+grep -q 'Keeping pre-existing cosign' "${INSTALLER_OUT}" || fail "uninstall did not report keeping a user cosign"
 
 # Required by default: a missing verifier fails closed.
 reset_sandbox

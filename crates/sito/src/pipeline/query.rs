@@ -9,6 +9,10 @@ use super::*;
 /// The fetcher performs network I/O and an upstream can stall a response (or
 /// an attacker can black-hole DS/DNSKEY queries). A bound here keeps one query
 /// from pinning a worker for the upstream timeout times the chain depth.
+///
+/// Keep this in sync with `DEFAULT_KEY_FETCH_DEADLINE` in `sito-dnssec`
+/// (`crates/sito-dnssec/src/lib.rs`): both are 5s, and the compatibility
+/// wrapper relies on the same bound as this pipeline.
 pub(super) const DNSSEC_VALIDATION_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(5);
 
@@ -32,9 +36,10 @@ pub(super) async fn validate_dnssec_with_deadline(
     // unvalidated helper records cannot leak to the client (or into a log-only
     // cached response).
     let original_additionals = response.additionals.len();
-    if let Ok(outcome) = tokio::time::timeout(
-        deadline,
-        validator.validate_with_key_fetcher(response, upstream, now, fetcher),
+    let deadline_at = std::time::Instant::now() + deadline;
+    if let Ok(outcome) = tokio::time::timeout_at(
+        tokio::time::Instant::from(deadline_at),
+        validator.validate_with_key_fetcher_deadline(response, upstream, now, fetcher, deadline_at),
     )
     .await
     {
@@ -173,6 +178,12 @@ pub(super) fn build_upstream_query(
 }
 
 /// Maps a DNSSEC validation outcome onto the status stored in the cache.
+///
+/// Strict-mode Bogus is handled before this mapping: it is a SERVFAIL and is
+/// stored through `insert_validation_failure_at_epochs` as
+/// [`ValidationStatus::Bogus`]. Every other Bogus occurrence is log-only, where
+/// the answer is kept with AD=0 and must remain unservable as
+/// [`ValidationStatus::Indeterminate`].
 pub(super) fn validation_status(
     outcome: Option<&sito_dnssec::ValidationOutcome>,
 ) -> ValidationStatus {
@@ -194,15 +205,16 @@ pub(super) fn validation_status(
 /// `Unchecked` entries (CD=1 / validation disabled) must never be served when
 /// a CD=0 query expects the resolver to have validated the answer.
 /// `Indeterminate` is not an authenticated decision either: in log-only mode a
-/// Bogus result is recorded that way, and strict mode answers it with SERVFAIL
-/// rather than serving the data. Only an authenticated `Secure`/`Insecure`
-/// decision may be served; both are returned with AD cleared when not
-/// `Secure`.
+/// Bogus result is recorded that way. A cached `Bogus` entry is different: it
+/// is a fail-closed SERVFAIL with no answer data, so serving it is safe and
+/// avoids re-querying an upstream that already produced a Bogus answer. Only
+/// an authenticated `Secure`/`Insecure` decision may be served with data; both
+/// are returned with AD cleared when not `Secure`.
 pub(super) fn cache_entry_servable(status: ValidationStatus, validation_active: bool) -> bool {
     !validation_active
         || matches!(
             status,
-            ValidationStatus::Secure | ValidationStatus::Insecure
+            ValidationStatus::Secure | ValidationStatus::Insecure | ValidationStatus::Bogus
         )
 }
 
@@ -210,11 +222,20 @@ pub(super) fn cache_entry_servable(status: ValidationStatus, validation_active: 
 /// active.
 ///
 /// Stale answers are not revalidated, so only authenticated cache decisions
-/// (`Secure`/`Insecure`) may be served. An `Indeterminate` entry is
-/// inconclusive by definition — in log-only mode even Bogus data is recorded
-/// that way — and `Unchecked` means no local validation ran at all. Neither
-/// may be handed to a CD=0 client that relies on the resolver. Stale answers
-/// are always sanitized to AD=0 before they leave the cache.
+/// (`Secure`/`Insecure`) may be served. A `Bogus` entry is a fail-closed
+/// SERVFAIL and is never reused from the stale path **while validation is
+/// active**; an `Indeterminate` entry is inconclusive by definition — in
+/// log-only mode even Bogus data is recorded that way — and `Unchecked` means
+/// no local validation ran at all. Neither may be handed to a CD=0 client that
+/// relies on the resolver. Stale answers are always sanitized to AD=0 before
+/// they leave the cache.
+///
+/// The status-less stale getters enforce the same rule without a gate:
+/// `get_stale`/`get_stale_for_query` hide `Bogus`/`Indeterminate` entries, and
+/// only the status-aware `get_stale_for_query_with_status` exposes them.
+/// When local validation is inactive, this gate allows every status, so a
+/// cached `Bogus` entry may still be served — but only as its fail-closed
+/// SERVFAIL, never as answer data.
 pub(super) fn stale_cache_entry_servable(
     status: ValidationStatus,
     validation_active: bool,

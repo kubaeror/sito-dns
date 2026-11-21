@@ -73,6 +73,10 @@ expect_job_match "${RELEASE}" "release-gate" 'checks: read' "release-gate job ca
 expect_job_match "${RELEASE}" "release-gate" 'statuses: read' "release-gate job can read legacy statuses"
 expect_job_absent "${RELEASE}" "release-gate" 'continue-on-error' "release-gate cannot continue on error"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate\]' "build job depends on the release gate"
+expect_absent "${RELEASE}" 'test-hooks' "release workflow never enables test hooks"
+expect_absent "${RELEASE}" '--all-features' "release workflow never builds with all features"
+expect_absent "${ROOT}/Dockerfile" 'test-hooks' "release image never enables test hooks"
+expect_absent "${ROOT}/Dockerfile" '--all-features' "release image never builds with all features"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate, build-binaries\]' "publish job depends on the release gate"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate, build-binaries, sbom-and-release, artifact-e2e\]' "image job depends on the release gate"
 
@@ -105,6 +109,10 @@ expect_job_absent "${RELEASE}" "docker-build-push" 'continue-on-error' "image sc
 expect_match "${CI}" 'branches: \[main, release/1\.9\.x\]' "CI runs on the release branch"
 expect_match "${SECURITY}" 'branches: \[main, release/1\.9\.x\]' "security runs on the release branch"
 expect_match "${CI}" 'bash contrib/tests/test-installer\.sh' "CI runs the installer E2E"
+expect_job_match "${RELEASE}" "build-binaries" 'cp contrib/install\.sh "\$\{ARCHIVE_DIR\}/contrib/"' "release archive ships contrib/install.sh"
+expect_job_match "${RELEASE}" "build-binaries" 'cp contrib/systemd/sito\.service' "release archive ships contrib/systemd/sito.service"
+expect_match "${ARTIFACT_E2E}" 'contrib/install\.sh' "artifact E2E checks the archived installer"
+expect_match "${ARTIFACT_E2E}" 'contrib/systemd/sito\.service' "artifact E2E checks the archived systemd unit"
 expect_match "${CI}" "needs.changes.outputs.workflows == 'true'" "contrib job runs when workflows change"
 
 # WP-1.9: the long fuzz/benchmark runs stay out of PR CI, but their structural

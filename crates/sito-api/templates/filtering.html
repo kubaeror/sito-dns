@@ -107,7 +107,7 @@
     <span class="badge badge-neutral">built-in (minimal)</span>
   </div>
   <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 16px;">
-    Versioned fallback data for parental controls and service blocking, verified against the bundled manifest at startup. Subscribe to a full blocklist above for broader coverage.
+    Minimal built-in fallback for parental controls and service blocking, verified against the bundled manifest at startup. This is not a maintained external dataset and covers common providers only; subscribe to a full blocklist above or configure <code>[integrations.lists]</code> for broader coverage.
   </p>
   <div class="table-container">
     <table>
@@ -131,15 +131,31 @@
           <td>
             {{ list.state }}
             <div style="font-size: 0.75rem; color: var(--text-muted);">Last refresh: {{ list.last_refresh }}</div>
+            {% if list.last_attempt != "—" %}
+            <div style="font-size: 0.75rem; color: var(--text-muted);">Last attempt: {{ list.last_attempt }}</div>
+            {% endif %}
+            {% if let Some(error) = list.last_error %}
+            <div style="font-size: 0.75rem; color: var(--danger, #dc2626);">Last error: {{ error }}</div>
+            {% endif %}
           </td>
           <td class="mono" style="font-size: 0.8rem; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+            {% if list.source == "***" %}
+            {{ list.source }}
+            {% else %}
             <a href="{{ list.source }}" target="_blank" rel="noopener">{{ list.source }}</a>
+            {% endif %}
           </td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 12px;">
+    Categories configured under <code>[integrations.lists]</code> refresh on their
+    schedule. Operators can force an immediate refresh of one category with
+    <code>POST /api/v1/integrations/lists/{category}/refresh</code>; the web UI
+    has no separate refresh button.
+  </p>
 </div>
 
 <!-- Custom Rules & Simulation -->

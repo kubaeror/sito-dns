@@ -41,7 +41,6 @@ pub(crate) async fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewI
             address: addr_str.clone(),
             protocol: proto.to_string(),
             is_healthy,
-            weight: 100,
             total_queries: total_queries.max(0) as u64,
             avg_latency_ms,
         });

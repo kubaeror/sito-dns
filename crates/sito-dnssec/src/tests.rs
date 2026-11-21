@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use super::chain::TrustChain;
 use super::test_util::*;
 use super::*;
 use hickory_proto::op::{MessageType, OpCode, Query};
@@ -8,7 +9,7 @@ use hickory_proto::rr::RecordType;
 use hickory_proto::rr::rdata::A;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn test_dnssec_secure_validation() {
@@ -169,6 +170,7 @@ use sito_core::error::UpstreamError;
 struct StaticFetcher {
     responses: std::collections::HashMap<(LowerName, RecordType), Message>,
     calls: std::sync::atomic::AtomicUsize,
+    seen: std::sync::Mutex<Vec<(LowerName, RecordType, Instant)>>,
 }
 
 impl StaticFetcher {
@@ -176,6 +178,7 @@ impl StaticFetcher {
         Self {
             responses: std::collections::HashMap::new(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -188,12 +191,26 @@ impl StaticFetcher {
     fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Every `(name, rtype, deadline)` the fetcher was handed, in call order.
+    fn seen(&self) -> Vec<(LowerName, RecordType, Instant)> {
+        self.seen.lock().expect("fetch log").clone()
+    }
 }
 
 #[async_trait::async_trait]
 impl DnssecKeyFetcher for StaticFetcher {
-    async fn query(&self, name: &Name, rtype: RecordType) -> Result<Message, UpstreamError> {
+    async fn query(
+        &self,
+        name: &Name,
+        rtype: RecordType,
+        deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.seen
+            .lock()
+            .expect("fetch log")
+            .push((LowerName::from(name), rtype, deadline));
         Ok(self
             .responses
             .get(&(LowerName::from(name), rtype))
@@ -705,6 +722,196 @@ fn signed_optout_nxdomain(
     msg
 }
 
+/// Parts of an RFC 5155 §8.4 NSEC3 NXDOMAIN proof. Tests omit one part to
+/// prove the validator rejects an incomplete (never Secure) proof.
+#[derive(Clone, Copy, Debug)]
+enum Nsec3NxPart {
+    ClosestEncloser,
+    NextCloserCover,
+    WildcardCover,
+}
+
+/// Builds a signed NSEC3 NXDOMAIN response for `qname` directly below
+/// `origin`, including only the requested proof parts.
+fn signed_nsec3_nxdomain(
+    origin: &Name,
+    qname: &Name,
+    key: &DNSKEY,
+    signer: &hickory_proto::dnssec::DnssecSigner,
+    parts: &[Nsec3NxPart],
+    encloser_types: &[RecordType],
+) -> Message {
+    use data_encoding::BASE32_DNSSEC;
+    use hickory_proto::dnssec::Nsec3HashAlgorithm;
+    use hickory_proto::dnssec::rdata::NSEC3;
+    use hickory_proto::rr::RecordSet;
+
+    let alg = Nsec3HashAlgorithm::SHA1;
+    let hash = |name: &Name| alg.hash(&[], name, 0).expect("hash").as_ref().to_vec();
+    let step = |bytes: &[u8], up: bool| {
+        let mut out = bytes.to_vec();
+        for byte in out.iter_mut().rev() {
+            if up {
+                *byte = byte.wrapping_add(1);
+                if *byte != 0 {
+                    break;
+                }
+            } else {
+                *byte = byte.wrapping_sub(1);
+                if *byte != u8::MAX {
+                    break;
+                }
+            }
+        }
+        out
+    };
+
+    let mut message = Message::new(27, MessageType::Response, OpCode::Query);
+    message
+        .queries
+        .push(Query::query(qname.clone(), RecordType::A));
+    message.metadata.response_code = ResponseCode::NXDomain;
+
+    let mut push = |owner_hash: &[u8], next_hash: Vec<u8>, types: &[RecordType]| {
+        let nsec3 = NSEC3::new(alg, false, 0, Vec::new(), next_hash, types.iter().copied());
+        let owner = Name::from_ascii(format!(
+            "{}.{}",
+            BASE32_DNSSEC.encode(owner_hash),
+            origin.to_ascii()
+        ))
+        .expect("NSEC3 owner");
+        let record =
+            Record::from_rdata(owner.clone(), 300, RData::DNSSEC(DNSSECRData::NSEC3(nsec3)));
+        let mut set = RecordSet::new(owner, RecordType::NSEC3, 0);
+        set.insert(record.clone(), 0);
+        message.authorities.push(record);
+        message.authorities.push(sign_test_rrset(&set, signer));
+    };
+
+    for part in parts {
+        let types = [RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3];
+        match part {
+            Nsec3NxPart::ClosestEncloser => {
+                let encloser = hash(origin);
+                push(&encloser, step(&encloser, true), encloser_types);
+            }
+            Nsec3NxPart::NextCloserCover => {
+                let next_closer = hash(qname);
+                push(&step(&next_closer, false), step(&next_closer, true), &types);
+            }
+            Nsec3NxPart::WildcardCover => {
+                let wildcard =
+                    Name::from_ascii(format!("*.{}", origin.to_ascii())).expect("wildcard");
+                let wildcard_hash = hash(&wildcard);
+                push(
+                    &step(&wildcard_hash, false),
+                    step(&wildcard_hash, true),
+                    &types,
+                );
+            }
+        }
+    }
+
+    message.additionals.push(Record::from_rdata(
+        origin.clone(),
+        300,
+        RData::DNSSEC(DNSSECRData::DNSKEY(key.clone())),
+    ));
+    message
+}
+
+fn nsec3_nxdomain_validator(origin: &Name, key: &DNSKEY) -> DnssecValidator {
+    let mut anchors = TrustAnchors::empty();
+    anchors.insert_with_name(key.public_key(), LowerName::from(origin));
+    DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors)
+}
+
+/// Asserts that an NSEC3 NXDOMAIN proof built from `parts` is rejected by the
+/// full validation path (Bogus/SERVFAIL), never served as Secure.
+fn assert_nsec3_nxdomain_rejected(parts: &[Nsec3NxPart], encloser_types: &[RecordType]) {
+    let (origin, dnskey, signer) = create_test_signer("example.");
+    let qname = Name::from_str("missing.example.").unwrap();
+    let validator = nsec3_nxdomain_validator(&origin, &dnskey);
+    let mut msg = signed_nsec3_nxdomain(&origin, &qname, &dnskey, &signer, parts, encloser_types);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    let outcome = validator.validate_response(&mut msg, Some("nsec3"), now);
+    assert!(
+        matches!(outcome, ValidationOutcome::Bogus { .. }),
+        "an incomplete NSEC3 NXDOMAIN proof must be Bogus: {outcome:?}"
+    );
+    assert_eq!(msg.metadata.response_code, ResponseCode::ServFail);
+    assert!(!msg.metadata.authentic_data);
+}
+
+#[test]
+fn test_nsec3_nxdomain_complete_proof_is_secure() {
+    let (origin, dnskey, signer) = create_test_signer("example.");
+    let qname = Name::from_str("missing.example.").unwrap();
+    let validator = nsec3_nxdomain_validator(&origin, &dnskey);
+    let mut msg = signed_nsec3_nxdomain(
+        &origin,
+        &qname,
+        &dnskey,
+        &signer,
+        &[
+            Nsec3NxPart::ClosestEncloser,
+            Nsec3NxPart::NextCloserCover,
+            Nsec3NxPart::WildcardCover,
+        ],
+        &[RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3],
+    );
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    let outcome = validator.validate_response(&mut msg, Some("nsec3"), now);
+    assert_eq!(outcome, ValidationOutcome::Secure);
+    assert!(msg.metadata.authentic_data);
+}
+
+#[test]
+fn test_nsec3_nxdomain_missing_closest_encloser_is_bogus() {
+    // RFC 5155 §8.3: without an exact-match NSEC3 for the closest encloser
+    // there is no proof at all.
+    assert_nsec3_nxdomain_rejected(
+        &[Nsec3NxPart::NextCloserCover, Nsec3NxPart::WildcardCover],
+        &[RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3],
+    );
+}
+
+#[test]
+fn test_nsec3_nxdomain_missing_next_closer_cover_is_bogus() {
+    // RFC 5155 §8.3: the closest encloser does not deny the next closer name
+    // without a covering NSEC3.
+    assert_nsec3_nxdomain_rejected(
+        &[Nsec3NxPart::ClosestEncloser, Nsec3NxPart::WildcardCover],
+        &[RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3],
+    );
+}
+
+#[test]
+fn test_nsec3_nxdomain_missing_wildcard_cover_is_bogus() {
+    // RFC 5155 §8.4: without a wildcard denial the name could have been
+    // synthesized from a wildcard.
+    assert_nsec3_nxdomain_rejected(
+        &[Nsec3NxPart::ClosestEncloser, Nsec3NxPart::NextCloserCover],
+        &[RecordType::SOA, RecordType::RRSIG, RecordType::NSEC3],
+    );
+}
+
+#[test]
+fn test_nsec3_nxdomain_closest_encloser_without_soa_is_bogus() {
+    // RFC 5155 §7.1: the apex NSEC3 must carry the SOA bit. A closest-encloser
+    // bitmap that does not describe the apex must not complete the proof.
+    assert_nsec3_nxdomain_rejected(
+        &[
+            Nsec3NxPart::ClosestEncloser,
+            Nsec3NxPart::NextCloserCover,
+            Nsec3NxPart::WildcardCover,
+        ],
+        &[RecordType::A, RecordType::RRSIG],
+    );
+}
+
 #[test]
 fn test_nxdomain_optout_nsec3_is_insecure() {
     let (origin, dnskey, signer) = create_test_signer("example.");
@@ -957,6 +1164,297 @@ async fn test_chain_fetch_resolves_ds_delegation() {
     assert_eq!(outcome, ValidationOutcome::Secure);
     assert!(response.metadata.authentic_data);
     assert_eq!(fetcher.calls(), 3);
+    assert!(
+        response.additionals.is_empty(),
+        "unexpected additionals: {:?}",
+        response.additionals
+    );
+}
+
+#[tokio::test]
+async fn test_chain_fetch_passes_budget_deadline_to_fetches() {
+    use hickory_proto::dnssec::DigestType;
+    use hickory_proto::rr::RecordSet;
+
+    let (parent, parent_key, parent_signer) = create_test_signer("example.");
+    let (child, child_key, child_signer) = create_test_signer("sub.example.");
+
+    let (answer, answer_sig) = signed_a_response(&child, &child_signer);
+
+    let ds = DS::from_key(child_key.public_key(), &child, DigestType::SHA256).unwrap();
+    let ds_record = Record::from_rdata(child.clone(), 300, RData::DNSSEC(DNSSECRData::DS(ds)));
+    let mut ds_set = RecordSet::new(child.clone(), RecordType::DS, 0);
+    ds_set.insert(ds_record.clone(), 0);
+    let ds_sig = sign_test_rrset(&ds_set, &parent_signer);
+    let mut ds_message = Message::new(0, MessageType::Response, OpCode::Query);
+    ds_message.authorities.push(ds_record);
+    ds_message.authorities.push(ds_sig);
+
+    let fetcher = StaticFetcher::new()
+        .with(
+            &child,
+            RecordType::DNSKEY,
+            fetched_dnskey_message(&child, &[child_key], None),
+        )
+        .with(&child, RecordType::DS, ds_message)
+        .with(
+            &parent,
+            RecordType::DNSKEY,
+            fetched_dnskey_message(&parent, std::slice::from_ref(&parent_key), None),
+        );
+
+    let mut anchors = TrustAnchors::empty();
+    anchors.insert_with_name(parent_key.public_key(), LowerName::from(&parent));
+    let validator =
+        DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(anchors);
+
+    let mut response = Message::new(23, MessageType::Response, OpCode::Query);
+    response
+        .queries
+        .push(Query::query(child.clone(), RecordType::A));
+    response.answers.push(answer);
+    response.answers.push(answer_sig);
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcome = validator
+        .validate_with_key_fetcher_deadline(&mut response, Some("test"), now, &fetcher, deadline)
+        .await;
+
+    assert_eq!(outcome, ValidationOutcome::Secure);
+    let seen = fetcher.seen();
+    assert!(
+        seen.len() >= 2,
+        "the chain walk must issue at least two fetches: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|(_, rtype, _)| *rtype == RecordType::DNSKEY),
+        "the chain walk must fetch a DNSKEY RRset: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|(_, rtype, _)| *rtype == RecordType::DS),
+        "the chain walk must fetch a DS RRset: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .all(|(_, _, seen_deadline)| *seen_deadline == deadline),
+        "fetch_zone_chain must pass budget.deadline() to every fetch: {seen:?}"
+    );
+}
+
+#[test]
+fn test_fetch_budget_rejects_after_deadline_or_exhaustion() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut budget = FetchBudget::new(2, deadline);
+    assert_eq!(budget.deadline(), deadline);
+    assert!(budget.try_take());
+    assert!(budget.try_take());
+    assert!(
+        !budget.try_take(),
+        "an exhausted budget must reject further fetches"
+    );
+
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("clock arithmetic");
+    let mut budget = FetchBudget::new(3, expired);
+    assert!(budget.is_expired(), "a past deadline must be expired");
+    assert_eq!(budget.deadline(), expired);
+    assert!(
+        !budget.try_take(),
+        "an expired budget must reject fetches even with budget left"
+    );
+    assert!(
+        budget.is_expired(),
+        "the expiry check must not depend on consuming budget"
+    );
+}
+
+/// A denial must be attributed to exactly one cause: count exhaustion or the
+/// absolute deadline. The other counter must stay untouched so operators can
+/// tell a too-small budget from a stalled upstream.
+#[test]
+fn test_fetch_budget_denials_record_matching_metric() {
+    let metrics = Arc::new(DnssecMetrics::new());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut budget = FetchBudget::with_metrics(1, deadline, Arc::clone(&metrics));
+    assert!(budget.try_take());
+    assert!(
+        !budget.try_take(),
+        "the count budget must reject the second fetch"
+    );
+    assert_eq!(metrics.fetch_budget_exhausted(), 1);
+    assert_eq!(metrics.fetch_deadline_exceeded(), 0);
+
+    let metrics = Arc::new(DnssecMetrics::new());
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("clock arithmetic");
+    let mut budget = FetchBudget::with_metrics(3, expired, Arc::clone(&metrics));
+    assert!(
+        !budget.try_take(),
+        "an expired deadline must reject fetches even with budget left"
+    );
+    assert_eq!(metrics.fetch_deadline_exceeded(), 1);
+    assert_eq!(metrics.fetch_budget_exhausted(), 0);
+}
+
+/// The absolute deadline wins even when the count budget is also zero: the
+/// refusal must be attributed to the deadline, not to count exhaustion.
+#[test]
+fn test_fetch_budget_deadline_precedence_when_count_also_exhausted() {
+    let metrics = Arc::new(DnssecMetrics::new());
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("clock arithmetic");
+    let mut budget = FetchBudget::with_metrics(0, expired, Arc::clone(&metrics));
+
+    assert!(
+        !budget.try_take(),
+        "an expired deadline must reject fetches even with no count budget"
+    );
+    assert_eq!(metrics.fetch_deadline_exceeded(), 1);
+    assert_eq!(metrics.fetch_budget_exhausted(), 0);
+}
+
+/// A production-shaped [`TrustChain`] must attribute its refusals to the
+/// validator's metrics, not only to the local `FetchBudget`.
+#[tokio::test]
+async fn test_trust_chain_with_metrics_counts_exhausted_budget() {
+    let metrics = Arc::new(DnssecMetrics::new());
+    let validator = d05_validator(None);
+    let fetcher = StaticFetcher::new();
+    let mut chain = TrustChain::with_metrics(
+        Instant::now() + Duration::from_secs(60),
+        0,
+        Arc::clone(&metrics),
+    );
+
+    let mut response = Message::new(0, MessageType::Response, OpCode::Query);
+    let progressed = chain
+        .fetch_path(&validator, &fetcher, &Name::root(), &mut response)
+        .await;
+
+    assert!(
+        !progressed,
+        "an exhausted chain budget must not make progress"
+    );
+    assert_eq!(metrics.fetch_budget_exhausted(), 1);
+    assert_eq!(metrics.fetch_deadline_exceeded(), 0);
+    assert_eq!(
+        fetcher.calls(),
+        0,
+        "an exhausted budget must stop before any network fetch"
+    );
+}
+
+/// An already-expired deadline is refused at the walk's early `is_expired`
+/// guard, before `try_take` is reached. That early refusal is still a deadline
+/// refusal and must be visible as `fetch_deadline_exceeded`, with the count
+/// budget counter untouched.
+#[tokio::test]
+async fn test_trust_chain_with_metrics_counts_early_deadline_refusal() {
+    let metrics = Arc::new(DnssecMetrics::new());
+    let validator = d05_validator(None);
+    let fetcher = StaticFetcher::new();
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("clock arithmetic");
+    let mut chain = TrustChain::with_metrics(expired, MAX_FETCHES_PER_QUERY, Arc::clone(&metrics));
+
+    let mut response = Message::new(0, MessageType::Response, OpCode::Query);
+    let progressed = chain
+        .fetch_path(&validator, &fetcher, &Name::root(), &mut response)
+        .await;
+
+    assert!(
+        !progressed,
+        "an expired deadline must not make chain progress"
+    );
+    assert_eq!(metrics.fetch_deadline_exceeded(), 1);
+    assert_eq!(
+        metrics.fetch_budget_exhausted(),
+        0,
+        "an expired deadline must not be attributed to count exhaustion"
+    );
+    assert_eq!(
+        fetcher.calls(),
+        0,
+        "an expired deadline must stop before any network fetch"
+    );
+}
+
+/// The same early refusal is recorded for the delegation probe and the key
+/// walk, not only for `fetch_zone_chain`.
+#[tokio::test]
+async fn test_probe_and_key_walk_count_early_deadline_refusal() {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("clock arithmetic");
+    let name = Name::from_str("www.expired.example.").expect("name");
+    let lower = LowerName::from(&name);
+    let validator = d05_validator(None);
+    let fetcher = StaticFetcher::new();
+
+    let metrics = Arc::new(DnssecMetrics::new());
+    let mut chain = TrustChain::with_metrics(expired, MAX_FETCHES_PER_QUERY, Arc::clone(&metrics));
+    let probe = chain
+        .probe_unsigned(&validator, &fetcher, &lower, now)
+        .await;
+    assert!(
+        matches!(probe, UnsignedProbe::Failed),
+        "an expired deadline must fail the probe closed: {probe:?}"
+    );
+    assert_eq!(metrics.fetch_deadline_exceeded(), 1);
+    assert_eq!(metrics.fetch_budget_exhausted(), 0);
+
+    let metrics = Arc::new(DnssecMetrics::new());
+    let mut budget =
+        FetchBudget::with_metrics(MAX_FETCHES_PER_QUERY, expired, Arc::clone(&metrics));
+    assert!(
+        validator
+            .keys_for_zone(&lower, &fetcher, now, &mut budget)
+            .await
+            .is_none(),
+        "an expired deadline must not start the key walk"
+    );
+    assert_eq!(metrics.fetch_deadline_exceeded(), 1);
+    assert_eq!(metrics.fetch_budget_exhausted(), 0);
+    assert_eq!(
+        fetcher.calls(),
+        0,
+        "no early-deadline guard may reach the fetcher"
+    );
+}
+
+#[tokio::test]
+async fn test_fetch_zone_chain_expired_deadline_makes_no_fetch() {
+    let anchors = TrustAnchors::default();
+    let root = Name::root();
+    let fetcher = StaticFetcher::new();
+
+    let mut budget = FetchBudget::new(
+        4,
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("clock arithmetic"),
+    );
+    let mut visited = HashSet::new();
+    let mut response = Message::new(41, MessageType::Response, OpCode::Query);
+    let result = fetch_zone_chain(
+        &anchors,
+        &fetcher,
+        &root,
+        &mut budget,
+        &mut visited,
+        &mut response,
+    )
+    .await;
+
+    assert_eq!(result, None, "no chain progress is possible after expiry");
+    assert_eq!(fetcher.calls(), 0, "an expired deadline must not fetch");
     assert!(
         response.additionals.is_empty(),
         "unexpected additionals: {:?}",
@@ -1455,6 +1953,137 @@ fn test_cross_zone_ds_is_rejected() {
     assert!(!msg.metadata.authentic_data);
 }
 
+/// RFC 6840 §4.1: only a signature from the parent zone authenticates a DS
+/// RRset. A valid signature from the DS owner (the child zone) or from a
+/// sibling/unrelated zone must leave the delegation status `Unknown`, even
+/// when that signer's key is in the candidate set.
+///
+/// `test_cross_zone_ds_is_rejected` covers the full-response variant; this
+/// locks the delegation probe itself.
+#[test]
+fn test_ds_status_accepts_only_parent_zone_signer() {
+    let (parent, parent_key, parent_signer) = create_test_signer("example.");
+    let (cut, child_key, child_signer) = create_test_signer("child.example.");
+    let (_, sibling_key, sibling_signer) = create_test_signer("sibling.example.");
+    let parent_zone = LowerName::from(&parent);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    // Control: the parent signature authenticates the delegation.
+    let control = signed_ds_message(&cut, &parent_signer, &child_key);
+    assert!(
+        matches!(
+            ds_response_status(
+                &control,
+                &cut,
+                &parent_zone,
+                std::slice::from_ref(&parent_key),
+                now
+            ),
+            DsStatus::Signed(_)
+        ),
+        "the parent signature must authenticate the delegation"
+    );
+
+    // DS owner/child signer: rejected even though its key is a candidate.
+    let child_signed = signed_ds_message(&cut, &child_signer, &child_key);
+    assert!(
+        matches!(
+            ds_response_status(
+                &child_signed,
+                &cut,
+                &parent_zone,
+                &[parent_key.clone(), child_key.clone()],
+                now
+            ),
+            DsStatus::Unknown
+        ),
+        "a DS signed by its owner (the child zone) must not authenticate"
+    );
+
+    // Sibling signer: rejected even though its key is a candidate.
+    let sibling_signed = signed_ds_message(&cut, &sibling_signer, &child_key);
+    assert!(
+        matches!(
+            ds_response_status(
+                &sibling_signed,
+                &cut,
+                &parent_zone,
+                &[parent_key, sibling_key],
+                now
+            ),
+            DsStatus::Unknown
+        ),
+        "a DS signed by an unrelated/sibling zone must not authenticate"
+    );
+}
+
+/// RFC 6840 §4.1 delegation filtering: once `child.signed.example.` is an
+/// authenticated signed cut, the anchored parent key is no longer
+/// authoritative below it. A grandparent-signed DS for `x.child...` (below the
+/// cut) must not authenticate the deeper cut, and neither may a DS RRset owned
+/// by an unrelated name (here the ancestor cut's own DS) supplied as the
+/// deeper name's answer.
+#[tokio::test]
+async fn test_ds_below_ancestor_cut_does_not_authenticate_deeper_cut() {
+    let (parent_origin, parent_key, parent_signer) = create_test_signer("signed.example.");
+    let (child_origin, child_key, child_signer) = create_test_signer("child.signed.example.");
+    let (deeper_origin, deeper_key, _) = create_test_signer("x.child.signed.example.");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    let anchor_dnskey = anchored_dnskey_message(&parent_origin, &parent_key, &parent_signer);
+    let child_ds = signed_ds_message(&child_origin, &parent_signer, &child_key);
+    let child_dnskey = anchored_dnskey_message(&child_origin, &child_key, &child_signer);
+
+    // A valid DS RRset for the deeper name, but signed by the grandparent (the
+    // anchor zone), which stops being authoritative at the child cut.
+    let below_cut = signed_ds_message(&deeper_origin, &parent_signer, &deeper_key);
+    // A DS RRset owned by an unrelated name (the ancestor cut itself, not the
+    // queried deeper name) must not widen the proof either.
+    let unrelated_ds_owner = child_ds.clone();
+
+    for (label, ds_response) in [
+        ("below the cut", below_cut),
+        ("for an unrelated DS owner", unrelated_ds_owner),
+    ] {
+        let validator = d05_validator(None);
+        validator.add_trust_anchor(&parent_key, LowerName::from(&parent_origin));
+        let fetcher = StaticFetcher::new()
+            .with(&parent_origin, RecordType::DNSKEY, anchor_dnskey.clone())
+            .with(&child_origin, RecordType::DS, child_ds.clone())
+            .with(&child_origin, RecordType::DNSKEY, child_dnskey.clone())
+            .with(&deeper_origin, RecordType::DS, ds_response);
+
+        let mut response = stripped_response(&deeper_origin);
+        let outcome = validator
+            .validate_with_key_fetcher(&mut response, Some("probe"), now, &fetcher)
+            .await;
+
+        assert!(
+            matches!(outcome, ValidationOutcome::Bogus { .. }),
+            "a DS {label} must not authenticate the deeper cut: {outcome:?}"
+        );
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(!response.metadata.authentic_data);
+        assert!(
+            validator.signed_zone_contains(&LowerName::from(&child_origin), now),
+            "the fixture must establish the child cut as signed"
+        );
+        assert!(
+            !validator
+                .signed_zones
+                .contains_key(&LowerName::from(&deeper_origin)),
+            "a DS {label} must not mark the deeper cut signed"
+        );
+        assert!(
+            validator
+                .chain_cache()
+                .get(&LowerName::from(&deeper_origin), now)
+                .is_none(),
+            "a DS {label} must not persist the deeper cut as Signed"
+        );
+    }
+}
+
 #[test]
 fn test_ds_sha1_digest_is_treated_as_unsigned() {
     use hickory_proto::dnssec::DigestType;
@@ -1616,7 +2245,7 @@ async fn test_root_walk_matches_default_anchor() {
         fetched_dnskey_message(&root, &[root_key], None),
     );
 
-    let mut budget = 1u8;
+    let mut budget = FetchBudget::new(1, Instant::now() + Duration::from_secs(30));
     let mut visited = HashSet::new();
     let mut response = Message::new(40, MessageType::Response, OpCode::Query);
     let result = fetch_zone_chain(
@@ -4375,7 +5004,12 @@ impl NxdomainFetcher {
 
 #[async_trait::async_trait]
 impl DnssecKeyFetcher for NxdomainFetcher {
-    async fn query(&self, name: &Name, _rtype: RecordType) -> Result<Message, UpstreamError> {
+    async fn query(
+        &self,
+        name: &Name,
+        _rtype: RecordType,
+        _deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut message = Message::new(0, MessageType::Response, OpCode::Query);
         message
@@ -4404,10 +5038,104 @@ impl OfflineFetcher {
 
 #[async_trait::async_trait]
 impl DnssecKeyFetcher for OfflineFetcher {
-    async fn query(&self, _name: &Name, _rtype: RecordType) -> Result<Message, UpstreamError> {
+    async fn query(
+        &self,
+        _name: &Name,
+        _rtype: RecordType,
+        _deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(UpstreamError::Timeout)
     }
+}
+
+/// Records every deadline it is handed, then fails like an offline upstream.
+struct DeadlineRecordingFetcher {
+    deadlines: std::sync::Mutex<Vec<Instant>>,
+}
+
+impl DeadlineRecordingFetcher {
+    fn new() -> Self {
+        Self {
+            deadlines: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn deadlines(&self) -> Vec<Instant> {
+        self.deadlines.lock().expect("deadline log").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl DnssecKeyFetcher for DeadlineRecordingFetcher {
+    async fn query(
+        &self,
+        _name: &Name,
+        _rtype: RecordType,
+        deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
+        self.deadlines.lock().expect("deadline log").push(deadline);
+        Err(UpstreamError::Timeout)
+    }
+}
+
+#[tokio::test]
+async fn test_validate_with_key_fetcher_deadline_is_propagated() {
+    let qname = Name::from_str("www.deadline.example.").expect("qname");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let validator = DnssecValidator::from_config(&DnssecConfig::default());
+    let fetcher = DeadlineRecordingFetcher::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    let mut response = stripped_response(&qname);
+    let _ = validator
+        .validate_with_key_fetcher_deadline(
+            &mut response,
+            Some("deadline"),
+            now,
+            &fetcher,
+            deadline,
+        )
+        .await;
+
+    let seen = fetcher.deadlines();
+    assert!(
+        !seen.is_empty(),
+        "the chain walk must have attempted at least one fetch"
+    );
+    assert!(
+        seen.iter().all(|seen| *seen == deadline),
+        "every fetch must receive the caller's deadline: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_validate_with_key_fetcher_default_deadline_is_bounded() {
+    let qname = Name::from_str("www.default-deadline.example.").expect("qname");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let validator = DnssecValidator::from_config(&DnssecConfig::default());
+    let fetcher = DeadlineRecordingFetcher::new();
+
+    let before = Instant::now();
+    let mut response = stripped_response(&qname);
+    let _ = validator
+        .validate_with_key_fetcher(&mut response, Some("deadline"), now, &fetcher)
+        .await;
+
+    let seen = fetcher.deadlines();
+    assert!(!seen.is_empty(), "the compatibility wrapper must fetch");
+    assert!(
+        seen.iter().all(|seen| *seen >= before),
+        "the default deadline must not be in the past: {seen:?}"
+    );
+    // Scheduling slack only; the default must stay close to the call time.
+    // One second absorbs a loaded CI runner descheduling the task between the
+    // `before` timestamp and the wrapper's deadline construction.
+    let upper = before + DEFAULT_KEY_FETCH_DEADLINE + Duration::from_secs(1);
+    assert!(
+        seen.iter().all(|seen| *seen <= upper),
+        "the compatibility wrapper must apply a bounded default deadline: {seen:?}"
+    );
 }
 
 /// Offline policy: a never-proven zone fails closed (Bogus/SERVFAIL) and is
@@ -4558,6 +5286,16 @@ async fn test_dname_unknown_rdata_fails_closed() {
     assert!(
         !decoded.metadata.authentic_data,
         "a DNAME response must never be served with AD=1"
+    );
+    assert!(
+        decoded.answers.is_empty(),
+        "a fail-closed DNAME response must not serve the uninterpretable answer: {:?}",
+        decoded.answers
+    );
+    assert_eq!(
+        validator.metrics.get_validations("bogus"),
+        1,
+        "the DNAME fail-closed outcome must be recorded as Bogus once"
     );
 }
 
@@ -5333,5 +6071,598 @@ fn test_qtype_cname_positive_answer_is_not_negative() {
     assert!(
         is_negative_response(&response, &qname, RecordType::A),
         "the same response is NODATA for QTYPE=A"
+    );
+}
+
+/// A signed CNAME RRset answers QTYPE=CNAME positively. The validator must
+/// verify its RRSIG and return Secure/AD=1 instead of treating it as a
+/// negative answer or requiring a denial proof.
+#[test]
+fn test_signed_qtype_cname_answer_is_secure() {
+    use hickory_proto::rr::RecordSet;
+    use hickory_proto::rr::rdata::CNAME;
+
+    let (origin, dnskey, signer) = create_test_signer("signed-cname.example.");
+    let target = Name::from_str("target.example.").expect("target");
+    let answer = Record::from_rdata(origin.clone(), 300, RData::CNAME(CNAME(target)));
+    let mut set = RecordSet::new(origin.clone(), RecordType::CNAME, 0);
+    set.insert(answer.clone(), 0);
+    let signature = sign_test_rrset(&set, &signer);
+
+    let mut trust_anchors = TrustAnchors::empty();
+    trust_anchors.insert_with_name(dnskey.public_key(), LowerName::from(&origin));
+    let validator =
+        DnssecValidator::new(DnssecMode::Validate, Vec::new()).with_trust_anchors(trust_anchors);
+
+    let mut response = Message::new(20, MessageType::Response, OpCode::Query);
+    response
+        .queries
+        .push(Query::query(origin.clone(), RecordType::CNAME));
+    response.answers.push(answer);
+    response.answers.push(signature);
+    response.additionals.push(Record::from_rdata(
+        origin,
+        300,
+        RData::DNSSEC(DNSSECRData::DNSKEY(dnskey)),
+    ));
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let outcome = validator.validate_response(&mut response, Some("1.1.1.1"), now);
+
+    assert_eq!(
+        outcome,
+        ValidationOutcome::Secure,
+        "a signed CNAME answering QTYPE=CNAME must be Secure: {outcome:?}"
+    );
+    assert!(response.metadata.authentic_data);
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(validator.metrics.get_validations("secure"), 1);
+}
+
+/// Stripping the RRSIG from a signed QTYPE=CNAME answer without an
+/// authenticated unsigned-delegation proof must fail closed: Bogus,
+/// SERVFAIL, no AD and no answers served.
+#[tokio::test]
+async fn test_stripped_signed_qtype_cname_is_bogus() {
+    use hickory_proto::rr::rdata::CNAME;
+
+    let (validator, origin, _key, _signer) = signed_zone_validator("stripped-cname.example.");
+    let target = Name::from_str("target.example.").expect("target");
+    let mut response = Message::new(21, MessageType::Response, OpCode::Query);
+    response
+        .queries
+        .push(Query::query(origin.clone(), RecordType::CNAME));
+    response
+        .answers
+        .push(Record::from_rdata(origin, 300, RData::CNAME(CNAME(target))));
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let offline = OfflineFetcher::new();
+    let outcome = validator
+        .validate_with_key_fetcher(&mut response, Some("stripped"), now, &offline)
+        .await;
+
+    match outcome {
+        ValidationOutcome::Bogus { reason, .. } => assert!(
+            reason.contains("Missing RRSIG for zone previously proven signed"),
+            "the stripped CNAME must fail for the signed-zone reason, got: {reason}"
+        ),
+        other => panic!("a stripped signed CNAME must fail closed: {other:?}"),
+    }
+    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    assert!(!response.metadata.authentic_data, "Bogus must clear AD");
+    assert!(
+        response.answers.is_empty(),
+        "Bogus must not serve the stripped CNAME: {:?}",
+        response.answers
+    );
+}
+
+#[test]
+fn trust_chain_state_maps_to_validation_decision() {
+    assert_eq!(
+        ValidationDecision::from(TrustChainState::Signed),
+        ValidationDecision::Secure
+    );
+    assert_eq!(
+        ValidationDecision::from(TrustChainState::Unsigned),
+        ValidationDecision::Insecure
+    );
+    assert_eq!(
+        ValidationDecision::from(TrustChainState::Unknown),
+        ValidationDecision::Indeterminate
+    );
+
+    match ValidationDecision::from(TrustChainState::Bogus) {
+        ValidationDecision::Bogus { reason, ede_code } => {
+            assert!(!reason.is_empty(), "a bogus chain must carry a reason");
+            assert_eq!(ede_code, EDE_DNSSEC_BOGUS);
+        }
+        other => panic!("a bogus chain must map to Bogus, got {other:?}"),
+    }
+}
+
+#[test]
+fn trust_chain_decision_preserves_bogus_reason_and_ede() {
+    let outcome = ValidationOutcome::Bogus {
+        reason: "signature expired".to_string(),
+        ede_code: EDE_SIGNATURE_EXPIRED,
+    };
+
+    let decision = ValidationDecision::from_outcome(&outcome);
+    assert_eq!(
+        decision,
+        ValidationDecision::Bogus {
+            reason: "signature expired".to_string(),
+            ede_code: EDE_SIGNATURE_EXPIRED,
+        }
+    );
+    assert_eq!(decision.to_outcome(), outcome);
+
+    let converted = ValidationOutcome::from(decision);
+    assert_eq!(converted, outcome);
+}
+
+#[test]
+fn trust_chain_nta_bypass_maps_to_insecure() {
+    assert_eq!(
+        ValidationDecision::from_outcome(&ValidationOutcome::NtaBypass),
+        ValidationDecision::Insecure
+    );
+    assert_eq!(
+        ValidationDecision::Insecure.to_outcome(),
+        ValidationOutcome::Insecure
+    );
+}
+
+#[test]
+fn trust_chain_validation_decision_round_trips() {
+    for outcome in [
+        ValidationOutcome::Secure,
+        ValidationOutcome::Insecure,
+        ValidationOutcome::Indeterminate,
+    ] {
+        let decision = ValidationDecision::from_outcome(&outcome);
+        assert_eq!(decision.to_outcome(), outcome);
+        assert_eq!(ValidationOutcome::from(decision.clone()), outcome);
+        assert_eq!(
+            ValidationDecision::from_outcome(&ValidationOutcome::from(decision)).to_outcome(),
+            outcome,
+            "outcome -> decision -> outcome -> decision -> outcome must be stable"
+        );
+    }
+}
+
+/// Several RRSIG signers must draw from one shared budget. The empty-message
+/// fetcher makes every walk stop after its DNSKEY+DS pair, so three signers
+/// would issue six fetches if each had its own budget.
+#[tokio::test]
+async fn trust_chain_shares_one_fetch_budget_across_signers() {
+    let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+    let fetcher = StaticFetcher::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let remaining = 5;
+    let mut chain = TrustChain::new(deadline, remaining);
+    let mut response = Message::new(51, MessageType::Response, OpCode::Query);
+
+    for signer in ["one.example.", "two.example.", "three.example."] {
+        let signer = Name::from_str(signer).expect("signer");
+        let _ = chain
+            .fetch_path(&validator, &fetcher, &signer, &mut response)
+            .await;
+    }
+
+    assert_eq!(
+        fetcher.calls(),
+        usize::from(remaining),
+        "signers must share one budget instead of multiplying cold-start fetches"
+    );
+}
+
+/// The deadline handed to `TrustChain` is the caller's absolute `Instant` and
+/// must reach every fetch, not just the first signer's.
+#[tokio::test]
+async fn trust_chain_passes_caller_deadline_to_every_fetch() {
+    let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+    let fetcher = StaticFetcher::new();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut chain = TrustChain::new(deadline, 10);
+    let mut response = Message::new(52, MessageType::Response, OpCode::Query);
+
+    assert_eq!(
+        chain.budget().deadline(),
+        deadline,
+        "the shared budget must carry the caller's absolute deadline"
+    );
+    for signer in ["one.example.", "two.example."] {
+        let signer = Name::from_str(signer).expect("signer");
+        let _ = chain
+            .fetch_path(&validator, &fetcher, &signer, &mut response)
+            .await;
+    }
+
+    let seen = fetcher.seen();
+    assert!(!seen.is_empty(), "the walk must attempt fetches");
+    assert!(
+        seen.iter()
+            .all(|(_, _, seen_deadline)| *seen_deadline == deadline),
+        "every fetch through TrustChain must see the caller's deadline: {seen:?}"
+    );
+}
+
+/// Fetcher that answers every DS query with a DS record at that exact name and
+/// every DNSKEY query with an empty message, so a chain walk keeps descending
+/// to the root and issues the maximum number of fetches.
+struct AlwaysDsFetcher {
+    key: DNSKEY,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl AlwaysDsFetcher {
+    fn new(key: DNSKEY) -> Self {
+        Self {
+            key,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl DnssecKeyFetcher for AlwaysDsFetcher {
+    async fn query(
+        &self,
+        name: &Name,
+        rtype: RecordType,
+        _deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
+        use hickory_proto::dnssec::DigestType;
+
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+        if rtype == RecordType::DS
+            && let Ok(ds) = DS::from_key(self.key.public_key(), name, DigestType::SHA256)
+        {
+            message.authorities.push(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::DNSSEC(DNSSECRData::DS(ds)),
+            ));
+        }
+        Ok(message)
+    }
+}
+
+/// Builds a positive A response whose RRset carries one RRSIG per entry in
+/// `signers`. Each signer is a 15-label zone in a disjoint tree: a cold-start
+/// walk from each would cost 26 fetches if budgets were per-signer.
+fn hostile_multi_signer_response(qname: &Name, signers: &[&str]) -> (Message, Vec<Name>) {
+    let mut response = Message::new(53, MessageType::Response, OpCode::Query);
+    response
+        .queries
+        .push(Query::query(qname.clone(), RecordType::A));
+    let mut signer_names = Vec::with_capacity(signers.len());
+    for (index, signer_name) in signers.iter().enumerate() {
+        let (origin, _, signer) = create_test_signer(signer_name);
+        let (answer, signature) = signed_a_response(qname, &signer);
+        if index == 0 {
+            response.answers.push(answer);
+        }
+        response.answers.push(signature);
+        signer_names.push(origin);
+    }
+    (response, signer_names)
+}
+
+const HOSTILE_SIGNERS: [&str; 4] = [
+    "a.b.c.d.e.f.g.h.i.j.k.l.m.n.one.",
+    "a.b.c.d.e.f.g.h.i.j.k.l.m.n.two.",
+    "a.b.c.d.e.f.g.h.i.j.k.l.m.n.three.",
+    "a.b.c.d.e.f.g.h.i.j.k.l.m.n.four.",
+];
+
+/// Old per-signer maximum (`labels * 2 + 1`, capped at 31) for a 15-label
+/// signer.
+const HOSTILE_CHAIN_CAP: u8 = 31;
+
+/// A hostile message carrying several deep signers in disjoint zones must not
+/// multiply cold-start fetches: one shared budget bounds the walk to the old
+/// per-signer maximum (31) instead of 4 x 26.
+#[tokio::test]
+async fn trust_chain_hostile_multi_signer_response_stays_within_global_cap() {
+    let qname = Name::from_str("www.hostile.example.").expect("qname");
+    let (mut response, signers) = hostile_multi_signer_response(&qname, &HOSTILE_SIGNERS);
+    let (_, fetcher_key, _) = create_test_signer("fetcher.example.");
+    let fetcher = AlwaysDsFetcher::new(fetcher_key);
+    let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+
+    let mut chain = TrustChain::new(Instant::now() + Duration::from_secs(30), HOSTILE_CHAIN_CAP);
+    for signer in &signers {
+        let _ = chain
+            .fetch_path(&validator, &fetcher, signer, &mut response)
+            .await;
+    }
+
+    assert_eq!(
+        fetcher.calls(),
+        usize::from(HOSTILE_CHAIN_CAP),
+        "the shared budget, not the signer count, must bound the walk"
+    );
+}
+
+/// The same hostile response through the validator must stay within the one
+/// documented per-query fetch cap, which now also covers the bounded probes.
+#[tokio::test]
+async fn trust_chain_validate_bounds_hostile_multi_signer_fetches() {
+    let qname = Name::from_str("www.hostile.example.").expect("qname");
+    let (mut response, _) = hostile_multi_signer_response(&qname, &HOSTILE_SIGNERS);
+    let (_, fetcher_key, _) = create_test_signer("fetcher.example.");
+    let fetcher = AlwaysDsFetcher::new(fetcher_key);
+    let validator = DnssecValidator::new(DnssecMode::Validate, Vec::new());
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let outcome = validator
+        .validate_with_key_fetcher_deadline(&mut response, Some("hostile"), now, &fetcher, deadline)
+        .await;
+
+    // Old per-signer budgets allowed 4 x 26 chain fetches for this response.
+    assert!(
+        fetcher.calls() <= usize::from(MAX_FETCHES_PER_QUERY),
+        "a multi-signer response must not multiply cold-start fetches: {} > {}",
+        fetcher.calls(),
+        MAX_FETCHES_PER_QUERY
+    );
+    assert!(
+        fetcher.calls() > 0,
+        "the hostile signers must still trigger the chain walk"
+    );
+    assert_ne!(
+        outcome,
+        ValidationOutcome::Secure,
+        "junk DS records must never produce AD=1"
+    );
+    assert!(
+        !response.metadata.authentic_data,
+        "an unproven chain must not set AD"
+    );
+}
+
+/// Answers the anchor DNSKEY with an anchored self-signed RRset and every DS
+/// query with a signed in-zone NSEC denial. A cold-start probe therefore walks
+/// all `MAX_CHAIN_CUTS` cuts, spending `MAX_CHAIN_CUTS + 1` fetches per
+/// distinct probe name.
+struct DeepSignedDenialFetcher {
+    parent: Name,
+    next: Name,
+    key: DNSKEY,
+    signer: hickory_proto::dnssec::DnssecSigner,
+    calls: std::sync::atomic::AtomicUsize,
+    seen: std::sync::Mutex<Vec<(LowerName, RecordType, Instant)>>,
+}
+
+impl DeepSignedDenialFetcher {
+    fn new(parent: &Name, key: DNSKEY, signer: hickory_proto::dnssec::DnssecSigner) -> Self {
+        let next = Name::from_str(&format!("zzz.{}", parent.to_ascii())).expect("next name");
+        Self {
+            parent: parent.clone(),
+            next,
+            key,
+            signer,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn seen(&self) -> Vec<(LowerName, RecordType, Instant)> {
+        self.seen.lock().expect("fetch log").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl DnssecKeyFetcher for DeepSignedDenialFetcher {
+    async fn query(
+        &self,
+        name: &Name,
+        rtype: RecordType,
+        deadline: Instant,
+    ) -> Result<Message, UpstreamError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.seen
+            .lock()
+            .expect("fetch log")
+            .push((LowerName::from(name), rtype, deadline));
+        match rtype {
+            RecordType::DNSKEY => Ok(anchored_dnskey_message(name, &self.key, &self.signer)),
+            RecordType::DS => Ok(signed_nsec_response(
+                &self.parent,
+                name,
+                &self.next,
+                &[RecordType::A, RecordType::NSEC, RecordType::RRSIG],
+                name,
+                &self.key,
+                &self.signer,
+                ResponseCode::NoError,
+            )),
+            _ => Ok(Message::new(0, MessageType::Response, OpCode::Query)),
+        }
+    }
+}
+
+/// A name deep enough below `origin` to exceed `MAX_CHAIN_CUTS`.
+fn deep_probe_name(origin: &Name, index: usize) -> Name {
+    Name::from_str(&format!("t{index}.a.b.c.d.e.f.g.h.{}", origin.to_ascii()))
+        .expect("deep probe name")
+}
+
+/// A CNAME fan-out must draw from the same budget as the cold-start walk:
+/// after the probes spend most of it, the signer walk only gets the remainder.
+#[tokio::test]
+async fn trust_chain_probe_fanout_leaves_only_remainder_for_cold_start() {
+    let (origin, key, signer) = create_test_signer("probe-budget.example.");
+    let validator = d05_validator(None);
+    validator.add_trust_anchor(&key, LowerName::from(&origin));
+    let fetcher = StaticFetcher::new().with(
+        &origin,
+        RecordType::DNSKEY,
+        anchored_dnskey_message(&origin, &key, &signer),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let cap = 5u8;
+    let mut chain = TrustChain::new(deadline, cap);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    for label in ["a", "b"] {
+        let name = Name::from_str(&format!("{label}.probe-budget.example.")).expect("probe name");
+        let probe = chain
+            .probe_unsigned(&validator, &fetcher, &LowerName::from(&name), now)
+            .await;
+        assert!(
+            matches!(probe, UnsignedProbe::Probed | UnsignedProbe::Failed),
+            "a cold probe must run or fail closed: {probe:?}"
+        );
+    }
+    assert_eq!(
+        fetcher.calls(),
+        4,
+        "two cold probes spend the anchor DNSKEY plus one DS lookup each"
+    );
+
+    let mut response = Message::new(60, MessageType::Response, OpCode::Query);
+    let signer_name = Name::from_str("c.probe-budget.example.").expect("signer name");
+    let _ = chain
+        .fetch_path(&validator, &fetcher, &signer_name, &mut response)
+        .await;
+
+    assert_eq!(
+        fetcher.calls(),
+        usize::from(cap),
+        "the signer walk must only get the remainder of the shared budget"
+    );
+}
+
+/// Repeated deep delegation probes share one budget and cannot exceed the
+/// documented total, even when each probe would walk every cut.
+#[tokio::test]
+async fn trust_chain_deep_probes_cannot_exceed_total_cap() {
+    let (origin, key, signer) = create_test_signer("deep-cap.example.");
+    let validator = d05_validator(None);
+    validator.add_trust_anchor(&key, LowerName::from(&origin));
+    let fetcher = DeepSignedDenialFetcher::new(&origin, key, signer);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut chain = TrustChain::new(deadline, MAX_FETCHES_PER_QUERY);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    let mut probes = Vec::new();
+    for index in 0..10 {
+        let name = LowerName::from(&deep_probe_name(&origin, index));
+        probes.push(chain.probe_unsigned(&validator, &fetcher, &name, now).await);
+    }
+
+    assert!(
+        fetcher.calls() <= usize::from(MAX_FETCHES_PER_QUERY),
+        "deep probes must share one cap: {} > {}",
+        fetcher.calls(),
+        MAX_FETCHES_PER_QUERY
+    );
+    assert!(
+        fetcher.calls() > MAX_CHAIN_CUTS,
+        "the deep probes must actually walk cuts"
+    );
+    assert!(
+        probes
+            .iter()
+            .any(|probe| matches!(probe, UnsignedProbe::Failed)),
+        "an exhausted probe budget must fail closed: {probes:?}"
+    );
+}
+
+/// Probe fetches must receive the caller's absolute deadline, not a fresh
+/// per-probe timeout.
+#[tokio::test]
+async fn trust_chain_probe_fetches_see_caller_deadline() {
+    let (origin, key, _signer) = create_test_signer("deadline-probe.example.");
+    let validator = d05_validator(None);
+    validator.add_trust_anchor(&key, LowerName::from(&origin));
+    let fetcher = DeadlineRecordingFetcher::new();
+    let deadline = Instant::now() + Duration::from_secs(55);
+    let mut chain = TrustChain::new(deadline, 3);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+
+    let name = Name::from_str("www.deadline-probe.example.").expect("probe name");
+    let _ = chain
+        .probe_unsigned(&validator, &fetcher, &LowerName::from(&name), now)
+        .await;
+    let mut response = Message::new(61, MessageType::Response, OpCode::Query);
+    let signer_name = Name::from_str("a.deadline-probe.example.").expect("signer name");
+    let _ = chain
+        .fetch_path(&validator, &fetcher, &signer_name, &mut response)
+        .await;
+
+    let seen = fetcher.deadlines();
+    assert!(
+        !seen.is_empty(),
+        "the probe and chain walk must attempt fetches"
+    );
+    assert!(
+        seen.iter().all(|observed| *observed == deadline),
+        "every probe and chain fetch must see the caller's deadline: {seen:?}"
+    );
+}
+
+/// A validator-level CNAME fan-out that drains the shared probe budget must
+/// still fail closed in strict mode: Bogus/SERVFAIL, never Indeterminate or
+/// Secure/AD. The fixture deterministically spends the full documented cap.
+#[tokio::test]
+async fn trust_chain_probe_budget_exhaustion_still_fails_closed() {
+    let (origin, key, signer) = create_test_signer("probe-failclosed.example.");
+    let validator = d05_validator(None);
+    validator.add_trust_anchor(&key, LowerName::from(&origin));
+    let fetcher = DeepSignedDenialFetcher::new(&origin, key, signer);
+    let qname = deep_probe_name(&origin, 0);
+    let targets: Vec<Name> = (1..=8)
+        .map(|index| deep_probe_name(&origin, index))
+        .collect();
+    let mut response = stripped_cname_chain_response(&qname, &targets);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp() as u32;
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    let outcome = validator
+        .validate_with_key_fetcher_deadline(&mut response, Some("probe"), now, &fetcher, deadline)
+        .await;
+
+    assert!(
+        matches!(outcome, ValidationOutcome::Bogus { .. }),
+        "strict-mode probe budget exhaustion must be Bogus: {outcome:?}"
+    );
+    assert_eq!(
+        response.metadata.response_code,
+        ResponseCode::ServFail,
+        "strict-mode Bogus must become SERVFAIL"
+    );
+    assert!(
+        !response.metadata.authentic_data,
+        "budget exhaustion must never set AD"
+    );
+    assert_eq!(
+        fetcher.calls(),
+        usize::from(MAX_FETCHES_PER_QUERY),
+        "the fixture must deterministically spend the exact documented cap"
+    );
+    let seen = fetcher.seen();
+    assert!(
+        !seen.is_empty(),
+        "the probe fan-out must have attempted fetches"
+    );
+    assert!(
+        seen.iter().all(|(_, _, observed)| *observed == deadline),
+        "every probe fetch must see the caller's deadline: {seen:?}"
     );
 }

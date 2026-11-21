@@ -37,23 +37,110 @@ pub(crate) fn key_query(name: &Name, rtype: RecordType) -> Message {
 
 #[async_trait]
 impl DnssecKeyFetcher for UpstreamKeyFetcher {
-    async fn query(&self, name: &Name, rtype: RecordType) -> Result<Message, UpstreamError> {
-        self.manager.resolve(&key_query(name, rtype)).await
+    async fn query(
+        &self,
+        name: &Name,
+        rtype: RecordType,
+        deadline: std::time::Instant,
+    ) -> Result<Message, UpstreamError> {
+        // The deadline is shared by every fetch for one client query, so a
+        // black-holed DS/DNSKEY lookup cannot outlive the query's budget.
+        match tokio::time::timeout_at(
+            deadline.into(),
+            self.manager.resolve(&key_query(name, rtype)),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(UpstreamError::Timeout),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plain::PlainUpstream;
+    use crate::upstream::Upstream;
+    use sito_core::config::UpstreamStrategy;
     use std::str::FromStr;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_key_query_sets_dnssec_ok() {
         let name = Name::from_str("example.com.").unwrap();
         let message = key_query(&name, RecordType::DNSKEY);
         assert!(
+            message.metadata.recursion_desired,
+            "key fetches must ask the upstream for recursion (RD=1)"
+        );
+        assert!(
             message.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok),
             "key fetches must set the DO bit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_key_fetcher_maps_deadline_to_timeout() {
+        // Bind a local UDP socket but never read from it: every datagram is
+        // black-holed. The manager and upstream timeouts are long, so only the
+        // fetcher's own deadline can end the lookup.
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind black-hole socket");
+        let addr = socket.local_addr().expect("black-hole address");
+        let manager = Arc::new(UpstreamManager::with_upstreams(
+            vec![(
+                "black-hole".to_string(),
+                Arc::new(PlainUpstream::new(addr, Duration::from_secs(30))),
+            )],
+            UpstreamStrategy::Failover,
+            Duration::from_secs(30),
+        ));
+        let fetcher = UpstreamKeyFetcher::new(manager);
+        let name = Name::from_str("example.com.").expect("name");
+        let deadline = Instant::now() + Duration::from_millis(20);
+
+        let result = fetcher.query(&name, RecordType::DNSKEY, deadline).await;
+
+        assert!(
+            matches!(result, Err(UpstreamError::Timeout)),
+            "the fetcher deadline must surface as Timeout, got {result:?}"
+        );
+        drop(socket);
+    }
+
+    /// An upstream that always refuses the query.
+    struct RefusedUpstream;
+
+    #[async_trait::async_trait]
+    impl Upstream for RefusedUpstream {
+        async fn resolve(&self, _msg: &Message) -> Result<Message, UpstreamError> {
+            Err(UpstreamError::Refused)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upstream_key_fetcher_preserves_refused_error() {
+        let manager = Arc::new(UpstreamManager::with_upstreams(
+            vec![("refused".to_string(), Arc::new(RefusedUpstream))],
+            UpstreamStrategy::Failover,
+            Duration::from_secs(5),
+        ));
+        let fetcher = UpstreamKeyFetcher::new(manager);
+        let name = Name::from_str("example.com.").expect("name");
+
+        let result = fetcher
+            .query(
+                &name,
+                RecordType::DNSKEY,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(UpstreamError::Refused)),
+            "the fetcher must preserve a non-timeout upstream error, got {result:?}"
         );
     }
 }

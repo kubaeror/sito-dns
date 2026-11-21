@@ -6,7 +6,7 @@
 //! there is a single downloader implementation.
 
 use crate::error::FilterError;
-use crate::subscription::read_metadata;
+use crate::subscription::{ListMetadata, read_metadata};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -194,26 +194,53 @@ pub async fn save_to_cache(path: &Path, content: &str) -> Result<(), FilterError
     write_atomic(path, content.as_bytes()).await
 }
 
-/// Reads a cached list and rejects it unless its metadata records matching
-/// integrity signals (byte length and line count).
+/// Returns true when cached metadata records exactly `url` as its source.
+///
+/// Legacy metadata without a recorded URL is a miss: an old cache cannot be
+/// attributed to any configured source and must not be served.
+pub(crate) fn metadata_url_matches(meta: &ListMetadata, url: &str) -> bool {
+    meta.url.as_deref() == Some(url)
+}
+
+/// Reads a cached list and rejects it unless its metadata records the same
+/// source URL and matching integrity signals (byte length and line count).
 ///
 /// A cache file is trusted only when it is accompanied by metadata written
-/// after the same fetch. Truncated, partially replaced or unverifiable
-/// (legacy, metadata-less) caches are refused so the caller re-downloads the
-/// list instead of serving partial or stale content.
+/// after the same fetch. Metadata without a recorded URL (legacy) is a cache
+/// miss, and a cache recorded for a different URL is refused: changing a
+/// list's URL under the same name must not serve the previous URL's rules.
+/// Truncated, partially replaced or unverifiable caches are refused so the
+/// caller re-downloads the list instead of serving partial or stale content.
 pub(crate) async fn read_cache_verified(
     cache_path: &Path,
     meta_path: &Path,
     list_name: &str,
+    expected_url: &str,
     max_bytes: usize,
 ) -> Result<String, FilterError> {
-    let content = read_from_cache_capped(cache_path, max_bytes).await?;
     let Some(meta) = read_metadata(meta_path).await else {
         return Err(FilterError::CacheCorrupted {
             path: cache_path.to_path_buf(),
             reason: format!("list '{list_name}' cache has no readable metadata"),
         });
     };
+    // URL provenance is checked before the body is read or validated: content
+    // served for the wrong source would be stale rules, not a corrupt cache.
+    if !metadata_url_matches(&meta, expected_url) {
+        let reason = match meta.url.as_deref() {
+            None => format!(
+                "list '{list_name}' cache has no recorded source URL (legacy) but the configured URL is '{expected_url}'"
+            ),
+            Some(cached_url) => format!(
+                "list '{list_name}' cache was downloaded from a different source URL ('{cached_url}') than the configured URL ('{expected_url}')"
+            ),
+        };
+        return Err(FilterError::CacheCorrupted {
+            path: cache_path.to_path_buf(),
+            reason,
+        });
+    }
+    let content = read_from_cache_capped(cache_path, max_bytes).await?;
     let (Some(expected_len), Some(expected_lines)) = (meta.content_len, meta.line_count) else {
         return Err(FilterError::CacheCorrupted {
             path: cache_path.to_path_buf(),
@@ -331,12 +358,14 @@ mod tests {
         let cache_file = cache_path_for_list(&temp_dir, "Truncated");
         let meta_file = crate::subscription::meta_path_for_list(&temp_dir, "Truncated");
         let content = "0.0.0.0 one.example\n0.0.0.0 two.example\n";
+        let url = "https://example.com/truncated.txt";
         save_to_cache(&cache_file, content).await.unwrap();
         crate::subscription::save_metadata(
             &meta_file,
             &crate::subscription::ListMetadata {
                 content_len: Some(content.len() as u64),
                 line_count: Some(content.lines().count()),
+                url: Some(url.to_string()),
                 ..Default::default()
             },
         )
@@ -344,17 +373,28 @@ mod tests {
         .unwrap();
 
         // The intact cache verifies.
-        let verified =
-            read_cache_verified(&cache_file, &meta_file, "Truncated", DEFAULT_MAX_LIST_BYTES)
-                .await
-                .unwrap();
+        let verified = read_cache_verified(
+            &cache_file,
+            &meta_file,
+            "Truncated",
+            url,
+            DEFAULT_MAX_LIST_BYTES,
+        )
+        .await
+        .unwrap();
         assert_eq!(verified, content);
 
         // A truncated file (crash mid-write) is refused.
         tokio::fs::write(&cache_file, &content[..10]).await.unwrap();
-        let err = read_cache_verified(&cache_file, &meta_file, "Truncated", DEFAULT_MAX_LIST_BYTES)
-            .await
-            .expect_err("truncated cache must be rejected");
+        let err = read_cache_verified(
+            &cache_file,
+            &meta_file,
+            "Truncated",
+            url,
+            DEFAULT_MAX_LIST_BYTES,
+        )
+        .await
+        .expect_err("truncated cache must be rejected");
         assert!(
             matches!(err, FilterError::CacheCorrupted { .. }),
             "unexpected error: {err}"
@@ -366,13 +406,100 @@ mod tests {
         assert_eq!(same_len.len(), content.len(), "test precondition");
         assert_eq!(same_len.lines().count(), 1, "test precondition");
         tokio::fs::write(&cache_file, same_len).await.unwrap();
-        let err = read_cache_verified(&cache_file, &meta_file, "Truncated", DEFAULT_MAX_LIST_BYTES)
-            .await
-            .expect_err("line-structure mismatch must be rejected");
+        let err = read_cache_verified(
+            &cache_file,
+            &meta_file,
+            "Truncated",
+            url,
+            DEFAULT_MAX_LIST_BYTES,
+        )
+        .await
+        .expect_err("line-structure mismatch must be rejected");
         assert!(
             matches!(err, FilterError::CacheCorrupted { .. }),
             "unexpected error: {err}"
         );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// URL provenance is part of the integrity contract: a cache written for
+    /// one URL must not be served for another, even when its byte length and
+    /// line count still match.
+    #[tokio::test]
+    async fn test_verified_reader_rejects_url_mismatch() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_cache_url_mismatch_{}", std::process::id()));
+        let cache_file = cache_path_for_list(&temp_dir, "UrlMismatch");
+        let meta_file = crate::subscription::meta_path_for_list(&temp_dir, "UrlMismatch");
+        let content = "0.0.0.0 fresh.example\n";
+        save_to_cache(&cache_file, content).await.unwrap();
+        crate::subscription::save_metadata(
+            &meta_file,
+            &crate::subscription::ListMetadata {
+                content_len: Some(content.len() as u64),
+                line_count: Some(content.lines().count()),
+                url: Some("https://example.com/list-b.txt".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = read_cache_verified(
+            &cache_file,
+            &meta_file,
+            "UrlMismatch",
+            "https://example.com/list-a.txt",
+            DEFAULT_MAX_LIST_BYTES,
+        )
+        .await
+        .expect_err("a cache from another URL must never be served");
+        match err {
+            FilterError::CacheCorrupted { reason, .. } => {
+                assert!(
+                    reason.contains("list-b.txt") && reason.contains("list-a.txt"),
+                    "the reason must name the cached and expected URLs: {reason}"
+                );
+                assert!(
+                    reason.contains("different source URL"),
+                    "a different recorded URL must be distinguished from legacy metadata: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        // Legacy metadata without any recorded URL is also a provenance miss,
+        // reported distinctly from a different URL.
+        crate::subscription::save_metadata(
+            &meta_file,
+            &crate::subscription::ListMetadata {
+                content_len: Some(content.len() as u64),
+                line_count: Some(content.lines().count()),
+                url: None,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let err = read_cache_verified(
+            &cache_file,
+            &meta_file,
+            "UrlMismatch",
+            "https://example.com/list-a.txt",
+            DEFAULT_MAX_LIST_BYTES,
+        )
+        .await
+        .expect_err("metadata without a recorded URL must never be served");
+        match err {
+            FilterError::CacheCorrupted { reason, .. } => {
+                assert!(
+                    reason.contains("no recorded source URL (legacy)"),
+                    "legacy metadata must be reported distinctly: {reason}"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
@@ -388,9 +515,15 @@ mod tests {
             .await
             .unwrap();
 
-        let err = read_cache_verified(&cache_file, &meta_file, "NoMeta", DEFAULT_MAX_LIST_BYTES)
-            .await
-            .expect_err("metadata-less cache must be rejected");
+        let err = read_cache_verified(
+            &cache_file,
+            &meta_file,
+            "NoMeta",
+            "https://example.com/nometa.txt",
+            DEFAULT_MAX_LIST_BYTES,
+        )
+        .await
+        .expect_err("metadata-less cache must be rejected");
         assert!(
             matches!(err, FilterError::CacheCorrupted { .. }),
             "unexpected error: {err}"

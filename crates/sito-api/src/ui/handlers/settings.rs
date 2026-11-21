@@ -62,9 +62,11 @@ pub async fn settings_save_handler(
 
     // Same apply-then-persist pipeline as the REST API: the settings take
     // effect (and are validated) before the file is written, and a failed
-    // write rolls the in-memory apply back.
+    // write rolls the in-memory apply back. `[filtering]` is untouched, so
+    // the already-loaded rules are reused instead of refetching blocklists.
+    let filter_apply = filter_apply_for(&ctx.config.load(), &new_cfg);
     if let Err(e) =
-        apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, hooks.as_dyn()).await
+        apply_and_persist_config_locked(&ctx, &new_cfg, filter_apply, hooks.as_dyn()).await
     {
         tracing::error!("Failed to apply settings: {e:?}");
         return StatusCode::from_u16(e.status)

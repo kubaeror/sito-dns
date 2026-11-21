@@ -15,7 +15,22 @@ use super::*;
 pub(crate) fn bundled_list_views(
     manifest: Result<sito_clients::BundledManifest, serde_json::Error>,
     statuses: &[sito_clients::RuntimeListStatus],
+    can_view_urls: bool,
 ) -> Vec<crate::ui::templates::BundledListView> {
+    let redact_source = |source: String| -> String {
+        if can_view_urls {
+            source
+        } else {
+            redact_subscription_url(&source)
+        }
+    };
+    let redact_error = |error: String| -> String {
+        if can_view_urls {
+            error
+        } else {
+            redact_text_urls(&error)
+        }
+    };
     let manifest = match manifest {
         Ok(manifest) => manifest,
         Err(e) => {
@@ -47,9 +62,11 @@ pub(crate) fn bundled_list_views(
                 id: list.id.clone(),
                 kind: list.kind.clone(),
                 version: list.version.clone(),
-                source: status
-                    .and_then(|status| status.source_url.clone())
-                    .unwrap_or_else(|| list.source.clone()),
+                source: redact_source(
+                    status
+                        .and_then(|status| status.source_url.clone())
+                        .unwrap_or_else(|| list.source.clone()),
+                ),
                 license: list.license.clone(),
                 entries: status.map_or(list.entries, |status| status.entries),
                 state: if status.is_some_and(|status| !status.bundled) {
@@ -58,6 +75,10 @@ pub(crate) fn bundled_list_views(
                     "built-in (minimal)".to_string()
                 },
                 last_refresh: format_refresh(status.and_then(|status| status.last_refresh_unix)),
+                last_attempt: format_refresh(status.and_then(|status| status.last_attempt_unix)),
+                last_error: status
+                    .and_then(|status| status.last_error.clone())
+                    .map(redact_error),
             }
         })
         .collect();
@@ -69,7 +90,7 @@ pub(crate) fn bundled_list_views(
             id: status.category.clone(),
             kind: "custom".to_string(),
             version: "—".to_string(),
-            source: status.source_url.clone().unwrap_or_default(),
+            source: redact_source(status.source_url.clone().unwrap_or_default()),
             license: "—".to_string(),
             entries: status.entries,
             state: if status.bundled {
@@ -78,10 +99,52 @@ pub(crate) fn bundled_list_views(
                 "runtime refresh".to_string()
             },
             last_refresh: format_refresh(status.last_refresh_unix),
+            last_attempt: format_refresh(status.last_attempt_unix),
+            last_error: status.last_error.clone().map(redact_error),
         });
     }
     bundled_lists.sort_by(|a, b| a.id.cmp(&b.id));
     bundled_lists
+}
+
+/// Reduces a subscription URL to its scheme and host for roles that may see
+/// that a source exists but not its full (often tokenised) URL.
+pub(crate) fn redact_subscription_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "***".to_string();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    if scheme.is_empty() || host.is_empty() {
+        "***".to_string()
+    } else {
+        format!("{scheme}://{host}")
+    }
+}
+
+/// Redacts scheme URLs embedded in a free-form error string. Runtime-list
+/// errors can include the failing source; Viewers must not receive its path or
+/// credentials, so each URL is reduced to scheme+host.
+pub(crate) fn redact_text_urls(text: &str) -> String {
+    text.split_whitespace()
+        .map(|token| {
+            let Some(start) = ["http://", "https://", "file://"]
+                .iter()
+                .filter_map(|scheme| token.find(scheme))
+                .min()
+            else {
+                return token.to_string();
+            };
+            let (prefix, rest) = token.split_at(start);
+            let suffix_start = rest
+                .find([',', ';', ')', ']', '}', '"', '\''])
+                .unwrap_or(rest.len());
+            let (url, suffix) = rest.split_at(suffix_start);
+            format!("{prefix}{}{suffix}", redact_subscription_url(url))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
@@ -89,6 +152,7 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
         return Redirect::to("/login").into_response();
     };
     let csrf = get_csrf_token(&ctx, &headers);
+    let can_view_urls = user.role >= Role::Operator;
 
     let cfg = ctx.config.load();
     let snapshot = ctx.filter.snapshot();
@@ -109,7 +173,11 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
             FilterListDto {
                 id: list.name.clone(),
                 name: list.name.clone(),
-                url: list.url.clone(),
+                url: if can_view_urls {
+                    list.url.clone()
+                } else {
+                    redact_subscription_url(&list.url)
+                },
                 enabled: list.enabled,
                 refresh_hours: list.refresh_hours.unwrap_or(24) as u32,
                 rule_count: count,
@@ -122,7 +190,7 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
 
     // Curated lists bundled into the binary plus any runtime refresh state.
     let manifest = sito_clients::BundledManifest::try_bundled();
-    let bundled_lists = bundled_list_views(manifest, &ctx.runtime_lists.statuses());
+    let bundled_lists = bundled_list_views(manifest, &ctx.runtime_lists.statuses(), can_view_urls);
 
     HtmlTemplate(FilteringTemplate {
         csrf_token: &csrf,
@@ -245,6 +313,17 @@ pub async fn filtering_delete_handler(
     let Some(idx) = find_filter_list_index(&new_cfg, &id) else {
         return error_response(StatusCode::NOT_FOUND, "Filter list not found");
     };
+    let list_name = new_cfg.filtering.lists[idx].name.clone();
+    let groups = crate::handlers::filtering::groups_referencing_filter_list(&new_cfg, &list_name);
+    if !groups.is_empty() {
+        return error_response(
+            StatusCode::CONFLICT,
+            &format!(
+                "Filter list '{list_name}' is referenced by client group(s) {}; update the groups before deleting it",
+                groups.join(", ")
+            ),
+        );
+    }
     new_cfg.filtering.lists.remove(idx);
     if let Err(e) = apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Sync, None).await {
         tracing::error!("Failed to apply filter configuration: {e:?}");
@@ -402,5 +481,6 @@ pub async fn filtering_update_all_handler(
     }
     ctx.metrics.set_filter_rules(ctx.filter.rule_count());
     ctx.cache.flush();
+    ctx.publish_cache_size();
     Redirect::to("/filtering").into_response()
 }

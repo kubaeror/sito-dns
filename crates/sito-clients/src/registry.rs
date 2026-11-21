@@ -619,10 +619,17 @@ fn build_client_index(config: &ClientsConfig) -> ClientIndex {
 
     for (entry_idx, entry) in config.entries.iter().enumerate() {
         for id in &entry.ids {
-            if let Ok(ip) = id.trim().parse::<IpAddr>() {
+            let id = id.trim();
+            // An id that parses as an address or CIDR is never MAC-parsed,
+            // even when its hex digits would otherwise look like a MAC (for
+            // example `::aa:bb:cc:dd:ee:ff`).
+            if let Ok(ip) = id.parse::<IpAddr>() {
                 index.exact_ips.entry(ip).or_insert(entry_idx);
-            } else if let Ok(network) = IpNetwork::parse(id) {
+                continue;
+            }
+            if let Ok(network) = IpNetwork::parse(id) {
                 index.subnets.push((network, entry_idx));
+                continue;
             }
             if let Some(mac) = normalize_mac_id(id) {
                 index.macs.entry(mac).or_insert(entry_idx);
@@ -937,6 +944,54 @@ group = "hex"
     }
 
     #[test]
+    fn test_ip_or_cidr_id_is_never_a_mac_identity() {
+        let cfg: ClientsConfig = toml::from_str(
+            r#"
+[[entries]]
+name = "IPv6 Address"
+ids = ["::aa:bb:cc:dd:ee:ff"]
+group = "ipv6"
+
+[[entries]]
+name = "IPv6 Subnet"
+ids = ["::aa:bb:cc:dd:ee:ff/128"]
+group = "subnet"
+
+[groups.ipv6]
+[groups.subnet]
+"#,
+        )
+        .unwrap();
+
+        let index = build_client_index(&cfg);
+        assert!(
+            index.macs.is_empty(),
+            "an id that parses as an IP/CIDR must never become a MAC identity"
+        );
+        assert!(
+            index
+                .exact_ips
+                .contains_key(&"::aa:bb:cc:dd:ee:ff".parse().unwrap())
+        );
+        assert_eq!(index.subnets.len(), 1);
+
+        // A client whose ARP MAC matches those hex digits is still not
+        // identified by the MAC-shaped address/subnet ids.
+        let reg = ClientRegistry::new(cfg);
+        let ip = IpAddr::from_str("192.168.1.200").unwrap();
+        let mut arp = HashMap::new();
+        arp.insert(ip, "aa:bb:cc:dd:ee:ff".to_string());
+        reg.mac_resolver().set_mock_arp(arp);
+        let mut ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(policy.group_name, "default");
+        assert_eq!(
+            ctx.mac, None,
+            "no entry declares MAC identity, so ARP is not consulted"
+        );
+    }
+
+    #[test]
     fn test_unverified_routeros_lease_never_identifies_a_client() {
         let reg = ClientRegistry::new(sample_config());
         let ip = IpAddr::from_str("192.168.1.99").unwrap();
@@ -1163,6 +1218,40 @@ schedule = "0 0 15-21 * * MON-FRI"
             !policy.is_filtering_enabled,
             "14:59:59 local must be outside the window"
         );
+    }
+
+    #[test]
+    fn test_schedule_enabled_without_schedule_is_always_active() {
+        // Pins the documented behaviour: `schedule_enabled = true` without a
+        // `schedule` does not disable filtering, it leaves the group active at
+        // all times (the same as `schedule_enabled = false`).
+        let cfg: ClientsConfig = toml::from_str(
+            r#"
+[[entries]]
+name = "Kid"
+ids = ["192.168.1.31"]
+group = "kids"
+
+[groups.kids]
+schedule_enabled = true
+"#,
+        )
+        .unwrap();
+        let reg = ClientRegistry::new(cfg);
+
+        for (hour, minute) in [(3, 0), (12, 0), (23, 59)] {
+            let at = Utc.with_ymd_and_hms(2026, 9, 7, hour, minute, 0).unwrap();
+            let mut ctx = ClientContext::new(IpAddr::from_str("192.168.1.31").unwrap());
+            let policy = reg.resolve(&mut ctx, reg.timezone().at_utc(at));
+            assert_eq!(
+                policy.group_name, "kids",
+                "the test must resolve the configured group, not the default group"
+            );
+            assert!(
+                policy.is_filtering_enabled,
+                "schedule_enabled without schedule must stay active at {hour:02}:{minute:02}"
+            );
+        }
     }
 
     #[test]

@@ -188,6 +188,38 @@ pub(super) async fn init_runtime_components(
     })
 }
 
+/// Retry period when no curated list category has a representable refresh
+/// deadline, so the task re-evaluates instead of spinning.
+const UNSCHEDULABLE_REFRESH_RETRY: Duration = Duration::from_secs(3600);
+
+/// Converts a configured `[integrations.lists]` refresh interval in hours into
+/// a safe [`Duration`].
+///
+/// Clamps to `1..=MAX_REFRESH_HOURS`. Config validation already rejects `0` and
+/// values above the cap; the runtime clamp is defense in depth for configs
+/// constructed without validation, and keeps the hour-to-second multiplication
+/// from overflowing.
+fn integration_refresh_interval(hours: u64) -> Duration {
+    Duration::from_secs(
+        hours
+            .clamp(1, sito_core::config::MAX_REFRESH_HOURS)
+            .saturating_mul(3600),
+    )
+}
+
+/// Returns the next refresh deadline, or `None` when the platform `Instant`
+/// cannot represent it.
+///
+/// The interval is already clamped to one year, so `None` only happens when the
+/// platform clock is exhausted; callers skip such categories rather than
+/// scheduling them in the past (which would hot-loop the refresh task).
+fn integration_next_deadline(
+    now: tokio::time::Instant,
+    interval: Duration,
+) -> Option<tokio::time::Instant> {
+    now.checked_add(interval)
+}
+
 /// Periodically refreshes `[integrations.lists]` categories through the
 /// shared subscription downloader (ETag/disk cache/size caps) and swaps the
 /// runtime registries on success.
@@ -199,17 +231,21 @@ pub(crate) async fn run_list_refresh(
 ) {
     let fetcher =
         sito_filter::subscription::SubscriptionFetcher::default().with_file_root(data_dir.clone());
-    let default_hours = config.refresh_hours.max(1);
-    let mut entries: Vec<(String, String, Duration, tokio::time::Instant)> = config
+    let default_hours = config.refresh_hours;
+    let mut entries: Vec<(String, String, Duration, Option<tokio::time::Instant>)> = config
         .categories
         .into_iter()
         .map(|(name, source)| {
-            let hours = source.refresh_hours.unwrap_or(default_hours).max(1);
+            let hours = source.refresh_hours.unwrap_or(default_hours);
+            let interval = integration_refresh_interval(hours);
+            // Refresh immediately on startup (bundled data is only the
+            // fallback until the first successful download), then reschedule
+            // through `integration_next_deadline` after every refresh.
             (
                 name,
                 source.url,
-                Duration::from_secs(hours.saturating_mul(3600)),
-                tokio::time::Instant::now(),
+                interval,
+                Some(tokio::time::Instant::now()),
             )
         })
         .collect();
@@ -217,10 +253,35 @@ pub(crate) async fn run_list_refresh(
         return;
     }
 
-    while let Some((next_idx, _)) = entries.iter().enumerate().min_by_key(|(_, entry)| entry.3) {
-        let wait = entries[next_idx]
-            .3
-            .saturating_duration_since(tokio::time::Instant::now());
+    loop {
+        // Pick the earliest representable deadline. A category whose
+        // reschedule yielded `None` was warned about there and is skipped.
+        let Some((next_idx, deadline)) = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.3.map(|deadline| (index, deadline)))
+            .min_by_key(|(_, deadline)| *deadline)
+        else {
+            // No category is schedulable: wait before re-evaluating instead of
+            // hot-looping the selection.
+            tokio::select! {
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep(UNSCHEDULABLE_REFRESH_RETRY) => {
+                    for entry in &mut entries {
+                        if entry.3.is_none() {
+                            entry.3 = integration_next_deadline(tokio::time::Instant::now(), entry.2);
+                        }
+                    }
+                }
+            }
+            continue;
+        };
+
+        let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
 
         tokio::select! {
             res = shutdown_rx.changed() => {
@@ -232,6 +293,9 @@ pub(crate) async fn run_list_refresh(
                 let name = entries[next_idx].0.clone();
                 let url = entries[next_idx].1.clone();
                 let cache_name = format!("integration-{name}");
+                // Record the attempt before the network/file read so status
+                // consumers see in-flight work even if the fetch stalls.
+                store.record_attempt(&name, None);
                 match fetcher.fetch_or_cached(&cache_name, &url, &data_dir).await {
                     Ok(content) => match store.apply_content(&name, &content) {
                         Ok(entries) => {
@@ -243,20 +307,125 @@ pub(crate) async fn run_list_refresh(
                                 "Refreshed curated list category"
                             );
                         }
-                        Err(e) => warn!(
-                            category = %name,
-                            "Ignoring invalid refreshed curated list: {e}"
-                        ),
+                        Err(e) => {
+                            store.record_attempt(&name, Some(e.clone()));
+                            warn!(
+                                category = %name,
+                                "Ignoring invalid refreshed curated list: {e}"
+                            );
+                        }
                     },
-                    Err(e) => warn!(
-                        category = %name,
-                        url = %url,
-                        "Failed to refresh curated list: {e}"
-                    ),
+                    Err(e) => {
+                        store.record_attempt(&name, Some(e.to_string()));
+                        warn!(
+                            category = %name,
+                            url = %url,
+                            "Failed to refresh curated list: {e}"
+                        );
+                    }
                 }
-                entries[next_idx].3 =
-                    tokio::time::Instant::now() + entries[next_idx].2;
+                let next = integration_next_deadline(
+                    tokio::time::Instant::now(),
+                    entries[next_idx].2,
+                );
+                entries[next_idx].3 = next;
+                if next.is_none() {
+                    warn!(
+                        category = %name,
+                        "Skipping curated list category: next refresh deadline is not representable on this platform"
+                    );
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sito_core::config::MAX_REFRESH_HOURS;
+
+    #[test]
+    fn test_integration_refresh_interval_is_bounded() {
+        let cap = Duration::from_secs(MAX_REFRESH_HOURS * 3600);
+        assert_eq!(integration_refresh_interval(0), Duration::from_secs(3600));
+        assert_eq!(integration_refresh_interval(1), Duration::from_secs(3600));
+        assert_eq!(integration_refresh_interval(MAX_REFRESH_HOURS), cap);
+        assert_eq!(integration_refresh_interval(u64::MAX), cap);
+    }
+
+    #[tokio::test]
+    async fn test_list_refresh_failure_records_last_error() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_list_refresh_failure_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut config = sito_clients::ListCategoriesConfig::default();
+        config.categories.insert(
+            "adult".to_string(),
+            sito_clients::ListSourceConfig {
+                url: format!("file://{}", temp_dir.join("missing.txt").display()),
+                refresh_hours: None,
+                license: None,
+            },
+        );
+        let store = std::sync::Arc::new(
+            sito_clients::RuntimeLists::try_new().expect("bundled lists must load"),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_list_refresh(
+            config,
+            store.clone(),
+            temp_dir.clone(),
+            shutdown_rx,
+        ));
+
+        let mut recorded = None;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Some(status) = store
+                .statuses()
+                .into_iter()
+                .find(|status| status.category == "adult")
+                && status.last_error.is_some()
+            {
+                recorded = Some(status);
+                break;
+            }
+        }
+        let status = recorded.expect("a failed fetch must record last_error");
+        assert!(
+            !status.last_error.unwrap().is_empty(),
+            "last_error must carry the fetch failure"
+        );
+        assert!(status.last_attempt_unix.is_some());
+        assert!(
+            status.bundled,
+            "a failed refresh keeps the bundled fallback active"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_integration_next_deadline_is_bounded() {
+        let now = tokio::time::Instant::now();
+        let interval = integration_refresh_interval(u64::MAX);
+        let deadline = integration_next_deadline(now, interval)
+            .expect("a clamped one-year interval must be representable");
+        assert!(deadline > now, "the deadline must be in the future");
+        assert_eq!(deadline - now, interval);
+        assert_eq!(
+            integration_next_deadline(now, Duration::from_secs(u64::MAX)),
+            None,
+            "checked_add must reject a duration beyond the platform Instant range"
+        );
     }
 }

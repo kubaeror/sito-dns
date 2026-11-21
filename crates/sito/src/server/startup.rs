@@ -3,6 +3,20 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// True when DNS listeners must stay gated because setup is still pending.
+/// A persisted configuration can exist after a failed first-boot refresh, so
+/// the startup flag alone is not authoritative; an active setup token keeps a
+/// deployment with a persisted config gated across restarts. Programmatic
+/// callers that pass `requested_setup_pending = false` and supply their config
+/// in memory keep the historical ungated behavior.
+pub(super) fn should_gate_dns(
+    requested_setup_pending: bool,
+    setup_token_required: bool,
+    persisted_config: bool,
+) -> bool {
+    requested_setup_pending || (setup_token_required && persisted_config)
+}
+
 /// Runs the DNS server with an optional custom shutdown receiver (useful for testing).
 pub async fn run_server_with_shutdown(
     config: Config,
@@ -110,20 +124,20 @@ pub async fn run_server_with_lease(
         service_registry.clone(),
     ));
     let integrations = integrations_from_config(&config)?;
+    // `validate_typed_sections` above already validated `[integrations.lists]`
+    // (generic rules and known bundled categories), so this block only starts
+    // the refresh task and does not duplicate validation.
     if let Some(ref integrations) = integrations
         && let Some(ref lists_cfg) = integrations.lists
+        && !lists_cfg.categories.is_empty()
     {
         let lists_cfg = lists_cfg.clone();
-        if let Err(e) = lists_cfg.validate() {
-            warn!("Ignoring invalid [integrations.lists] configuration: {e}");
-        } else if !lists_cfg.categories.is_empty() {
-            let lists_store = runtime_lists.clone();
-            let lists_data_dir = config.server.data_dir.clone();
-            let lists_shutdown = shutdown_rx.clone();
-            tokio::spawn(async move {
-                run_list_refresh(lists_cfg, lists_store, lists_data_dir, lists_shutdown).await;
-            });
-        }
+        let lists_store = runtime_lists.clone();
+        let lists_data_dir = config.server.data_dir.clone();
+        let lists_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_list_refresh(lists_cfg, lists_store, lists_data_dir, lists_shutdown).await;
+        });
     }
 
     // Initialize local rewrites table
@@ -170,15 +184,25 @@ pub async fn run_server_with_lease(
     // the runtime snapshot (and therefore the query path) on the new rules.
     {
         let refresh_runtime = Arc::clone(&runtime);
+        let refresh_cache = Arc::clone(&cache);
+        let refresh_metrics = metrics.clone();
         filter_engine.set_snapshot_observer(Arc::new(move |snapshot, groups| {
             // Called while the filter engine holds its reload guard, so the
             // config generation cannot change between the read and publish.
             let expected = refresh_runtime.generation();
-            if let Err(error) = refresh_runtime.publish_filter(Some(snapshot), groups, expected) {
-                tracing::debug!(
+            match refresh_runtime.publish_filter(Some(snapshot), groups, expected) {
+                Ok(_) => {
+                    // A successful filter publish flushes entries tagged with
+                    // the old filter epoch; keep the size gauge truthful for
+                    // scheduled refreshes as well as API-triggered ones.
+                    refresh_metrics.set_cache_size_bytes(
+                        i64::try_from(refresh_cache.weighted_size()).unwrap_or(i64::MAX),
+                    );
+                }
+                Err(error) => tracing::debug!(
                     error = %error,
                     "Discarding a scheduled blocklist refresh that raced a config apply"
-                );
+                ),
             }
         }));
     }
@@ -239,6 +263,15 @@ pub async fn run_server_with_lease(
         auth_cfg.token_default_ttl_days,
     )?);
     auth_mgr.spawn_pruner(shutdown_rx.clone());
+
+    // A failed first-boot refresh can leave config.toml persisted while setup
+    // is still incomplete. The setup token (or the caller's explicit flag) is
+    // authoritative; never bind DNS just because a config file now exists.
+    let setup_pending = should_gate_dns(
+        setup_pending,
+        auth_mgr.setup_token_required(),
+        config_path_buf.exists(),
+    );
 
     let (dns_start_tx, mut dns_start_rx) = tokio::sync::mpsc::unbounded_channel();
     let dns_starter = if setup_pending {

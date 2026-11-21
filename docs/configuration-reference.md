@@ -85,16 +85,16 @@ allow_plaintext_doh = false
 | `tls` | table | `None` | Top-level `[tls]` is the canonical config v2 table. `[dns.tls]` is a deprecated v1 alias that still takes precedence when both are present (v1 behavior); migration moves it to `[tls]`. Changing either table requires a restart. |
 | `edns_udp_size` | integer | `1232` | Maximum EDNS0 UDP buffer size (1232 bytes prevents IPv6 fragmentation). |
 | `rate_limit_per_ip` | integer | `20` | Maximum queries per second allowed from an individual source prefix (`0` disables rate limiting; maximum `1000000`). IPv4 budgets are keyed per `/24` and IPv6 per `/64`. |
-| `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, and DoH client connections. |
+| `max_tcp_connections` | integer | `256` | Maximum concurrent TCP, DoT, DoH, DoQ, and DoH3 client connections. Each source address is additionally capped at 16 concurrent connections, and long-lived connections are closed after a 300-second lifetime (DoT also honours its query/idle caps). |
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
 > [!WARNING]
-> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 2.0 has **no DNS client allow-list**.
-> `rate_limit_per_ip` only limits rate; it does not authorize clients. A wildcard bind therefore accepts recursive queries from any source
+> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 2.0 has no DNS client allow-list: a default-deny DNS client ACL is deferred, not part of Phase 2
+> core hardening. `rate_limit_per_ip` only limits rate; it does not authorize
+> clients. A wildcard bind therefore accepts recursive queries from any source
 > that can reach the host. Restrict the DNS ports to your LAN with a host
 > firewall, or bind specific LAN addresses. The server emits a startup warning
-> when a wildcard DNS bind is combined with an enabled DNS port. A
-> default-deny DNS client ACL is not part of the Phase 1 config work package.
+> when a wildcard DNS bind is combined with an enabled DNS port.
 
 ---
 
@@ -119,7 +119,7 @@ serve_stale_hours = 12
 | `max_ttl` | integer | `86400` | Maximum TTL (seconds) to assign to cached answers (caps excessively high upstream TTLs). |
 | `negative_ttl_max` | integer | `3600` | Maximum TTL (seconds) for negative caching (NXDOMAIN / NODATA). |
 | `prefetch` | boolean | `true` | When `true`, automatically re-resolves frequently requested domains before TTL expires. |
-| `serve_stale_hours` | integer | `12` | Hours to serve expired cache records as fallback when upstreams are unreachable. Stale answers are served with all DNSSEC records removed and AD=0; while DNSSEC validation is active, entries cached without validation (`Unchecked`) or with an inconclusive result (`Indeterminate`) are not served. |
+| `serve_stale_hours` | integer | `12` | Hours to serve expired cache records as fallback when upstreams are unreachable. Stale answers are served with all DNSSEC records removed and AD=0; while DNSSEC validation is active, entries cached without validation (`Unchecked`), with an inconclusive result (`Indeterminate`) or as a fail-closed `Bogus` SERVFAIL are not served. |
 
 ---
 
@@ -138,7 +138,7 @@ ntp = ["local.internal"]
 | `validate` | boolean | `true` | Enable DNSSEC processing. Validation walks DS/DNSKEY links present in the response and, when the chain is incomplete, resolves the missing DNSKEY/DS records through the configured upstreams (bounded per-query fetch budget). Cryptographic verification is bounded per response (256 RRSIG checks, at most 8 candidate keys per signature). NSEC/NSEC3 denial proofs are enumerated; NSEC3 records above 150 iterations are ignored (RFC 9276) and opt-out NXDOMAIN answers are treated as insecure. |
 | `ntp` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). Alias retained for compatibility; `nta` is the preferred key. |
 | `nta` | array of strings | `[]` | Negative Trust Anchors: domains exempt from DNSSEC validation (RFC 7646). |
-| `trust_anchors` | array of strings | `[]` | Trust anchors used as the top of the DS/DNSKEY chain (DS or DNSKEY records in zone-file/hex form). Empty uses validation of RRSIGs against configured anchors only. |
+| `trust_anchors` | array of strings | `[]` | Additional trust anchors used as the top of the DS/DNSKEY chain (DS or DNSKEY records in zone-file/hex form). The built-in root anchors are always present; an empty list means no *configured* anchors are added. Entries extend the built-in set rather than replacing it. |
 
 ---
 
@@ -218,14 +218,14 @@ servers = ["udp://192.168.1.1:53"]
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `servers` | array of strings | `["1.1.1.1", "1.0.0.1"]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port][/path]` (DoH, RFC 8484 with GET fallback; a bare `https://host` uses `/dns-query`), `quic://host[:port]` (DoQ, RFC 9250, default port 853). |
-| `bootstrap` | array of IP addresses | `["9.9.9.9", "149.112.112.112"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. Bootstrap and health-probe queries set RD=1. |
+| `servers` | array of strings | `["1.1.1.1", "1.0.0.1"]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port][/path]` (DoH, RFC 8484 with GET fallback; a bare `https://host` uses `/dns-query`), `quic://host[:port]` (DoQ, RFC 9250, default port 853). Scheme names are case-insensitive. Only `https://` and `quic://` accept a URL path; `udp://`, `tls://` and bare `host:port` targets reject one instead of validating and then failing at startup. |
+| `bootstrap` | array of IP addresses | `["9.9.9.9", "149.112.112.112"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. Bootstrap and health-probe queries set RD=1. Required whenever a target is a hostname: an empty list is rejected if any `servers`/`per_domain.servers` entry needs resolving. IP-literal targets can run with an empty list. Each answer is sorted/deduplicated and capped at 16 resolved candidates so a hostile or misconfigured zone cannot create an unbounded candidate set. |
 | `strategy` | string | `"failover"` | Forwarding strategy: `"parallel"` (fastest answer wins), `"failover"` (sequential fallback), or `"load_balance"`. |
-| `timeout_ms` | integer | `5000` | Overall per-query budget in milliseconds, shared across failover/load-balance retries (each sequential attempt gets an equal share of the remaining budget; parallel races use the full budget). |
+| `timeout_ms` | integer | `5000` | Overall per-query budget in milliseconds, shared across failover/load-balance retries (each sequential attempt gets an equal share of the remaining budget; parallel races use the full budget). Must be `1`–`60000`; larger values are rejected so one stalled upstream cannot hold the query pipeline indefinitely. |
 | `probe_domain` | string | `"example.com"` | Test domain used for periodic health-checking of upstreams. |
 | `ecs` | string | `"off"` | EDNS Client Subnet policy: `"off"` strips client ECS before forwarding and deduplicates cache keys; `"forward"` forwards ECS after clamping IPv4 to /24 and IPv6 to /56 (zero source prefixes dropped). Forwarding can improve CDN locality but discloses a coarse client-location hint and splits cache entries by subnet. |
-| `pool_size` | integer | `4` | Number of persistent TCP/TLS connections maintained per upstream endpoint. |
-| `allow_private_targets` | boolean | `false` | Allow hostname-configured upstreams to resolve to private/loopback/link-local/reserved addresses. Disabled by default so a compromised or spoofed bootstrap cannot redirect an upstream into the local network or cloud metadata. IP literals in `servers` are always accepted as an explicit operator choice. This is a config-file-only key: the REST/UI upstream update preserves the current value rather than accepting it in the DTO. |
+| `pool_size` | integer | `4` | Number of persistent TCP/TLS connections maintained per upstream endpoint. Must be `1`–`64`; each pooled connection is a live socket, so larger values are rejected. |
+| `allow_private_targets` | boolean | `false` | Allow hostname-configured upstreams to resolve to private/loopback/link-local/reserved addresses. Disabled by default so a compromised or spoofed bootstrap cannot redirect an upstream into the local network or cloud metadata. Bootstrap answers are checked for IPv4-mapped, NAT64, 6to4 and Teredo embeddings of denied addresses, and a denied-only answer is not cached. IP literals in `servers` (and `per_domain.servers`) are the intentional allowlist path: an explicit literal is always accepted, because it is an operator choice rather than a bootstrap answer. This is a config-file-only key: the REST/UI upstream update preserves the current value rather than accepting it in the DTO. |
 | `per_domain` | array of tables | `[]` | Domain-specific upstream forwarder rules (e.g., routing LAN domains to internal router). |
 
 ### `[[upstream.per_domain]]` entries
@@ -263,7 +263,7 @@ enabled = true
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `true` | Master toggle for blocklist filtering and custom rules. |
-| `refresh_interval_hours` | integer | `24` | Default interval between automated subscription list re-downloads. |
+| `refresh_interval_hours` | integer | `24` | Default interval between automated subscription list re-downloads. Must be greater than 0 and at most 8760 (one year); larger values are rejected. |
 | `blocking_mode` | string | `"zero_ip"` | DNS answer returned for blocked domains: `"zero_ip"` (`0.0.0.0` / `::`), `"nxdomain"`, `"refused"`, `"null_rdata"`, or `"custom_ip:<ip>"`. |
 | `blocking_ttl` | integer | `10` | TTL in seconds returned on blocked responses (low TTL allows rapid unblocking). |
 | `cname_cloaking` | boolean | `true` | Follow CNAME chains upstream and apply filter rules against intermediate canonical names. |
@@ -283,7 +283,7 @@ enabled = true
 | `lists.name` | string | required | Unique list name shown in status, API and UI. |
 | `lists.url` | string | required | Source URL (`http://`, `https://` or `file://`). |
 | `lists.enabled` | boolean | `true` | Download and compile this list. |
-| `lists.refresh_hours` | integer | `None` | Per-list refresh interval in hours. When unset, `filtering.refresh_interval_hours` is used. Must be greater than 0 when set. |
+| `lists.refresh_hours` | integer | `None` | Per-list refresh interval in hours. When unset, `filtering.refresh_interval_hours` is used. Must be greater than 0 and at most 8760 (one year) when set. |
 
 ---
 
@@ -325,7 +325,7 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `groups` | table (map of name → group) | `{}` | Policy groups keyed by group name, e.g. `[clients.groups.kids]`, with optional `[[clients.groups.<name>.blocked_services]]` entries. Group fields: description (optional operator note), filtering, lists, custom_rules, safe_search, safe_search_youtube, parental, parental_categories, schedule_enabled, schedule, blocked_services. |
 | `client_id_secrets` | table (map of entry name → secret) | `{}` | Shared secrets accepted as the first DoT SNI label (`<secret>.dns.example.com`) or the DoH path segment (`/dns-query/<secret>`). Empty disables path/SNI identification. |
 | `trust_routeros_lease_names` | boolean | `false` | Trust RouterOS DHCP lease host names/comments for client identification. Off by default because lease data is client-controlled. |
-| `timezone` | string | `"local"` | Timezone used to evaluate client schedules and time-of-day rules. `"local"`/`"system"` uses the host zone (DST-aware); `"UTC"` and fixed offsets (`"+02:00"`, `"-05:30"`, `"+0530"`, `"UTC+2"`) are also accepted. IANA names are not supported (no tzdb dependency); schedules in UTC-only deployments should set this explicitly. |
+| `timezone` | string | `"local"` | Timezone used to evaluate client schedules and time-of-day rules. `"local"`/`"system"` resolves the host zone at runtime, so DST transitions and skipped/repeated wall-clock times follow the host platform. `"UTC"` and fixed offsets (`"+02:00"`, `"-05:30"`, `"+0530"`, `"UTC+2"`) are accepted and never shift for DST. IANA names (e.g. `"Europe/Warsaw"`) are not supported (no tzdb dependency); deployments that need a stable clock should set `"UTC"` or a fixed offset explicitly. |
 
 > Every `[[clients.entries]]` `group` must name an existing
 > `[clients.groups.<name>]` table (or be omitted / `"default"`). An unknown
@@ -353,19 +353,41 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `groups.lists` | array of strings | `[]` | Filter list names applied to this group in addition to global lists. |
 | `groups.custom_rules` | array of strings | `[]` | Inline ABP/AdGuard rules applied only to this group. |
 | `groups.safe_search` | boolean | `false` | Force safe-search resolution for group members. |
-| `groups.safe_search_youtube` | string | `None` | YouTube safe-search mode when `safe_search` is enabled (`"off"`, `"moderate"` or `"strict"`). |
+| `groups.safe_search_youtube` | string | `None` | YouTube safe-search mode when `safe_search` is enabled (`"strict"` or `"moderate"`; defaults to `"strict"` when unset). |
 | `groups.parental` | boolean | `false` | Enable parental-category blocking for group members. |
-| `groups.parental_categories` | array of strings | `[]` | Parental categories to block (for example `"adult"`, `"gambling"`). |
-| `groups.schedule_enabled` | boolean | `false` | Enable the group's time-of-day schedule. |
-| `groups.schedule` | string | `None` | Cron-style schedule used when `schedule_enabled = true`, evaluated in `clients.timezone`. |
+| `groups.parental_categories` | array of strings | `[]` | Parental categories to block (for example `"adult"`, `"gambling"`). Unknown ids are rejected against the bundled parental registries during configuration validation. |
+| `groups.schedule_enabled` | boolean | `false` | Enable the group's time-of-day schedule. When `true` without `schedule`, the group stays active at all times (it does not disable filtering). |
+| `groups.schedule` | string | `None` | Cron-style schedule used only when `schedule_enabled = true`, evaluated in `clients.timezone`. Ranges do not wrap: split overnight windows into comma-separated ranges such as `0 22-23,0-6 * * *`. Reversed numeric ranges are rejected at configuration load; named day-of-week ranges (e.g. `FRI-MON`) are interpreted by `croner`. |
 | `groups.blocked_services` | array of tables | `[]` | Service-specific block rules for members of this group. |
 
 ### `[[clients.groups.<name>.blocked_services]]`
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `groups.blocked_services.service` | string | required | Service identifier (`tiktok`, `youtube`, …) to block. |
+| `groups.blocked_services.service` | string | required | Service identifier (`tiktok`, `youtube`, …) to block. Unknown ids are rejected against the bundled service registry during configuration validation. |
 | `groups.blocked_services.schedule` | string | `None` | Optional cron-style schedule that limits when the service is blocked. |
+
+> [!NOTE]
+> Group and blocked-service schedules are evaluated lazily against the query
+> timestamp. `schedule_enabled = true` without a `schedule` leaves the group
+> always active (the same result as `schedule_enabled = false`); a `schedule`
+> configured while `schedule_enabled = false` is ignored. Cron ranges do not
+> wrap around, so an overnight window must be written as split ranges, for
+> example `0 22-23,0-6 * * *`; a reversed numeric range such as `0 22-6 * * *`
+> is rejected at configuration load with an error naming the field. Named
+> day-of-week ranges are left to `croner`.
+
+> [!NOTE]
+> `parental_categories` and `blocked_services.service` are validated against the
+> **bundled** parental/service registries at configuration-validation time (the
+> same data startup uses). Service ids that only exist in a runtime-refreshed
+> `[integrations.lists]` source are not accepted as client references yet.
+>
+> The bundled parental (`adult`, `gambling`) and service data is a **minimal
+> built-in fallback**, not a maintained external dataset: it covers common
+> providers only and is not continuously curated or security-reviewed. External
+> curated data (licensed source, update pipeline, checksum/version manifest) is
+> deferred past WP-2.5; configure `[integrations.lists]` for broader coverage.
 
 ---
 
@@ -387,7 +409,7 @@ exception_clients = ["admin-laptop"]
 |---|---|---|---|
 | `auto_ptr` | boolean | `false` | Automatically synthesize reverse PTR records (`in-addr.arpa` / `ip6.arpa`) for local A/AAAA rewrites in RFC 1918 / ULA ranges. Opt-in. |
 | `ttl` | integer | `60` | TTL for synthesized rewrite records. |
-| `entries` | array of tables | `[]` | Local record rewrites (`domain`, `type` (`A`/`AAAA`/`CNAME`/`PTR`/`TXT`), `answer`, and optional `exception_clients`). |
+| `entries` | array of tables | `[]` | Local record rewrites (`domain`, `type` (`A`/`AAAA`/`CNAME`/`PTR`/`TXT`), `answer`, and optional `exception_clients`). A local `A`/`AAAA`/`PTR`/`TXT` owner is authoritative: a query for an unconfigured qtype returns NOERROR/NODATA without an upstream lookup, unless the client matches `exception_clients`, in which case the rewrite is bypassed and the query falls through to upstream instead. Stage 2 (local rewrites) runs before standard, parental and service blocking, so those block stages do not apply to locally owned qtypes. |
 
 ### `[[rewrites.entries]]` entries
 
@@ -396,7 +418,7 @@ exception_clients = ["admin-laptop"]
 | `entries.domain` | string | required | Domain or wildcard pattern to answer locally (`*.home.arpa`). Normalized as a domain. |
 | `entries.type` | string | required | Record type: `"A"`, `"AAAA"`, `"CNAME"`, `"PTR"` or `"TXT"`. |
 | `entries.answer` | string | required | Answer value for the record. |
-| `entries.exception_clients` | array of strings | `[]` | Client names/groups/MACs that bypass the rewrite. Matching requires an authenticated identity; IP/CIDR matching still uses the query source. |
+| `entries.exception_clients` | array of strings | `[]` | Client names/groups/MACs that bypass the rewrite. Matching requires an authenticated identity; IP/CIDR matching still uses the query source. Names may contain spaces and apostrophes; leading/trailing whitespace is rejected, and names containing `/` are not supported (the value is treated as a CIDR attempt). |
 | `entries.id` | string | `None` | Stable rewrite identifier preserved by the admin rewrite API and returned by `/api/v1/rewrites`. The DNS rewrite loader does not use it. If it is absent, the API synthesizes `legacy-<index>`; removing an existing id changes the identifier clients see. |
 
 ---
@@ -530,7 +552,10 @@ key before any retention task starts.
 > SQLite runs with `secure_delete=ON`. Rollup client IPs are keyed BLAKE3
 > hashes using `<data_dir>/stats-salt` (0600); client names are omitted unless
 > `rollup_client_names = true`. Switching `rollup_client_names` from `true` to
-> `false` scrubs names from existing rollups on the next startup. Archived
+> `false` scrubs names from existing rollups immediately on a live config
+> apply (the scrub runs in one `BEGIN IMMEDIATE` transaction, so it waits for
+> an in-flight retention/clear writer and later writers see the `false` policy).
+> Startup re-runs the same sync if the marker did not commit. Archived
 > per-client rows therefore show the keyed hash (`blake3:…`) instead of a raw
 > address for data older than the detailed query-log retention. Symlinked
 > `stats.db` or `stats-salt` paths are refused. Hashes written by the
@@ -546,6 +571,23 @@ key before any retention task starts.
 > the contributions of already-deleted rows. The final per-hour top-N sort runs
 > inside the chunk transaction and can be expensive for a pathological hour
 > with very many distinct domains/clients.
+
+**Retention and clear capacity notes.** Normal retention is hour-bounded and
+commits each hour separately, so a backlog is pruned without holding the
+writer lock for the whole sweep; the per-connection temp tables hold at most
+one hour of distinct domains, clients and upstreams and are cleared after each
+hour. The `keep_aggregates=true` clear is the exception: it folds the whole
+query-log range into rollups in one immediate transaction and loads every
+affected hour's top lists into memory before deleting, so a very large first
+clear can be slow and memory-heavy (documented residual, P2-61). A 1M-row,
+90-day soak is likewise a documented capacity-testing residual rather than a
+unit-test guarantee; the row-bounded chunks keep each transaction bounded but
+the sweep is still linear in the number of expired rows. `stats_watermark` is
+still written for progress diagnostics/backward compatibility but is not read
+to skip rows: aggregation and deletion share a transaction, and backdated rows
+must be re-aggregated. Enabling `privacy.anonymize_querylog` is forward-only;
+old detailed rows are not rewritten (retroactive anonymization is deferred,
+P2-59).
 
 > Query logging is always enabled when `[stats]` is present. Prometheus metrics
 > are exposed at `/metrics` and require a Viewer-or-higher bearer token or
@@ -572,6 +614,7 @@ replication_port = 8953
 
 # On Slave instance:
 # master_url = "wss://192.168.1.10:8953"
+# master_url = "wss://[2001:db8::10]:8953"   # bracketed IPv6 literal
 # master_fingerprint = "blake3:4f8a12..."
 # master_pubkey = "<ed25519 public key>"   # required on slaves (signed bundle verification)
 # cert = "/etc/sito/ha_slave.crt"
@@ -583,23 +626,47 @@ replication_port = 8953
 |---|---|---|---|
 | `replication_port` | integer | `8953` | Mutual-TLS WebSocket port for config synchronization. |
 | `listen_addr` | string | `"0.0.0.0"` | Address the master replication listener binds to. |
-| `master_url` | string | `None` | (Slave only) WebSocket URL of the master instance. |
-| `master_fingerprint` | string | `None` | (Slave only) Expected Blake3 public certificate fingerprint of master for pinning. |
-| `master_pubkey` | string | `None` | (Slave only, **required**) Ed25519 public key of the master used to verify signed configuration pushes. |
-| `cert` / `key` / `ca` | string | `None` | Paths to mTLS certificates and CA bundles for replication. When `ca` is set, the peer chain is validated against it **including hostname/SAN verification**, even when BLAKE3 pinning is also configured. |
+| `master_url` | string | `None` | (Slave only) WebSocket URL of the master instance. IPv6 literals must be bracketed, for example `wss://[2001:db8::10]:8953`. |
+| `master_fingerprint` | string | `None` | (Slave only) Expected Blake3 public certificate fingerprint of master for pinning. A configured pin is always enforced. |
+| `master_pubkey` | string | `None` | (Slave only, **required**) Ed25519 public key of the master used to verify signed configuration pushes. Protocol v2 also binds a BLAKE3 config digest and this key's fingerprint into every signed bundle. |
+| `cert` / `key` / `ca` | string | `None` | Paths to mTLS certificates and CA bundles for replication. When `ca` is set, the peer chain is validated against it **including hostname/SAN verification**, even when BLAKE3 pinning is also configured. CA-only verification is supported and does not require `allow_unpinned_tls`. |
 | `ping_interval_secs` | integer | `15` | Master heartbeat interval. Slaves silent for 3× this interval are disconnected and removed from the active tracker. |
 | `slave_token` | string | `None` | Pre-shared token for slave authentication (mandatory when serving plaintext `ws://`). |
 | `pinned_slave_fingerprints` | array of strings | `[]` | BLAKE3 fingerprints of slave certificates accepted by the master. |
-| `allow_unpinned_tls` | boolean | `false` | Allow TLS peers without a configured fingerprint (insecure; only for controlled networks). |
+| `allow_unpinned_tls` | boolean | `false` | Explicit no-verification opt-out. It only applies when neither `master_fingerprint` nor `ca` is configured; a configured pin or CA is always enforced. |
 | `allow_insecure_ws` | boolean | `false` | Allow plaintext `ws://` replication. Requires a non-empty `slave_token`; must be set explicitly on both ends. |
 | `stats_interval_secs` | integer | `30` | Interval between slave-to-master statistics reports. |
+
+HA protocol **v2** is required on every node. A `Hello` without
+`protocol_version`, a v1 `ConfigPush`, or a v1 `ha_state.toml`/
+`ha_watermark.toml` is refused with an actionable `protocol_mismatch` (close
+reason, log, readiness reason and the `sito_ha_protocol_rejections_total`
+counter). Rejecting a bad peer never changes the listener or master readiness.
+Upgrade the master first and then each slave; downgrade requires restoring the
+pre-upgrade state/watermark and certificate backups. See the
+[HA runbook §7](runbook-ha.md#7-ha-protocol-v2-upgrade-and-downgrade).
+
+Runtime limits are fixed: 1 MiB maximum WebSocket message/frame, 4 MiB of
+queued bundles per slave (older pushes coalesce to the latest active bundle),
+10 s send and handshake deadlines, and 64 global/8 per-source-IP concurrent
+sessions (the per-IP permit covers the whole session, not only the handshake).
+A publish response with `ha_publish.status = "queued"` means at least one slave
+was enqueued (directly or coalesced), not delivered; inspect
+`slaves_connected`/`slaves_queued`/`slaves_coalesced` and the slave ACKs in
+`GET /api/v1/ha/slaves`. If slaves are connected but every channel is closed,
+nothing was queued and the status is `connected_no_delivery`. An oversized
+bundle returns `TooLarge`, is not persisted/broadcast, and is not retried:
+reduce the shared configuration. Private keys (`cert`/`key`, `ca.key`, and the
+Ed25519 signing key) are `0600`; reusing an existing CA repairs `ca.key` to
+`0600` without rewriting it.
 
 The slave stores a **single** `master_fingerprint`; the master stores a list of
 accepted `pinned_slave_fingerprints`. During certificate rotation, the master
 can pin both the old and new slave fingerprints at once, while each slave must
 switch its one master fingerprint to the new value. `allow_unpinned_tls = true`
-is an explicit insecure opt-out; with `ca` configured, the server name is still
-checked against the certificate SAN.
+is an explicit insecure opt-out only when no pin and no CA are configured; with
+`ca` configured, the chain and server-name/SAN are still checked. CA-only
+verification is a supported trust mode.
 
 Private keys referenced by `key` are read by the unprivileged service account
 (`sito` under systemd, uid/gid `65532` in the container image). Generate them
@@ -615,29 +682,37 @@ readiness is reported by the admin web listener, keep `[web] enabled = true`
 fails closed rather than assuming replication is healthy.
 
 Slaves persist the last successfully applied bundle identity to
-`<data_dir>/ha_watermark.toml` (JSON, mode `0600`, written atomically) after
-the configuration is applied and before the push is acknowledged. The file
-records the term, version, signed payload hash and application timestamp. It is
-restored at startup: pushes from an older term are rejected, pushes below the
-recorded version within the same term are rejected, and a push at the same
-version is only accepted when the signed payload hash matches. A corrupt or
-unreadable watermark fails startup rather than resetting to version 0; delete
-it only when you intend to force a full resync from the master. The watermark
-is node-local and must not be copied between slaves.
+`<data_dir>/ha_watermark.toml` (JSON, mode `0600`, written atomically, wrapped
+v2 shape with a required `protocol_version`) after the configuration is applied
+and before the push is acknowledged. The file records the term, version, signed
+payload hash, application timestamp, signing-key fingerprint and a BLAKE3 digest
+of the **shared projection** of the applied `config.toml` (not the exact
+per-node document). It is restored at startup: pushes from an older term are
+rejected, pushes below the recorded version within the same term are rejected,
+and a push at the same version is only accepted when the signed payload hash and
+shared-projection digest match. A v1 or corrupt/unreadable watermark fails
+startup rather than being guessed at or reset to version 0; back it up and move
+it aside only as part of the coordinated v2 upgrade. The watermark is node-local
+and must not be copied between slaves.
 
 A slave must receive a frame (push, ping/pong, stats or close) within
 `3 × ping_interval_secs` (default 45 s); otherwise it leaves `Synced`, records a
 `readiness_reason`, and `/health` reports not ready while DNS keeps serving the
 last applied configuration. The watermark also records a BLAKE3 digest of the
-exact applied `config.toml`; a local edit or revert marks the node `Degraded`
-and forces a full apply before it can report `Synced` again. A watermark written
-by 1.9.3 or earlier has no digest and forces one full apply after upgrade.
-Master publish failures are reported through `ha_publish` on config writes and
-make HA readiness false. `POST /api/v1/ha/resync` returns `200` when the request
-was accepted (including a master with no connected slaves and no active bundle,
-which reports `slaves_notified: 0`). It returns `503` when replication is
-inactive, the slave worker is stopped, or a master has connected slaves and an
-active bundle but the push could not be queued for any of them.
+**shared projection** of the applied `config.toml` and the master signing-key
+fingerprint; a local edit to a shared field marks the node `Degraded` and forces
+a full apply before it can report `Synced` again, while node-local edits do not.
+Protocol v2 refuses v1 `ha_state.toml`/`ha_watermark.toml`; before the first v2
+start, back them up and move them aside on the master and every slave (see the
+[HA runbook §7.2](runbook-ha.md#72-upgrade-v1-cluster--v2)). This intentionally
+resets the master sequence and each slave's local replay guard and requires a
+full resync; keep the v1 files for downgrade. Master publish failures are
+reported through `ha_publish` on config writes and make HA readiness false.
+`POST /api/v1/ha/resync` returns `200` when the request was accepted (including
+a master with no connected slaves and no active bundle, which reports
+`slaves_notified: 0`). It returns `503` when replication is inactive, the slave
+worker is stopped, or a master has connected slaves and an active bundle but the
+push could not be queued for any of them.
 
 Replication preserves node-local identity. The master does not overwrite a
 slave's `dns.bind`, `[dns.tls]`/`[tls]` certificate paths, `[acme]` account and
@@ -708,11 +783,19 @@ interval_s = 300
 
 ## 15. `[integrations.lists]` — Curated List Updates
 
-Point the bundled parental/service categories at maintained sources; a
+Point the bundled parental/service categories at operator-managed sources; a
 background task downloads them through the shared subscription downloader
 (ETag/If-Modified-Since, disk cache under `data_dir`, size caps) and swaps the
 runtime registries without a restart. The bundled data remains the fallback
 until the first successful refresh.
+
+> [!IMPORTANT]
+> The bundled parental/service lists are a **minimal built-in fallback**, not a
+> maintained external dataset. They cover common providers, are not
+> continuously curated, and are not a substitute for a licensed blocklist.
+> Shipping a maintained external dataset is deferred past WP-2.5; the bundled
+> entries and their manifest exist to make the fallback honest and
+> reproducible, not to claim upstream curation.
 
 ```toml
 [integrations.lists]
@@ -729,15 +812,15 @@ url = "https://lists.example.com/services.json"
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be ≥ 1). |
-| `categories` | table (map of category → source) | `{}` | Sources keyed by category id (`adult`, `gambling`, `services`, or any custom parental category). Each entry has a required `url` (`https://`, `http://` or `file://`), an optional `refresh_hours` override and an optional `license` string for operator reference. Refreshed domain lists replace the bundled content of that category; `services` expects service JSON. |
+| `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be ≥ 1 and at most 8760, one year). |
+| `categories` | table (map of category → source) | `{}` | Sources keyed by a bundled category id (`adult`, `gambling` or `services`, case-insensitive). Unknown ids and case-insensitive duplicates are rejected at startup and on configuration writes; empty/whitespace keys are invalid. Each entry has a required `url` (`https://`, `http://` or `file://`), an optional `refresh_hours` override and an optional `license` string for operator reference. Refreshed domain lists replace the bundled content of that category; `services` expects service JSON. Operators can force an immediate refresh (bypassing the >50% shrink guard) with `POST /api/v1/integrations/lists/{category}/refresh`; `GET /api/v1/integrations/lists` reports last refresh/attempt and the most recent error. |
 
 ### `[integrations.lists.categories.<name>]` entries
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `categories.url` | string | required | Source URL for the category (`https://`, `http://` or `file://`). |
-| `categories.refresh_hours` | integer | `None` | Per-category refresh interval in hours. When unset, `integrations.lists.refresh_hours` is used; must be greater than 0 when set. |
+| `categories.refresh_hours` | integer | `None` | Per-category refresh interval in hours. When unset, `integrations.lists.refresh_hours` is used; must be greater than 0 and at most 8760 (one year) when set. |
 | `categories.license` | string | `None` | SPDX license identifier of the upstream data, for operator reference. |
 
 ---
@@ -783,7 +866,8 @@ applies the hot settings and reports the restart-only fields that remain.
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
 | `privacy.anonymize_querylog` | Query-log writer updated. |
-| `stats.retention_days`, `stats.rollup_retention_days`, `stats.rollup_client_names` | Re-read at each retention sweep: a bounded catch-up on startup (within 5 minutes) and every 24 h thereafter. |
+| `stats.retention_days`, `stats.rollup_retention_days` | Re-read at each retention sweep: a bounded catch-up on startup (within 5 minutes) and every 24 h thereafter. |
+| `stats.rollup_client_names` | Applied immediately on a live config apply: existing rollups are scrubbed when switched off, and in-flight retention/merge writes consult the live policy so a captured `true` cannot re-insert names. Forward-only for raw `query_log` rows. |
 
 ### 16.2 Requires a restart
 

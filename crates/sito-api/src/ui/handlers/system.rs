@@ -85,6 +85,19 @@ pub(crate) fn update_action_html(info: &crate::updater::UpdateInfo, csrf_token: 
             .to_string();
     }
 
+    if info.is_systemd {
+        return r#"<div style="margin-top: 14px; padding: 12px; background: rgba(56, 189, 248, 0.1); border: 1px solid var(--accent); border-radius: 6px;">
+                <div style="font-weight: 600; color: var(--accent); margin-bottom: 4px;">Systemd Service Detected</div>
+                <div style="font-size: 0.85rem; color: var(--text-secondary);">
+                    In-app binary updates are disabled for systemd services. Upgrade from a shell after stopping the service:
+                    <pre style="margin-top: 6px; padding: 6px 10px; background: var(--bg-surface); border-radius: 4px;"><code>sudo systemctl stop sito
+sudo sito update
+sudo systemctl start sito</code></pre>
+                </div>
+            </div>"#
+            .to_string();
+    }
+
     format!(
         r##"<form hx-post="/ui/system/update/apply" hx-target="#update-container" hx-swap="innerHTML" hx-disabled-elt="button" style="margin-top: 14px;">
             <input type="hidden" name="csrf_token" value="{}">
@@ -98,6 +111,63 @@ pub(crate) fn update_action_html(info: &crate::updater::UpdateInfo, csrf_token: 
     )
 }
 
+/// Renders the update-check result. An unknown version comparison is shown as
+/// a warning, never as "up to date", and points at the explicit `--force`
+/// reinstall command.
+pub(crate) fn update_check_html(info: &crate::updater::UpdateInfo, csrf: &str) -> String {
+    if info.version_comparison_unknown {
+        return format!(
+            r##"<div>
+                <div style="padding: 10px 14px; background: rgba(245, 158, 11, 0.1); border: 1px solid var(--warning, #f59e0b); border-radius: 6px; font-size: 0.875rem; margin-bottom: 12px;">
+                    <strong>Version comparison unknown.</strong>
+                    The latest release tag (v{}) is not strict semver, so this server cannot tell whether v{} is current.
+                    Run <code>sudo sito update --force</code> after stopping the service to reinstall it.
+                </div>
+                <button hx-get="/ui/system/update/check" hx-target="#update-container" hx-swap="innerHTML" class="btn btn-outline" style="font-size: 0.8rem; padding: 4px 10px;">
+                    Check Again
+                </button>
+            </div>"##,
+            escape_html(&info.latest_version),
+            escape_html(&info.current_version)
+        );
+    }
+
+    if info.update_available {
+        let install_or_docker = update_action_html(info, csrf);
+        return format!(
+            r#"<div>
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+                    <div>
+                        <span class="badge badge-warning" style="font-size: 0.85rem;">New version available: v{}</span>
+                        <span style="font-size: 0.85rem; color: var(--text-secondary); margin-left: 8px;">(Current: v{})</span>
+                    </div>
+                    <a href="{}" target="_blank" rel="noopener" class="btn btn-outline" style="font-size: 0.8rem; padding: 4px 10px;">View on GitHub</a>
+                </div>
+                <div style="background: var(--bg-base); padding: 12px; border-radius: 6px; font-size: 0.85rem; max-height: 150px; overflow-y: auto; white-space: pre-wrap; font-family: monospace;">{}</div>
+                {}
+            </div>"#,
+            escape_html(&info.latest_version),
+            escape_html(&info.current_version),
+            escape_html(&info.release_url),
+            escape_html(&info.release_notes),
+            install_or_docker
+        );
+    }
+
+    format!(
+        r##"<div>
+            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+                <span class="badge badge-success" style="font-size: 0.85rem;">Up to date</span>
+                <span style="font-size: 0.875rem; color: var(--text-secondary);">sito is running the latest release (v{})</span>
+            </div>
+            <button hx-get="/ui/system/update/check" hx-target="#update-container" hx-swap="innerHTML" class="btn btn-outline" style="font-size: 0.8rem; padding: 4px 10px;">
+                Check Again
+            </button>
+        </div>"##,
+        escape_html(&info.current_version)
+    )
+}
+
 pub async fn system_update_check_handler(
     State(ctx): State<ServerContext>,
     headers: HeaderMap,
@@ -108,43 +178,7 @@ pub async fn system_update_check_handler(
     let csrf = get_csrf_token(&ctx, &headers);
 
     match crate::updater::check_for_update(None).await {
-        Ok(info) => {
-            if info.update_available {
-                let install_or_docker = update_action_html(&info, &csrf);
-
-                axum::response::Html(format!(
-                    r#"<div>
-                        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
-                            <div>
-                                <span class="badge badge-warning" style="font-size: 0.85rem;">New version available: v{}</span>
-                                <span style="font-size: 0.85rem; color: var(--text-secondary); margin-left: 8px;">(Current: v{})</span>
-                            </div>
-                            <a href="{}" target="_blank" rel="noopener" class="btn btn-outline" style="font-size: 0.8rem; padding: 4px 10px;">View on GitHub</a>
-                        </div>
-                        <div style="background: var(--bg-base); padding: 12px; border-radius: 6px; font-size: 0.85rem; max-height: 150px; overflow-y: auto; white-space: pre-wrap; font-family: monospace;">{}</div>
-                        {}
-                    </div>"#,
-                    escape_html(&info.latest_version),
-                    escape_html(&info.current_version),
-                    escape_html(&info.release_url),
-                    escape_html(&info.release_notes),
-                    install_or_docker
-                )).into_response()
-            } else {
-                axum::response::Html(format!(
-                    r##"<div>
-                        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
-                            <span class="badge badge-success" style="font-size: 0.85rem;">Up to date</span>
-                            <span style="font-size: 0.875rem; color: var(--text-secondary);">sito is running the latest release (v{})</span>
-                        </div>
-                        <button hx-get="/ui/system/update/check" hx-target="#update-container" hx-swap="innerHTML" class="btn btn-outline" style="font-size: 0.8rem; padding: 4px 10px;">
-                            Check Again
-                        </button>
-                    </div>"##,
-                    escape_html(&info.current_version)
-                )).into_response()
-            }
-        }
+        Ok(info) => axum::response::Html(update_check_html(&info, &csrf)).into_response(),
         Err(e) => {
             axum::response::Html(format!(
                 r##"<div>

@@ -1,5 +1,16 @@
 # sito 1.9.4 — release notes
 
+> **Historical release notes (1.9.x line).** The HA statements below describe
+> 1.9.x. In particular, a 1.9.3 watermark without a digest triggers one full
+> apply **on 1.9.x**: 2.0 HA protocol v2 refuses a v1 watermark instead of
+> reading it, and the v2 watermark stores the **shared projection**, not the
+> exact per-node document. Before the first v2 start, back up and move
+> `ha_state.toml`/`ha_watermark.toml` aside (see the
+> [2.0 migration guide](2.0-migration.md#82-ha-protocol-v2-upgrade)). The 2.0
+> querylog WebSocket also rejects the legacy `?token=` query parameter; use a
+> session cookie or `Authorization: Bearer` header. Current operator contracts
+> are in the [2.0 claim matrix](2.0-claim-matrix.md).
+
 Target release: **1.9.4** on 2026-11-10. This is the Phase 0 **safety-gate**
 patch: it closes the release-blocking P0 and directly exploitable P1 findings
 recorded in [audit6.md](audit6.md) while remaining a non-breaking 1.9.x patch.
@@ -285,7 +296,8 @@ P1-19, P1-23, and P1-24 are closed in this branch:
   rows are not retroactively anonymized.
 - **P1-23 — query-log/dashboard polling cost.** Query-log pages accept
   `include_total` (default `true`; the live 3 s UI refresh sends `false`), and
-  dashboard aggregates are cached for 45 s with invalidation on clear/retention.
+  dashboard aggregates are cached for 45 s with invalidation on clear/retention
+  (2.0 uses a 30 s TTL).
   Stats endpoints are rate-limited per authenticated user, and their `429`
   responses include `Retry-After: 1`. The REST query-log endpoint now returns
   the same `Retry-After: 1` on its `429`.

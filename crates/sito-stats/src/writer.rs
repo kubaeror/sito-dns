@@ -157,8 +157,13 @@ impl QueryLogSender {
             entry.client_ip = crate::anonymize_ip(ip);
         }
 
-        // Broadcast immediately to live-tail listeners regardless of storage queue
-        let _ = self.live_tail_tx.send(entry.clone());
+        // Broadcast immediately to live-tail listeners regardless of storage
+        // queue. `broadcast::Sender::send` discards the value without a
+        // subscriber, so clone only when someone is listening; the hot path
+        // must not pay for a full entry clone on every query.
+        if self.live_tail_tx.receiver_count() > 0 {
+            let _ = self.live_tail_tx.send(entry.clone());
+        }
 
         // Increment before enqueueing so the writer can never observe an entry
         // it has already persisted but whose pending count was not raised yet.
@@ -417,6 +422,64 @@ mod tests {
         assert_eq!(flush_retry_delay(5), Duration::from_millis(800));
         assert_eq!(flush_retry_delay(6), FLUSH_RETRY_MAX_DELAY);
         assert_eq!(flush_retry_delay(u32::MAX), FLUSH_RETRY_MAX_DELAY);
+    }
+
+    /// P2-60: the hot path must not clone the entry for the live-tail
+    /// broadcast when nothing is subscribed, while a subscriber still gets the
+    /// entry and the writer still stores it.
+    #[tokio::test]
+    async fn test_live_tail_clone_only_with_subscribers() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let writer = QueryLogWriter::spawn(db.clone(), 16);
+        let sender = writer.sender();
+        let make_entry = |qname: &str| {
+            QueryLogEntry::new(
+                chrono::Utc::now().timestamp_millis(),
+                "192.0.2.44",
+                None,
+                qname,
+                1,
+                Some(0),
+                "allowed",
+                "udp",
+            )
+        };
+
+        crate::entry::reset_clone_count();
+        assert!(sender.try_send(make_entry("no-listener.example")));
+        assert_eq!(
+            crate::entry::clone_count(),
+            0,
+            "an entry must not be cloned when no live-tail subscriber exists"
+        );
+
+        let mut receiver = sender.subscribe();
+        crate::entry::reset_clone_count();
+        assert!(sender.try_send(make_entry("listener.example")));
+        assert_eq!(
+            crate::entry::clone_count(),
+            1,
+            "a live-tail subscriber must receive exactly one cloned entry"
+        );
+        let live = receiver
+            .try_recv()
+            .expect("the subscriber must receive the live entry");
+        assert_eq!(live.qname, "listener.example");
+
+        sender.flush().await;
+        let stored = db
+            .query_logs(&crate::QueryLogFilter::default())
+            .await
+            .unwrap();
+        assert!(
+            stored
+                .entries
+                .iter()
+                .any(|entry| entry.qname == "listener.example"),
+            "the moved entry must still reach the writer channel"
+        );
+
+        writer.shutdown().await;
     }
 
     /// Deferred D4a: a slow disk that holds the write lock past a short stall

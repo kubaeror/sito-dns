@@ -31,6 +31,12 @@ git -C "${repo}" rm -rf . >/dev/null 2>&1 || true
 printf 'main-only\n' >"${repo}/MAIN"
 git -C "${repo}" add MAIN
 git -C "${repo}" commit -q -m main-only
+# 2.0 releases (stable and prerelease) are cut from the tested `main` history.
+printf 'tested-main\n' >>"${repo}/MAIN"
+git -C "${repo}" add MAIN
+git -C "${repo}" commit -q -m tested-main
+git -C "${repo}" tag v2.0.0
+git -C "${repo}" tag v2.0.0-alpha.1
 git -C "${repo}" checkout -q release/1.9.x
 
 # A tag from a side branch that is not an ancestor of the release branch.
@@ -89,7 +95,7 @@ run_gate() {
             RELEASE_TAG="${case_tag}" \
             GITHUB_REPOSITORY="example/sito" \
             GH_TOKEN="test-token" \
-            RELEASE_REQUIRED_BRANCH="${case_branch:-release/1.9.x}" \
+            RELEASE_REQUIRED_BRANCH="${case_branch:-}" \
             SITO_GATE_SKIP_FETCH=1 \
             FAKE_CHECKS_FILE="${case_checks}" \
             FAKE_STATUS_FILE="${case_status}" \
@@ -141,6 +147,21 @@ check_case "accepts a different branch override that contains the tag" 0
 case_tag="v1.9.4"; case_checks="${green_checks}"; case_status="${green_status}"
 case_branch="main"
 check_case "rejects a different branch override that does not contain the tag" 1
+unset case_branch
+
+# 2.0 stable/prerelease tags must resolve to `main` without an override.
+case_tag="v2.0.0"; case_checks="${green_checks}"; case_status="${green_status}"
+check_case "accepts v2.0.0 on tested main with green checks" 0
+
+case_tag="v2.0.0-alpha.1"; case_checks="${green_checks}"; case_status="${green_status}"
+check_case "accepts v2.0.0-alpha.1 on tested main with green checks" 0
+
+case_tag="v2.0.0-alpha.1"; case_checks="${red_checks}"; case_status="${green_status}"
+check_case "rejects a v2.0.0-alpha.1 tag without green checks" 1
+
+case_tag="v2.0.0"; case_checks="${green_checks}"; case_status="${green_status}"
+case_branch="release/1.9.x"
+check_case "rejects v2.0.0 when forced onto the 1.9 release branch" 1
 unset case_branch
 
 echo "${cases} cases, ${failures} failure(s)"
