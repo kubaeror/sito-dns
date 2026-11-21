@@ -15,21 +15,26 @@ python3 scripts/test_check_config_reference.py
 python3 scripts/check_migration_guide.py --github
 python3 scripts/test_check_migration_guide.py
 python3 scripts/check_markdown_links.py
+python3 scripts/check_test_matrix.py
+python3 scripts/test_check_test_matrix.py
 bash scripts/check-error-swallowing.sh
 bash scripts/check-file-size.sh
 bash scripts/check-function-size.sh
 python3 scripts/test_rust_size.py
 ```
 
-Blank/deferred rows are explained in `docs/release-notes-1.9.4.md` and
-`progress.md`. A test name without a crate prefix is a unit test in the crate
-named by the command.
+Blank/deferred rows are explained in `docs/release-notes-1.9.4.md` and the
+per-work-package status notes in `docs/audit6-followup-plan.md`. A test name
+without a crate prefix is a unit test in the crate named by the command. The
+backticked test and script names are mechanically checked with
+`python3 scripts/check_test_matrix.py` (fixtures in
+`scripts/test_check_test_matrix.py`).
 
 | ID | Named test / check | Focused command |
 |---|---|---|
 | P0-1 | `test_fresh_bootstrap_certificate_requires_renewal`, `test_legacy_self_signed_bootstrap_requires_renewal`, `test_acme_bootstrap_issuance_all_transports_and_renewal` | `cargo test -p sito-transport test_fresh_bootstrap_certificate_requires_renewal`; `cargo test -p sito-test --test m11_acme test_legacy_self_signed_bootstrap_requires_renewal` |
 | P0-2 | `test_parent_delegation_nsec_cannot_prove_nxdomain_below_cut`, `test_parent_delegation_nsec3_cannot_prove_nxdomain_below_cut`, `test_parent_delegation_nsec3_nodata_only_denies_ds`, `test_ds_nodata_at_delegation_is_secure` | `cargo test -p sito-dnssec parent_delegation` |
-| P1-1 | `test_forged_covering_rrsig_still_probes_unsigned_delegation`, `test_signed_cname_to_stripped_target_without_ds_denial_is_bogus`, `test_m11_cd1_bypasses_post_fetch_indeterminate`, `test_dname_unknown_rdata_fails_closed`; DNAME handling remains a documented residual (see `docs/audit6.md`) | `cargo test -p sito-dnssec forged_covering_rrsig`; `cargo test -p sito-dnssec test_dname_unknown_rdata_fails_closed`; `cargo test -p sito-test --test m11_dnssec_security test_m11_cd1_bypasses_post_fetch_indeterminate` |
+| P1-1 | `test_forged_covering_rrsig_still_probes_unsigned_delegation`, `test_signed_cname_to_stripped_target_without_ds_denial_is_bogus`, `test_m11_cd1_bypasses_post_fetch_indeterminate`, `test_dname_unknown_rdata_fails_closed`; DNAME handling remains a documented, fail-closed residual (see `docs/audit6.md` and the [Phase 3 review](phase3-security-review.md#4-p1-1-dname-residual-and-rc1-risk-acceptance)) | `cargo test -p sito-dnssec forged_covering_rrsig`; `cargo test -p sito-dnssec test_dname_unknown_rdata_fails_closed`; `cargo test -p sito-test --test m11_dnssec_security test_m11_cd1_bypasses_post_fetch_indeterminate` |
 | P1-2 | `test_m11_blocked_key_fetch_is_bounded_and_servfails`, `test_m11_eight_hop_chain_is_bounded_end_to_end` | `cargo test -p sito-test --test m11_dnssec_security test_m11_blocked_key_fetch_is_bounded_and_servfails` |
 | P1-3 | `test_slave_goes_not_ready_when_master_stops_sending_frames` | `cargo test -p sito-test --features ha --test m11_ha_partition test_slave_goes_not_ready_when_master_stops_sending_frames` |
 | P1-4 | `test_restart_with_locally_modified_shared_config_does_not_early_ack_synced`, `test_watermark_without_digest_forces_full_apply` | `cargo test -p sito-test --features ha --test m11_ha_partition test_restart_with_locally_modified_shared_config_does_not_early_ack_synced` |
@@ -85,7 +90,7 @@ function over 200 lines fails the checker.
 | D12 challenge readiness | `test_acme_readiness_no_80_no_443` | `cargo test -p sito-api test_acme_readiness_no_80_no_443` |
 | IPv4-mapped rate key | `test_ipv4_mapped_ipv6_uses_ipv4_24_bucket` | `cargo test -p sito-transport test_ipv4_mapped_ipv6_uses_ipv4_24_bucket` |
 | Filter-unavailable metric | `test_render_prometheus_golden_output`, `test_filter_metrics_are_reported` | `cargo test -p sito-stats filter_metrics` |
-| DNAME | `test_dname_unknown_rdata_fails_closed` (wire decode as `Unknown`, strict Bogus/SERVFAIL, no AD); handling remains a documented residual | `cargo test -p sito-dnssec test_dname_unknown_rdata_fails_closed` |
+| DNAME | `test_dname_unknown_rdata_fails_closed` (wire decode as `Unknown`, strict Bogus/SERVFAIL, no AD, answer stripped); handling remains a documented, fail-closed residual | `cargo test -p sito-dnssec test_dname_unknown_rdata_fails_closed` |
 
 ## Deferred D3 — policy/transport/docs cleanup
 
@@ -240,7 +245,7 @@ evidence and the exact commands are recorded in
 | HA fake master frames/heartbeats/partition | `test_slave_goes_not_ready_when_master_stops_sending_frames`, `test_delayed_same_version_fork_ack_after_newer_publish_is_divergence` | `cargo test -p sito-test --test m11_ha_partition` |
 | DNSSEC signed-zone/key/denial fixtures | `signed_zone_fixture_exposes_anchor_keys_and_denial_records`, `test_m11_policy_change_rejects_in_flight_cache_insert` | `cargo test -p sito-test --test fixtures_contract signed_zone`; `cargo test -p sito-test --test m11_dnssec_security` |
 | Domain normalization property tests | `normalization_is_idempotent_and_never_panics`, `lowercase_and_one_trailing_dot_are_equivalent`, `idn_labels_round_trip_through_punycode`, `wildcard_labels_are_preserved_exactly`, `suffix_matching_is_reflexive_transitive_and_strict_only_for_children` | `cargo test -p sito-core --test domain_properties` |
-| ABP parser property tests | `arbitrary_lines_never_panic`, `parsed_canonical_matches_recomputed_canonical`, `modifier_order_does_not_change_the_canonical_form`, `badfilter_suffix_is_recognised_and_excluded_from_the_canonical_form`, `long_lines_are_skipped_without_materialising_a_rule`, `byte_budget_rejects_without_returning_partial_rules` | `cargo test -p sito-filter --test parser_properties` |
+| ABP parser property tests | `arbitrary_lines_never_panic`, `parsed_canonical_matches_independent_oracle`, `modifier_order_does_not_change_the_canonical_form`, `badfilter_suffix_is_recognised_and_excluded_from_the_canonical_form`, `long_lines_are_skipped_without_materialising_a_rule`, `byte_budget_rejects_without_returning_partial_rules` | `cargo test -p sito-filter --test parser_properties` |
 | 20-run parallel stability | harness/m11/HA/cache plus the changed `sito --lib` and `sito-transport` suites, 20 consecutive runs, no port collisions or timing flakes | see `docs/test-harness.md#stability-evidence` |
 
 ## WP-1.9 — fuzz, benchmarks and CI gates
@@ -598,7 +603,7 @@ tracked for WP-3.1.
 | P2-69: the installer has a behavioral fresh/upgrade/rollback/uninstall E2E, not just shellcheck | `contrib/tests/test-installer.sh`; CI `contrib` job | `bash contrib/tests/test-installer.sh` |
 | P2-70: release images are scanned for HIGH/CRITICAL and cosign-signed; scan coverage is linux/amd64 only (residual, WP-3.1) | `scripts/test-release-workflow.sh`, `scripts/test-release-attestation-gate.sh`, release workflow `docker-build-push` | `bash scripts/test-release-workflow.sh`; `bash scripts/test-release-attestation-gate.sh` |
 | P2-82: systemd unit and installer fallback read `EnvironmentFile=-/etc/sito/sito.env` and apply `UMask=0077`, `PrivateTmp`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictSUIDSGID`, `LockPersonality`, `SystemCallArchitectures=native` | `scripts/test-systemd-hardening.sh`; `test_m9_release_configuration_and_systemd` | `bash scripts/test-systemd-hardening.sh`; `cargo test -p sito-test --test m9_acceptance test_m9_release_configuration_and_systemd` |
-| P2-83: `sito update` preserves the existing executable mode and extended attributes (including `security.capability`); 0755 is only the absent-target fallback | `test_install_preserves_existing_mode_and_xattrs`, `test_install_preserves_security_capability_when_root`, `test_install_uses_0755_when_target_is_absent`, `test_temp_exe_removed_when_rename_fails` | `cargo test -p sito-api --lib updater` |
+| P2-83: `sito update` preserves the existing executable mode and extended attributes (including `security.capability`); 0755 is only the absent-target fallback; a failed rename restores the backup and removes the temporary files | `test_install_preserves_existing_mode_and_xattrs`, `test_install_preserves_security_capability_when_root`, `test_install_uses_0755_when_target_is_absent`, `test_replace_restores_backup_when_rename_fails` | `cargo test -p sito-api --lib updater` |
 | P3-20: uninstall removes installer-managed cosign (marker), keeps a pre-existing user cosign, warns without systemd, removes the unit unconditionally, and makes setcap/getcap outcomes visible | `contrib/tests/test-installer.sh` capability/no-systemd/cosign cases | `bash contrib/tests/test-installer.sh` |
 | P3-21: root-gated HA certificate ownership test exists and documents the manual `sudo` run; CI wiring is deferred to WP-3.1 | `scripts/test-ha-ownership-root.sh`; see the WP-2.13 status in `docs/audit6-followup-plan.md` | `sudo bash scripts/test-ha-ownership-root.sh` |
 | P3-22: build contexts exclude root and nested Cargo targets, including `fuzz/target` | `.dockerignore`; `scripts/test-compose-defaults.sh` | `bash scripts/test-compose-defaults.sh` |

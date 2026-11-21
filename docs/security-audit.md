@@ -1,26 +1,37 @@
 # Security Review and Threat Model (current)
 
 This document summarizes the **implemented** security controls and known
-limitations of the current development tree (**2.0.0-alpha.1**, Phase 2 core
-hardening; WP-2.1 through WP-2.13 are delivered) and calls out where the
-published stable **1.9.5** line differs. It replaces an earlier v1.0.0/v1.2.1
-audit record whose claims had drifted from the code. Point-in-time audits with
-file/line evidence and remediation status live in the
+limitations of the current development tree (**2.0.0-rc.1 candidate**;
+workspace version `2.0.0-alpha.1` until WP-3.4 tags rc.1). Phase 3 verification
+at commit `67269ea` is recorded in the
+[Phase 3 security review](phase3-security-review.md), which is the current
+evidence for the audit streams and residuals. This page replaces an earlier
+v1.0.0/v1.2.1 audit record whose claims had drifted from the code. Point-in-time
+audits with file/line evidence and remediation status live in the
 [historical documentation index](history/README.md); they are leads, not
 current evidence.
+
+**Phase 3 verdict at `67269ea`:** no open P0. The only open P1 sub-item is
+P1-1 DNAME, accepted for rc.1 because `validate`/`strict` fails closed
+(SERVFAIL, AD=0, answer stripped). The complete residual register is in the
+[Phase 3 review](phase3-security-review.md#13-residual-risk-register).
 
 Current contracts:
 
 * [`docs/2.0-migration.md`](2.0-migration.md) — breaking changes, the Phase 2
-  delivered set and the deferred Phase 3 work.
-* [`docs/2.0-claim-matrix.md`](2.0-claim-matrix.md) — current Phase 2 claims
-  mapped to code, tests and documentation.
+  delivered set and the remaining Phase 3 release work.
+* [`docs/2.0-claim-matrix.md`](2.0-claim-matrix.md) — current Phase 2 and
+  Phase 3 verification claims mapped to code, tests and documentation.
 * [`docs/config-v2.md`](config-v2.md) — config v2 validation, unknown-key policy
   and restart-only matrix.
 * [`docs/runbook-ha.md`](runbook-ha.md#health-and-status-endpoint-semantics-wp-17)
   — `/health` vs `/api/v1/status` and the D12 certificate readiness ladder.
 * [`docs/audit6-test-matrix.md`](audit6-test-matrix.md) — named regression tests
-  for the P0/P1 safety findings.
+  for the P0/P1 safety findings, mechanically checked by
+  `scripts/check_test_matrix.py`.
+* [`docs/phase3-security-review.md`](phase3-security-review.md) — the Phase 3
+  stream review, unsafe/FFI inventory, suppression review and rc.1 residual
+  register.
 
 Everything below is verifiable in the source; the referenced modules are the
 implementation of record.
@@ -38,10 +49,11 @@ implementation of record.
 | **First boot** | One-time setup token (CSPRNG, console-printed, per-IP rate-limited) gates the wizard until setup completes; the token is not pruned while first-run is pending. The wizard is strictly bootstrap-only: after setup it returns `403` even for an Admin session, and admin password changes use the authenticated account flow. | `sito-api::auth::manager`, `sito-api::router` |
 | **CSRF / browser** | Strict same-origin `Origin`/`Referer` checks (missing origin fails closed for cookie sessions), session-bound CSRF tokens for mutating requests, `__Host-` cookies on TLS, `HttpOnly`, `SameSite=Strict`, `Cache-Control: no-store` and `Vary: Cookie` on every authenticated `/api/v1/` response plus `/metrics` and `/ui/`, CSP/HSTS/X-Frame-Options/nosniff. Querylog WebSocket upgrades reject cross-origin and `Origin: null`, require a same-origin Origin for session clients, and accept credentials only from a Bearer header or cookie (never `?token=`). | `sito-api::security`, `auth::session`, `handlers::querylog` |
 | **DoS / flooding** | One shared token bucket across UDP/TCP/DoT/DoH/DoQ/DoH3, keyed by IPv4 `/24` and IPv6 `/64` and checked before reading request bodies on DoH/DoQ; per-source connection caps, handshake/request deadlines, maximum connection lifetimes, bounded QUIC windows/streams, and approximate-LRU rate-limit eviction. | `sito-transport`, `crates/sito/src/server.rs` |
-| **HA security** | mTLS with BLAKE3 certificate pinning (optional explicit insecure WS for isolated networks), constant-time shared-token check, Ed25519-signed bundles with monotonic versions, master-loss heartbeat deadline (`3 × ping_interval_secs`), applied-config digest drift detection, per-slave publish outcomes that make `/health` false on failure, 64-global/8-per-IP session admission, and a bounded signing-key identity check on state restore. | `sito-ha` |
+| **HA security** | mTLS with BLAKE3 certificate pinning or CA-chain validation (CA-only is supported and validates hostname/SAN; a configured pin or CA is always enforced; explicit insecure WS is a documented isolated-network opt-out), constant-time shared-token check, Ed25519-signed bundles with monotonic versions, master-loss heartbeat deadline (`3 × ping_interval_secs`), applied-config digest drift detection, per-slave publish outcomes that make `/health` false on failure, 64-global/8-per-IP session admission, and a bounded signing-key identity check on state restore. | `sito-ha` |
 | **Secrets** | HA bundles strip TLS/web keys, auth hashes/tokens, RouterOS credentials and per-client shared secrets (`${SECRET:*}` placeholders where applicable; node-local values are restored on the slave). Config/users/tokens/sessions and ACME keys are written 0600 atomically. Headers and cookies are never logged. | `sito-ha::bundle`, `sito-api::config_writer`, `sito-transport::acme` |
 | **TLS/ACME readiness** | rustls-only, TLS 1.2/1.3, AEAD cipher suites, RPK/SNI certificate support, atomic certificate reload, native ACME (TLS-ALPN-01 with a bound TCP 443 listener, otherwise HTTP-01). Bootstrap certificates are 7-day self-signed placeholders and are not served unless `acme.allow_bootstrap_cert = true`; invalid, expired, or mismatched configured TLS material is a startup error. A successful issuance reloads DoT, DoH, DoQ, and DoH3. Readiness distinguishes current-with-renewal-failure (`acme_renewal_failed`, degraded), expiring within 30 days (`acme_cert_expiring`/`tls_cert_expiring`, degraded), and expired/unparseable (`acme_cert_expired`/`tls_cert_expired`, not ready); there is no self-signed fallback for an expired ACME certificate. | `sito-transport::tls`, `::acme`, `sito-api::readiness` |
-| **DNSSEC** | Fail-closed validation with trust-anchor chains, DS/DNSKEY walking, NSEC/NSEC3 denial proofs (including wildcard denial and delegation-boundary checks), algorithm/digest policy, key-cache bounds, a 5-second per-query validation deadline, CD/DO semantics and AD only for validated answers. | `sito-dnssec` |
+| **DNSSEC** | Fail-closed validation with trust-anchor chains, DS/DNSKEY walking, NSEC/NSEC3 denial proofs (including wildcard denial and delegation-boundary checks), algorithm/digest policy, key-cache bounds, a 5-second per-query validation deadline, CD/DO semantics and AD only for validated answers. DNAME cannot be interpreted by the pinned parser and fails closed in `validate`/`strict` mode (see the accepted residual). | `sito-dnssec` |
+| **Unsafe/FFI** | Production `unsafe` is confined to UDP socket setup (`sito-transport::udp`), Unix packet-info socket calls (`sito-transport::pktinfo`) and updater xattr preservation (`sito-api::updater`); the allocation counter is test-only. Safety arguments and scope are in the Phase 3 review. | `sito-transport::udp`, `sito-transport::pktinfo`, `sito-api::updater`, `sito-stats::metrics` (test) |
 | **Supply chain** | `cargo deny` (advisories/bans/licenses/sources) in CI, SHA-pinned GitHub Actions, digest-pinned container bases, signed (cosign) release archives. The **installer** requires signatures by default (`SITO_REQUIRE_SIGNATURE=1`, explicit `=0` opt-out); the **self-updater** uses `server.update_require_signature = true` by default (explicit `false` opt-out). A signature pair that is present is always verified even when optional; a present pair without a verifier or an incomplete `.sig`/`.pem` pair is an error; only no signature assets + optional may proceed checksum-only. In-app apply is disabled on Docker and detected systemd services; the updater serializes applies, verifies the staged binary, backs up/restores the old binary, writes temp assets `0600` in a `0700` signature directory, and preserves the existing executable's mode/xattrs (including `security.capability`). The installer records an installer-owned cosign marker so `--uninstall` removes only that copy. Release tags are gated on the required branch plus green CI/security checks, and container images are scanned and cosign-signed. | `deny.toml`, `.github/workflows`, `contrib/install.sh`, `sito-api::updater` |
 | **API integrity** | Config writes run the same deep typed-section validation as startup, invalid configs are rejected before persisting, restart-only writes return 409 and persist nothing, restore archives are decompression-capped, unknown keys are rejected everywhere except the explicit migration flag, tokens expire by default (90 days), deleting a user revokes sessions. `/metrics` requires a Viewer-or-higher token or session by default (`web.metrics_auth = true`). | `sito-api::config_validation`, `config_apply`, `handlers::config`, `auth::manager`, `handlers::metrics` |
 | **Health/status split** | `/health` is generic (`200`/`503` only) and leaks no setup state, component names, reasons, paths or configuration values. Authenticated `GET /api/v1/status` carries `ready`/`reasons[]`; `GET /api/v1/ha/status` carries the detailed HA reason. A stats outage is advisory and never makes DNS unhealthy. | `sito-api::readiness`, `handlers::status`, `handlers::ha` |
@@ -88,12 +100,15 @@ python3 scripts/test_check_config_reference.py
 python3 scripts/check_migration_guide.py --github
 python3 scripts/test_check_migration_guide.py
 python3 scripts/check_markdown_links.py
+python3 scripts/check_test_matrix.py
 ```
 
 Scheduled fuzzing was removed from the 1.9.x CI line; the 2.0 branch restored
-the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
-[docs/ci.md](ci.md#fuzzing-is-nightlyrelease-not-a-pr-gate) and
-[fuzz/README.md](../fuzz/README.md).
+the `fuzz/` harness as a nightly/release mechanism, not a PR gate. The
+pre-Phase-3 scheduled workflow produced an invalid matrix and did not run; the
+Phase 3 workflow builds a valid target × shard matrix, and the 24-hour campaign
+remains deferred. See [docs/ci.md](ci.md#fuzzing-is-nightlyrelease-not-a-pr-gate)
+and [fuzz/README.md](../fuzz/README.md).
 
 ---
 
@@ -114,6 +129,20 @@ the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
 * DNSSEC wildcard denial requires complete NSEC/NSEC3 proofs; responses whose
   proofs are incomplete are treated as `Bogus` (fail closed) rather than
   downgraded to `Insecure`.
+* **P1-1 DNAME residual (accepted for rc.1):** `hickory-proto 0.26.3` decodes
+  DNAME as `RData::Unknown { code: DNAME }`. In `validate`/`strict` mode the
+  validator returns `Bogus`, turns the response into SERVFAIL, clears AD,
+  removes the uninterpretable answer and records the failure. A legitimate DNAME
+  alias therefore fails closed (availability/compatibility limitation, not an
+  authentication bypass); `log_only` returns it without AD by design. The
+  regression test is `test_dname_unknown_rdata_fails_closed`; re-review on a
+  hickory upgrade or by 2027-01-31. See the
+  [Phase 3 review](phase3-security-review.md#4-p1-1-dname-residual-and-rc1-risk-acceptance).
+* The 24-hour fuzz campaign is a deferred release-checklist item. The
+  pre-Phase-3 scheduled workflow was invalid and did not run; the Phase 3
+  workflow builds a valid target × shard matrix and the nightly 600 s/target
+  smoke is the active evidence. Do not claim a 24-hour clean run for rc.1. See
+  the [Phase 3 review](phase3-security-review.md#13-residual-risk-register).
 * Self-update under systemd requires running `sito update` as root with the
   service stopped (the unit keeps `ProtectSystem=strict`). The updater writes a
   temporary executable next to the target, copies the existing mode and xattrs
@@ -122,6 +151,13 @@ the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
   config only after stopping the service and restores it with temp-file +
   rename. `setcap`/`getcap` problems are printed as warnings rather than
   swallowed.
+* Config and `users.toml` atomic writers create their temporary sibling with the
+  process umask and narrow it to `0600` before writing content. A local user who
+  opens the empty inode during that short window can retain a read descriptor;
+  content is never written while wider than `0600`. This local-only race is
+  accepted for rc.1 (recommended hardening: `OpenOptionsExt::mode(0o600)` at
+  create); see R-14 in the
+  [Phase 3 review](phase3-security-review.md#13-residual-risk-register).
 * Statistics retention and rollup privacy (P1-19/P1-23/P1-24) now use keyed
   rollup hashes, rollup retention, clear/vacuum, optional query-log totals,
   bounded retention chunks, and a 30 s cached dashboard aggregate. Query-log
@@ -136,10 +172,11 @@ the `fuzz/` harness as a nightly/release mechanism, not a PR gate. See
   absent from the default build. If enabled, only a verified `https://` lease
   grants identity; plaintext or insecure-TLS leases are display-only.
 * Pull requests compile the Criterion benches but do not run a performance
-  threshold. The nightly `bench.yml` comparison is thresholded (>10% fails) and
-  runs on GitHub-hosted `ubuntu-24.04` only. The committed baseline must be
-  generated on that same runner class (`update_baseline=true`, download the
-  artifact, commit it); the checker fails closed on an environment mismatch.
-  The current alpha baseline is still the development-host reference, so the
-  nightly gate is inactive until that one-time GitHub-hosted regeneration.
-  This is an explicit residual, not a silent pass.
+  threshold. The nightly `bench.yml` comparison is **active**: it runs on
+  GitHub-hosted `ubuntu-24.04`, compares against the committed
+  `benches/baseline.json` (`environment: github-ubuntu-24.04`) and fails above
+  the tolerance (default 10%). The checker fails closed on an environment
+  mismatch. A local comparison on another host must use `--reference-only` and
+  is not the release gate; regenerate the baseline only through the
+  GitHub-hosted `update_baseline=true` workflow. See
+  [docs/ci.md](ci.md#benchmark-baseline).

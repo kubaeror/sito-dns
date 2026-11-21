@@ -14,18 +14,20 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 
 `sito` is designed as a modern, rock-solid alternative to AdGuard Home and Pi-hole. Engineered in Rust (edition 2024), it combines sub-millisecond p99 latency, comprehensive ad/tracker/malware blocking (using AdGuard/ABP rule syntax), multi-protocol encryption (DoT, DoH H2, DoQ, DoH3), and automated master/slave high availability.
 
-> **Development status:** the `main` line is currently **2.0.0-alpha.1**
-> (Phase 2 core hardening; WP-2.1 through WP-2.13 are delivered on this tree).
-> The latest stable release remains **1.9.5**; the quickstart below
-> intentionally pins the published stable installer and container image. Alpha
-> builds are not published as stable artifacts.
+> **Development status:** the `main` line is the **2.0.0-rc.1 candidate**
+> (workspace version `2.0.0-alpha.1` until WP-3.4 tags rc.1; Phase 2 core
+> hardening and the Phase 3 security review are delivered on this tree). The
+> latest stable release remains **1.9.5**; the quickstart below intentionally
+> pins the published stable installer and container image. Alpha/rc builds are
+> not published as stable artifacts.
 >
-> Phase 3 verification and release (WP-3.1 through WP-3.4) is still pending.
-> Deferred work includes `/api/v2` and the API v1 compatibility facade, the
-> SQLite schema/PII migration (`sito db migrate`), installer/Docker
-> auto-migration, a default-deny DNS client ACL, weighted upstream balancing, a
-> second proof for user/token deletion, edit-time read-only HA enforcement, and
-> the optional external parental/service data. The current evidence matrix is
+> Remaining Phase 3 release work includes the 24-hour fuzz campaign, full
+> migration acceptance and rc.1 publication. Deferred work includes `/api/v2`
+> and the API v1 compatibility facade, the SQLite schema/PII migration
+> (`sito db migrate`), installer/Docker auto-migration, a default-deny DNS
+> client ACL, weighted upstream balancing, a second proof for user/token
+> deletion, edit-time read-only HA enforcement, and the optional external
+> parental/service data. The current evidence matrix is
 > [`docs/2.0-claim-matrix.md`](docs/2.0-claim-matrix.md).
 
 ---
@@ -49,13 +51,12 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 
 > Throughput, latency, and memory figures are from the **v1.0.0**
 > reference-hardware run recorded in [docs/benchmarks.md](docs/benchmarks.md).
-> They are historical reference numbers, not a measurement of the 2.0 alpha
-> line. Pull requests only compile the Criterion benches; the nightly
-> `bench.yml` comparison fails above its tolerance once a dedicated
-> `BENCH_RUNNER_LABEL` runner and a baseline generated on it are provisioned.
-> The committed baseline is a development-host baseline, so that nightly gate
-> is currently inactive — see
-> [docs/ci.md](docs/ci.md#benchmark-baseline).
+> They are historical reference numbers, not a measurement of the 2.0 rc line.
+> Pull requests only compile the Criterion benches; the nightly `bench.yml`
+> comparison is active on GitHub-hosted `ubuntu-24.04` against the committed
+> `github-ubuntu-24.04` baseline and fails above its tolerance. A local
+> comparison on different hardware is reference-only (`--reference-only`) and is
+> not the gate — see [docs/ci.md](docs/ci.md#benchmark-baseline).
 
 ---
 
