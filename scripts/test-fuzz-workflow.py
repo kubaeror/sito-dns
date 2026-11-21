@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -70,7 +71,7 @@ def matrix_generator(text: str) -> str:
         end = text.index("'", start)
     except ValueError as exc:
         raise SystemExit("prepare matrix step no longer runs python3 -c") from exc
-    return text[start:end]
+    return textwrap.dedent(text[start:end])
 
 
 def run_generator(code: str, shards: int) -> object:
