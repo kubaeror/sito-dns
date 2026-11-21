@@ -233,22 +233,23 @@ release, run the 24-hour checklist on the release candidate commit:
 ```bash
 gh workflow run fuzz.yml \
   --ref <release-commit-or-branch> \
-  -f fuzz_seconds=21600 \
-  -f shards=4
+  -f fuzz_seconds=17280 \
+  -f shards=5
 gh run list --workflow fuzz.yml --limit 1
 gh run watch <run-id> --exit-status
 ```
 
 The workflow runs on GitHub-hosted `ubuntu-24.04` only. GitHub-hosted jobs stop
-after 6 hours, so the 24-hour checklist is four parallel 6-hour shards per
-target (≈24 target-hours aggregate); no self-hosted runner is required.
+after 6 hours, so the 24-hour checklist is five parallel 4.8-hour shards per
+target (≈24 target-hours aggregate); each job keeps 72 minutes of headroom for
+checkout/build/setup/upload. No self-hosted runner is required.
 
 Record in the release checklist:
 
 - run URL and commit SHA;
 - all five matrix targets (`dns_wire`, `abp_parser`, `dnssec_response`,
   `ha_bundle`, `config_toml`) completed with no crash, timeout or OOM;
-- `fuzz_seconds=21600` × `shards=4` (≈24 target-hours aggregate) and the
+- `fuzz_seconds=17280` × `shards=5` (≈24 target-hours aggregate) and the
   per-input timeout of 10 s;
 - the checked-in seed-corpus size before the run and the corpus size reported
   by the job after the run (a growing corpus is expected; a crash is not);
