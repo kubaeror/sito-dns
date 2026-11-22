@@ -144,6 +144,9 @@ anonymize_querylog = false
 # path / DoT SNI identification requires a shared secret per entry.
 # [clients]
 # trust_routeros_lease_names = false
+# Trust the ARP-resolved MAC as client identity even when no entry lists it
+# (MAC-only; no ARP hostname/other attribute is trusted).
+# trust_arp = false
 # [clients.client_id_secrets]
 # "phone" = "change-me-shared-secret"
 # [clients.groups.kids]

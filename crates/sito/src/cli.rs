@@ -1609,6 +1609,31 @@ mod tests {
     }
 
     #[test]
+    fn test_check_config_accepts_clients_trust_arp() {
+        let dir = temp_config_dir("check_config_trust_arp");
+        let path = dir.join("config.toml");
+
+        // The key is in the v1→v2 map and the typed `[clients]` conversion,
+        // so the real loader used by startup/`check-config` accepts it.
+        std::fs::write(
+            &path,
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\ntrust_arp = true\n",
+        )
+        .unwrap();
+        run_check_config(&path).expect("clients.trust_arp = true must pass check-config");
+
+        // Absent keeps the opt-in off and stays valid.
+        std::fs::write(
+            &path,
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\n",
+        )
+        .unwrap();
+        run_check_config(&path).expect("an absent clients.trust_arp must stay valid");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_config_migrate_writes_v2_and_0600_backup() {
         let dir = temp_config_dir("migrate");
         let path = dir.join("config.toml");

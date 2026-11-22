@@ -266,9 +266,11 @@ schema also fails the fixture test.
 
 ## 10. Deferred fields
 
-- `clients.trust_arp` is **not** added in config v2. D10 defines the trust
-  table, but the optional ARP-trust knob remains unimplemented; if it lands it
-  will be an optional v2 field with default `false`.
+- `clients.trust_arp` is an optional v2 field with default `false` (added after
+  the schema freeze). It opts into MAC-only ARP identity: an ARP-resolved MAC
+  may match `$client`/rewrite-exception policy even when no entry lists it. ARP
+  hostnames and other attributes stay untrusted; see
+  [`docs/configuration-reference.md`](configuration-reference.md).
 - `/api/v1` and its compatibility facade are absent: 2.0 removed v1, and
   `/api/v2` is the only administrative API, including
   `/api/v2/config/restart-required`.
