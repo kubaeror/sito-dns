@@ -92,11 +92,130 @@
         </div>
       </div>
 
-      <!-- Section 3: Upstream Resolvers -->
+      {% if fresh_install_acl %}
+      <!-- Section 3: Client Access Control (ADR-0011) -->
+      <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color);">
+        <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
+          3. Client Access Control
+        </h3>
+        <input type="hidden" name="client_acl_present" value="1">
+        <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 12px;">
+          Only clients whose source address matches a selected network may use the DNS
+          listeners. Loopback and any allow prefixes already in the base template are
+          selected; no other network is auto-detected into the allow list. The admin
+          UI/API is never filtered by this ACL.
+        </div>
+        {% if acl_template_explicit_allow %}
+        <div style="font-size: 0.85rem; color: var(--accent-danger); background: rgba(239, 68, 68, 0.1); border: 1px solid var(--accent-danger); padding: 10px 14px; border-radius: var(--radius-md); margin-bottom: 12px;">
+          <strong>The base template sets <code>default_policy = "allow"</code>.</strong>
+          This fresh install still starts with default deny unless you actively uncheck the
+          box below. Any allow prefixes from the template are prefilled and kept.
+        </div>
+        {% endif %}
+        <div class="form-group">
+          <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
+            <input type="checkbox" name="client_acl_default_deny" checked style="width: 16px; height: 16px; margin-top: 2px;">
+            <span style="font-size: 0.875rem;">
+              <strong>Deny DNS clients by default (recommended).</strong>
+              Uncheck this only to keep the template's current allow-everyone policy.
+              A deny policy is enforced before cache, filtering and upstream work, and a
+              denied client gets REFUSED (or silence when <code>deny_response = "drop"</code>).
+            </span>
+          </label>
+        </div>
+        <div style="font-size: 0.8rem; color: var(--text-muted); margin: 4px 0 8px;">
+          If you uncheck default deny, the selected networks below are not written; the
+          template's existing ACL is preserved as-is.
+        </div>
+        <div class="form-group">
+          <label class="form-label">Allowed client networks (detected)</label>
+          <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
+            {% for candidate in acl_candidates %}
+            <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer; padding: 6px 8px; border: 1px solid var(--border-color); border-radius: var(--radius-md);">
+              {% if candidate.locked %}
+              <input type="hidden" name="client_acl_selected__{{ loop.index0 }}" value="{{ candidate.id }}">
+              <input type="checkbox" checked disabled style="width: 16px; height: 16px; margin-top: 2px;">
+              {% else %}
+              <input type="checkbox" name="client_acl_selected__{{ loop.index0 }}" value="{{ candidate.id }}"
+                     {% if candidate.selected %}checked{% endif %}
+                     {% if candidate.is_bridge_or_tunnel %}onchange="if (this.checked && !confirm('{{ candidate.interface }} is a bridge/tunnel/container network. Admitting it admits the local forwarder or overlay gateway, not necessarily the clients behind it. Continue?')) { this.checked = false; }"{% endif %}
+                     style="width: 16px; height: 16px; margin-top: 2px;">
+              {% endif %}
+              <span style="font-size: 0.825rem;">
+                <strong>{{ candidate.interface }}</strong>
+                <span class="mono">{{ candidate.address }}/{{ candidate.prefix }}</span>
+                <span style="color: var(--text-muted);">({{ candidate.family }}, {{ candidate.source_label }})</span>
+                <span style="display: inline-block; margin-left: 6px; font-size: 0.7rem; padding: 1px 6px; border-radius: 999px; background: var(--bg-tertiary); color: var(--text-secondary);">{{ candidate.class_label }}</span>
+                {% if candidate.kept_from_template %}<span style="display: inline-block; margin-left: 6px; font-size: 0.7rem; padding: 1px 6px; border-radius: 999px; background: var(--bg-tertiary); color: var(--text-secondary);">kept from base template (cannot be removed here)</span>{% endif %}
+                {% if candidate.is_public %}<span style="color: var(--accent-danger); font-size: 0.75rem;"> public address: requires the public acknowledgement below</span>{% endif %}
+              </span>
+            </label>
+            {% endfor %}
+            {% for candidate in acl_prefilled %}
+            <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer; padding: 6px 8px; border: 1px dashed var(--border-color); border-radius: var(--radius-md);">
+              <input type="hidden" name="client_acl_selected__prefill_{{ loop.index0 }}" value="{{ candidate.id }}">
+              <input type="checkbox" checked disabled style="width: 16px; height: 16px; margin-top: 2px;">
+              <span style="font-size: 0.825rem;">
+                <strong>{{ candidate.interface }}</strong>
+                <span class="mono">{{ candidate.address }}/{{ candidate.prefix }}</span>
+                <span style="color: var(--text-muted);">({{ candidate.family }}, {{ candidate.class_label }})</span>
+                <span style="display: block; color: var(--text-muted); font-size: 0.75rem;">Kept from the base template; remove it only by editing the configuration after setup.</span>
+              </span>
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="wiz-acl-manual">Additional allowed addresses or CIDRs (one per line)</label>
+          <textarea id="wiz-acl-manual" name="client_acl_manual" class="form-textarea mono" rows="2" placeholder="192.168.1.0/24&#10;2001:db8:1::/64">{{ acl_manual }}</textarea>
+          <div class="form-help">Use this for routed subnets, NAT gateways, a forwarder, or a network interface discovery did not expose. Bare addresses are treated as /32 or /128.</div>
+        </div>
+        <div class="form-group">
+          <div style="display: flex; flex-direction: column; gap: 10px;">
+            <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer;">
+              <input type="checkbox" name="client_acl_loopback_only_ack" style="width: 16px; height: 16px; margin-top: 2px;">
+              <span style="font-size: 0.85rem;">I understand that with no non-loopback network selected or entered, <strong>only this host</strong> may use the DNS listener.</span>
+            </label>
+            <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer;">
+              <input type="checkbox" name="client_acl_public_ack" style="width: 16px; height: 16px; margin-top: 2px;">
+              <span style="font-size: 0.85rem;">I understand that a selected or entered <strong>public</strong> network exposes this resolver to the Internet and requires firewall protection.</span>
+            </label>
+            <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer;">
+              <input type="checkbox" name="client_acl_allow_entry_ids" style="width: 16px; height: 16px; margin-top: 2px;">
+              <span style="font-size: 0.85rem;">Also admit static IP/CIDR values from <code>[[clients.entries]]</code>. Off by default: entries are identity/policy, not admission.{% if acl_base_allow_entry_ids %} The base template enabled this. It is written only if you keep default deny and check this box; unchecking default deny preserves the template ACL unchanged.{% endif %}</span>
+            </label>
+          </div>
+        </div>
+        <div class="form-group" style="border: 1px solid var(--accent-danger); border-radius: var(--radius-md); padding: 12px; margin-bottom: 0;">
+          <div style="font-size: 0.85rem; color: var(--accent-danger); font-weight: 600; margin-bottom: 8px;">
+            Dangerous: make this an open resolver
+          </div>
+          <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer;">
+            <input type="checkbox" name="client_acl_allow_all" style="width: 16px; height: 16px; margin-top: 2px;">
+            <span style="font-size: 0.85rem;">Allow every IPv4 and IPv6 source (<code>0.0.0.0/0</code> and <code>::/0</code>). This requires the exact text below.</span>
+          </label>
+          <div style="margin-top: 8px;">
+            <label class="form-label" for="wiz-acl-allow-all-confirm">Type <code>ALLOW ALL</code> to confirm</label>
+            <input type="text" id="wiz-acl-allow-all-confirm" name="client_acl_allow_all_confirm" class="form-input mono" placeholder="ALLOW ALL" autocomplete="off">
+          </div>
+        </div>
+        <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 12px;">
+          The ACL is a per-source-address control. A NAT gateway, local forwarder
+          (dnsmasq/systemd-resolved/unbound/container DNS), or reverse proxy in front of
+          DoH collapses every downstream client to one observed address; admitting it
+          admits all clients behind it. DoH <code>X-Forwarded-For</code> is never used.
+          Denied clients appear in the <code>sito_dns_acl_*</code> metrics and sampled
+          logs, not in the query log or unidentified-client list.
+        </div>
+      </div>
+      {% endif %}
+
+      <!-- Section 4: Upstream Resolvers -->
       <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color);">
         <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" x2="22" y1="12" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-          3. Upstream DNS Resolvers
+          4. Upstream DNS Resolvers
         </h3>
         <div class="form-group">
           <label class="form-label" for="wiz-upstreams">Upstream Servers (one per line or comma-separated)</label>
@@ -147,11 +266,11 @@
         </div>
       </div>
 
-      <!-- Section 4: Cache & DNSSEC -->
+      <!-- Section 5: Cache & DNSSEC -->
       <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color);">
         <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-          4. Cache & DNSSEC
+          5. Cache & DNSSEC
         </h3>
         <div class="grid-2">
           <div class="form-group">
@@ -187,11 +306,11 @@
         </div>
       </div>
 
-      <!-- Section 5: Filtering & Protection -->
+      <!-- Section 6: Filtering & Protection -->
       <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color);">
         <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="9.5" x2="14.5" y1="9" y2="14"/><line x1="14.5" x2="9.5" y1="9" y2="14"/></svg>
-          5. Filtering & Adblock Protection
+          6. Filtering & Adblock Protection
         </h3>
         <div class="grid-2">
           <div class="form-group">
@@ -242,11 +361,11 @@
         </div>
       </div>
 
-      <!-- Section 6: Web Panel & Statistics -->
+      <!-- Section 7: Web Panel & Statistics -->
       <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border-color);">
         <h3 style="font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; color: var(--text-primary);">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/><path d="M6 6h10"/><path d="M6 10h10"/><path d="M6 14h6"/></svg>
-          6. Web Panel & Statistics
+          7. Web Panel & Statistics
         </h3>
         <div class="grid-2">
           <div class="form-group">

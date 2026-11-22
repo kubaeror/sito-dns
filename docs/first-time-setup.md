@@ -4,6 +4,9 @@
 > config, default credentials, port conflicts) no longer describe the tree.
 > For current behavior see [first-boot setup in the
 > README](../README.md#-first-time-setup-wizard),
+> [installation](installation.md#5-post-installation-verification),
+> the [DNS client ACL reference](configuration-reference.md#clientsacl--dns-client-admission)
+> and [ADR-0011](adr/0011-default-deny-dns-client-acl.md), plus
 > [security-audit.md](security-audit.md) and [audit5.md](audit5.md).
 
 # Plan: Web-Based First-Time Setup Wizard + Installer Hardening

@@ -8,6 +8,17 @@ This document formalizes the client identification pipeline, policy routing, sch
 
 Every incoming DNS query is associated with a client context resolved through a 5-tier identification chain evaluated in strict order of specificity:
 
+> **Admission precedes identification.** [ADR-0011](adr/0011-default-deny-dns-client-acl.md)
+> adds one source-address ACL stage before this chain. Under
+> `clients.default_policy = "deny"`, a source that matches no `clients.acl.allow`
+> prefix (and no opted-in static IP/CIDR entry id) is refused before identity
+> resolution, ARP/RouterOS lookup, cache, filtering, DNSSEC or upstream work. The
+> ACL never admits on DoH path/SNI, HTTP headers, MAC/ARP or RouterOS lease
+> identity. With the compatibility default `"allow"` and no rules, admission is
+> unchanged. Groups, `filtering`, `trusted`, schedules and blocked services are
+> applied only after admission.
+
+
 ```
 Incoming Request
       │

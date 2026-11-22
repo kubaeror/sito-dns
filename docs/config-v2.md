@@ -119,9 +119,15 @@ materializes `web.bind = "0.0.0.0"` and lists it in
 explicit v1 bind is copied unchanged. Pass `--adopt-safe-defaults` to write the
 loopback default instead; the report lists every changed field.
 
-`dns.bind` remains `["0.0.0.0", "::"]` because a default-deny DNS client ACL is
-deferred, not part of Phase 2 core hardening. Keep the startup warning and
-restrict the DNS ports with a host firewall.
+`dns.bind` remains `["0.0.0.0", "::"]`. The ADR-0011 ACL is additive and
+behavior-preserving: a v1→v2 migration materializes
+`clients.default_policy = "allow"` once and reports it in
+`defaults_materialized`; it never writes deny, enables `allow_entry_ids`, or
+invents allow rules. `--adopt-safe-defaults` does not change the ACL policy.
+Only the first-boot wizard writes default deny. Keep the startup warning and
+restrict the DNS ports with a host firewall until you opt in. Before downgrading
+to an older 2.0 RC binary without ACL support, remove `clients.default_policy`
+and `[clients.acl]` and re-run `check-config`.
 
 ## 5. Migration
 

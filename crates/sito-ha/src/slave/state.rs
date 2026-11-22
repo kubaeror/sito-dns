@@ -31,6 +31,12 @@ pub struct SlaveStatusTracker {
     /// True when the on-disk configuration no longer matches the digest of the
     /// document that was last applied from the master.
     local_config_drift: Arc<std::sync::atomic::AtomicBool>,
+    /// Startup DNS gate sender. A fresh slave signals this only after the first
+    /// bundle is applied, persisted **and** watermarked, so a failed watermark
+    /// write cannot ungated listeners.
+    dns_starter: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
+    /// Ensures the gate is signalled at most once.
+    dns_ready_signaled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SlaveStatusTracker {
@@ -47,6 +53,8 @@ impl SlaveStatusTracker {
             watermark: Arc::new(Mutex::new(None)),
             watermark_path: Arc::new(Mutex::new(None)),
             local_config_drift: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dns_starter: Arc::new(Mutex::new(None)),
+            dns_ready_signaled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -109,6 +117,52 @@ impl SlaveStatusTracker {
     /// Returns the last durably applied bundle watermark, if any.
     pub fn get_watermark(&self) -> Option<AppliedWatermark> {
         sito_core::sync::lock_or_recover(&self.watermark).clone()
+    }
+
+    /// Returns true when this slave has a durably applied bundle to serve from.
+    ///
+    /// ADR-0011: a fresh/headless slave with no watermark must not bind DNS
+    /// listeners until the first valid bundle is applied. A restart with a
+    /// watermark serves the persisted applied configuration, including its
+    /// shared ACL.
+    #[must_use]
+    pub fn has_applied_bundle(&self) -> bool {
+        self.get_watermark()
+            .is_some_and(|watermark| watermark.version > 0)
+    }
+
+    /// Marks a fresh slave as not yet provisioned by the master.
+    ///
+    /// DNS listeners stay unbound until [`Self::has_applied_bundle`] is true.
+    /// The reason is surfaced through `/ha/status` and `/health`; it is not a
+    /// new ACL and never invents an allow policy. A later successful apply
+    /// clears it via [`Self::mark_synced`].
+    pub fn mark_acl_unprovisioned(&self) {
+        self.set_connection_error(Some(
+            "acl_unprovisioned: no applied configuration bundle/watermark yet; DNS listeners are not bound until the master pushes the first valid bundle"
+                .to_string(),
+        ));
+    }
+
+    /// Installs the startup DNS-gate sender. Safe to call more than once; the
+    /// latest sender wins.
+    pub fn set_dns_starter(&self, starter: tokio::sync::mpsc::UnboundedSender<()>) {
+        *sito_core::sync::lock_or_recover(&self.dns_starter) = Some(starter);
+    }
+
+    /// Signals the startup DNS gate exactly once, after the first bundle has
+    /// been applied, persisted and watermarked.
+    ///
+    /// A missing receiver (gate already opened) is not an error. This is a
+    /// no-op for a slave that already served from a persisted watermark.
+    pub fn signal_dns_ready(&self) {
+        if self.dns_ready_signaled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let sender = sito_core::sync::lock_or_recover(&self.dns_starter).clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
     }
 
     /// Returns true when a same-version payload fork has been latched.
@@ -513,6 +567,65 @@ mod tests {
         let readiness = tracker.readiness();
         assert!(!readiness.ready);
         assert_eq!(readiness.reason.as_deref(), Some("TCP connect error"));
+    }
+
+    #[test]
+    fn test_fresh_slave_is_acl_unprovisioned_until_first_bundle() {
+        let tracker = SlaveStatusTracker::new(
+            "fresh-slave".to_string(),
+            0,
+            Some("wss://127.0.0.1:8953".to_string()),
+        );
+        assert!(
+            !tracker.has_applied_bundle(),
+            "a fresh slave has no applied bundle to serve from"
+        );
+        tracker.mark_acl_unprovisioned();
+        let readiness = tracker.readiness();
+        assert!(!readiness.ready);
+        assert!(
+            readiness
+                .reason
+                .unwrap_or_default()
+                .contains("acl_unprovisioned"),
+            "a fresh slave must report acl_unprovisioned"
+        );
+
+        // The first applied bundle opens the DNS gate; it does not invent an
+        // ACL, it uses whatever shared `[clients]` configuration was applied.
+        tracker.persist_watermark(1, 0, &"ab".repeat(32)).unwrap();
+        tracker.mark_synced(1);
+        assert!(tracker.has_applied_bundle());
+        assert!(tracker.readiness().ready);
+        assert!(
+            tracker
+                .get_watermark()
+                .is_some_and(|watermark| watermark.version == 1)
+        );
+    }
+
+    #[test]
+    fn test_restarted_slave_with_watermark_serves_persisted_config() {
+        let path = temp_path("acl_restart_gate");
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None)
+            .with_watermark_path(path.clone())
+            .unwrap();
+        assert!(!tracker.has_applied_bundle());
+        tracker.persist_watermark(4, 2, &"cd".repeat(32)).unwrap();
+        drop(tracker);
+
+        // A restart with a watermark serves the persisted applied configuration
+        // without waiting for a new push.
+        let restarted = SlaveStatusTracker::new(
+            "slave-1".to_string(),
+            0,
+            Some("wss://127.0.0.1:8953".to_string()),
+        )
+        .with_watermark_path(path)
+        .unwrap();
+        assert!(restarted.has_applied_bundle());
+        assert_eq!(restarted.get_version(), 4);
+        assert_eq!(restarted.get_term(), 2);
     }
 
     #[test]

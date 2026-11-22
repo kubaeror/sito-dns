@@ -3,6 +3,9 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Dynamic checkbox name prefix for one offered client-network candidate.
+pub(crate) const ACL_SELECTED_FIELD_PREFIX: &str = "client_acl_selected__";
+
 // ---------------------------------------------------------------------------
 // Setup Wizard
 // ---------------------------------------------------------------------------
@@ -17,8 +20,20 @@ pub struct SetupTokenQuery {
     pub reauth_token: Option<String>,
 }
 
+/// ADR-0011's true fresh-install predicate. `bootstrapping` also covers
+/// setup-token/re-auth recovery, which must not render or apply the ACL step.
+///
+/// `is_first_run()` alone is not enough: it is true while the bootstrap
+/// `admin/adminadmin` account is active even when another usable Admin already
+/// exists (a provisioned/template install). Such an install must keep its
+/// existing `[clients.acl]`.
+pub(crate) fn fresh_install_acl(auth: &crate::auth::AuthManager) -> bool {
+    auth.is_first_run() && !auth.is_setup_complete() && !auth.has_usable_admin()
+}
+
 pub async fn wizard_page(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Query(params): Query<SetupTokenQuery>,
 ) -> Response {
@@ -41,6 +56,46 @@ pub async fn wizard_page(
     let setup_token = params.setup_token.unwrap_or_default();
     let reauth_token = params.reauth_token.unwrap_or_default();
 
+    // ADR-0011: a true fresh install is `is_first_run && !is_setup_complete()`.
+    // `bootstrapping` also covers setup-token recovery on an existing install,
+    // which must never render (or apply) the ACL step.
+    let fresh_install_acl = fresh_install_acl(&ctx.auth_mgr);
+    let config = ctx.config.load();
+    let (acl_candidates, acl_prefilled, acl_template_explicit_allow, acl_base_allow_entry_ids) =
+        if fresh_install_acl {
+            let live = wizard_acl::discover_candidates(peer_addr.map(|addr| addr.ip()));
+            let live_ids = wizard_acl::offered_ids(&live);
+            let prefill = wizard_acl::template_prefill_candidates(&config);
+            let prefill_ids = wizard_acl::offered_ids(&prefill);
+            let candidates = live
+                .into_iter()
+                .map(|candidate| {
+                    let kept_from_template = prefill_ids.contains(&candidate.id);
+                    let selected = candidate.is_loopback() || kept_from_template;
+                    acl_candidate_view(
+                        &candidate,
+                        selected,
+                        candidate.is_loopback() || kept_from_template,
+                        kept_from_template,
+                    )
+                })
+                .collect();
+            let prefilled = prefill
+                .into_iter()
+                .filter(|candidate| !live_ids.contains(&candidate.id))
+                .map(|candidate| acl_candidate_view(&candidate, true, true, true))
+                .collect();
+            (
+                candidates,
+                prefilled,
+                wizard_acl::base_template_explicit_allow(&config),
+                wizard_acl::base_clients(&config).acl.allow_entry_ids,
+            )
+        } else {
+            (Vec::new(), Vec::new(), false, false)
+        };
+    drop(config);
+
     HtmlTemplate(WizardTemplate {
         is_authenticated: auth_user.is_some(),
         username: auth_user.as_ref().map_or("admin", |u| &u.username),
@@ -51,8 +106,38 @@ pub async fn wizard_page(
         setup_required,
         setup_token: &setup_token,
         reauth_token: &reauth_token,
+        fresh_install_acl,
+        acl_candidates,
+        acl_prefilled,
+        acl_template_explicit_allow,
+        acl_base_allow_entry_ids,
+        acl_manual: "",
     })
     .into_response()
+}
+
+fn acl_candidate_view(
+    candidate: &wizard_acl::AclCandidate,
+    selected: bool,
+    locked: bool,
+    kept_from_template: bool,
+) -> crate::ui::templates::AclCandidateView {
+    crate::ui::templates::AclCandidateView {
+        id: candidate.id.clone(),
+        interface: candidate.interface.clone(),
+        address: candidate.address(),
+        prefix: candidate.prefix(),
+        family: candidate.family(),
+        class: candidate.class.as_str(),
+        class_label: candidate.class.label(),
+        source_label: candidate.source.label(),
+        selected,
+        locked,
+        kept_from_template,
+        is_loopback: candidate.is_loopback(),
+        is_public: candidate.is_public(),
+        is_bridge_or_tunnel: candidate.class.is_bridge_or_tunnel(),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -111,9 +196,40 @@ pub struct WizardCompleteForm {
     pub web_bind: Option<String>,
     pub web_port: Option<String>,
     pub retention_days: Option<String>,
+
+    // 7. Client access control (ADR-0011). Rendered only for a genuine fresh
+    // install; recovery runs leave `[clients.acl]` byte-for-byte untouched.
+    /// Hidden marker that the fresh-install ACL step was part of the
+    /// submission. Recovery submissions never include it.
+    pub client_acl_present: Option<String>,
+    pub client_acl_default_deny: Option<String>,
+    pub client_acl_manual: Option<String>,
+    pub client_acl_loopback_only_ack: Option<String>,
+    pub client_acl_public_ack: Option<String>,
+    pub client_acl_allow_entry_ids: Option<String>,
+    pub client_acl_allow_all: Option<String>,
+    pub client_acl_allow_all_confirm: Option<String>,
+    /// One uniquely named checkbox per offered candidate; the value is the
+    /// canonical CIDR. A flattened map avoids serde_urlencoded's lack of
+    /// repeated-key sequence support and keeps forged values re-validated.
+    #[serde(flatten)]
+    pub client_acl_extra: std::collections::HashMap<String, String>,
 }
 
 impl WizardCompleteForm {
+    /// Form defaults for a genuine fresh-install submission: the rendered ACL
+    /// step always posts the hidden marker, default deny, and the loopback-only
+    /// acknowledgement. Tests and callers that build a fresh form directly use
+    /// this instead of `Default`, which represents an ACL-less submission.
+    pub fn fresh_defaults() -> Self {
+        Self {
+            client_acl_present: Some("1".to_string()),
+            client_acl_default_deny: Some("on".to_string()),
+            client_acl_loopback_only_ack: Some("on".to_string()),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn is_checkbox_checked(val: Option<&str>) -> bool {
         match val {
             Some(v) => {
@@ -124,17 +240,68 @@ impl WizardCompleteForm {
         }
     }
 
-    pub fn build_config(&self, base: &Config) -> Result<Config, String> {
+    pub(crate) fn build_config(
+        &self,
+        base: &Config,
+        fresh_install_acl: bool,
+        acl_candidates: &[wizard_acl::AclCandidate],
+        acl_prefill: &[wizard_acl::AclCandidate],
+    ) -> Result<Config, String> {
         let mut cfg = base.clone();
         self.apply_dns_and_upstream(&mut cfg)?;
         self.apply_cache_and_filtering(&mut cfg)?;
         self.apply_web_and_stats(&mut cfg)?;
+        if fresh_install_acl {
+            self.apply_client_acl(&mut cfg, acl_candidates, acl_prefill)?;
+        }
 
         // Validate final configuration
         cfg.validate()
             .map_err(|e| format!("Configuration validation failed: {e}"))?;
 
         Ok(cfg)
+    }
+
+    /// Applies the fresh-install Client access control step. Never called for
+    /// setup-token/re-auth recovery, which must preserve an existing ACL.
+    fn apply_client_acl(
+        &self,
+        cfg: &mut Config,
+        candidates: &[wizard_acl::AclCandidate],
+        prefill: &[wizard_acl::AclCandidate],
+    ) -> Result<(), String> {
+        let base_clients = wizard_acl::base_clients(cfg);
+        let mut selected: Vec<String> = self
+            .client_acl_extra
+            .iter()
+            .filter(|(name, _)| name.starts_with(ACL_SELECTED_FIELD_PREFIX))
+            .map(|(_, value)| value.clone())
+            .collect();
+        selected.sort();
+        let manual = self.client_acl_manual.as_deref().unwrap_or("");
+        let input = wizard_acl::AclWizardInput {
+            present: self.client_acl_present.is_some(),
+            default_deny: Self::is_checkbox_checked(self.client_acl_default_deny.as_deref()),
+            selected: &selected,
+            manual,
+            loopback_only_ack: Self::is_checkbox_checked(
+                self.client_acl_loopback_only_ack.as_deref(),
+            ),
+            public_ack: Self::is_checkbox_checked(self.client_acl_public_ack.as_deref()),
+            allow_entry_ids: Self::is_checkbox_checked(self.client_acl_allow_entry_ids.as_deref()),
+            allow_all: Self::is_checkbox_checked(self.client_acl_allow_all.as_deref()),
+            allow_all_confirm: self.client_acl_allow_all_confirm.as_deref().unwrap_or(""),
+        };
+        let outcome = wizard_acl::build_acl(&input, &base_clients, candidates, prefill)?;
+
+        let mut clients = base_clients;
+        clients.default_policy = outcome.default_policy;
+        clients.acl = outcome.acl;
+        cfg.clients = Some(
+            toml::Value::try_from(clients)
+                .map_err(|e| format!("Failed to serialize clients configuration: {e}"))?,
+        );
+        Ok(())
     }
 
     /// Wizard fields for DNS listeners, ports, and upstream resolvers.
@@ -492,6 +659,10 @@ pub async fn wizard_complete_handler(
     // with no usable Admin yet (for example only non-admin accounts), which
     // are recoverable only with the setup token.
     let bootstrapping = is_first_run || setup_token_required;
+    // ADR-0011: the ACL step is applied only for a genuine fresh install.
+    // Setup-token/re-auth recovery (`setup_token_required && !is_first_run`)
+    // must preserve an existing `[clients.acl]` untouched.
+    let fresh_install_acl = fresh_install_acl(&ctx.auth_mgr);
     let auth_user = get_session_user(&ctx, &headers);
 
     // WP-0.7 (P1-16): completing the wizard mutates the administrator password.
@@ -637,6 +808,8 @@ pub async fn wizard_complete_handler(
         admin_user,
         effective_password,
         bootstrapping,
+        fresh_install_acl,
+        peer_addr,
     )
     .await
     {
@@ -649,6 +822,7 @@ pub async fn wizard_complete_handler(
 /// Applies the wizard configuration and persists the administrator credential.
 /// On any failure the credential undo log is used so setup remains pending.
 #[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 async fn apply_wizard_configuration(
     ctx: &ServerContext,
     hooks: &ApplyHooks,
@@ -656,21 +830,35 @@ async fn apply_wizard_configuration(
     admin_user: &str,
     effective_password: &str,
     bootstrapping: bool,
+    fresh_install_acl: bool,
+    peer_addr: Option<std::net::SocketAddr>,
 ) -> Result<(crate::config_apply::AppliedReport, WizardCredentialUndo), Response> {
     let mut credential_undo = WizardCredentialUndo::default();
     let report = {
         let _apply_guard = ctx.lock_config_apply().await;
         let base_cfg = (**ctx.config.load()).clone();
-        let new_cfg = match form.build_config(&base_cfg) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid configuration: {e}"),
-                )
-                    .into_response());
-            }
+        // Re-run interface discovery on POST: only currently offered candidates
+        // (plus manual entries and the base template's ACL) may be written. A
+        // submitted prefix is never trusted just because it was rendered once.
+        let (acl_candidates, acl_prefill) = if fresh_install_acl {
+            (
+                wizard_acl::discover_candidates(peer_addr.map(|addr| addr.ip())),
+                wizard_acl::template_prefill_candidates(&base_cfg),
+            )
+        } else {
+            (Vec::new(), Vec::new())
         };
+        let new_cfg =
+            match form.build_config(&base_cfg, fresh_install_acl, &acl_candidates, &acl_prefill) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid configuration: {e}"),
+                    )
+                        .into_response());
+                }
+            };
 
         // Defense in depth: if another writer completed setup while this
         // request waited, do not mutate credentials with a stale bootstrap

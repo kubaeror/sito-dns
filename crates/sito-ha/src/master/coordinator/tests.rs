@@ -876,6 +876,44 @@ fn test_require_all_slaves_with_one_behind_is_not_ready() {
 }
 
 #[test]
+fn test_mixed_version_acl_capability_is_required_only_for_deny() {
+    // An allow-policy cluster stays ready with a legacy peer.
+    let allow = test_coordinator().with_acl_enforcement(false);
+    allow.mark_replication_ready();
+    install_slave(&allow, "legacy-slave", allow.get_current_version());
+    assert!(
+        allow.readiness().ready,
+        "allow-policy clusters may keep legacy peers"
+    );
+
+    // A deny-enforcing master reports the missing capability.
+    let deny = test_coordinator().with_acl_enforcement(true);
+    deny.mark_replication_ready();
+    install_slave(&deny, "legacy-slave", deny.get_current_version());
+    let readiness = deny.readiness();
+    assert!(!readiness.ready);
+    let reason = readiness.reason.unwrap_or_default();
+    assert!(
+        reason.contains("acl_capability_missing") && reason.contains("legacy-slave"),
+        "mixed-version deny must name acl_capability_missing: {reason}"
+    );
+
+    // Advertising `client_acl` clears it.
+    {
+        let mut slaves = sito_core::sync::lock_or_recover(&deny.slaves);
+        slaves
+            .get_mut("legacy-slave")
+            .expect("installed slave")
+            .capabilities
+            .push(crate::protocol::CAPABILITY_CLIENT_ACL.to_string());
+    }
+    assert!(
+        deny.readiness().ready,
+        "an ACL-aware peer satisfies the deny readiness gate"
+    );
+}
+
+#[test]
 fn test_require_all_slaves_implies_require_slaves() {
     // Only require_all_slaves is set: with no slaves it must still fail, so
     // the stricter flag cannot be satisfied by the laxer default.

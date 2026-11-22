@@ -39,6 +39,16 @@ fn hello_bundle_hash(tracker: &SlaveStatusTracker) -> Option<String> {
     sito_ha_types::hash::normalize_blake3_hash(&watermark.payload_hash).ok()
 }
 
+/// Capabilities advertised in every `Hello`. `client_acl` tells the master this
+/// slave enforces the ADR-0011 source-address ACL, so a deny policy can be
+/// enabled cluster-wide only after every DNS-serving node is upgraded.
+fn hello_capabilities() -> Vec<String> {
+    vec![
+        "stats-v1".to_string(),
+        crate::protocol::CAPABILITY_CLIENT_ACL.to_string(),
+    ]
+}
+
 /// Delay before reconnecting after a clean master close.
 ///
 /// A clean close usually means a master restart/rollout, so reconnect promptly
@@ -343,7 +353,7 @@ where
         instance: tracker.instance_name.clone(),
         have_version,
         have_term: tracker.get_term(),
-        capabilities: vec!["stats-v1".to_string()],
+        capabilities: hello_capabilities(),
         token: ha_config.slave_token.clone(),
         role: Some("slave".to_string()),
         protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
@@ -416,7 +426,7 @@ where
                     instance: tracker.instance_name.clone(),
                     have_version: cur_v,
                     have_term: tracker.get_term(),
-                    capabilities: vec!["stats-v1".to_string()],
+                    capabilities: hello_capabilities(),
                     token: ha_config.slave_token.clone(),
                     role: Some("slave".to_string()),
                     protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
@@ -793,5 +803,17 @@ mod tests {
         // present-but-invalid hash, which the master would reject.
         tracker.persist_watermark(4, 1, "not-a-hash").unwrap();
         assert_eq!(hello_bundle_hash(&tracker), None);
+    }
+
+    #[test]
+    fn hello_advertises_client_acl_capability() {
+        let capabilities = hello_capabilities();
+        assert!(capabilities.iter().any(|c| c == "stats-v1"));
+        assert!(
+            capabilities
+                .iter()
+                .any(|c| c == crate::protocol::CAPABILITY_CLIENT_ACL),
+            "a slave must advertise client_acl so a deny master can require it"
+        );
     }
 }

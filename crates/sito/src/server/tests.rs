@@ -1160,3 +1160,75 @@ async fn test_doh_alt_svc_not_advertised_when_doh3_fails() {
     drop(occupied);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[cfg(feature = "ha")]
+#[test]
+fn test_slave_acl_gate_requires_an_applied_bundle() {
+    let tracker = sito_ha::SlaveStatusTracker::new("fresh".to_string(), 0, None);
+    assert!(
+        slave_acl_unprovisioned("slave", Some(&tracker)),
+        "a fresh slave must not bind DNS before the first bundle"
+    );
+    assert!(
+        !slave_acl_unprovisioned("master", Some(&tracker)),
+        "the gate only applies to the slave role"
+    );
+
+    tracker
+        .persist_watermark(1, 0, &"ab".repeat(32))
+        .expect("persist watermark");
+    assert!(
+        !slave_acl_unprovisioned("slave", Some(&tracker)),
+        "a restart/apply with a watermark serves the persisted ACL"
+    );
+}
+
+#[cfg(feature = "ha")]
+#[test]
+fn test_acl_deny_effective_uses_typed_clients_table() {
+    let mut config = sito_core::config::Config::default();
+    assert!(!acl_deny_effective(&config));
+    config.clients = Some(
+        "default_policy = \"deny\"\n"
+            .parse::<toml::Table>()
+            .map(toml::Value::Table)
+            .unwrap(),
+    );
+    assert!(acl_deny_effective(&config));
+}
+
+#[cfg(feature = "ha")]
+#[test]
+fn test_ha_dns_gate_waits_for_setup_and_applied_bundle() {
+    let fresh = sito_ha::SlaveStatusTracker::new("fresh-gated".to_string(), 0, None);
+    assert!(
+        !dns_start_ready(true, true, Some(&fresh)),
+        "a fresh slave must not serve DNS before the first applied bundle"
+    );
+    assert!(
+        !dns_start_ready(false, true, Some(&fresh)),
+        "a bundle alone must not bypass setup gating"
+    );
+    assert!(
+        !dns_start_ready(true, true, None),
+        "a missing tracker must fail closed"
+    );
+
+    // A rejected bundle or a failed watermark write leaves version 0 / no
+    // watermark: the gate stays closed.
+    let rejected = sito_ha::SlaveStatusTracker::new("rejected-gated".to_string(), 0, None);
+    assert!(!dns_start_ready(true, true, Some(&rejected)));
+
+    // A valid applied+watermarked bundle opens the gate.
+    fresh
+        .persist_watermark(1, 0, &"ab".repeat(32))
+        .expect("watermark");
+    assert!(
+        dns_start_ready(true, true, Some(&fresh)),
+        "setup complete plus a watermarked bundle may start listeners"
+    );
+    assert!(
+        dns_start_ready(true, false, Some(&fresh)),
+        "a non-gated slave is unaffected by the bundle gate"
+    );
+}

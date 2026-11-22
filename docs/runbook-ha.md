@@ -35,6 +35,64 @@ offline `sito ha lease-admin set` recovery tool are documented in the
 HA node is supported only for lab/test and is **not** HA: it shares that node's
 failure domain.
 
+### DNS client ACL across HA (ADR-0011)
+
+`clients.default_policy` and every `[clients.acl]` key are shared
+configuration: the sanitizer keeps them in the bundle and the
+shared-projection digest, and only `clients.client_id_secrets` is stripped.
+There is no `[ha]` ACL key, no per-node ACL override and no node-local allow
+file. For the same observed source address and applied bundle, every ACL-aware
+node makes the same decision; nodes can legitimately differ when a client
+reaches them through different NAT/proxy paths.
+
+**All-site address plan.** The policy is one shared list. Before enabling deny,
+add every site's client CIDRs to `[clients.acl] allow` (or opt in to the static
+entry ids). A list that only contains site A is a deliberate denial of site B
+on every node, not a local default. Agree the plan with the operator of every
+site, then publish it from the master.
+
+**Fresh/headless/rebuild slave.** A slave with no applied
+`ha_watermark.toml`/bundle starts its admin/HA client, reports
+`acl_unprovisioned`, and **does not bind DNS listeners**. It serves only after
+the first valid bundle is applied, persisted and the watermark write succeeds;
+a rejected bundle or a failed watermark write keeps DNS unbound. A restart with
+a watermark serves the persisted applied configuration immediately. If the
+master is unreachable, a first-boot slave cannot serve DNS: restore the master
+(or use the documented recovery procedure) instead of expecting a temporary
+allow. Setup completion does not bypass this rule: a setup-pending slave starts
+its replication worker after the wizard completes and still waits for the first
+watermarked bundle before binding DNS.
+
+**Invalid bundle.** An invalid ACL (bad enum/CIDR, duplicate canonical prefix,
+allow/deny exact conflict, over-cap list, malformed clients table) rejects the
+whole bundle atomically. The slave keeps its previous runtime generation and
+ACL, reports `Degraded`, and does not ACK `applied: true`.
+
+**Mixed versions.** An ACL-aware slave advertises `client_acl` in its `Hello`.
+While the published configuration has `default_policy = "deny"`, a connected
+slave without the capability makes master readiness report
+`acl_capability_missing` and logs a warning (at Hello and when an allow→deny
+publish transition is made). Upgrade every DNS-serving node before enabling
+deny; a mixed-version cluster must stay on `default_policy = "allow"`. Legacy v2
+peers that cannot report `have_bundle_hash` also cannot participate in promotion
+candidate reconciliation; that flow is not part of this ACL change and remains
+release-gated until the promotion engine is merged.
+
+**Promotion.** Automatic promotion is governed by ADR-0010 and is not part of
+this ACL change. A node that has already applied the bundle keeps that shared
+ACL if a promotion flow later runs. The ACL startup gate does not invent a
+policy for an unprovisioned node, but the claim that an unprovisioned slave
+cannot be promoted is not enforced by this tree until the promotion engine is
+merged; keep promotion disabled until then. A promoted node writes the shared
+configuration it received, so verify the all-site allow plan before promotion.
+
+**Discovery.** Denied queries are absent from the detailed query log and the
+`unidentified_clients` list by design. Use
+`sito_dns_acl_decisions_total{action,reason,family}`,
+`sito_dns_acl_matched_prefix_total`, `sito_dns_acl_dropped_total` and the
+rate-limited ACL log lines on each node. ACL metrics are per node and are not
+merged into the master's Prometheus registry.
+
 ### Build prerequisites and the optional HA module
 
 HA is an optional Cargo feature, not a runtime toggle:

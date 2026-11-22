@@ -713,7 +713,7 @@ async fn test_wizard_validation_and_user_creation() {
         admin_user: Some(String::new()),
         admin_password: Some("ValidPassword123!".to_string()),
         upstream: Some("1.1.1.1:53".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -731,7 +731,7 @@ async fn test_wizard_validation_and_user_creation() {
         admin_user: Some("admin user".to_string()),
         admin_password: Some("ValidPassword123!".to_string()),
         upstream: Some("1.1.1.1:53".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -749,7 +749,7 @@ async fn test_wizard_validation_and_user_creation() {
         admin_user: Some("admin".to_string()),
         admin_password: Some("short".to_string()),
         upstream: Some("1.1.1.1:53".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -768,7 +768,7 @@ async fn test_wizard_validation_and_user_creation() {
         admin_password: Some("SuperSecretPassword123!".to_string()),
         upstream: Some("1.1.1.1:53".to_string()),
         enable_adblock: Some("on".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -818,7 +818,7 @@ async fn test_wizard_rejects_empty_and_default_password() {
     let default_pass_form = WizardCompleteForm {
         admin_user: Some("admin".to_string()),
         admin_password: Some("adminadmin".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -860,7 +860,7 @@ async fn test_wizard_password_mismatch() {
         admin_user: Some("admin".to_string()),
         admin_password: Some("Password123!".to_string()),
         confirm_password: Some("Mismatch123!".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -890,7 +890,7 @@ async fn test_wizard_rejects_existing_non_admin_target() {
         admin_user: Some("bob".to_string()),
         admin_password: Some("NewBobPassword123!".to_string()),
         upstream: Some("1.1.1.1:53".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -941,7 +941,7 @@ async fn test_wizard_password_persist_failure_does_not_persist_config() {
         admin_user: Some("admin".to_string()),
         admin_password: Some("StrongPassword123!".to_string()),
         upstream: Some("1.1.1.1:53".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -981,7 +981,7 @@ async fn test_concurrent_wizard_completion_only_one_succeeds() {
         admin_password: Some("RacedPassword123!".to_string()),
         confirm_password: Some("RacedPassword123!".to_string()),
         upstream: Some("1.1.1.1:53".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
 
     let first = wizard_complete_handler(
@@ -1053,7 +1053,7 @@ async fn test_wizard_bootstrap_delete_persist_failure_keeps_setup_pending() {
         admin_password: Some("NewOwnerPassword123!".to_string()),
         confirm_password: Some("NewOwnerPassword123!".to_string()),
         upstream: Some("1.1.1.1:53".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -1100,7 +1100,7 @@ async fn test_wizard_config_persist_failure_rolls_back_admin_password() {
         admin_user: Some("admin".to_string()),
         admin_password: Some("StrongPassword123!".to_string()),
         upstream: Some("1.1.1.1:53".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -1173,6 +1173,7 @@ async fn test_wizard_custom_config_and_presets() {
         web_bind: Some("127.0.0.1".to_string()),
         web_port: Some("9090".to_string()),
         retention_days: Some("30".to_string()),
+        ..WizardCompleteForm::fresh_defaults()
     };
 
     let resp = wizard_complete_handler(
@@ -1228,7 +1229,7 @@ async fn test_wizard_invalid_ports_and_ips() {
         admin_user: Some("admin".to_string()),
         admin_password: Some("ValidPassword123!".to_string()),
         port: Some("not_a_port".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -1245,7 +1246,7 @@ async fn test_wizard_invalid_ports_and_ips() {
         admin_user: Some("admin".to_string()),
         admin_password: Some("ValidPassword123!".to_string()),
         web_bind: Some("not_an_ip".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -2174,7 +2175,7 @@ async fn test_wizard_completion_requires_setup_token_when_provisioned() {
         setup_token: None,
         admin_user: Some("admin".to_string()),
         admin_password: Some("Str0ngPassword!".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
 
     // Without the token -> 403 and setup stays pending.
@@ -2229,7 +2230,7 @@ async fn test_wizard_admin_recovery_requires_setup_token_or_reauth() {
         reauth_token: None,
         admin_user: Some("admin".to_string()),
         admin_password: Some("Str0ngPassword!".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
 
     // An Admin session alone is not enough while the setup token is pending.
@@ -2299,6 +2300,7 @@ async fn test_wizard_forbidden_after_setup_even_for_admin() {
 
     let resp = wizard_page(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Query(SetupTokenQuery::default()),
     )
@@ -2318,7 +2320,7 @@ async fn test_wizard_forbidden_after_setup_even_for_admin() {
             admin_user: Some("admin".to_string()),
             admin_password: Some("AttackerKnownPassword1".to_string()),
             confirm_password: Some("AttackerKnownPassword1".to_string()),
-            ..Default::default()
+            ..WizardCompleteForm::fresh_defaults()
         }),
     )
     .await;
@@ -4794,7 +4796,7 @@ async fn test_wizard_unchecked_flags_disable_existing_features() {
         filtering_enabled_present: Some("1".to_string()),
         dnssec_validate_present: Some("1".to_string()),
         cname_cloaking_present: Some("1".to_string()),
-        ..Default::default()
+        ..WizardCompleteForm::fresh_defaults()
     };
     let resp = wizard_complete_handler(
         State(ctx.clone()),
@@ -5933,6 +5935,625 @@ async fn test_clients_group_services_apply_failure_persists_nothing() {
         kids.blocked_services
     );
     assert!(!ctx.config_path.exists());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Default-deny client ACL wizard (ADR-0011, D7b2)
+// ---------------------------------------------------------------------------
+
+fn seed_raw_clients(ctx: &ServerContext, clients: &str) {
+    let mut cfg = (**ctx.config.load()).clone();
+    cfg.clients = Some(toml::from_str::<toml::Value>(clients).expect("valid clients TOML"));
+    ctx.set_config(cfg);
+}
+
+fn configured_acl(
+    ctx: &ServerContext,
+) -> (
+    sito_clients::AclDefaultPolicy,
+    sito_clients::ClientAclConfig,
+) {
+    let clients = wizard_acl::base_clients(&ctx.config.load());
+    (clients.default_policy, clients.acl)
+}
+
+async fn complete_wizard(ctx: &ServerContext, form: WizardCompleteForm) -> StatusCode {
+    wizard_complete_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        crate::auth::MaybeConnectInfo(None),
+        HeaderMap::new(),
+        Form(form),
+    )
+    .await
+    .status()
+}
+
+fn wizard_form_with_pass() -> WizardCompleteForm {
+    WizardCompleteForm {
+        admin_user: Some("admin".to_string()),
+        admin_password: Some("Str0ngPassword!".to_string()),
+        confirm_password: Some("Str0ngPassword!".to_string()),
+        ..WizardCompleteForm::fresh_defaults()
+    }
+}
+
+fn candidate_tag<'a>(body: &'a str, value: &str) -> &'a str {
+    let marker = format!("value=\"{value}\"");
+    let index = body
+        .find(&marker)
+        .unwrap_or_else(|| panic!("candidate {value} not rendered: {body}"));
+    let start = body[..index].rfind("<label").unwrap_or(index);
+    let end = body[index..]
+        .find("</label>")
+        .map_or(body.len(), |offset| index + offset);
+    &body[start..end]
+}
+
+#[tokio::test]
+async fn test_wizard_fresh_template_explicit_allow_still_shows_acl() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_acl_template_allow_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    seed_raw_clients(
+        &ctx,
+        "default_policy = \"allow\"\n[acl]\nallow = [\"192.168.50.0/24\"]\n",
+    );
+
+    let body = response_body(
+        wizard_page(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Query(SetupTokenQuery::default()),
+        )
+        .await,
+    )
+    .await;
+
+    assert!(
+        body.contains("Client Access Control"),
+        "fresh install must render the ACL step even when the template explicitly allows"
+    );
+    assert!(
+        body.contains("The base template sets"),
+        "the template's explicit allow must be called out: {body}"
+    );
+    assert!(
+        body.contains("name=\"client_acl_default_deny\" checked"),
+        "deny must be checked by default on every fresh install"
+    );
+    let prefilled = candidate_tag(&body, "192.168.50.0/24");
+    assert!(
+        prefilled.contains("checked"),
+        "existing template allow prefixes must be prefilled/selected: {prefilled}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_public_peer_is_not_seeded() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_acl_public_peer_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let peer: std::net::SocketAddr = "203.0.113.9:51234".parse().unwrap();
+    let body = response_body(
+        wizard_page(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(Some(peer)),
+            HeaderMap::new(),
+            Query(SetupTokenQuery::default()),
+        )
+        .await,
+    )
+    .await;
+
+    let tag = candidate_tag(&body, "203.0.113.0/24");
+    assert!(
+        !tag.contains("checked"),
+        "the raw wizard peer must be shown but never selected: {tag}"
+    );
+    assert!(
+        body.contains("public address"),
+        "the public peer candidate must be labelled public"
+    );
+
+    // Accepting the default without selecting anything writes loopback only.
+    let resp = complete_wizard(&ctx, wizard_form_with_pass()).await;
+    assert_eq!(resp, StatusCode::SEE_OTHER);
+    let (policy, acl) = configured_acl(&ctx);
+    assert_eq!(policy, sito_clients::AclDefaultPolicy::Deny);
+    assert_eq!(acl.allow, vec!["127.0.0.1/32", "::1/128"]);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_does_not_seed_all_interfaces() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_acl_multihomed_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let body = response_body(
+        wizard_page(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Query(SetupTokenQuery::default()),
+        )
+        .await,
+    )
+    .await;
+
+    for chunk in body.split("client_acl_selected__").skip(1) {
+        let tag = &chunk[..chunk.find('>').unwrap_or(chunk.len())];
+        let checked = tag.split_whitespace().any(|token| token == "checked");
+        if checked {
+            assert!(
+                tag.contains("127.0.0.1/32") || tag.contains("::1/128"),
+                "only loopback may be preselected on a fresh install: {tag}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_loopback_only_requires_ack() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_acl_loopback_ack_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let mut missing_ack = wizard_form_with_pass();
+    missing_ack.client_acl_loopback_only_ack = None;
+    let resp = complete_wizard(&ctx, missing_ack).await;
+    assert_eq!(resp, StatusCode::BAD_REQUEST);
+    assert!(ctx.auth_mgr.is_first_run(), "setup must stay pending");
+    let (policy, _) = configured_acl(&ctx);
+    assert_eq!(policy, sito_clients::AclDefaultPolicy::Allow);
+
+    let resp = complete_wizard(&ctx, wizard_form_with_pass()).await;
+    assert_eq!(resp, StatusCode::SEE_OTHER);
+    let (policy, acl) = configured_acl(&ctx);
+    assert_eq!(policy, sito_clients::AclDefaultPolicy::Deny);
+    assert_eq!(acl.allow, vec!["127.0.0.1/32", "::1/128"]);
+    assert!(!acl.allow_entry_ids);
+    assert_eq!(acl.deny_response, sito_clients::AclDenyResponse::Refused);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_public_manual_requires_ack() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_acl_public_ack_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let mut form = wizard_form_with_pass();
+    form.client_acl_manual = Some("203.0.113.0/24".to_string());
+    let resp = complete_wizard(&ctx, form).await;
+    assert_eq!(resp, StatusCode::BAD_REQUEST);
+    assert!(ctx.auth_mgr.is_first_run());
+
+    let mut form = wizard_form_with_pass();
+    form.client_acl_manual = Some("203.0.113.0/24".to_string());
+    form.client_acl_public_ack = Some("on".to_string());
+    let resp = complete_wizard(&ctx, form).await;
+    assert_eq!(resp, StatusCode::SEE_OTHER);
+    let (policy, acl) = configured_acl(&ctx);
+    assert_eq!(policy, sito_clients::AclDefaultPolicy::Deny);
+    assert!(acl.allow.contains(&"203.0.113.0/24".to_string()));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_allow_all_requires_exact_text() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_acl_allow_all_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let mut checkbox_only = wizard_form_with_pass();
+    checkbox_only.client_acl_allow_all = Some("on".to_string());
+    let resp = complete_wizard(&ctx, checkbox_only).await;
+    assert_eq!(resp, StatusCode::BAD_REQUEST);
+    assert!(ctx.auth_mgr.is_first_run());
+
+    let mut wrong_text = wizard_form_with_pass();
+    wrong_text.client_acl_allow_all = Some("on".to_string());
+    wrong_text.client_acl_allow_all_confirm = Some("allow all".to_string());
+    let resp = complete_wizard(&ctx, wrong_text).await;
+    assert_eq!(resp, StatusCode::BAD_REQUEST);
+    assert!(ctx.auth_mgr.is_first_run());
+
+    let mut confirmed = wizard_form_with_pass();
+    confirmed.client_acl_allow_all = Some("on".to_string());
+    confirmed.client_acl_allow_all_confirm = Some("ALLOW ALL".to_string());
+    let resp = complete_wizard(&ctx, confirmed).await;
+    assert_eq!(resp, StatusCode::SEE_OTHER);
+    let (policy, acl) = configured_acl(&ctx);
+    assert_eq!(policy, sito_clients::AclDefaultPolicy::Deny);
+    assert_eq!(acl.allow, vec!["0.0.0.0/0", "::/0"]);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_rejects_forged_interface_candidate() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_acl_forged_candidate_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let mut form = wizard_form_with_pass();
+    form.client_acl_extra.insert(
+        "client_acl_selected__0".to_string(),
+        "198.51.100.0/24".to_string(),
+    );
+    let resp = complete_wizard(&ctx, form).await;
+    assert_eq!(resp, StatusCode::BAD_REQUEST);
+    assert!(ctx.auth_mgr.is_first_run());
+    let (policy, _) = configured_acl(&ctx);
+    assert_eq!(policy, sito_clients::AclDefaultPolicy::Allow);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_fresh_template_prefills_existing_allow() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_acl_prefill_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    seed_raw_clients(&ctx, "[acl]\nallow = [\"192.168.50.0/24\"]\n");
+
+    let body = response_body(
+        wizard_page(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Query(SetupTokenQuery::default()),
+        )
+        .await,
+    )
+    .await;
+    let tag = candidate_tag(&body, "192.168.50.0/24");
+    assert!(
+        tag.contains("disabled") && body.to_lowercase().contains("kept from"),
+        "template prefixes must be visibly locked/kept, not an ignorable checkbox: {tag}"
+    );
+
+    let resp = complete_wizard(&ctx, wizard_form_with_pass()).await;
+    assert_eq!(resp, StatusCode::SEE_OTHER);
+    let (policy, acl) = configured_acl(&ctx);
+    assert_eq!(policy, sito_clients::AclDefaultPolicy::Deny);
+    assert!(
+        acl.allow.contains(&"192.168.50.0/24".to_string()),
+        "accepting default deny must keep the template allow network: {:?}",
+        acl.allow
+    );
+    assert_eq!(acl.allow.len(), 3, "template prefix plus two loopbacks");
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_manual_catch_all_requires_allow_all_confirmation() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_acl_manual_catch_all_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let mut form = wizard_form_with_pass();
+    form.client_acl_manual = Some("0.0.0.0/0".to_string());
+    form.client_acl_public_ack = Some("on".to_string());
+    let resp = complete_wizard(&ctx, form).await;
+    assert_eq!(
+        resp,
+        StatusCode::BAD_REQUEST,
+        "a manual catch-all must not bypass the ALLOW ALL double confirmation"
+    );
+    assert!(ctx.auth_mgr.is_first_run());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_template_catch_all_requires_allow_all_confirmation() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_acl_template_catch_all_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    seed_raw_clients(&ctx, "[acl]\nallow = [\"0.0.0.0/0\", \"::/0\"]\n");
+
+    let mut form = wizard_form_with_pass();
+    form.client_acl_public_ack = Some("on".to_string());
+    let resp = complete_wizard(&ctx, form).await;
+    assert_eq!(
+        resp,
+        StatusCode::BAD_REQUEST,
+        "a template catch-all must not bypass the ALLOW ALL double confirmation"
+    );
+    assert!(ctx.auth_mgr.is_first_run());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_entry_ids_opt_in_is_explicit() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_acl_entry_ids_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    seed_raw_clients(&ctx, "[acl]\nallow_entry_ids = true\n");
+
+    let resp = complete_wizard(&ctx, wizard_form_with_pass()).await;
+    assert_eq!(resp, StatusCode::SEE_OTHER);
+    let (_, acl) = configured_acl(&ctx);
+    assert!(
+        !acl.allow_entry_ids,
+        "a base allow_entry_ids = true must not carry through silently"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_can_keep_default_allow() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_acl_keep_allow_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let mut form = wizard_form_with_pass();
+    form.client_acl_default_deny = None;
+    let resp = complete_wizard(&ctx, form).await;
+    assert_eq!(resp, StatusCode::SEE_OTHER);
+    let (policy, acl) = configured_acl(&ctx);
+    assert_eq!(policy, sito_clients::AclDefaultPolicy::Allow);
+    assert!(acl.allow.is_empty(), "no locking ACL may be invented");
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_wizard_acl_dynamic_candidate_fields_deserialize_from_urlencoded_form() {
+    let form: WizardCompleteForm = serde_urlencoded::from_str(
+        "admin_user=admin&admin_password=Str0ngPassword%21&client_acl_present=1&client_acl_default_deny=on&client_acl_selected__0=127.0.0.1%2F32&client_acl_selected__4=192.168.1.0%2F24&client_acl_loopback_only_ack=on&ignored=value",
+    )
+    .expect("axum form encoding must deserialize into the ACL form");
+    assert!(form.client_acl_present.is_some());
+    assert!(WizardCompleteForm::is_checkbox_checked(
+        form.client_acl_default_deny.as_deref()
+    ));
+    let mut selected: Vec<_> = form
+        .client_acl_extra
+        .iter()
+        .filter(|(name, _)| name.starts_with(ACL_SELECTED_FIELD_PREFIX))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    selected.sort_unstable();
+    assert_eq!(selected, vec!["127.0.0.1/32", "192.168.1.0/24"]);
+}
+
+#[tokio::test]
+async fn test_wizard_fresh_install_predicate() {
+    let auth = crate::auth::AuthManager::new();
+    assert!(
+        wizard::fresh_install_acl(&auth),
+        "default-admin first run is a fresh install"
+    );
+    auth.mark_setup_complete();
+    assert!(
+        !wizard::fresh_install_acl(&auth),
+        "setup completion must close the fresh-install ACL step"
+    );
+}
+
+#[tokio::test]
+async fn test_wizard_setup_token_recovery_preserves_existing_acl() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_acl_setup_recovery_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let mut ctx = mock_context(&temp_dir).await;
+    ctx.auth_mgr = Arc::new(crate::auth::AuthManager::with_storage(&temp_dir, 24, 5).unwrap());
+    seed_raw_clients(
+        &ctx,
+        "default_policy = \"deny\"\n[acl]\nallow = [\"192.168.50.0/24\"]\ndeny = [\"192.168.50.128/25\"]\ndeny_response = \"drop\"\nallow_entry_ids = true\n",
+    );
+    let before = wizard_acl::base_clients(&ctx.config.load());
+    // Existing install: the Admin is unavailable but this is not first run.
+    ctx.auth_mgr.mark_setup_complete();
+    assert!(!ctx.auth_mgr.is_first_run());
+    assert!(ctx.auth_mgr.setup_token_required());
+    let token = ctx.auth_mgr.setup_token().expect("setup token");
+
+    let mut form = wizard_form_with_pass();
+    form.setup_token = Some(token);
+    // Even a hostile/fresh ACL payload must be ignored on a recovery run.
+    form.client_acl_manual = Some("203.0.113.0/24".to_string());
+    form.client_acl_default_deny = Some("on".to_string());
+    form.client_acl_public_ack = Some("on".to_string());
+    let resp = complete_wizard(&ctx, form).await;
+    assert_eq!(resp, StatusCode::SEE_OTHER);
+
+    let after = wizard_acl::base_clients(&ctx.config.load());
+    assert_eq!(after.default_policy, before.default_policy);
+    assert_eq!(
+        after.acl, before.acl,
+        "recovery must preserve the existing ACL"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_reauth_recovery_preserves_existing_acl() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_acl_reauth_recovery_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let mut ctx = mock_context(&temp_dir).await;
+    ctx.auth_mgr = Arc::new(crate::auth::AuthManager::with_storage(&temp_dir, 24, 5).unwrap());
+    seed_raw_clients(
+        &ctx,
+        "default_policy = \"deny\"\n[acl]\nallow = [\"10.20.0.0/16\"]\ndeny_response = \"refused\"\n",
+    );
+    let before = wizard_acl::base_clients(&ctx.config.load());
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("bootstrap admin login failed");
+    };
+    let headers = session_headers(&session);
+    ctx.auth_mgr.mark_setup_complete();
+    assert!(!ctx.auth_mgr.is_first_run());
+    assert!(ctx.auth_mgr.setup_token_required());
+    let ticket = ctx
+        .auth_mgr
+        .reauth("admin", "adminadmin", None, &session.id, "")
+        .await
+        .expect("reauth ticket");
+
+    let mut form = wizard_form_with_pass();
+    form.setup_token = None;
+    form.reauth_token = Some(ticket.token);
+    form.client_acl_manual = Some("198.51.100.0/24".to_string());
+    form.client_acl_public_ack = Some("on".to_string());
+    let resp = wizard_complete_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        crate::auth::MaybeConnectInfo(None),
+        headers,
+        Form(form),
+    )
+    .await
+    .status();
+    assert_eq!(resp, StatusCode::SEE_OTHER);
+
+    let after = wizard_acl::base_clients(&ctx.config.load());
+    assert_eq!(
+        after.acl, before.acl,
+        "reauth recovery must preserve the existing ACL"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_usable_admin_with_active_bootstrap_is_not_fresh() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_acl_usable_admin_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let mut ctx = mock_context(&temp_dir).await;
+    ctx.auth_mgr = Arc::new(crate::auth::AuthManager::with_storage(&temp_dir, 24, 5).unwrap());
+    seed_raw_clients(
+        &ctx,
+        "default_policy = \"deny\"\n[acl]\nallow = [\"10.20.0.0/16\"]\nallow_entry_ids = true\n",
+    );
+    let before = wizard_acl::base_clients(&ctx.config.load());
+    ctx.auth_mgr
+        .create_user("owner", "OwnerPassword123!", Role::Admin)
+        .await;
+    assert!(ctx.auth_mgr.is_first_run());
+    assert!(ctx.auth_mgr.is_default_admin_active());
+    assert!(
+        ctx.auth_mgr.has_usable_admin(),
+        "a second Admin account makes this a provisioned install"
+    );
+    assert!(
+        !wizard::fresh_install_acl(&ctx.auth_mgr),
+        "active bootstrap admin plus a usable Admin must not be treated as fresh"
+    );
+
+    let body = response_body(
+        wizard_page(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Query(SetupTokenQuery::default()),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        !body.contains("Client Access Control"),
+        "a provisioned install must not render the ACL step"
+    );
+
+    let token = ctx.auth_mgr.setup_token().expect("setup token");
+    let mut form = wizard_form_with_pass();
+    form.setup_token = Some(token);
+    form.client_acl_manual = Some("198.51.100.0/24".to_string());
+    form.client_acl_public_ack = Some("on".to_string());
+    let resp = complete_wizard(&ctx, form).await;
+    assert_eq!(resp, StatusCode::SEE_OTHER);
+    let after = wizard_acl::base_clients(&ctx.config.load());
+    assert_eq!(
+        after.acl, before.acl,
+        "a provisioned install's existing ACL must not be rewritten"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_wizard_page_omits_acl_step_for_setup_token_recovery() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_acl_recovery_page_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let mut ctx = mock_context(&temp_dir).await;
+    ctx.auth_mgr = Arc::new(crate::auth::AuthManager::with_storage(&temp_dir, 24, 5).unwrap());
+    seed_raw_clients(
+        &ctx,
+        "default_policy = \"deny\"\n[acl]\nallow = [\"10.0.0.0/8\"]\n",
+    );
+    ctx.auth_mgr.mark_setup_complete();
+    assert!(!ctx.auth_mgr.is_first_run());
+    assert!(ctx.auth_mgr.setup_token_required());
+
+    let body = response_body(
+        wizard_page(
+            State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
+            HeaderMap::new(),
+            Query(SetupTokenQuery::default()),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        !body.contains("Client Access Control") && !body.contains("client_acl_default_deny"),
+        "setup-token recovery must not render the ACL step: {body}"
+    );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
