@@ -141,8 +141,10 @@ See [`docs/release-verification.md`](release-verification.md) and the
   it for progress diagnostics and v1.9 schema compatibility but never reads it
   to skip rows; aggregate and delete share one transaction per chunk, and
   backdated rows re-aggregate. The `--keep-aggregates` clear has one documented
-  deleted-rollup exception: it clears the detailed rows without resurrecting a
-  rollup that rollup retention deleted mid-run. See
+  deleted-rollup exception: if an hour's rollup exists when the clear reaches
+  that hour but rollup retention deletes it mid-run, the clear still clears the
+  detailed rows without resurrecting that rollup (a row already absent when the
+  clear reaches its hour is recreated normally). See
   [migration §10.1](2.0-migration.md#101-backendstats-residual-b7).
 - **A TTL-only live cache apply is cold by design (B8, accepted residual).** The
   runtime apply advances the cache-policy epoch instead of re-clamping warm

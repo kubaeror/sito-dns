@@ -628,10 +628,13 @@ accumulator is cumulative for the hour (the temp tables are not cleared per
 chunk), so a heavy hitter below a chunk-local top-N but in the hour's top-N is
 preserved; only the counters are per-chunk deltas. Memory is therefore bounded
 to roughly one hour of distinct values and the writer lock is held for at most
-one chunk. A committed chunk already contains the rollup contribution of the
-rows it deleted, so an interrupted clear leaves a consistent prefix and
-re-running the command resumes from the oldest remaining row without double
-counting. Each chunk re-reads the current `stats_hourly` row inside the write
+one chunk. On the normal path a committed chunk already contains the rollup
+contribution of the rows it deleted, so an interrupted clear leaves a consistent
+prefix and re-running the command resumes from the oldest remaining row without
+double counting. The one exception is the deleted-rollup case below: a chunk
+still clears its detailed rows but writes no rollup because the hour's rollup
+row was deleted after the clear observed it. Each chunk re-reads the current
+`stats_hourly` row inside the write
 transaction, merges the pre-clear snapshot plus the run's cumulative counts,
 and adds any positive-only external top-list delta; a concurrent rollup update
 is therefore preserved, a deleted rollup row is not resurrected, and a zero-row
@@ -681,9 +684,12 @@ production path reads it to skip rows: the aggregate read, rollup upsert,
 watermark update and delete share one transaction per chunk. In the retention
 sweep a row is not deleted unless its rollup contribution committed, and a
 backdated row is re-aggregated on the next sweep. The `--keep-aggregates` clear
-shares that transaction but has one documented exception: if the hour's
-`stats_hourly` row was deleted mid-run by rollup retention, the clear skips the
-upsert and clears the detailed rows without resurrecting the rollup. This is an
+shares that transaction but has one documented exception: `hour_had_rollup` is
+evaluated per hour when the clear reaches that hour. If the hour's
+`stats_hourly` row existed then but was deleted mid-run by rollup retention, the
+clear skips the upsert and clears the detailed rows without resurrecting the
+rollup; a row already absent when the clear reached its hour is recreated
+normally. This is an
 accepted 2.0 residual, not a missing read optimization;
 see [migration §10.1](2.0-migration.md#101-backendstats-residual-b7). Enabling
 `privacy.anonymize_querylog` is forward-only: old
