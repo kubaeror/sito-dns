@@ -1,9 +1,11 @@
 # Benchmark baselines
 
-`baseline.json` stores Criterion median estimates (nanoseconds) for every
-workspace benchmark. The nightly `bench.yml` workflow compares the latest
-`target/criterion/**/new/estimates.json` against it and fails when a benchmark
-is more than 10% slower.
+`baseline.json` stores Criterion median estimates (nanoseconds) for the
+benchmarks that existed when it was generated. The nightly `bench.yml` workflow
+compares the latest `target/criterion/**/new/estimates.json` against it and
+fails when a benchmark with a baseline entry is more than 10% slower. A
+benchmark added after the baseline is reported as informational (`new ... not
+in the baseline`) until the next regeneration; it is not thresholded yet.
 
 The file is **environment specific**: it records the machine class in
 `environment.description`, and the checker fails closed when the current

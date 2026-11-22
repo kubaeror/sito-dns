@@ -846,20 +846,21 @@ mod tests {
 
     /// Wall-clock hang guard for the wildcard compile regression test.
     ///
-    /// This is deliberately far above the reported CI timings (≈10 s isolated)
-    /// so unrelated host load cannot trip it. It only catches a deadlock or a
-    /// return to the pre-batching behaviour where a build never finished.
+    /// The compile runs on a worker thread and the test waits on a channel with
+    /// this timeout, so a deadlock or a build that never returns fails the test
+    /// after 600 s instead of hanging until the CI job timeout. This is only a
+    /// hang guard, not the performance signal.
     const WILDCARD_COMPILE_HANG_GUARD: Duration = Duration::from_secs(600);
 
     /// Thread CPU-time budget for compiling three in-limit wildcard batches.
     ///
-    /// Isolated on the GitHub-hosted runner class this consumes ≈10 s of CPU;
-    /// the bound keeps ≈12× margin for cache contention or CPU-frequency
-    /// variation under load. A return to the old minutes-long, superlinear
-    /// unified build still fails. It is intentionally a CPU-time bound: under
-    /// six concurrent builds the same healthy compile took 78–118 s of wall
-    /// time, which is why the previous 60 s wall-clock assertion flaked.
-    const WILDCARD_COMPILE_CPU_BUDGET: Duration = Duration::from_secs(120);
+    /// This keeps the old gate's numeric bound: 60 s wall before, now 60 s of
+    /// thread CPU. For this single-threaded CPU-bound workload CPU≈wall when
+    /// unloaded, so the effective threshold is not loosened. It is ≈5× the
+    /// ≈12 s debug cost and ≈2× the ≈32 s observed on a heavily loaded host,
+    /// so host load cannot trip it; a return to the pre-batching superlinear
+    /// build, which consumed minutes of CPU, still fails.
+    const WILDCARD_COMPILE_CPU_BUDGET: Duration = Duration::from_secs(60);
 
     /// Regression (audit 6, WP-3.2): a large but in-limit wildcard set must
     /// compile in bounded time and keep every rule active. Previously the
@@ -868,10 +869,11 @@ mod tests {
     /// them as active.
     ///
     /// The performance bound is thread CPU time rather than wall time; see the
-    /// budget constants above. Wall time is only a generous hang guard.
+    /// budget constants above. The build runs on a worker thread so the wall
+    /// deadline is a real hang guard.
     #[test]
     fn test_pathological_wildcard_set_compiles_in_bounded_batches() {
-        use crate::structures::timing::ThreadCpuTimer;
+        use crate::structures::timing::{ThreadCpuTimer, with_hang_guard};
 
         let mut interner = LabelInterner::new();
         let mut builder = RuleSetBuilder::new();
@@ -882,11 +884,18 @@ mod tests {
             builder.add_wildcard(&format!("*.sub{i}.example.com"), i);
         }
 
-        let cpu_timer = ThreadCpuTimer::start();
-        let started = Instant::now();
-        let compiled = builder.build(&mut interner);
-        let wall_elapsed = started.elapsed();
-        let cpu_elapsed = cpu_timer.elapsed();
+        // Compile on a worker thread so a hang is caught by the real timeout
+        // guard instead of blocking forever. CPU time is sampled inside the
+        // worker, so it measures only the compiling thread.
+        let (compiled, interner, wall_elapsed, cpu_elapsed) =
+            with_hang_guard(WILDCARD_COMPILE_HANG_GUARD, move || {
+                let cpu_timer = ThreadCpuTimer::start();
+                let started = Instant::now();
+                let compiled = builder.build(&mut interner);
+                let wall_elapsed = started.elapsed();
+                let cpu_elapsed = cpu_timer.elapsed();
+                (compiled, interner, wall_elapsed, cpu_elapsed)
+            });
         // Optional diagnostics for reproducing loaded-run evidence; silent in
         // normal test runs.
         if std::env::var_os("SITO_TIMING_EVIDENCE").is_some() {
@@ -906,13 +915,6 @@ mod tests {
             compiled.dropped_regex_patterns, 0,
             "no pattern may be silently dropped"
         );
-        assert!(
-            wall_elapsed < WILDCARD_COMPILE_HANG_GUARD,
-            "batched compilation must not hang, took {wall_elapsed:?}"
-        );
-        // No thread CPU clock on this platform: the wall-clock hang guard
-        // above is the only in-test timing assertion; the nightly Criterion
-        // benchmark is the thresholded performance gate there.
         if let Some(cpu) = cpu_elapsed {
             assert!(
                 cpu < WILDCARD_COMPILE_CPU_BUDGET,

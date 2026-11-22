@@ -1,4 +1,4 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use fnv::FnvHashSet;
 use hickory_proto::rr::RecordType;
 use sito_core::client::ClientContext;
@@ -155,15 +155,21 @@ fn bench_wildcard_batch_compile(c: &mut Criterion) {
     // the minimum Criterion sample count instead of the default 100.
     group.sample_size(10);
     group.bench_function("wildcard_set_3_batches", |b| {
-        b.iter(|| {
-            let mut interner = LabelInterner::new();
-            let mut builder = RuleSetBuilder::new();
-            for (wildcard, rule_id) in &wildcards {
-                builder.add_wildcard(wildcard, *rule_id);
-            }
-            let compiled = builder.build(&mut interner);
-            black_box(compiled.regex_batches.len())
-        });
+        // Match the unit test: registration happens before the timed compile.
+        b.iter_batched(
+            || {
+                let mut builder = RuleSetBuilder::new();
+                for (wildcard, rule_id) in &wildcards {
+                    builder.add_wildcard(wildcard, *rule_id);
+                }
+                (builder, LabelInterner::new())
+            },
+            |(builder, mut interner)| {
+                let compiled = builder.build(&mut interner);
+                black_box(compiled.regex_batches.len())
+            },
+            BatchSize::PerIteration,
+        );
     });
     group.finish();
 }
