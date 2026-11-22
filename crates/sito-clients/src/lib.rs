@@ -8,6 +8,7 @@
 //!   snapshot sync lives in the separate `sito-routeros` crate.
 
 pub mod bundled;
+pub mod catalog;
 pub mod config;
 pub mod mac;
 pub mod parental;
@@ -21,6 +22,10 @@ pub mod services;
 pub mod timezone;
 
 pub use bundled::{BundledList, BundledListError, BundledManifest};
+pub use catalog::{
+    CATALOG_JSON, CATALOG_LICENSE, CATALOG_VERSION, Catalog, CatalogCategory, CatalogError,
+    CatalogFilter, CatalogService, CatalogSource, FILTERS_SOURCE_URL, SERVICES_SOURCE_URL,
+};
 pub use config::{
     BlockedServiceConfig, ClientEntryConfig, ClientGroupConfig, ClientsConfig, IntegrationsConfig,
 };
