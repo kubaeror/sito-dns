@@ -147,6 +147,254 @@ pub(crate) fn redact_text_urls(text: &str) -> String {
         .join(" ")
 }
 
+/// Maximum number of catalog filters an operator may add in one request.
+pub(crate) const MAX_CATALOG_SELECTION: usize = 20;
+
+/// Returns the effective filter-list name for a catalog entry.
+///
+/// `FilterListConfig::name` doubles as the list id in UI routes, so it must
+/// pass [`crate::handlers::filtering::valid_filter_list_name`]. Most catalog
+/// names already qualify; a few contain `/` (for example
+/// `HaGeZi's Windows/Office Tracker Blocklist`), which would break routing, so
+/// those characters become `-` and control characters are removed. Valid
+/// names are returned unchanged.
+pub(crate) fn catalog_list_name(filter: &sito_clients::CatalogFilter) -> String {
+    let sanitized: String = filter
+        .name
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '?' | '#' | '%') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .filter(|c| !c.is_control())
+        .collect();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        filter.id.clone()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+/// The URL stored when a catalog filter is selected: `download_url`, with the
+/// upstream `subscription_url` as a fallback.
+pub(crate) fn catalog_filter_url(filter: &sito_clients::CatalogFilter) -> &str {
+    if filter.download_url.trim().is_empty() {
+        &filter.subscription_url
+    } else {
+        &filter.download_url
+    }
+}
+
+fn catalog_list_is_present(
+    filter: &sito_clients::CatalogFilter,
+    names: &std::collections::HashSet<String>,
+    urls: &std::collections::HashSet<String>,
+) -> bool {
+    names.contains(&catalog_list_name(filter).to_lowercase())
+        || urls.contains(&catalog_filter_url(filter).to_lowercase())
+        || urls.contains(&filter.subscription_url.to_lowercase())
+}
+
+/// Builds the catalog picker data for the filtering page.
+///
+/// A corrupt embedded catalog is logged and degrades to an empty catalog
+/// section instead of failing the whole page. Categories and filters are
+/// sorted explicitly so the rendered order does not depend on the JSON order.
+pub(crate) fn catalog_page_views(
+    catalog: Result<sito_clients::Catalog, sito_clients::CatalogError>,
+    lists: &[FilterListConfig],
+) -> (
+    Vec<crate::ui::templates::CatalogCategoryView>,
+    Vec<crate::ui::templates::CatalogFilterView>,
+) {
+    let catalog = match catalog {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Embedded filter catalog is invalid; rendering an empty catalog section"
+            );
+            return (Vec::new(), Vec::new());
+        }
+    };
+
+    let existing_names: std::collections::HashSet<String> =
+        lists.iter().map(|list| list.name.to_lowercase()).collect();
+    let existing_urls: std::collections::HashSet<String> =
+        lists.iter().map(|list| list.url.to_lowercase()).collect();
+
+    let mut categories: Vec<&sito_clients::CatalogCategory> = catalog.categories().collect();
+    categories.sort_by(|a, b| {
+        a.display_number
+            .cmp(&b.display_number)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let category_views: Vec<crate::ui::templates::CatalogCategoryView> = categories
+        .iter()
+        .map(|category| crate::ui::templates::CatalogCategoryView {
+            id: category.id.clone(),
+            name: category.name.clone(),
+            display_number: category.display_number,
+            filter_count: catalog.filter_count_in_category(&category.id),
+        })
+        .collect();
+
+    let mut filter_views = Vec::with_capacity(catalog.filters.len());
+    for category in &categories {
+        let mut filters: Vec<&sito_clients::CatalogFilter> =
+            catalog.filters_in_category(&category.id).collect();
+        filters.sort_by(|a, b| {
+            a.display_number
+                .cmp(&b.display_number)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        for filter in filters {
+            filter_views.push(crate::ui::templates::CatalogFilterView {
+                id: filter.id.clone(),
+                name: filter.name.clone(),
+                category: filter.category.clone(),
+                category_name: category.name.clone(),
+                description: filter.description.clone(),
+                homepage: filter.homepage.clone(),
+                source_url: catalog_filter_url(filter).to_string(),
+                version: filter.version.clone(),
+                deprecated: filter.deprecated,
+                already_added: catalog_list_is_present(filter, &existing_names, &existing_urls),
+            });
+        }
+    }
+
+    (category_views, filter_views)
+}
+
+/// Collects the repeated `selected` form field into catalog filter ids.
+///
+/// The form only ever contributes catalog ids; names and URLs always come from
+/// the embedded catalog. Blank values are ignored and the order is preserved.
+pub(crate) fn selected_catalog_ids(pairs: &[(String, String)]) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(key, _)| key == "selected")
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Why a catalog selection could not be turned into filter lists.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CatalogSelectionError {
+    #[error("select at most {MAX_CATALOG_SELECTION} catalog lists at a time")]
+    TooMany,
+    #[error("unknown catalog filter id '{0}'")]
+    Unknown(String),
+    #[error("catalog filter '{0}' is deprecated and cannot be added")]
+    Deprecated(String),
+    #[error("catalog filter '{0}' has a name that cannot be stored as a filter list")]
+    InvalidName(String),
+}
+
+/// Resolves selected catalog ids into the filter lists to append.
+///
+/// Every id is validated against the embedded catalog before anything is
+/// mutated, so callers can treat a returned error as "nothing was added".
+/// Already-configured lists (case-insensitive name or URL, including the
+/// catalog subscription URL) are skipped; the selection itself is deduped and
+/// capped at [`MAX_CATALOG_SELECTION`]. Deprecated entries are rejected rather
+/// than silently added.
+pub(crate) fn catalog_lists_to_add(
+    catalog: &sito_clients::Catalog,
+    existing: &[FilterListConfig],
+    selected: &[String],
+) -> Result<Vec<FilterListConfig>, CatalogSelectionError> {
+    let mut ids: Vec<&str> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for id in selected {
+        let id = id.trim();
+        if id.is_empty() || !seen_ids.insert(id) {
+            continue;
+        }
+        ids.push(id);
+    }
+    if ids.len() > MAX_CATALOG_SELECTION {
+        return Err(CatalogSelectionError::TooMany);
+    }
+
+    let mut filters = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let Some(filter) = catalog.filter_by_id(id) else {
+            return Err(CatalogSelectionError::Unknown((*id).to_string()));
+        };
+        if filter.deprecated {
+            return Err(CatalogSelectionError::Deprecated((*id).to_string()));
+        }
+        filters.push(filter);
+    }
+
+    let mut names: std::collections::HashSet<String> = existing
+        .iter()
+        .map(|list| list.name.to_lowercase())
+        .collect();
+    let mut urls: std::collections::HashSet<String> = existing
+        .iter()
+        .map(|list| list.url.to_lowercase())
+        .collect();
+
+    let mut additions = Vec::with_capacity(filters.len());
+    for filter in filters {
+        if catalog_list_is_present(filter, &names, &urls) {
+            continue;
+        }
+        let name = catalog_list_name(filter);
+        if !crate::handlers::filtering::valid_filter_list_name(&name) {
+            return Err(CatalogSelectionError::InvalidName(filter.id.clone()));
+        }
+        names.insert(name.to_lowercase());
+        urls.insert(catalog_filter_url(filter).to_lowercase());
+        additions.push(FilterListConfig {
+            name,
+            url: catalog_filter_url(filter).to_string(),
+            enabled: true,
+            refresh_hours: None,
+        });
+    }
+    Ok(additions)
+}
+
+/// Applies a validated catalog selection in one config clone and one sync
+/// apply, so a validation or persist failure leaves both the live config and
+/// `config.toml` untouched.
+pub(crate) async fn apply_catalog_selection(
+    ctx: &ServerContext,
+    catalog: &sito_clients::Catalog,
+    selected: &[String],
+) -> Response {
+    let _apply_guard = ctx.lock_config_apply().await;
+    let mut new_cfg = (**ctx.config.load()).clone();
+    let additions = match catalog_lists_to_add(catalog, &new_cfg.filtering.lists, selected) {
+        Ok(additions) => additions,
+        Err(error) => {
+            return error_response(StatusCode::BAD_REQUEST, &error.to_string());
+        }
+    };
+    if additions.is_empty() {
+        return Redirect::to("/filtering").into_response();
+    }
+    new_cfg.filtering.lists.extend(additions);
+    if let Err(e) = apply_and_persist_config_locked(ctx, &new_cfg, FilterApply::Sync, None).await {
+        tracing::error!("Failed to apply filter configuration: {e:?}");
+        return error_response(
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply filter configuration: {}", e.detail),
+        );
+    }
+    Redirect::to("/filtering").into_response()
+}
+
 pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap) -> Response {
     let Some(user) = get_session_user(&ctx, &headers) else {
         return Redirect::to("/login").into_response();
@@ -191,6 +439,9 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
     // Curated lists bundled into the binary plus any runtime refresh state.
     let manifest = sito_clients::BundledManifest::try_bundled();
     let bundled_lists = bundled_list_views(manifest, &ctx.runtime_lists.statuses(), can_view_urls);
+    let (catalog_categories, catalog_filters) =
+        catalog_page_views(sito_clients::Catalog::embedded(), &cfg.filtering.lists);
+    let catalog_filter_count = catalog_filters.len();
 
     HtmlTemplate(FilteringTemplate {
         csrf_token: &csrf,
@@ -202,6 +453,9 @@ pub async fn filtering_page(State(ctx): State<ServerContext>, headers: HeaderMap
         lists: &lists,
         custom_rules: &custom_rules,
         bundled_lists,
+        catalog_categories,
+        catalog_filters,
+        catalog_filter_count,
     })
     .into_response()
 }
@@ -294,6 +548,42 @@ pub async fn filtering_add_handler(
     }
 
     Redirect::to("/filtering").into_response()
+}
+
+/// Operator-only catalog selection: adds one or more embedded-catalog filter
+/// lists to `[filtering].lists`.
+///
+/// The form supplies only repeated `selected` catalog ids (never names or
+/// URLs); the catalog metadata decides what is persisted. All selected lists
+/// are applied in a single configuration transaction.
+pub async fn filtering_add_catalog_handler(
+    State(ctx): State<ServerContext>,
+    headers: HeaderMap,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let Some(user) = get_session_user(&ctx, &headers) else {
+        return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let selected = selected_catalog_ids(&pairs);
+    let catalog = match sito_clients::Catalog::embedded() {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Embedded filter catalog is invalid; catalog selection is unavailable"
+            );
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Embedded filter catalog is unavailable",
+            );
+        }
+    };
+
+    apply_catalog_selection(&ctx, &catalog, &selected).await
 }
 
 pub async fn filtering_delete_handler(

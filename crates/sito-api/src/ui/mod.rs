@@ -62,6 +62,10 @@ pub fn ui_router() -> Router<ServerContext> {
         .route("/ui/partials/querylog-rows", get(handlers::querylog_rows_partial))
         .route("/ui/filtering/toggle/{id}", post(handlers::filtering_toggle_handler))
         .route("/ui/filtering/add", post(handlers::filtering_add_handler))
+        .route(
+            "/ui/filtering/add-catalog",
+            post(handlers::filtering_add_catalog_handler),
+        )
         .route("/ui/filtering/delete/{id}", post(handlers::filtering_delete_handler))
         .route("/ui/filtering/custom-rules", post(handlers::filtering_custom_rules_handler))
         .route("/ui/filtering/simulate", post(handlers::filtering_simulate_handler))
@@ -245,6 +249,25 @@ mod tests {
                 last_attempt: "2023-11-14 22:13 UTC".to_string(),
                 last_error: Some("fetch failed".to_string()),
             }],
+            catalog_categories: vec![crate::ui::templates::CatalogCategoryView {
+                id: "general".to_string(),
+                name: "General".to_string(),
+                display_number: 1,
+                filter_count: 1,
+            }],
+            catalog_filters: vec![crate::ui::templates::CatalogFilterView {
+                id: "adguard_dns_filter".to_string(),
+                name: "AdGuard DNS filter".to_string(),
+                category: "general".to_string(),
+                category_name: "General".to_string(),
+                description: "Ads and trackers".to_string(),
+                homepage: "https://example.com".to_string(),
+                source_url: "https://example.com/filter.txt".to_string(),
+                version: "1.0.0".to_string(),
+                deprecated: false,
+                already_added: false,
+            }],
+            catalog_filter_count: 1,
         };
         let filtering_html = filter_tmpl.render().expect("render filtering page");
         assert!(filtering_html.contains("built-in (minimal)"));
