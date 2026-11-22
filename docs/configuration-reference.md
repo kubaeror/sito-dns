@@ -220,10 +220,13 @@ servers = [
     "udp://1.1.1.1:53"
 ]
 bootstrap = ["9.9.9.9", "1.1.1.1"]
-strategy = "parallel"                  # "parallel" | "failover" | "load_balance"
+strategy = "load_balance"              # "parallel" | "failover" | "load_balance"
 timeout_ms = 5000
 probe_domain = "example.com"
 pool_size = 4
+# Optional, index-aligned with `servers`; default 1 for every server.
+# Values are 1..=100 and only affect the load_balance strategy.
+weights = [3, 1, 1, 1]
 # false (default): hostname-configured upstreams must resolve to public
 # addresses. IP literals are always accepted as an explicit choice.
 allow_private_targets = false
@@ -236,6 +239,7 @@ servers = ["udp://192.168.1.1:53"]
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `servers` | array of strings | `["1.1.1.1", "1.0.0.1"]` | Upstream resolvers. Schemes: `udp://` or `host:port` (UDP with TCP fallback), `tls://` (DoT), `https://host[:port][/path]` (DoH, RFC 8484 with GET fallback; a bare `https://host` uses `/dns-query`), `quic://host[:port]` (DoQ, RFC 9250, default port 853). Scheme names are case-insensitive. Only `https://` and `quic://` accept a URL path; `udp://`, `tls://` and bare `host:port` targets reject one instead of validating and then failing at startup. |
+| `weights` | array of integers | `[]` | Optional load-balancing weights, index-aligned with `servers`; an absent list means weight `1` for every server. A non-empty list must have exactly one entry per server, each in `1`–`100`; `0` is rejected rather than silently disabling the server (health checks alone decide eligibility). Weights affect only `strategy = "load_balance"`: the first candidate is chosen with probability proportional to its weight, and a failed pick falls through to the remaining weighted order inside the same deadline. `failover` keeps its configured order, `parallel` races every eligible candidate, and no weight can bypass health, DNSSEC, EDNS or timeout handling. An absent list is omitted from the persisted document (the UI also drops a list it normalizes back to all `1`), so default configurations remain byte-identical. |
 | `bootstrap` | array of IP addresses | `["9.9.9.9", "149.112.112.112"]` | Plain IP addresses used to bootstrap resolution of encrypted upstream domain names. Bootstrap and health-probe queries set RD=1. Required whenever a target is a hostname: an empty list is rejected if any `servers`/`per_domain.servers` entry needs resolving. IP-literal targets can run with an empty list. Each answer is sorted/deduplicated and capped at 16 resolved candidates so a hostile or misconfigured zone cannot create an unbounded candidate set. |
 | `strategy` | string | `"failover"` | Forwarding strategy: `"parallel"` (fastest answer wins), `"failover"` (sequential fallback), or `"load_balance"`. |
 | `timeout_ms` | integer | `5000` | Overall per-query budget in milliseconds, shared across failover/load-balance retries (each sequential attempt gets an equal share of the remaining budget; parallel races use the full budget). Must be `1`–`60000`; larger values are rejected so one stalled upstream cannot hold the query pipeline indefinitely. |
@@ -259,6 +263,7 @@ servers = ["udp://192.168.1.1:53"]
 |---|---|---|---|
 | `per_domain.domains` | array of strings | required | Domain suffixes served by this rule. Values are normalized as domains. |
 | `per_domain.servers` | array of strings | required | Upstream targets for the matching domains. Same syntax and SSRF rules as `upstream.servers`. |
+| `per_domain.weights` | array of integers | `[]` | Optional weights for this rule, index-aligned with `per_domain.servers` and using the same `1`–`100` bounds and `load_balance` semantics as `upstream.weights`. |
 
 ---
 
@@ -1166,7 +1171,7 @@ applies the hot settings and reports the restart-only fields that remain.
 | `dns.rate_limit_per_ip` | Live rate limiters updated. |
 | `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | The cache policy is published and the single cache-policy epoch is advanced immediately afterwards: entries from the previous generation become unservable immediately and are reclaimed lazily, so a TTL-only live apply leaves the cache **cold by design** and new inserts use the new TTLs. A `size_mb` change also resizes the cache. Direct `DnsCache` users keep the warm re-clamping `update_config` path. See [§4](#4-dnscache--caching-layer) and [migration §10.2](2.0-migration.md#102-cache-ttl-residual-b8). |
 | `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration; the response cache is flushed because cached validation decisions belong to the old policy. |
-| `upstream.servers`, `upstream.bootstrap`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.ecs`, `upstream.allow_private_targets`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt, including a fresh bootstrap resolver and SSRF policy. |
+| `upstream.servers`, `upstream.bootstrap`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.weights`, `upstream.ecs`, `upstream.allow_private_targets`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt, including a fresh bootstrap resolver and SSRF policy. Weights are hot-applied with the new entry set; health state is carried over for unchanged server names. |
 | `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.max_list_bytes`, `filtering.allow_empty_list`, `filtering.regex_compile_budget_ms`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.trust_arp`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |

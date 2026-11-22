@@ -27,9 +27,35 @@ pub async fn upstreams_page(State(ctx): State<ServerContext>, headers: HeaderMap
     .into_response()
 }
 
+const fn default_upstream_weight() -> u32 {
+    sito_core::config::DEFAULT_UPSTREAM_WEIGHT
+}
+
+/// Validates a submitted weight against the same bounds as the config schema.
+///
+/// Returns the operator-facing message on failure; callers map it to a 400.
+fn validate_submitted_weight(weight: u32) -> Result<(), String> {
+    if weight == 0 {
+        return Err(
+            "Weight must be between 1 and 100; 0 would silently disable the upstream. Remove the server instead."
+                .to_string(),
+        );
+    }
+    if weight > sito_core::config::MAX_UPSTREAM_WEIGHT {
+        return Err(format!(
+            "Weight must be between 1 and {}",
+            sito_core::config::MAX_UPSTREAM_WEIGHT
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct AddUpstreamForm {
     pub address: String,
+    /// Optional so older forms keep working; the default is weight 1.
+    #[serde(default = "default_upstream_weight")]
+    pub weight: u32,
 }
 
 pub async fn upstreams_add_handler(
@@ -49,11 +75,29 @@ pub async fn upstreams_add_handler(
     if clean.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "Upstream address is required");
     }
+    if let Err(message) = validate_submitted_weight(form.weight) {
+        return error_response(StatusCode::BAD_REQUEST, &message);
+    }
 
     let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
     if new_cfg.upstream.servers.contains(&clean) {
         return error_response(StatusCode::CONFLICT, "Upstream is already configured");
+    }
+    let previous_len = new_cfg.upstream.servers.len();
+    // Keep the on-disk document weight-less until the operator sets a
+    // non-default weight for at least one server.
+    if !new_cfg.upstream.weights.is_empty() {
+        if new_cfg.upstream.weights.len() != previous_len {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Stored upstream weights are not aligned with the server list",
+            );
+        }
+        new_cfg.upstream.weights.push(form.weight);
+    } else if form.weight != sito_core::config::DEFAULT_UPSTREAM_WEIGHT {
+        new_cfg.upstream.weights = vec![sito_core::config::DEFAULT_UPSTREAM_WEIGHT; previous_len];
+        new_cfg.upstream.weights.push(form.weight);
     }
     new_cfg.upstream.servers.push(clean);
     if let Err(e) =
@@ -63,6 +107,86 @@ pub async fn upstreams_add_handler(
         return error_response(
             StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             &format!("Failed to apply upstream configuration: {}", e.detail),
+        );
+    }
+
+    Redirect::to("/upstreams").into_response()
+}
+
+#[derive(Deserialize)]
+pub struct UpdateUpstreamWeightForm {
+    pub address: String,
+    pub weight: u32,
+}
+
+/// Updates one upstream's load-balancing weight through the normal
+/// validate/apply/persist pipeline.
+pub async fn upstreams_weight_handler(
+    State(ctx): State<ServerContext>,
+    Extension(hooks): Extension<ApplyHooks>,
+    headers: HeaderMap,
+    Form(form): Form<UpdateUpstreamWeightForm>,
+) -> Response {
+    let Some(user) = get_session_user(&ctx, &headers) else {
+        return Redirect::to("/login").into_response();
+    };
+    if user.role < Role::Operator {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let address = form.address.trim();
+    if address.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "Upstream address is required");
+    }
+    if let Err(message) = validate_submitted_weight(form.weight) {
+        return error_response(StatusCode::BAD_REQUEST, &message);
+    }
+
+    let _apply_guard = ctx.lock_config_apply().await;
+    let mut new_cfg = (**ctx.config.load()).clone();
+    let Some(index) = new_cfg
+        .upstream
+        .servers
+        .iter()
+        .position(|server| server.as_str() == address)
+    else {
+        return error_response(StatusCode::NOT_FOUND, "Upstream is not configured");
+    };
+
+    if new_cfg.upstream.weights.is_empty() {
+        if form.weight == sito_core::config::DEFAULT_UPSTREAM_WEIGHT {
+            // Already at the implicit default: do not rewrite the document.
+            return Redirect::to("/upstreams").into_response();
+        }
+        new_cfg.upstream.weights =
+            vec![sito_core::config::DEFAULT_UPSTREAM_WEIGHT; new_cfg.upstream.servers.len()];
+        new_cfg.upstream.weights[index] = form.weight;
+    } else {
+        if new_cfg.upstream.weights.len() != new_cfg.upstream.servers.len() {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Stored upstream weights are not aligned with the server list",
+            );
+        }
+        new_cfg.upstream.weights[index] = form.weight;
+        // Drop an all-default list so it stays omitted from the document.
+        if new_cfg
+            .upstream
+            .weights
+            .iter()
+            .all(|weight| *weight == sito_core::config::DEFAULT_UPSTREAM_WEIGHT)
+        {
+            new_cfg.upstream.weights.clear();
+        }
+    }
+
+    if let Err(e) =
+        apply_and_persist_config_locked(&ctx, &new_cfg, FilterApply::Deferred, hooks.as_dyn()).await
+    {
+        tracing::error!("Failed to apply upstream weight: {e:?}");
+        return error_response(
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            &format!("Failed to apply upstream weight: {}", e.detail),
         );
     }
 

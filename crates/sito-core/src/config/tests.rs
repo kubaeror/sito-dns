@@ -1242,6 +1242,138 @@ fn test_upstream_config_validate_checks_targets_directly() {
         .expect("an IP literal does not need a bootstrap resolver");
 }
 
+/// F1: an absent weight list means one unit of weight per server, and the
+/// default configuration must keep its pre-weight on-disk bytes.
+#[test]
+fn test_upstream_weights_default_to_one_without_changing_config_bytes() {
+    let config = Config::default();
+    assert_eq!(config.upstream.weights, Vec::<u32>::new());
+    assert_eq!(
+        config.upstream.effective_weights(),
+        vec![DEFAULT_UPSTREAM_WEIGHT; config.upstream.servers.len()]
+    );
+    assert_eq!(config.upstream.effective_weight(0), DEFAULT_UPSTREAM_WEIGHT);
+
+    let rendered = toml::to_string_pretty(&config).expect("serialize default config");
+    assert!(
+        !rendered.contains("weights"),
+        "a default configuration must not materialize the weights key:\n{rendered}"
+    );
+
+    // Explicitly re-serializing a parsed weight-less document is also stable.
+    let parsed = Config::from_toml_str(TEST_BASE).expect("weight-less config is valid");
+    let rendered = toml::to_string_pretty(&parsed).expect("serialize parsed config");
+    assert!(!rendered.contains("weights"), "{rendered}");
+}
+
+/// F1: weights are index-aligned with `servers`, bounded 1..=100, and a weight
+/// of 0 is rejected rather than silently disabling the upstream.
+#[test]
+fn test_upstream_weights_validate_alignment_and_bounds() {
+    let weighted =
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\", \"1.0.0.1\"]\nweights = [3, 1]\n";
+    let config = Config::from_toml_str(weighted).expect("valid weights");
+    assert_eq!(config.upstream.weights, vec![3, 1]);
+    assert_eq!(config.upstream.effective_weights(), vec![3, 1]);
+
+    expect_validation_field(
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\nweights = [0]\n",
+        "upstream.weights[0]",
+    );
+    expect_validation_field(
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\nweights = [101]\n",
+        "upstream.weights[0]",
+    );
+    expect_validation_field(
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\", \"1.0.0.1\"]\nweights = [2]\n",
+        "upstream.weights",
+    );
+    expect_validation_field(
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\", \"1.0.0.1\"]\nweights = [1, 2, 3]\n",
+        "upstream.weights",
+    );
+
+    // The error must name the offending value so a typo is actionable.
+    let err = Config::from_toml_str(
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\nweights = [0]\n",
+    )
+    .expect_err("zero weight is rejected");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("upstream.weights[0]") && rendered.contains('0'),
+        "unexpected error: {rendered}"
+    );
+
+    // The documented bounds themselves are accepted.
+    let at_bounds = format!(
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\", \"1.0.0.1\"]\nweights = [1, {MAX_UPSTREAM_WEIGHT}]\n"
+    );
+    Config::from_toml_str(&at_bounds).expect("1 and the upper bound are accepted");
+}
+
+/// F1: per-domain rules carry their own index-aligned weights with the same
+/// bounds and error paths.
+#[test]
+fn test_per_domain_upstream_weights_validate_and_round_trip() {
+    let document = "config_version = 2\n\
+        [upstream]\n\
+        servers = [\"1.1.1.1\"]\n\
+        [[upstream.per_domain]]\n\
+        domains = [\"lan\"]\n\
+        servers = [\"192.168.1.1\", \"192.168.1.2\"]\n\
+        weights = [4, 1]\n";
+    let config = Config::from_toml_str(document).expect("valid per-domain weights");
+    assert_eq!(config.upstream.per_domain[0].weights, vec![4, 1]);
+    assert_eq!(
+        config.upstream.per_domain[0].effective_weights(),
+        vec![4, 1]
+    );
+    let rendered = toml::to_string_pretty(&config).expect("serialize");
+    assert!(rendered.contains("weights = ["), "{rendered}");
+    let reparsed = Config::from_toml_str(&rendered).expect("round trip");
+    assert_eq!(reparsed.upstream.per_domain[0].weights, vec![4, 1]);
+
+    expect_validation_field(
+        "config_version = 2\n\
+         [upstream]\n\
+         servers = [\"1.1.1.1\"]\n\
+         [[upstream.per_domain]]\n\
+         domains = [\"lan\"]\n\
+         servers = [\"192.168.1.1\"]\n\
+         weights = [0]\n",
+        "upstream.per_domain[0].weights[0]",
+    );
+    expect_validation_field(
+        "config_version = 2\n\
+         [upstream]\n\
+         servers = [\"1.1.1.1\"]\n\
+         [[upstream.per_domain]]\n\
+         domains = [\"lan\"]\n\
+         servers = [\"192.168.1.1\", \"192.168.1.2\"]\n\
+         weights = [2]\n",
+        "upstream.per_domain[0].weights",
+    );
+}
+
+/// F1: weights survive the loader/serializer round trip and remain aligned
+/// with the server list (the utilities/UI edit the same document).
+#[test]
+fn test_upstream_weights_round_trip_through_loader() {
+    let document =
+        "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\", \"1.0.0.1\"]\nweights = [5, 2]\n";
+    let config = Config::from_toml_str(document).expect("valid weighted config");
+    let rendered = toml::to_string_pretty(&config).expect("serialize weighted config");
+    assert!(
+        rendered.contains("weights = [\n    5,\n    2,\n]")
+            || rendered.contains("weights = [5, 2]"),
+        "{rendered}"
+    );
+
+    let reparsed = Config::from_toml_str(&rendered).expect("reload serialized weights");
+    assert_eq!(reparsed.upstream.servers, config.upstream.servers);
+    assert_eq!(reparsed.upstream.weights, vec![5, 2]);
+}
+
 /// 1.9.2 keeps the historical wildcard defaults, so startup must tell the
 /// operator that both the plain-HTTP admin UI and the DNS listeners are
 /// reachable beyond loopback (fail-closed visibility, truthful default).
@@ -1451,10 +1583,12 @@ probe_domain = "example.com"
 pool_size = 4
 allow_private_targets = false
 ecs = "off"
+weights = [3]
 
 [[upstream.per_domain]]
 domains = ["lan"]
 servers = ["192.168.1.1"]
+weights = [2]
 
 [filtering]
 enabled = true

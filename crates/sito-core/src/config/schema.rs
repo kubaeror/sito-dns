@@ -973,6 +973,24 @@ pub enum UpstreamEcs {
 pub struct PerDomainUpstream {
     pub domains: Vec<String>,
     pub servers: Vec<String>,
+    /// Optional weights index-aligned with `servers`; same rules as
+    /// [`UpstreamConfig::weights`]. Affects `load_balance` for this rule only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weights: Vec<u32>,
+}
+
+impl PerDomainUpstream {
+    /// One weight per `servers` entry, expanding the default when absent.
+    #[must_use]
+    pub fn effective_weights(&self) -> Vec<u32> {
+        expand_weights(&self.weights, self.servers.len())
+    }
+
+    /// Effective weight for `index`, defaulting out-of-range to 1.
+    #[must_use]
+    pub fn effective_weight(&self, index: usize) -> u32 {
+        effective_weight(&self.weights, index)
+    }
 }
 
 /// Largest accepted `upstream.timeout_ms` (60 seconds).
@@ -988,6 +1006,71 @@ pub const MAX_UPSTREAM_TIMEOUT_MS: u64 = 60_000;
 /// Each pooled connection is a live TLS/TCP socket; an unbounded pool would let
 /// a typo exhaust file descriptors and memory on every configured upstream.
 pub const MAX_UPSTREAM_POOL_SIZE: usize = 64;
+
+/// Largest accepted per-upstream load-balancing weight.
+///
+/// Weights are relative, so the cap only keeps the cumulative total (and its
+/// arithmetic) bounded; it does not change the 1:1 default.
+pub const MAX_UPSTREAM_WEIGHT: u32 = 100;
+
+/// Default load-balancing weight for an upstream server.
+pub const DEFAULT_UPSTREAM_WEIGHT: u32 = 1;
+
+/// Expands an optional weight list to one entry per server.
+fn expand_weights(weights: &[u32], server_count: usize) -> Vec<u32> {
+    if weights.is_empty() {
+        vec![DEFAULT_UPSTREAM_WEIGHT; server_count]
+    } else {
+        weights.to_vec()
+    }
+}
+
+/// Returns the effective weight for one index, defaulting to 1.
+fn effective_weight(weights: &[u32], index: usize) -> u32 {
+    if weights.is_empty() {
+        DEFAULT_UPSTREAM_WEIGHT
+    } else {
+        weights
+            .get(index)
+            .copied()
+            .unwrap_or(DEFAULT_UPSTREAM_WEIGHT)
+    }
+}
+
+/// Validates one optional weight list against its server list.
+fn validate_weight_list(
+    weights: &[u32],
+    server_count: usize,
+    field: &str,
+) -> Result<(), ConfigError> {
+    if weights.is_empty() {
+        return Ok(());
+    }
+    if weights.len() != server_count {
+        return Err(ConfigError::validation(
+            field,
+            format!(
+                "weights must have exactly one entry per upstream server (got {} weights for {server_count} servers)",
+                weights.len()
+            ),
+        ));
+    }
+    for (index, weight) in weights.iter().enumerate() {
+        if *weight == 0 {
+            return Err(ConfigError::validation(
+                format!("{field}[{index}]"),
+                "weight must be between 1 and 100; 0 would disable an upstream silently, so remove the server or let health checks mark it down instead",
+            ));
+        }
+        if *weight > MAX_UPSTREAM_WEIGHT {
+            return Err(ConfigError::validation(
+                format!("{field}[{index}]"),
+                format!("weight must be at most {MAX_UPSTREAM_WEIGHT} (got {weight})"),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Upstream resolvers and forwarding configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1032,6 +1115,23 @@ pub struct UpstreamConfig {
     /// (otherwise matching queries would fail closed with SERVFAIL).
     #[serde(default)]
     pub per_domain: Vec<PerDomainUpstream>,
+    /// Optional load-balancing weights, index-aligned with `servers`.
+    ///
+    /// An empty list (the default) means every upstream has weight
+    /// [`DEFAULT_UPSTREAM_WEIGHT`]. A non-empty list must contain exactly one
+    /// entry per server; each value is bounded to `1..=MAX_UPSTREAM_WEIGHT`.
+    /// Weight `0` is rejected instead of silently disabling an upstream:
+    /// health checks alone decide eligibility, and a disabled-by-weight server
+    /// would hide configuration mistakes while still being probed and counted.
+    ///
+    /// Weights apply to the `load_balance` strategy. `failover` keeps its
+    /// configuration order and `parallel` races every eligible candidate, so
+    /// neither strategy changes behavior when weights are left at 1.
+    ///
+    /// The field is omitted from serialization when empty so a default or
+    /// weight-less configuration keeps its previous on-disk bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weights: Vec<u32>,
 }
 
 fn default_upstream_servers() -> Vec<String> {
@@ -1065,11 +1165,44 @@ impl Default for UpstreamConfig {
             allow_private_targets: false,
             ecs: UpstreamEcs::default(),
             per_domain: Vec::new(),
+            weights: Vec::new(),
         }
     }
 }
 
 impl UpstreamConfig {
+    /// Returns one weight per configured `servers` entry.
+    ///
+    /// An absent `weights` list expands to the default weight for every
+    /// server, so callers never need to special-case the unweighted form.
+    #[must_use]
+    pub fn effective_weights(&self) -> Vec<u32> {
+        expand_weights(&self.weights, self.servers.len())
+    }
+
+    /// Returns the effective weight of `index`, falling back to the default
+    /// for an out-of-range index (callers iterate `servers`, so this only
+    /// happens for a transient, concurrently-edited configuration).
+    #[must_use]
+    pub fn effective_weight(&self, index: usize) -> u32 {
+        effective_weight(&self.weights, index)
+    }
+
+    /// Checks every optional weight list before target validation so an
+    /// index-alignment error is reported against the weight field instead of a
+    /// confusing server-target error.
+    fn validate_weights(&self) -> Result<(), ConfigError> {
+        validate_weight_list(&self.weights, self.servers.len(), "upstream.weights")?;
+        for (index, rule) in self.per_domain.iter().enumerate() {
+            validate_weight_list(
+                &rule.weights,
+                rule.servers.len(),
+                &format!("upstream.per_domain[{index}].weights"),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.servers.is_empty() {
             return Err(ConfigError::validation(
@@ -1077,6 +1210,7 @@ impl UpstreamConfig {
                 "servers list cannot be empty",
             ));
         }
+        self.validate_weights()?;
         if self.timeout_ms == 0 {
             return Err(ConfigError::validation(
                 "upstream.timeout_ms",

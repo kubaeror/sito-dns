@@ -295,6 +295,14 @@ status = "kept"
 path = "upstream.per_domain[].servers"
 status = "kept"
 
+[[field]]
+path = "upstream.per_domain[].weights"
+status = "kept"
+
+[[field]]
+path = "upstream.weights"
+status = "kept"
+
 # ---------------------------------------------------------------------------
 # [filtering]
 # ---------------------------------------------------------------------------

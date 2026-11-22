@@ -51,6 +51,7 @@ pub async fn get_upstream_config(
         timeout_ms: up.timeout_ms,
         probe_domain: up.probe_domain.clone(),
         pool_size: up.pool_size,
+        weights: up.weights.clone(),
     })
 }
 
@@ -106,6 +107,7 @@ pub async fn update_upstream_config(
         allow_private_targets: new_config.upstream.allow_private_targets,
         ecs: new_config.upstream.ecs,
         per_domain: new_config.upstream.per_domain,
+        weights: dto.weights.clone(),
     };
 
     // The shared pipeline reloads (and validates) the upstream manager,
@@ -307,6 +309,7 @@ mod tests {
             timeout_ms: 3000,
             probe_domain: "cloudflare.com".to_string(),
             pool_size: 4,
+            weights: vec![3],
         };
 
         let res = update_upstream_config(
@@ -320,6 +323,7 @@ mod tests {
 
         assert_eq!(ctx.upstream.strategy(), UpstreamStrategy::LoadBalance);
         assert_eq!(ctx.upstream.timeout(), Duration::from_millis(3000));
+        assert_eq!(ctx.config.load().upstream.weights, vec![3]);
         let statuses = ctx.upstream.statuses().await;
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].0, "1.1.1.1:53");
@@ -332,10 +336,11 @@ mod tests {
             timeout_ms: 1000,
             probe_domain: "example.com".to_string(),
             pool_size: 2,
+            weights: vec![1],
         };
 
         let bad_res = update_upstream_config(
-            operator,
+            operator.clone(),
             State(ctx.clone()),
             Extension(ApplyHooks::default()),
             Json(bad_dto),
@@ -344,5 +349,115 @@ mod tests {
         assert!(bad_res.is_err());
         // Strategy remains LoadBalance
         assert_eq!(ctx.upstream.strategy(), UpstreamStrategy::LoadBalance);
+
+        // A weight of 0 is rejected rather than silently disabling the
+        // upstream, and the live configuration is unchanged.
+        let zero_weight = UpstreamConfigDto {
+            servers: vec!["1.1.1.1:53".to_string()],
+            bootstrap: vec!["1.0.0.1".to_string()],
+            strategy: "load_balance".to_string(),
+            timeout_ms: 3000,
+            probe_domain: "cloudflare.com".to_string(),
+            pool_size: 4,
+            weights: vec![0],
+        };
+        let error = update_upstream_config(
+            operator.clone(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(zero_weight),
+        )
+        .await
+        .expect_err("zero weight must be rejected");
+        assert_eq!(error.status, 400);
+        assert!(
+            error.detail.contains("upstream.weights[0]") && error.detail.contains('0'),
+            "unexpected error: {}",
+            error.detail
+        );
+        assert_eq!(ctx.config.load().upstream.weights, vec![3]);
+
+        // A mismatched weight/server count is rejected too.
+        let misaligned = UpstreamConfigDto {
+            servers: vec!["1.1.1.1:53".to_string(), "1.0.0.1:53".to_string()],
+            bootstrap: vec!["1.0.0.1".to_string()],
+            strategy: "load_balance".to_string(),
+            timeout_ms: 3000,
+            probe_domain: "cloudflare.com".to_string(),
+            pool_size: 4,
+            weights: vec![1],
+        };
+        let error = update_upstream_config(
+            operator,
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(misaligned),
+        )
+        .await
+        .expect_err("misaligned weights must be rejected");
+        assert_eq!(error.status, 400);
+        assert!(
+            error.detail.contains("upstream.weights"),
+            "unexpected error: {}",
+            error.detail
+        );
+    }
+
+    /// The API accepts an omitted weight list (the default) and round-trips
+    /// explicit weights through the same config path.
+    #[tokio::test]
+    async fn test_upstream_weights_api_round_trip_and_legacy_default() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_upstream_weights_api_{}",
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+        let operator = RequireOperator(AuthUser {
+            username: "operator".to_string(),
+            role: Role::Operator,
+            token_id: None,
+            owner: None,
+        });
+
+        // Legacy request shape: no `weights` key at all.
+        let legacy: UpstreamConfigDto = serde_json::from_value(serde_json::json!({
+            "servers": ["1.1.1.1:53", "1.0.0.1:53"],
+            "bootstrap": ["9.9.9.9"],
+            "strategy": "load_balance",
+            "timeout_ms": 3000,
+            "probe_domain": "example.com",
+            "pool_size": 2
+        }))
+        .expect("legacy payload without weights");
+        assert_eq!(legacy.weights, Vec::<u32>::new());
+        let _ = update_upstream_config(
+            operator.clone(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(legacy),
+        )
+        .await
+        .expect("legacy payload must still apply");
+        assert_eq!(ctx.config.load().upstream.weights, Vec::<u32>::new());
+
+        let weighted = UpstreamConfigDto {
+            servers: vec!["1.1.1.1:53".to_string(), "1.0.0.1:53".to_string()],
+            bootstrap: vec!["9.9.9.9".to_string()],
+            strategy: "load_balance".to_string(),
+            timeout_ms: 3000,
+            probe_domain: "example.com".to_string(),
+            pool_size: 2,
+            weights: vec![5, 2],
+        };
+        let _ = update_upstream_config(
+            operator,
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(weighted),
+        )
+        .await
+        .expect("explicit weights must apply");
+        assert_eq!(ctx.config.load().upstream.weights, vec![5, 2]);
     }
 }

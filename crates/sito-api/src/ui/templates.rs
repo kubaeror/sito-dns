@@ -32,6 +32,8 @@ pub struct UpstreamViewItem {
     pub is_healthy: bool,
     pub total_queries: u64,
     pub avg_latency_ms: f64,
+    /// Effective load-balancing weight (defaults to 1 when unset).
+    pub weight: u32,
 }
 
 #[derive(Debug, Clone)]

@@ -386,7 +386,10 @@ deny_response = "refused"
 [upstream]
 servers = ["tls://dns.quad9.net", "1.1.1.1:53"]
 bootstrap = ["9.9.9.9", "1.1.1.1"]
-strategy = "parallel"
+strategy = "load_balance"
+# Optional, index-aligned with `servers`; default 1 each. Values 1..=100 and
+# only used by load_balance. A failed weighted pick still fails over.
+weights = [3, 1]
 
 [filtering]
 enabled = true
@@ -403,6 +406,19 @@ port = 8080
 # if the host firewall/network restricts access to the admin port.
 bind = "127.0.0.1"
 ```
+
+#### Upstream weights
+
+`upstream.weights` is optional and index-aligned with `upstream.servers`;
+`[[upstream.per_domain]]` rules accept the same `weights` list for their own
+servers. Leave it out (or set every value to `1`) for the historical behavior. Under
+`strategy = "load_balance"`, a weight of `3` receives roughly three times as
+many first attempts as a weight of `1`; if that pick fails, the resolver still
+tries the remaining healthy upstreams within the normal `timeout_ms` budget.
+Weights never override health checks: a server marked down is skipped at any
+weight and is only used by the all-down emergency path. `0` is rejected
+instead of disabling a server silently. The upstream page/API and the HA
+bundle carry weights; the per-node client secrets remain local.
 
 ### 2.5 Install Systemd Unit
 The canonical unit is [`contrib/systemd/sito.service`](../contrib/systemd/sito.service);

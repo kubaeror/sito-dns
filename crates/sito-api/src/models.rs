@@ -365,6 +365,15 @@ pub struct UpstreamConfigDto {
     /// validation (`MAX_UPSTREAM_POOL_SIZE`).
     #[schema(maximum = 64, minimum = 1)]
     pub pool_size: usize,
+    /// Optional load-balancing weights, index-aligned with `servers`.
+    ///
+    /// An empty list means weight 1 for every server. A non-empty list must
+    /// contain one value per server, each in `1..=100`; `0` is rejected
+    /// rather than silently disabling a server. Weights apply to
+    /// `strategy = "load_balance"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(maximum = 100, minimum = 1)]
+    pub weights: Vec<u32>,
 }
 
 /// Upstream latency test request.

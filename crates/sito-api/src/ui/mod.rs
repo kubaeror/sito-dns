@@ -79,6 +79,10 @@ pub fn ui_router() -> Router<ServerContext> {
             post(handlers::clients_group_services_handler),
         )
         .route("/ui/upstreams/add", post(handlers::upstreams_add_handler))
+        .route(
+            "/ui/upstreams/weight",
+            post(handlers::upstreams_weight_handler),
+        )
         .route("/ui/upstreams/test", post(handlers::upstreams_test_handler))
         .route("/ui/settings/save", post(handlers::settings_save_handler))
         .route("/ui/system/reload", post(handlers::system_reload_handler))
@@ -186,6 +190,7 @@ mod tests {
                 is_healthy: true,
                 total_queries: 500,
                 avg_latency_ms: 15.2,
+                weight: 3,
             }],
             hourly_times_json: "[0, 1, 2]".to_string(),
             hourly_totals_json: "[10, 20, 30]".to_string(),
