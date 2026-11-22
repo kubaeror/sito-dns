@@ -288,6 +288,254 @@ async fn test_live_routes_skip_query_log_total_and_use_cached_dashboard() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// A5: the UI cursor is opt-in. Filter/refresh requests never send one, so they
+/// reset pagination to the newest page instead of continuing a history walk.
+#[test]
+fn test_querylog_cursor_is_opt_in_and_cleared_for_live_requests() {
+    let history = QueryLogParams {
+        cursor: Some("opaque-cursor".to_string()),
+        ..Default::default()
+    };
+    let filter = query_log_filter(&history);
+    assert_eq!(filter.cursor.as_deref(), Some("opaque-cursor"));
+    assert_eq!(filter.limit, Some(50));
+    assert!(
+        live_query_log_filter(&history).cursor.is_none(),
+        "the live refresh filter must never carry a history cursor"
+    );
+
+    // A filter change or refresh sends no cursor (or an empty field); either
+    // way the page starts again at the newest row.
+    for cursor in [None, Some(String::new())] {
+        let params = QueryLogParams {
+            cursor,
+            ..Default::default()
+        };
+        assert!(
+            query_log_filter(&params).cursor.is_none(),
+            "filter changes and refreshes must clear the cursor"
+        );
+    }
+}
+
+/// A5: following the cursor returns older rows and keeps row keys disjoint, so
+/// appended pages cannot duplicate a previously loaded row.
+#[tokio::test]
+async fn test_querylog_history_pages_append_without_duplicate_keys() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_querylog_history_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let base = 1_700_000_000_000;
+    let entries: Vec<_> = (0..60)
+        .map(|index| {
+            sito_stats::QueryLogEntry::new(
+                base + index,
+                "192.0.2.60",
+                None,
+                format!("history-{index}.example"),
+                1,
+                Some(5),
+                "allowed",
+                "udp",
+            )
+        })
+        .collect();
+    ctx.stats_db.insert_batch(&entries).await.unwrap();
+
+    let first = fetch_query_rows(&ctx, &QueryLogParams::default()).await;
+    assert_eq!(first.entries.len(), 50, "the first page stays bounded");
+    let cursor = first
+        .next_cursor
+        .clone()
+        .expect("60 rows need a second page");
+
+    let second = fetch_query_rows(
+        &ctx,
+        &QueryLogParams {
+            cursor: Some(cursor),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(second.entries.len(), 10, "only the older rows remain");
+    assert!(
+        second.next_cursor.is_none(),
+        "the last page must exhaust the cursor"
+    );
+
+    let first_keys: std::collections::HashSet<&str> = first
+        .entries
+        .iter()
+        .map(|row| row.row_key.as_str())
+        .collect();
+    assert!(
+        second
+            .entries
+            .iter()
+            .all(|row| !first_keys.contains(row.row_key.as_str())),
+        "an appended page must not repeat a row key from the page above"
+    );
+    let newest_ts = first.entries.iter().map(|row| row.ts).min().unwrap();
+    assert!(
+        second.entries.iter().all(|row| row.ts < newest_ts),
+        "continued pages must contain older rows only"
+    );
+    assert!(
+        second
+            .entries
+            .iter()
+            .any(|row| row.qname == "history-0.example"),
+        "the oldest row must be reachable through the cursor"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// A5: the page/partial handlers pass `next_cursor` to the templates; the
+/// partial marks an explicit history request and returns OOB controls.
+#[tokio::test]
+async fn test_querylog_ui_templates_receive_cursor_and_history_mode() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_querylog_markup_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    ctx.auth_mgr
+        .create_user("query_user", "pass", Role::Operator)
+        .await;
+    let LoginResult::Success(session) = ctx.auth_mgr.login("query_user", "pass", "127.0.0.1").await
+    else {
+        panic!("login failed");
+    };
+    let headers = session_headers(&session);
+
+    let base = 1_700_000_000_000;
+    let entries: Vec<_> = (0..120)
+        .map(|index| {
+            sito_stats::QueryLogEntry::new(
+                base + index,
+                "192.0.2.61",
+                None,
+                format!("markup-{index}.example"),
+                1,
+                Some(5),
+                "allowed",
+                "udp",
+            )
+        })
+        .collect();
+    ctx.stats_db.insert_batch(&entries).await.unwrap();
+
+    // A full page load starts live and offers Load older when a cursor exists.
+    let page = querylog_page(
+        State(ctx.clone()),
+        headers.clone(),
+        Query(QueryLogParams::default()),
+    )
+    .await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let page_html = response_body(page).await;
+    assert!(
+        page_html.contains("data-querylog-load-older"),
+        "{page_html}"
+    );
+    assert!(
+        page_html.contains("data-history-mode=\"false\""),
+        "a full page load starts in live mode: {page_html}"
+    );
+    assert!(
+        !page_html.contains("hx-swap-oob=\"true\""),
+        "the full page must not mark its controls as an OOB swap"
+    );
+
+    let first = fetch_query_rows(&ctx, &QueryLogParams::default()).await;
+    let cursor = first
+        .next_cursor
+        .clone()
+        .expect("120 rows need a second page");
+
+    // A full page load must ignore a stale cursor and show the live page.
+    let stale = querylog_page(
+        State(ctx.clone()),
+        headers.clone(),
+        Query(QueryLogParams {
+            cursor: Some(cursor.clone()),
+            ..Default::default()
+        }),
+    )
+    .await;
+    let stale_html = response_body(stale).await;
+    assert!(
+        stale_html.contains("markup-119.example")
+            && stale_html.contains("data-history-mode=\"false\""),
+        "a full page load must always start live at the newest page: {stale_html}"
+    );
+
+    // Following the cursor is history mode: pause polling, keep the new cursor.
+    let history = querylog_rows_partial(
+        State(ctx.clone()),
+        headers.clone(),
+        Query(QueryLogParams {
+            cursor: Some(cursor),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(history.status(), StatusCode::OK);
+    let history_html = response_body(history).await;
+    assert!(
+        history_html.contains("hx-swap-oob=\"true\""),
+        "history responses update the controls out of band: {history_html}"
+    );
+    assert!(
+        history_html.contains("data-history-mode=\"true\""),
+        "history mode must pause the live poll: {history_html}"
+    );
+    assert!(
+        history_html.contains("data-querylog-back-live"),
+        "history mode needs a Back to live control: {history_html}"
+    );
+    assert!(
+        history_html.contains("data-querylog-load-older"),
+        "a middle page keeps offering Load older: {history_html}"
+    );
+    assert!(
+        !history_html.contains("markup-119.example"),
+        "history pages must not repeat the newest page: {history_html}"
+    );
+    assert!(
+        history_html.contains("markup-69.example") && history_html.contains("markup-20.example"),
+        "the second page must contain the rows below the first page: {history_html}"
+    );
+
+    // A cursor-less request is a filter/refresh: live mode again, newest page.
+    let live = querylog_rows_partial(
+        State(ctx.clone()),
+        headers,
+        Query(QueryLogParams::default()),
+    )
+    .await;
+    let live_html = response_body(live).await;
+    assert!(
+        live_html.contains("data-history-mode=\"false\""),
+        "filter changes and refreshes must return to live mode: {live_html}"
+    );
+    assert!(
+        !live_html.contains("data-querylog-back-live"),
+        "live mode must not show Back to live: {live_html}"
+    );
+    assert!(
+        live_html.contains("markup-119.example"),
+        "the newest page must be restored after a filter change: {live_html}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 #[tokio::test]
 async fn test_ui_rbac_checks() {
     let temp_dir =

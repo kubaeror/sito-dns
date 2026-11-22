@@ -1,0 +1,40 @@
+<div id="query-history-controls"
+     class="query-history-controls"
+     data-history-mode="{% if history_mode %}true{% else %}false{% endif %}"
+     {% if controls_oob %}hx-swap-oob="true"{% endif %}>
+  <span class="badge {% if history_mode %}badge-warning{% else %}badge-success{% endif %}"
+        role="status"
+        aria-live="polite">
+    {% if history_mode %}History — live polling paused{% else %}Live polling (3s){% endif %}
+  </span>
+
+  {% if let Some(cursor) = next_cursor %}
+  <button type="button"
+          class="btn btn-secondary btn-sm"
+          data-querylog-load-older
+          hx-get="/ui/partials/querylog-rows"
+          hx-target="#query-table-body"
+          hx-swap="beforeend"
+          hx-include="#filter-form, #domain-search"
+          hx-vals='{"cursor": "{{ cursor }}"}'
+          hx-disabled-elt="this"
+          aria-label="Load older queries">
+    Load older
+  </button>
+  {% else %}
+  <span class="query-history-note">No more entries</span>
+  {% endif %}
+
+  {% if history_mode %}
+  <button type="button"
+          class="btn btn-outline btn-sm"
+          data-querylog-back-live
+          hx-get="/ui/partials/querylog-rows"
+          hx-target="#query-table-body"
+          hx-swap="innerHTML"
+          hx-include="#filter-form, #domain-search"
+          aria-label="Back to live queries and resume polling">
+    Back to live
+  </button>
+  {% endif %}
+</div>

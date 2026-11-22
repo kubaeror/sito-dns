@@ -73,9 +73,6 @@
 <div class="card">
   <div class="card-header">
     <div class="card-title">Queries Log Stream</div>
-    <div style="display: flex; align-items: center; gap: 8px;">
-      <span class="badge badge-success">Live Polling (3s)</span>
-    </div>
   </div>
 
   <div class="table-container">
@@ -100,5 +97,7 @@
       </tbody>
     </table>
   </div>
+
+  {% include "partials/querylog_history_controls.html" %}
 </div>
 {% endblock %}
