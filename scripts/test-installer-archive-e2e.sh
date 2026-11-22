@@ -41,9 +41,18 @@ expect_file "${DOC}"
 bash -n "${SCRIPT}" || fail "archived installer E2E has a shell syntax error"
 
 # Network gate: running it without SITO_ARCHIVE_E2E=1 must skip, not download.
-expect_match "${SCRIPT}" 'SITO_ARCHIVE_E2E' "the archive E2E is missing its environment gate"
+expect_match "${SCRIPT}" 'case "\$\{SITO_ARCHIVE_E2E:-0\}" in' \
+    "the archive E2E is missing its environment gate"
 expect_match "${SCRIPT}" 'Set SITO_ARCHIVE_E2E=1' "the gate does not explain how to run the lane"
 expect_match "${SCRIPT}" 'exit 2' "the gate does not exit before network access"
+expect_no_match "${SCRIPT}" '^[[:space:]]*SITO_ARCHIVE_E2E=1[[:space:]]*$' \
+    "the script must not enable its own network gate"
+GATE_LINE="$(grep -n 'case "\${SITO_ARCHIVE_E2E:-0}" in' "${SCRIPT}" | head -n 1 | cut -d: -f1)"
+FIRST_DOWNLOAD_LINE="$(grep -n 'download_file "\${BASE_URL}' "${SCRIPT}" | head -n 1 | cut -d: -f1)"
+[ -n "${GATE_LINE}" ] || fail "could not locate the network gate"
+[ -n "${FIRST_DOWNLOAD_LINE}" ] || fail "could not locate the first release download"
+[ "${GATE_LINE}" -lt "${FIRST_DOWNLOAD_LINE}" ] ||
+    fail "the network gate must run before the first release download"
 
 # Pin the real release and the real archive/checksum/signature path.
 expect_match "${SCRIPT}" 'TAG="\$\{SITO_ARCHIVE_TAG:-v1\.9\.5\}"' "the default release tag is not pinned to v1.9.5"
@@ -51,8 +60,17 @@ expect_match "${SCRIPT}" 'SITO_ARCHIVE_E2E=1' "the manual lane is not documented
 expect_match "${SCRIPT}" 'SHA256SUMS' "the script does not download SHA256SUMS"
 expect_match "${SCRIPT}" 'grep -F "  \$\{ARCHIVE\}" SHA256SUMS \| sha256sum -c -' \
     "the script does not verify the archive against SHA256SUMS"
-expect_match "${SCRIPT}" 'cosign verify-blob' "the script does not verify the cosign signature"
-expect_match "${SCRIPT}" 'certificate-identity-regexp' "the signature identity is not pinned"
+expect_match "${SCRIPT}" '"\$\{COSIGN_BIN\}" verify-blob' \
+    "the script does not verify the cosign signature with an explicit cosign binary"
+expect_match "${SCRIPT}" 'bootstrap_cosign' "the script does not bootstrap an independent cosign"
+expect_match "${SCRIPT}" 'cosign_checksums\.txt' "the independent cosign checksum file is missing"
+expect_match "${SCRIPT}" 'awk -v asset="\$\{asset\}"' "the independent cosign checksum is not exact"
+expect_match "${SCRIPT}" 'certificate-identity "\$\{ARCHIVE_CERT_IDENTITY\}"' \
+    "the signature identity is not pinned to the archived tag"
+expect_no_match "${SCRIPT}" 'certificate-identity-regexp' \
+    "the signature identity must not use a wildcard regexp"
+expect_match "${SCRIPT}" 'ARCHIVE_CERT_IDENTITY=.*refs/tags/\$\{TAG\}' \
+    "the certificate identity is not derived from the archived tag"
 expect_match "${SCRIPT}" 'SITO_REQUIRE_SIGNATURE="\$\{SIGNATURE_POLICY\}"' \
     "the archived installer is not passed the signature policy"
 expect_match "${SCRIPT}" 'SIGNATURE_POLICY=1' "signature verification does not default to required"
@@ -61,14 +79,20 @@ expect_match "${SCRIPT}" 'SITO_ARCHIVE_ALLOW_UNSIGNED' \
 expect_no_match "${SCRIPT}" '^[[:space:]]*SITO_REQUIRE_SIGNATURE=0[[:space:]]*$' \
     "the script contains an unconditional SITO_REQUIRE_SIGNATURE=0 assignment"
 
-# The checksum verification block must precede the signature block so a missing
-# cosign can never hide an integrity failure.
+# The checksum block must precede the signature block, and both must precede any
+# extraction or execution of archive contents.
 CHECKSUM_LINE="$(grep -n 'grep -F "  \${ARCHIVE}" SHA256SUMS | sha256sum -c -' "${SCRIPT}" | head -n 1 | cut -d: -f1)"
-SIGNATURE_LINE="$(grep -n 'log "Verify the cosign keyless signature"' "${SCRIPT}" | head -n 1 | cut -d: -f1)"
+SIGNATURE_LINE="$(grep -n 'log "Verify the cosign keyless signature before executing archive contents"' "${SCRIPT}" | head -n 1 | cut -d: -f1)"
+VERIFY_LINE="$(grep -n '"\${COSIGN_BIN}" verify-blob' "${SCRIPT}" | head -n 1 | cut -d: -f1)"
+EXTRACT_LINE="$(grep -n 'tar -xzf "\${DOWNLOAD_DIR}/\${ARCHIVE}"' "${SCRIPT}" | head -n 1 | cut -d: -f1)"
 [ -n "${CHECKSUM_LINE}" ] || fail "could not locate the checksum verification block"
 [ -n "${SIGNATURE_LINE}" ] || fail "could not locate the signature verification block"
+[ -n "${VERIFY_LINE}" ] || fail "could not locate the signature verification command"
+[ -n "${EXTRACT_LINE}" ] || fail "could not locate the archive extraction"
 [ "${CHECKSUM_LINE}" -lt "${SIGNATURE_LINE}" ] ||
     fail "signature verification runs before the mandatory checksum"
+[ "${VERIFY_LINE}" -lt "${EXTRACT_LINE}" ] ||
+    fail "the archive is extracted before its signature is verified"
 
 # The real archived installer must be used, not the current installer and not a
 # fake 1.9.5 binary.
@@ -87,6 +111,20 @@ expect_match "${SCRIPT}" 'stats\.db\.v1\.bak' "the DB migration backup is not as
 expect_match "${SCRIPT}" 'Migrating stats database' "the installer DB migration is not asserted"
 expect_match "${SCRIPT}" 'Restoring matching v1 configuration' \
     "the pre-2.0 rollback pairing is not asserted"
+expect_match "${SCRIPT}" 'db_query "\$\{DATA_DIR\}/stats\.db" v2 "\$\{PRE_COUNT\}"' \
+    "the live migrated database does not assert its exact row count"
+expect_match "${SCRIPT}" 'db_query "\$\{DB_BACKUP\}" v1 "\$\{PRE_COUNT\}"' \
+    "the v1 backup does not assert its exact row count"
+expect_match "${SCRIPT}" 'db_query "\$\{DATA_DIR\}/stats\.db" v1 "\$\{PRE_COUNT\}"' \
+    "the restored operator database does not assert its exact row count"
+expect_match "${SCRIPT}" 'db_query "\$\{DB_BACKUP\}" v1 "\$\{ROLLBACK_COUNT\}"' \
+    "the failed-health backup does not assert its exact row count"
+expect_match "${SCRIPT}" 'assert_live_service_version' \
+    "rollback does not verify the live PID executable/version"
+expect_match "${SCRIPT}" 'readlink -f "/proc/\$\{pid\}/exe"' \
+    "rollback does not inspect the live PID inode"
+expect_match "${SCRIPT}" 'assert_v2_api_absent' \
+    "rollback does not prove the 2.0-only API is absent"
 
 # It must remain an offline-static test's companion, not a default CI run.
 expect_match "${CI}" 'scripts/test-installer-archive-1\.9\.5\.sh' \

@@ -395,22 +395,26 @@ scripts are owned by E1/E2; this checklist records their evidence.
 
    Without `SITO_ARCHIVE_E2E=1` the script exits before any download. It pins
    `SITO_ARCHIVE_TAG=v1.9.5`, downloads the published archive and
-   `SHA256SUMS`, always verifies the SHA-256, and verifies the cosign keyless
-   signature by default (the archived installer installs a checksum-verified
-   cosign when needed). `SITO_ARCHIVE_ALLOW_UNSIGNED=1` is the only skip; it
-   prints `SKIP` and still verifies SHA-256. The script installs the real
-   archive with its own packaged `install.sh` into a temp prefix behind a fake
-   systemctl wrapper, seeds a v1 data directory through the real 1.9.5 server,
-   migrates the config with the current binary (`config migrate --from v1 --to
-   v2 --backup`, the documented precondition), then runs the current installer
-   with the local 2.x binary.
+   `SHA256SUMS`, always verifies the SHA-256, then installs a pinned
+   checksum-verified cosign **before** extracting the archive and verifies the
+   archive signature with the certificate identity
+   `https://github.com/kubaeror/sito-dns/.github/workflows/release.yml@refs/tags/v1.9.5`.
+   No archive content is executed before that verification.
+   `SITO_ARCHIVE_ALLOW_UNSIGNED=1` is the only skip; it prints `SKIP`, still
+   verifies SHA-256, and never claims a signature was verified. The script
+   installs the real archive with its own packaged `install.sh` into a temp
+   prefix behind a fake systemctl wrapper, seeds a v1 data directory through
+   the real 1.9.5 server, migrates the config with the current binary
+   (`config migrate --from v1 --to v2 --backup`, the documented
+   precondition), then runs the current installer with the local 2.x binary.
 
    Expected transcript tail:
    `PASS: real archived 1.9.5 installer upgrade, migration and rollback`.
    Record the archived 1.9.5 `--version` line, the SHA-256 `OK` line, the
-   `Cosign keyless signature verified successfully` / `Verified OK` output,
-   the `Migrating stats database` and 0600 `stats.db.v1.bak` lines, the
-   `/api/v2/status` version, the preserved query_log count, and the
+   independent cosign checksum/`Verified OK` output, the `Migrating stats
+   database` and 0600 `stats.db.v1.bak` lines, the exact preserved query_log
+   count, the `/api/v2/status` version, the rollback `live pid … is 'sito
+   1.9.5'` and `/api/v2/status is absent (HTTP 404)` lines, and the
    `Restoring matching v1 configuration` line from the failed-health rollback.
    The same lane is available as the manual/weekly
    [`archive-installer-e2e.yml`](../.github/workflows/archive-installer-e2e.yml)

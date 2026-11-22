@@ -45,5 +45,15 @@ jobs:
         env:
           SITO_ARCHIVE_E2E: '1'
           SITO_NEW_BIN: ${{ github.workspace }}/target/debug/sito
+          SITO_ARCHIVE_TMPDIR: ${{ runner.temp }}/sito-archive-e2e
           SITO_ARCHIVE_KEEP_TMP: '1'
         run: bash scripts/test-installer-archive-1.9.5.sh
+
+      - name: Upload archive E2E evidence
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archive-installer-e2e-evidence
+          path: ${{ runner.temp }}/sito-archive-e2e
+          if-no-files-found: warn
+          retention-days: 14

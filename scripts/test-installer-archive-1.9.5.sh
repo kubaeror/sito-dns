@@ -8,10 +8,12 @@
 # Evidence produced, in one isolated unprivileged temp prefix:
 #   1. the pinned real `sito-v1.9.5-<target>.tar.gz` and `SHA256SUMS` are
 #      downloaded from the GitHub release; the SHA-256 checksum is always
-#      verified. The cosign keyless signature is verified by default (the
-#      archived installer installs a checksum-verified cosign when needed).
+#      verified. A pinned cosign is installed independently from the sigstore
+#      release, with its own checksum verified, and the archive signature is
+#      verified before any archive content is extracted or executed.
 #      SHA-256-only mode is available only through the explicit
-#      SITO_ARCHIVE_ALLOW_UNSIGNED=1 opt-out, which is reported as a skip.
+#      SITO_ARCHIVE_ALLOW_UNSIGNED=1 opt-out, which is reported as a skip and
+#      is never described as signature-verified.
 #   2. the archive's own packaged `install.sh` installs 1.9.5 into a temp prefix
 #      behind a fake systemctl service wrapper; no root and no real systemd.
 #   3. a v1 data directory is seeded through the real 1.9.5 server: admin user,
@@ -33,6 +35,10 @@
 #   SITO_ARCHIVE_TAG=v1.9.5         pinned release tag
 #   SITO_NEW_BIN=/path/to/sito      current 2.x binary; otherwise cargo builds it
 #   SITO_ARCHIVE_ALLOW_UNSIGNED=1   explicitly accept SHA-256-only (reports skip)
+#   SITO_ARCHIVE_COSIGN=/path       explicit trusted cosign; default bootstraps
+#                                   a pinned checksum-verified cosign v2.6.5
+#   SITO_ARCHIVE_COSIGN_VERSION=v2.6.5
+#                                   pinned sigstore cosign release to bootstrap
 #   SITO_ARCHIVE_CACHE=/path        optional directory for already-downloaded assets
 #   SITO_ARCHIVE_KEEP_TMP=1         keep the temp evidence directory
 #   SITO_ARCHIVE_DNS_PORT / SITO_ARCHIVE_WEB_PORT
@@ -43,13 +49,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAG="${SITO_ARCHIVE_TAG:-v1.9.5}"
 VERSION="${TAG#v}"
 EXPECTED_VERSION="1.9.5"
+COSIGN_VERSION="${SITO_ARCHIVE_COSIGN_VERSION:-v2.6.5}"
+ARCHIVE_CERT_IDENTITY="https://github.com/kubaeror/sito-dns/.github/workflows/release.yml@refs/tags/${TAG}"
 TMP_BASE="${SITO_ARCHIVE_TMPDIR:-/tmp/opencode}"
 ADMIN_PASSWORD="ArchivePass123!"
 SEED_DOMAIN="archive.test"
 SEED_ANSWER="192.0.2.53"
 ALLOW_UNSIGNED="${SITO_ARCHIVE_ALLOW_UNSIGNED:-0}"
 KEEP_TMP="${SITO_ARCHIVE_KEEP_TMP:-0}"
-INSTALL_COSIGN="${SITO_ARCHIVE_INSTALL_COSIGN:-1}"
 
 log() { printf '\n== %s\n' "$*"; }
 step() { printf '+ %s\n' "$*"; }
@@ -89,7 +96,6 @@ esac
 
 if [ "${ALLOW_UNSIGNED}" = "1" ]; then
     SIGNATURE_POLICY=0
-    INSTALL_COSIGN=0
 else
     SIGNATURE_POLICY=1
 fi
@@ -97,10 +103,11 @@ fi
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
 command -v tar >/dev/null 2>&1 || fail "tar is required"
-command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 ||
-    fail "curl or wget is required"
+# The health, API and signature paths all use curl unconditionally.
+command -v curl >/dev/null 2>&1 || fail "curl is required"
 
 mkdir -p "${TMP_BASE}"
+TMP_BASE="$(cd "${TMP_BASE}" && pwd)"
 TMP="$(mktemp -d "${TMP_BASE}/sito-archive-e2e.XXXXXX")"
 PREFIX="${TMP}/prefix"
 BIN_DIR="${PREFIX}/bin"
@@ -179,6 +186,17 @@ start_service() {
     nohup "${FAKE_INSTALL_BIN:?}" --config "${FAKE_CONFIG_FILE}" \
         >>"${FAKE_SERVICE_LOG:?}" 2>&1 &
     echo "$!" >"${FAKE_SERVICE_PID:?}"
+    # A real systemctl start blocks until the unit is ready. The installer only
+    # sleeps 2s before its health check, which is too short for a cold 2.0
+    # startup; wait for the temp /health endpoint instead of racing it.
+    if [ -n "${FAKE_HEALTH_URL:-}" ]; then
+        for _ in $(seq 1 100); do
+            curl -fsS "${FAKE_HEALTH_URL}" >/dev/null 2>&1 && return 0
+            is_running || return 1
+            sleep 0.1
+        done
+        return 1
+    fi
 }
 stop_service() {
     local pid
@@ -226,18 +244,57 @@ download_file() {
     if [ -f "${output}" ] && [ -s "${output}" ]; then
         return 0
     fi
+    # Never reuse a zero-length or partial cache entry.
+    rm -f "${output}"
     for attempt in 1 2 3; do
         step "download ${url} (attempt ${attempt}/3)"
-        if command -v curl >/dev/null 2>&1; then
-            if curl -fsSL "${url}" -o "${output}"; then
+        if curl -fsSL "${url}" -o "${output}"; then
+            if [ -s "${output}" ]; then
                 return 0
             fi
-        elif wget -q "${url}" -O "${output}"; then
-            return 0
         fi
+        rm -f "${output}"
         sleep $((attempt * 2))
     done
     return 1
+}
+
+bootstrap_cosign() {
+    local asset base version
+    case "${TARGET}" in
+        x86_64-unknown-linux-gnu) asset="cosign-linux-amd64" ;;
+        aarch64-unknown-linux-gnu) asset="cosign-linux-arm64" ;;
+        armv7-unknown-linux-gnueabihf) asset="cosign-linux-arm" ;;
+        *) return 1 ;;
+    esac
+    case "${COSIGN_VERSION}" in
+        v[0-9]*) ;;
+        *) return 1 ;;
+    esac
+    case "${COSIGN_VERSION}" in
+        *[!0-9A-Za-z._-]*) return 1 ;;
+    esac
+    base="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}"
+    step "bootstrap pinned cosign ${COSIGN_VERSION} (${asset})"
+    download_file "${base}/${asset}" "${DOWNLOAD_DIR}/${asset}" || return 1
+    download_file "${base}/cosign_checksums.txt" "${DOWNLOAD_DIR}/cosign_checksums.txt" || return 1
+    (
+        cd "${DOWNLOAD_DIR}"
+        if ! awk -v asset="${asset}" '$2 == asset { found = 1 } END { exit found ? 0 : 1 }' cosign_checksums.txt; then
+            echo "Error: cosign checksum entry for ${asset} was not found." >&2
+            exit 1
+        fi
+        if ! awk -v asset="${asset}" '$2 == asset' cosign_checksums.txt | sha256sum -c -; then
+            echo "Error: cosign checksum verification failed for ${asset}." >&2
+            exit 1
+        fi
+    ) || return 1
+    install -m 0755 "${DOWNLOAD_DIR}/${asset}" "${BIN_DIR}/cosign" || return 1
+    version="$("${BIN_DIR}/cosign" version 2>/dev/null || true)"
+    case "${version}" in
+        *"GitVersion:    ${COSIGN_VERSION}"*) ;;
+        *) return 1 ;;
+    esac
 }
 
 pick_port() {
@@ -278,7 +335,7 @@ import struct
 import sys
 
 port = int(sys.argv[1])
-answer = bytes(int(part) for part in sys.argv[2].split("."))
+expected = bytes(int(part) for part in sys.argv[2].split("."))
 name = "archive.test"
 qname = b"".join(bytes([len(label)]) + label.encode() for label in name.split(".")) + b"\x00"
 query = struct.pack("!HHHHHH", 0x5A17, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", 1, 1)
@@ -293,11 +350,39 @@ finally:
     sock.close()
 if len(data) < 12:
     raise SystemExit(1)
-ident, flags, _qd, an, _ns, _ar = struct.unpack("!HHHHHH", data[:12])
+ident, flags, qd, an, _ns, _ar = struct.unpack("!HHHHHH", data[:12])
 if ident != 0x5A17 or (flags & 0x000F) != 0 or an < 1:
     raise SystemExit(1)
-if answer not in data:
-    raise SystemExit(1)
+
+
+def skip_name(offset):
+    while offset < len(data):
+        length = data[offset]
+        if length == 0:
+            return offset + 1
+        if length & 0xC0 == 0xC0:
+            return offset + 2
+        offset += 1 + length
+    raise ValueError("truncated name")
+
+
+offset = 12
+for _ in range(qd):
+    offset = skip_name(offset)
+    offset += 4
+for _ in range(an):
+    offset = skip_name(offset)
+    if offset + 10 > len(data):
+        raise SystemExit(1)
+    rtype, rclass, _ttl, rdlength = struct.unpack("!HHIH", data[offset:offset + 10])
+    offset += 10
+    rdata = data[offset:offset + rdlength]
+    if offset + rdlength > len(data):
+        raise SystemExit(1)
+    offset += rdlength
+    if rtype == 1 and rclass == 1 and rdlength == 4 and rdata == expected:
+        raise SystemExit(0)
+raise SystemExit(1)
 PY
 }
 
@@ -343,11 +428,12 @@ assert_sha256_equal() {
 }
 
 db_query() {
-    python3 - "$1" "$2" <<'PY'
+    python3 - "$1" "$2" "$3" <<'PY'
 import sqlite3
 import sys
 
-path, mode = sys.argv[1], sys.argv[2]
+path, mode, expected_text = sys.argv[1], sys.argv[2], sys.argv[3]
+expected = None if expected_text == "" else int(expected_text)
 con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 try:
     assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -360,16 +446,58 @@ try:
     ).fetchone()[0]
     if mode == "v1":
         assert marker == [], marker
-        assert seed >= 1, seed
     elif mode == "v2":
         assert marker == [("2",)], marker
-        assert seed >= 1, seed
     else:
         raise AssertionError(mode)
+    assert seed >= 1, seed
+    if expected is not None:
+        assert count == expected, (count, expected)
     print(f"{path}: integrity=ok marker={marker} query_log={count} archive_rows={seed}")
 finally:
     con.close()
 PY
+}
+
+count_rows() {
+    python3 - "$1" <<'PY'
+import sqlite3
+import sys
+con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+print(con.execute("SELECT COUNT(*) FROM query_log").fetchone()[0])
+PY
+}
+
+# The fake systemctl `start` is intentionally idempotent: if a PID exists it
+# succeeds. A rollback bug that left the 2.0 process running would therefore
+# pass DNS/health checks. Verify the live inode and version instead.
+assert_live_service_version() {
+    local expected="$1" label="$2" pid="" exe="" expected_exe actual="" attempt
+    expected_exe="$(readlink -f "${INSTALL_BIN}" 2>/dev/null || true)"
+    for attempt in $(seq 1 100); do
+        pid="$(cat "${SERVICE_PID}" 2>/dev/null || true)"
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            exe="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
+            actual="$(/proc/${pid}/exe --version 2>/dev/null || true)"
+            if [ "${exe}" = "${expected_exe}" ] &&
+                [ "${actual}" = "sito ${expected}" ]; then
+                step "${label}: live pid ${pid} is '${actual}'"
+                return 0
+            fi
+        fi
+        sleep 0.1
+    done
+    fail "${label}: live service is pid='${pid}' exe='${exe}' version='${actual}', expected '${expected_exe}' / 'sito ${expected}'"
+}
+
+# 1.9.5 has no /api/v2 route; a 404 here proves the 2.0 API is not serving.
+assert_v2_api_absent() {
+    local label="$1" code
+    code="$(curl -sS -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1:${WEB_PORT}/api/v2/status" 2>/dev/null || true)"
+    [ "${code}" = "404" ] ||
+        fail "${label}: /api/v2/status returned HTTP ${code}; a 2.0 server appears to be serving"
+    step "${label}: /api/v2/status is absent (HTTP 404)"
 }
 
 stop_service() {
@@ -421,7 +549,7 @@ ARCHIVE="sito-${TAG}-${TARGET}.tar.gz"
 BASE_URL="https://github.com/kubaeror/sito-dns/releases/download/${TAG}"
 if [ -n "${SITO_ARCHIVE_CACHE:-}" ]; then
     mkdir -p "${SITO_ARCHIVE_CACHE}"
-    DOWNLOAD_DIR="${SITO_ARCHIVE_CACHE}"
+    DOWNLOAD_DIR="$(cd "${SITO_ARCHIVE_CACHE}" && pwd)"
 fi
 [ "${VERSION}" = "${EXPECTED_VERSION}" ] ||
     printf 'notice: SITO_ARCHIVE_TAG=%s is not the pinned %s; continuing with the requested tag\n' \
@@ -457,28 +585,35 @@ if [ "${HAVE_PER_ARCHIVE_SHA}" = "1" ]; then
 fi
 step "SHA-256 verified for ${ARCHIVE}"
 
-log "Verify the cosign keyless signature"
+log "Verify the cosign keyless signature before executing archive contents"
+COSIGN_BIN=""
 if [ "${SIGNATURE_POLICY}" = "0" ]; then
     printf 'SKIP: SITO_ARCHIVE_ALLOW_UNSIGNED=1; relying on the verified SHA-256 only.\n'
     [ "${HAVE_SIG_ARTIFACTS}" = "1" ] || printf 'SKIP: no .sig/.pem assets were available either.\n'
 else
     [ "${HAVE_SIG_ARTIFACTS}" = "1" ] ||
         fail "release signatures are required but ${ARCHIVE}.sig/.pem are unavailable"
-    if command -v cosign >/dev/null 2>&1; then
-        step "cosign verify-blob (existing $(command -v cosign))"
-        cosign verify-blob \
-            --certificate "${DOWNLOAD_DIR}/${ARCHIVE}.pem" \
-            --signature "${DOWNLOAD_DIR}/${ARCHIVE}.sig" \
-            --certificate-identity-regexp \
-            "^https://github.com/kubaeror/sito-dns/\.github/workflows/release\.yml@refs/tags/.*$" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "${DOWNLOAD_DIR}/${ARCHIVE}"
+    if [ -n "${SITO_ARCHIVE_COSIGN:-}" ]; then
+        COSIGN_BIN="${SITO_ARCHIVE_COSIGN}"
+        [ -x "${COSIGN_BIN}" ] ||
+            fail "SITO_ARCHIVE_COSIGN is not executable: ${COSIGN_BIN}"
+        step "using operator-provided cosign ${COSIGN_BIN}"
     else
-        # The archived installer installs a checksum-verified cosign before it
-        # verifies the release signature. The direct verification below runs
-        # after that install.
-        step "cosign is absent; the archived installer will install and use it"
+        # Install a pinned, checksum-verified cosign independently of the
+        # release archive. Nothing from the archive is executed before this.
+        bootstrap_cosign ||
+            fail "signature verification is required but an independent checksum-verified cosign could not be installed; refusing to execute the release archive"
+        COSIGN_BIN="${BIN_DIR}/cosign"
     fi
+    step "${COSIGN_BIN} verify-blob (identity ${ARCHIVE_CERT_IDENTITY})"
+    "${COSIGN_BIN}" verify-blob \
+        --certificate "${DOWNLOAD_DIR}/${ARCHIVE}.pem" \
+        --signature "${DOWNLOAD_DIR}/${ARCHIVE}.sig" \
+        --certificate-identity "${ARCHIVE_CERT_IDENTITY}" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+        "${DOWNLOAD_DIR}/${ARCHIVE}" ||
+        fail "cosign verification of the downloaded archive failed; refusing to execute it"
+    step "archive signature verified before extraction"
 fi
 
 log "Extract the archive and locate its packaged installer"
@@ -511,8 +646,7 @@ log "Install ${VERSION} with the archived installer (fake systemctl, no root)"
     PATH="${BIN_DIR}:/usr/bin:/bin" \
         SITO_ALLOW_NON_ROOT=1 \
         SITO_VERSION="${VERSION}" \
-        SITO_INSTALL_COSIGN="${INSTALL_COSIGN}" \
-        SITO_INSTALL_COSIGN_BIN="${BIN_DIR}/cosign" \
+        SITO_INSTALL_COSIGN=0 \
         SITO_REQUIRE_SIGNATURE="${SIGNATURE_POLICY}" \
         SITO_INSTALL_BIN="${INSTALL_BIN}" \
         SITO_CONFIG_DIR="${CONFIG_DIR}" \
@@ -530,19 +664,9 @@ STEP_INSTALLED_VERSION="$("${INSTALL_BIN}" --version)"
 if [ "${SIGNATURE_POLICY}" = "1" ]; then
     grep -q 'Cosign keyless signature verified successfully' "${INSTALLER_LOG}" ||
         fail "the archived installer did not report a verified cosign signature"
-    [ -x "${BIN_DIR}/cosign" ] || command -v cosign >/dev/null 2>&1 ||
-        fail "signature verification was required but cosign is unavailable"
-    if [ -x "${BIN_DIR}/cosign" ]; then
-        step "direct cosign verify-blob with the installer-provided cosign"
-        "${BIN_DIR}/cosign" verify-blob \
-            --certificate "${DOWNLOAD_DIR}/${ARCHIVE}.pem" \
-            --signature "${DOWNLOAD_DIR}/${ARCHIVE}.sig" \
-            --certificate-identity-regexp \
-            "^https://github.com/kubaeror/sito-dns/\.github/workflows/release\.yml@refs/tags/.*$" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "${DOWNLOAD_DIR}/${ARCHIVE}" ||
-            fail "direct cosign verification of the downloaded archive failed"
-    fi
+    [ -x "${BIN_DIR}/cosign" ] ||
+        fail "signature verification was required but the pinned cosign is missing"
+    step "the archived installer reused the independently verified pinned cosign"
 else
     grep -qi 'SITO_REQUIRE_SIGNATURE=0' "${INSTALLER_LOG}" ||
         fail "unsigned mode did not produce the installer's explicit policy warning"
@@ -557,6 +681,7 @@ step "installed ${STEP_INSTALLED_VERSION} from the real archived installer"
 log "Seed a v1 data directory with the real ${VERSION} server"
 DNS_PORT="${SITO_ARCHIVE_DNS_PORT:-$(pick_port dns 15350)}"
 WEB_PORT="${SITO_ARCHIVE_WEB_PORT:-$(pick_port tcp 18080)}"
+export FAKE_HEALTH_URL="http://127.0.0.1:${WEB_PORT}/health"
 
 cat >"${CONFIG_FILE}" <<EOF
 config_version = 1
@@ -637,15 +762,9 @@ for _ in 1 2 3; do
 done
 stop_service
 [ -s "${DATA_DIR}/stats.db" ] || fail "the v1 server did not create stats.db"
-db_query "${DATA_DIR}/stats.db" v1 >/dev/null ||
-    fail "the seeded v1 stats.db is not legacy (or has no query_log rows)"
-PRE_COUNT="$(python3 - "${DATA_DIR}/stats.db" <<'PY'
-import sqlite3
-import sys
-con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-print(con.execute("SELECT COUNT(*) FROM query_log").fetchone()[0])
-PY
-)"
+PRE_COUNT="$(count_rows "${DATA_DIR}/stats.db")"
+db_query "${DATA_DIR}/stats.db" v1 "${PRE_COUNT}" >/dev/null ||
+    fail "the seeded v1 stats.db is not legacy (or lost rows)"
 step "seeded stats.db: ${PRE_COUNT} query_log rows, no schema_version marker"
 
 # ---------------------------------------------------------------------------
@@ -704,27 +823,26 @@ grep -q 'service is active and responding' "${UPGRADE_LOG}" ||
 [ -f "${CONFIG_DIR}/sito.env" ] || fail "the current installer did not write sito.env"
 [ "$(stat -c '%a' "${CONFIG_DIR}/sito.env")" = "600" ] ||
     fail "sito.env is not mode 0600"
-wait_for_dns "${DNS_PORT}" "2.0" || fail "2.0 did not answer the rewrite after the upgrade"
+# The installer's own health check only polls listeners/HTTP; wait for HTTP
+# before sending any DNS query so the exact pre-upgrade row count is still
+# observable on disk after a graceful stop.
 wait_for_http "http://127.0.0.1:${WEB_PORT}/health" "2.0 /health" ||
     fail "2.0 /health is unavailable after the upgrade"
-step "2.0 rewrite answered ${SEED_DOMAIN} A ${SEED_ANSWER} on 127.0.0.1:${DNS_PORT}"
+stop_service
 
 DB_BACKUP="${DATA_DIR}/stats.db.v1.bak"
 [ -f "${DB_BACKUP}" ] || fail "the installer migration did not write stats.db.v1.bak"
 [ "$(stat -c '%a' "${DB_BACKUP}")" = "600" ] ||
     fail "stats.db.v1.bak is not mode 0600"
-db_query "${DATA_DIR}/stats.db" v2 || fail "the migrated stats.db failed its v2 assertions"
-db_query "${DB_BACKUP}" v1 || fail "the pre-migration stats.db backup failed its v1 assertions"
-POST_COUNT="$(python3 - "${DATA_DIR}/stats.db" <<'PY'
-import sqlite3
-import sys
-con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-print(con.execute("SELECT COUNT(*) FROM query_log").fetchone()[0])
-PY
-)"
-[ "${POST_COUNT}" -ge "${PRE_COUNT}" ] ||
-    fail "the migrated database lost query_log rows (${PRE_COUNT} -> ${POST_COUNT})"
-step "db migrate wrote a 0600 stats.db.v1.bak; ${PRE_COUNT} v1 rows survive in both databases"
+db_query "${DATA_DIR}/stats.db" v2 "${PRE_COUNT}" ||
+    fail "the migrated stats.db failed its exact v2 assertions"
+db_query "${DB_BACKUP}" v1 "${PRE_COUNT}" ||
+    fail "the pre-migration stats.db backup failed its exact v1 assertions"
+step "db migrate wrote a 0600 stats.db.v1.bak; exactly ${PRE_COUNT} v1 rows survive in both databases"
+
+start_service
+wait_for_dns "${DNS_PORT}" "2.0" || fail "2.0 did not answer the rewrite after the upgrade"
+step "2.0 rewrite answered ${SEED_DOMAIN} A ${SEED_ANSWER} on 127.0.0.1:${DNS_PORT}"
 
 COOKIE_JAR="${LOGS}/cookies.txt"
 step "curl /api/v2/status (session required)"
@@ -774,20 +892,24 @@ step "restored ${BIN_BACKUP}, ${V1_CONFIG_BACKUP}, and stats.db.v1.bak"
 [ "$("${INSTALL_BIN}" --version)" = "sito ${EXPECTED_VERSION}" ] ||
     fail "operator rollback did not restore the 1.9.5 binary"
 grep -qx 'config_version = 1' "${CONFIG_FILE}" || fail "operator rollback did not restore v1 config"
-db_query "${DATA_DIR}/stats.db" v1 >/dev/null || fail "operator rollback did not restore the v1 database"
+db_query "${DATA_DIR}/stats.db" v1 "${PRE_COUNT}" ||
+    fail "operator rollback did not restore the exact v1 database"
 start_service
+assert_live_service_version "${EXPECTED_VERSION}" "operator rollback"
 wait_for_dns "${DNS_PORT}" "rollback 1.9.5" ||
     fail "the rolled-back 1.9.5 did not answer the rewrite"
 wait_for_http "http://127.0.0.1:${WEB_PORT}/health" "rollback 1.9.5 /health" ||
     fail "the rolled-back 1.9.5 /health is unavailable"
+assert_v2_api_absent "operator rollback"
 assert_sha256_equal "${USERS_SHA_BEFORE}" \
     "$(sha256sum "${DATA_DIR}/users.toml" | awk '{print $1}')" \
     "users.toml changed across the rollback"
 assert_sha256_equal "${TOTP_SHA_BEFORE}" \
     "$(sha256sum "${DATA_DIR}/totp.key" | awk '{print $1}')" \
     "totp.key changed across the rollback"
-step "rolled-back 1.9.5 answered the rewrite, /health, and preserved users/TOTP"
 stop_service
+ROLLBACK_COUNT="$(count_rows "${DATA_DIR}/stats.db")"
+step "rolled-back 1.9.5 answered the rewrite, /health, and preserved ${ROLLBACK_COUNT} rows/users/TOTP"
 
 # ---------------------------------------------------------------------------
 # Current installer failed-health rollback: v1 config pair, not v2
@@ -833,27 +955,26 @@ assert_sha256_equal "${V1_CONFIG_SHA}" \
 [ -f "${DB_BACKUP}" ] || fail "the failed-health attempt did not write a new DB backup"
 [ "$(stat -c '%a' "${DB_BACKUP}")" = "600" ] ||
     fail "the failed-health DB backup is not mode 0600"
-step "failed-health rollback restored the 1.9.5 binary and matching v1 config"
+db_query "${DB_BACKUP}" v1 "${ROLLBACK_COUNT}" ||
+    fail "the failed-health stats.db.v1.bak is not an exact unmarked v1 copy"
+# The installer's best-effort restart must have left the real 1.9.5 process,
+# not a still-running 2.0 process that happens to satisfy the fake PID check.
+assert_live_service_version "${EXPECTED_VERSION}" "failed-health rollback"
+stop_service
+# The installer does not roll the database back on a health failure; 1.9.5 must
+# still open the additive schema version 2 database. The v1 backup remains the
+# documented recovery copy. A graceful stop flushes any pending writer rows, so
+# the exact count is observable.
+db_query "${DATA_DIR}/stats.db" v2 "${ROLLBACK_COUNT}" ||
+    fail "1.9.5 could not open the exact additive migrated stats.db after the rollback"
 start_service
+assert_live_service_version "${EXPECTED_VERSION}" "failed-health rollback restart"
 wait_for_dns "${DNS_PORT}" "failed-health rollback 1.9.5" ||
     fail "the failed-health rollback did not leave a working 1.9.5 service"
 wait_for_http "http://127.0.0.1:${WEB_PORT}/health" "failed-health rollback /health" ||
     fail "the failed-health rollback /health is unavailable"
-# The installer does not roll the database back on a health failure; 1.9.5 must
-# still open the additive schema version 2 database. The v1 backup remains the
-# documented recovery copy.
-if ! python3 - "${DATA_DIR}/stats.db" <<'PY'
-import sqlite3
-import sys
-con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-assert con.execute("SELECT COUNT(*) FROM query_log WHERE qname = 'archive.test'").fetchone()[0] >= 1
-print("  recovered 1.9.5 still opens the additive migrated stats.db")
-PY
-then
-    fail "1.9.5 could not open the additive migrated stats.db after the rollback"
-fi
-step "recovered 1.9.5 answered the rewrite and /health after the failed upgrade"
+assert_v2_api_absent "failed-health rollback"
+step "failed-health rollback restored the 1.9.5 binary, exact v1 config/DB backup, and service"
 stop_service
 
 log "PASS: real archived ${VERSION} installer upgrade, migration and rollback"
