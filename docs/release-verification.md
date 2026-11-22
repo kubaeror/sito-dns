@@ -477,8 +477,10 @@ It proves the 2.0 surface:
 - `GET /api/v1/status` returns `404`: API v1 is removed with no alias or
   redirect.
 - `GET /health` returns `200 {"status":"ok"}` and the image healthcheck turns
-  `healthy` with the web listener enabled (so the DNS probe and the public
-  readiness endpoint are both required).
+  `healthy`. The direct `/health` assertion is what proves the public readiness
+  endpoint is served: on a non-HA node `run_healthcheck_or_web` treats an
+  unreachable admin listener as non-fatal, so the healthcheck alone does not
+  prove `/health`.
 - After the server is stopped, a read-only
   `sito db migrate --config /etc/sito/config.toml --dry-run` on the same data
   dir reports `already at schema version 2`, proving a fresh 2.0 install
@@ -502,6 +504,7 @@ re-run it manually for an existing release without `docker-build-push`:
 
 ```bash
 IMAGE=ghcr.io/kubaeror/sito-dns
+GITHUB_REF_NAME=v2.0.0   # the run step derives `sito 2.0.0` from this
 DIGEST="$(docker buildx imagetools inspect "${IMAGE}:v2.0.0" --format '{{json .Manifest.Digest}}' | tr -d '"')"
 docker run --rm --entrypoint /usr/bin/sito "${IMAGE}@${DIGEST}" --version
 # Then repeat the container/config/curl/db-migrate commands from the workflow

@@ -514,17 +514,28 @@ jobs:
           # Pin the digest so the smoke test cannot drift to a newer tag pushed
           # after the build step (and so it tests exactly what was attested).
           image="${IMAGE}@${DIGEST}"
+          # The tag was already validated by verify-tag; use it to assert that
+          # the image reports the version it was published for, not just any
+          # `--version` output.
+          : "${GITHUB_REF_NAME:?GITHUB_REF_NAME is required to verify --version}"
+          expected_version="sito ${GITHUB_REF_NAME#v}"
           # Override the entrypoint: it injects `--config /etc/sito/config.toml`
           # and would otherwise duplicate/override the arguments below.
-          docker run --rm --entrypoint /usr/bin/sito "${image}" --version
+          version_out="$(docker run --rm --entrypoint /usr/bin/sito "${image}" --version)"
+          printf '%s\n' "${version_out}"
+          [ "${version_out}" = "${expected_version}" ] ||
+            { echo "::error::release image reported '${version_out}', expected '${expected_version}'"; exit 1; }
           docker run --rm --entrypoint /usr/bin/sito \
             -v "${PWD}/config.example.toml:/config.toml:ro" \
             "${image}" check-config --config /config.toml
           # Exercise the shipped default entrypoint with the shipped config
           # mounted at the path it expects, so the image is usable as-is.
-          docker run --rm \
+          shipped_version="$(docker run --rm \
             -v "${PWD}/config.example.toml:/etc/sito/config.toml:ro" \
-            "${image}" --version
+            "${image}" --version)"
+          printf '%s\n' "${shipped_version}"
+          [ "${shipped_version}" = "${expected_version}" ] ||
+            { echo "::error::shipped entrypoint reported '${shipped_version}', expected '${expected_version}'"; exit 1; }
 
           # Live smoke test: start the published image with a self-contained
           # config, wait for a local rewrite, and require the image healthcheck
@@ -709,8 +720,11 @@ jobs:
           v1_status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18080/api/v1/status || true)"
           [ "${v1_status}" = "404" ] || { echo "::error::/api/v1/status returned ${v1_status}, expected 404"; docker logs "${api_container}" || true; exit 1; }
 
-          # The web-enabled container keeps the image healthcheck honest: the
-          # check now also needs the public `/health` endpoint, not just DNS.
+          # The web-enabled container must also expose the public readiness
+          # endpoint. This is asserted directly: on a non-HA node the image
+          # healthcheck deliberately tolerates an unreachable admin listener
+          # (`run_healthcheck_or_web` passes `required = false`), so only the
+          # `/health` 200/body check proves the endpoint is actually served.
           api_health_status="unknown"
           for _ in $(seq 1 90); do
             api_health_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${api_container}")"
@@ -724,15 +738,19 @@ jobs:
           # server first (the migration lease forbids a live inspection), then
           # use the shipped CLI read-only dry run on the same data dir.
           docker stop --time 30 "${api_container}" >/dev/null
-          schema_out="$(docker run --rm \
+          if ! schema_out="$(docker run --rm \
             -v "${api_tmp}/etc/config.toml:/etc/sito/config.toml:ro" \
             -v "${api_data_volume}:/var/lib/sito" \
             --entrypoint /usr/bin/sito "${image}" \
-            db migrate --config /etc/sito/config.toml --dry-run)"
+            db migrate --config /etc/sito/config.toml --dry-run)"; then
+            echo "::error::could not inspect the fresh release data dir schema"
+            docker logs "${api_container}" || true
+            exit 1
+          fi
           printf '%s\n' "${schema_out}"
           printf '%s' "${schema_out}" | grep -Eq 'already at schema version 2\b' ||
-            { echo "::error::fresh release data dir is not schema v2"; docker logs "${api_container}" || true; exit 1; }
-          echo "release image API smoke: /api/v2/status=${v2_status} (real auth response); /api/v1/status=404 (removed); fresh stats schema v2; healthcheck: ${api_health_status}"
+            { echo "::error::fresh release data dir is not schema v2: ${schema_out}"; docker logs "${api_container}" || true; exit 1; }
+          echo "release image API smoke: /api/v2/status=${v2_status} (real auth response); /api/v1/status=${v1_status} (removed); fresh stats schema v2; healthcheck: ${api_health_status}"
 
   publish-release:
     name: Publish GitHub Release
