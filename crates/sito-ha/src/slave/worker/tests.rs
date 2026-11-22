@@ -975,6 +975,111 @@ async fn test_unparseable_local_config_rejects_push_and_keeps_file() {
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 
+/// ADR-0011: HA apply rebuilds the typed clients table. That must not
+/// materialize the compatibility ACL defaults, while an explicitly pushed ACL
+/// is preserved.
+#[tokio::test]
+async fn test_ha_apply_does_not_materialize_acl_defaults() {
+    let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+    let dir = std::env::temp_dir().join(format!("sito_ha_acl_{}", rand::random::<u64>()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let path = dir.join("config.toml");
+    tokio::fs::write(&path, "config_version = 2\n[server]\nrole = \"slave\"\n")
+        .await
+        .unwrap();
+
+    let tracker = SlaveStatusTracker::new("slave-acl".to_string(), 0, None);
+    let handles = test_handles(Some(path.clone())).await;
+
+    let mut clients = sito_clients::ClientsConfig::default();
+    clients.entries.push(sito_clients::ClientEntryConfig {
+        name: "tablet".to_string(),
+        ids: vec!["192.0.2.55".to_string()],
+        group: "default".to_string(),
+        ignore_query_log: false,
+        ignore_stats: false,
+        use_global_upstreams: true,
+        upstreams: None,
+        trusted: false,
+    });
+    let bundle = test_bundle(
+        1,
+        "config_version = 2\n[server]\nrole = \"slave\"\n",
+        Some(toml::Value::try_from(&clients).unwrap()),
+        None,
+    );
+    let push = build_and_sign_push(&bundle, &signing_key).unwrap();
+    apply_config_push(&push, &tracker, &handles, &signing_key.public_key())
+        .await
+        .unwrap();
+
+    let persisted: toml::Table = tokio::fs::read_to_string(&path)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    let persisted_clients = persisted
+        .get("clients")
+        .and_then(toml::Value::as_table)
+        .expect("persisted clients table");
+    assert!(
+        !persisted_clients.contains_key("default_policy"),
+        "{persisted_clients:?}"
+    );
+    assert!(
+        !persisted_clients.contains_key("acl"),
+        "{persisted_clients:?}"
+    );
+    assert_eq!(
+        persisted_clients
+            .get("entries")
+            .and_then(toml::Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    // An explicitly pushed ACL survives the same typed rebuild.
+    let mut explicit = clients.clone();
+    explicit.default_policy = sito_clients::AclDefaultPolicy::Deny;
+    explicit.acl.allow = vec!["192.0.2.0/24".to_string()];
+    explicit.acl.deny_response = sito_clients::AclDenyResponse::Drop;
+    let bundle = test_bundle(
+        2,
+        "config_version = 2\n[server]\nrole = \"slave\"\n",
+        Some(toml::Value::try_from(&explicit).unwrap()),
+        None,
+    );
+    let push = build_and_sign_push(&bundle, &signing_key).unwrap();
+    apply_config_push(&push, &tracker, &handles, &signing_key.public_key())
+        .await
+        .unwrap();
+    let persisted: toml::Table = tokio::fs::read_to_string(&path)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap();
+    let persisted_clients = persisted
+        .get("clients")
+        .and_then(toml::Value::as_table)
+        .expect("persisted clients table");
+    assert_eq!(
+        persisted_clients
+            .get("default_policy")
+            .and_then(toml::Value::as_str),
+        Some("deny")
+    );
+    let acl = persisted_clients
+        .get("acl")
+        .and_then(toml::Value::as_table)
+        .expect("acl table");
+    assert_eq!(
+        acl.get("deny_response").and_then(toml::Value::as_str),
+        Some("drop")
+    );
+
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
 /// Absent `clients`/`rewrites` in the bundle are authoritative removals:
 /// the runtime snapshot and the persisted file must agree (a restart must
 /// observe what was applied).

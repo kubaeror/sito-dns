@@ -1130,8 +1130,10 @@ impl MetricsRegistry {
         {
             let map = sito_core::sync::read_or_recover(&self.acl_matched_prefix);
             if map.is_empty() {
+                // Neutral placeholder: never synthesize a real configured
+                // prefix (0.0.0.0/0) into an empty series.
                 out.push_str(
-                    "sito_dns_acl_matched_prefix_total{action=\"allow\",prefix=\"0.0.0.0/0\",family=\"ipv4\"} 0\n",
+                    "sito_dns_acl_matched_prefix_total{action=\"allow\",prefix=\"__none__\",family=\"ipv4\"} 0\n",
                 );
             } else {
                 let mut entries: Vec<ThreeLabelCount> = map
@@ -2078,7 +2080,7 @@ sito_query_duration_seconds_count{verdict="blocked"} 1
 sito_dns_acl_decisions_total{action="allow",reason="default_policy",family="ipv4"} 0
 # HELP sito_dns_acl_matched_prefix_total DNS client ACL decisions by canonical matched prefix
 # TYPE sito_dns_acl_matched_prefix_total counter
-sito_dns_acl_matched_prefix_total{action="allow",prefix="0.0.0.0/0",family="ipv4"} 0
+sito_dns_acl_matched_prefix_total{action="allow",prefix="__none__",family="ipv4"} 0
 # HELP sito_dns_acl_dropped_total DNS queries denied and silently dropped by the client ACL
 # TYPE sito_dns_acl_dropped_total counter
 sito_dns_acl_dropped_total{family="ipv4"} 0

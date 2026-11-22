@@ -2283,6 +2283,64 @@ async fn test_ui_client_delete_removes_shared_secret() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// ADR-0011: the UI client save path must not materialize the ACL defaults.
+#[tokio::test]
+async fn test_ui_client_add_does_not_materialize_acl_defaults() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_client_acl_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("login failed");
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
+
+    let resp = clients_add_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        headers,
+        Form(AddClientForm {
+            name: "tablet".to_string(),
+            ids: "192.0.2.55".to_string(),
+            group: "default".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let cfg = ctx.config.load();
+    let clients = cfg
+        .clients
+        .as_ref()
+        .and_then(toml::Value::as_table)
+        .expect("clients table");
+    assert!(!clients.contains_key("default_policy"), "{clients:?}");
+    assert!(!clients.contains_key("acl"), "{clients:?}");
+    assert_eq!(
+        clients
+            .get("entries")
+            .and_then(toml::Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let persisted: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&ctx.config_path).expect("persisted config"))
+            .unwrap();
+    let persisted_clients = persisted
+        .get("clients")
+        .and_then(toml::Value::as_table)
+        .expect("persisted clients table");
+    assert!(!persisted_clients.contains_key("default_policy"));
+    assert!(!persisted_clients.contains_key("acl"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 /// WP-4.4: the UI upstream probe requires Operator; a Viewer is rejected
 /// (the setup-token path stays for first boot).
 #[tokio::test]

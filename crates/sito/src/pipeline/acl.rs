@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 const ACL_INFO_WINDOW: Duration = Duration::from_secs(60);
 /// Drop source entries after this much inactivity.
 const ACL_SOURCE_IDLE: Duration = Duration::from_secs(300);
+/// Minimum interval between idle sweeps, so pruning is not an O(n) per-query
+/// cost even below the source cap.
+const ACL_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// Maximum tracked sources.
 const ACL_SOURCE_CAP: usize = 1024;
 /// Global `info` lines per second.
@@ -35,6 +38,7 @@ struct AclLogState {
     last_info: HashMap<IpAddr, Instant>,
     tokens: f64,
     last_refill: Instant,
+    last_prune: Instant,
 }
 
 impl AclLogState {
@@ -43,6 +47,7 @@ impl AclLogState {
             last_info: HashMap::new(),
             tokens: ACL_INFO_BURST,
             last_refill: now,
+            last_prune: now,
         }
     }
 }
@@ -73,24 +78,31 @@ impl AclLogSampler {
 
     /// Testable variant with an explicit clock.
     pub(super) fn record_at(&self, source: IpAddr, now: Instant) -> AclLogLevel {
-        let mut state = sito_core::sync::lock_or_recover(&self.state);
+        // Never block the query path on the sampler: if another task is
+        // updating it, fall back to debug (dropping an info line is safe).
+        let Ok(mut state) = self.state.try_lock() else {
+            return AclLogLevel::Debug;
+        };
 
-        // Bound the map: drop idle sources and, if still full, the oldest.
-        if state.last_info.len() >= ACL_SOURCE_CAP && !state.last_info.contains_key(&source) {
+        // Sweep idle sources at most once a minute, not only at the cap.
+        if now.saturating_duration_since(state.last_prune) >= ACL_PRUNE_INTERVAL {
             state
                 .last_info
                 .retain(|_, seen| now.saturating_duration_since(*seen) < ACL_SOURCE_IDLE);
-            while state.last_info.len() >= ACL_SOURCE_CAP {
-                let Some(oldest) = state
-                    .last_info
-                    .iter()
-                    .min_by_key(|(_, seen)| **seen)
-                    .map(|(ip, _)| *ip)
-                else {
-                    break;
-                };
-                state.last_info.remove(&oldest);
-            }
+            state.last_prune = now;
+        }
+
+        // Bound the map when it is full: drop the oldest entry. This scan is
+        // rare (only at the cap with a new source) and never per query.
+        if state.last_info.len() >= ACL_SOURCE_CAP
+            && !state.last_info.contains_key(&source)
+            && let Some(oldest) = state
+                .last_info
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(ip, _)| *ip)
+        {
+            state.last_info.remove(&oldest);
         }
 
         if let Some(seen) = state.last_info.get(&source)

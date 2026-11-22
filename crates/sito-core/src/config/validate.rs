@@ -40,6 +40,19 @@ impl Config {
         Ok(config)
     }
 
+    /// Loads and validates a configuration file through the same single
+    /// parser every other entry point uses.
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        let document = std::fs::read_to_string(path).map_err(|e| {
+            ConfigError::Parse(format!(
+                "failed to read configuration file '{}': {e}",
+                path.display()
+            ))
+        })?;
+        Self::from_toml_str(&document)
+    }
+
     /// The single full configuration validator (WP-1.3).
     ///
     /// Startup, `check-config`, API writes, restore and HA apply all reach
@@ -298,16 +311,25 @@ impl Config {
                     // otherwise silently ignore a typo and the client would
                     // fall back to the default policy. DoH path labels such
                     // as `/dns-query/foo` are not CIDRs.
-                    let cidr_like = id.split_once('/').is_some_and(|(address, prefix)| {
-                        address.parse::<IpAddr>().is_ok() && !prefix.is_empty()
-                    });
-                    if cidr_like {
-                        crate::net::IpNetwork::parse(id).map_err(|e| {
-                            ConfigError::cross_section(
-                                format!("clients.entries[{index}].ids[{id_index}]"),
-                                format!("invalid client CIDR id '{id}': {e}"),
-                            )
-                        })?;
+                    if let Some((address, prefix)) = id.split_once('/') {
+                        let address = address.trim();
+                        let prefix = prefix.trim();
+                        if address.parse::<IpAddr>().is_ok() {
+                            if prefix.is_empty() {
+                                return Err(ConfigError::cross_section(
+                                    format!("clients.entries[{index}].ids[{id_index}]"),
+                                    format!("invalid client CIDR id '{id}': missing prefix length"),
+                                ));
+                            }
+                            crate::net::IpNetwork::parse(&format!("{address}/{prefix}")).map_err(
+                                |e| {
+                                    ConfigError::cross_section(
+                                        format!("clients.entries[{index}].ids[{id_index}]"),
+                                        format!("invalid client CIDR id '{id}': {e}"),
+                                    )
+                                },
+                            )?;
+                        }
                     }
                 }
             }
@@ -778,6 +800,13 @@ impl Config {
         // reporting an unqualified exposure. The admin UI warning is separate
         // and unaffected.
         if self.clients_default_policy_is_deny() {
+            // A deny default does not protect anything if an allow prefix is
+            // `0.0.0.0/0`/`::/0` (explicitly or through opted-in entry ids).
+            if self.clients_acl_has_catch_all_allow() {
+                return Some(format!(
+                    "DNS listeners bind to {binds}; clients.default_policy = \"deny\" is set, but [clients.acl] contains a catch-all allow (0.0.0.0/0 or ::/0), so every source in that family is still admitted. Replace the catch-all with the operator's client networks, or rely on the host firewall. Rate limiting is not an access control"
+                ));
+            }
             return Some(format!(
                 "DNS listeners bind to {binds}; [clients] default_policy = \"deny\" is the active DNS client admission control, so only configured allow/entry networks may query. Verify the allow list before relying on it: a missing or loopback-only allow list denies every LAN client, and rate limiting is still not an access control. Keep the host firewall as defense in depth"
             ));
@@ -801,6 +830,46 @@ impl Config {
             .and_then(|table| table.get("default_policy"))
             .and_then(toml::Value::as_str)
             == Some("deny")
+    }
+
+    /// True when `[clients.acl] allow` (or an opted-in entry id) is a
+    /// catch-all prefix, i.e. the deny default is effectively allow in one
+    /// family.
+    fn clients_acl_has_catch_all_allow(&self) -> bool {
+        let Some(clients) = self.clients.as_ref().and_then(toml::Value::as_table) else {
+            return false;
+        };
+        let Some(acl) = clients.get("acl").and_then(toml::Value::as_table) else {
+            return false;
+        };
+        if prefix_list_has_catch_all(acl.get("allow")) {
+            return true;
+        }
+        if acl
+            .get("allow_entry_ids")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let entries = clients
+                .get("entries")
+                .and_then(toml::Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for entry in entries {
+                let Some(ids) = entry.get("ids").and_then(toml::Value::as_array) else {
+                    continue;
+                };
+                for id in ids.iter().filter_map(toml::Value::as_str) {
+                    if let Some((address, prefix)) = id.split_once('/')
+                        && address.trim().parse::<IpAddr>().is_ok()
+                        && prefix.trim() == "0"
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// True when the configuration explicitly declares that the admin scheme
@@ -1047,9 +1116,23 @@ fn validate_hostname(host: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Maximum number of prefixes in each `[clients.acl] allow`/`deny` list
-/// (ADR-0011). Mirrors `sito_clients::MAX_ACL_PREFIXES`.
-const MAX_ACL_PREFIXES: usize = 1024;
+/// True when a raw allow list contains an explicit catch-all prefix.
+fn prefix_list_has_catch_all(value: Option<&toml::Value>) -> bool {
+    value
+        .and_then(toml::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .any(|value| {
+            value
+                .trim()
+                .split_once('/')
+                .is_some_and(|(address, prefix)| {
+                    address.trim().parse::<IpAddr>().is_ok() && prefix.trim() == "0"
+                })
+        })
+}
 
 /// Parses and validates one `[clients.acl] allow`/`deny` list, returning
 /// canonical `(network, prefix)` pairs for duplicate/conflict checks.
@@ -1060,12 +1143,13 @@ fn parse_acl_list(acl: &toml::Table, field: &str) -> Result<Vec<(IpAddr, u8)>, C
     let values = value.as_array().ok_or_else(|| {
         ConfigError::validation(field, format!("{field} must be an array of strings"))
     })?;
-    if values.len() > MAX_ACL_PREFIXES {
+    if values.len() > crate::net::MAX_ACL_PREFIXES {
         return Err(ConfigError::validation(
             field,
             format!(
-                "{field} contains {} entries; at most {MAX_ACL_PREFIXES} prefixes are allowed",
-                values.len()
+                "{field} contains {} entries; at most {} prefixes are allowed",
+                values.len(),
+                crate::net::MAX_ACL_PREFIXES
             ),
         ));
     }

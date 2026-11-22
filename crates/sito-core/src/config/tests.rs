@@ -1056,6 +1056,12 @@ fn test_acl_config_rejections() {
             "clients.acl.deny",
             "192.0.2.0/24",
         ),
+        (
+            "[clients]\n[[clients.entries]]\nname = \"broken\"\nids = [\"192.0.2.5/\"]\n"
+                .to_string(),
+            "clients.entries[0].ids[0]",
+            "192.0.2.5/",
+        ),
     ] {
         let toml = format!("{TEST_BASE}{document}");
         let err = Config::from_toml_str(&toml).expect_err("must be rejected");
@@ -1107,6 +1113,88 @@ fn test_acl_config_save_does_not_materialize_default_policy() {
     let rendered = toml::to_string_pretty(&config).expect("serialize");
     assert!(rendered.contains("default_policy = \"deny\""));
     assert!(rendered.contains("\"192.0.2.0/24\""));
+}
+
+#[test]
+fn test_acl_config_load_full_fixture() {
+    let dir = std::env::temp_dir().join(format!("sito-acl-load-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "{TEST_BASE}\
+             [clients]\n\
+             default_policy = \"deny\"\n\
+             [clients.acl]\n\
+             allow = [\"127.0.0.1/32\", \"::1/128\", \"192.168.1.0/24\"]\n\
+             deny = [\"192.168.1.128/25\"]\n\
+             allow_entry_ids = false\n\
+             deny_response = \"refused\"\n"
+        ),
+    )
+    .unwrap();
+
+    let config = Config::load(&path).expect("Config::load accepts the full ACL fixture");
+    let clients = config
+        .clients
+        .as_ref()
+        .and_then(toml::Value::as_table)
+        .expect("clients table");
+    assert_eq!(
+        clients.get("default_policy").and_then(toml::Value::as_str),
+        Some("deny")
+    );
+    let acl = clients
+        .get("acl")
+        .and_then(toml::Value::as_table)
+        .expect("acl table");
+    assert_eq!(
+        acl.get("deny_response").and_then(toml::Value::as_str),
+        Some("refused")
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_acl_rollback_without_keys_preserves_allow() {
+    // A pre-ACL document (or a rollback that removes the additive keys) must
+    // load with the compatibility default and no ACL warnings.
+    let rollback = format!("{TEST_BASE}[clients]\nentries = []\n");
+    let config = Config::from_toml_str(&rollback).expect("pre-ACL document is valid");
+    let clients = config.clients.as_ref().and_then(toml::Value::as_table);
+    assert!(
+        clients.is_none_or(|table| !table.contains_key("default_policy")),
+        "rollback must not synthesize a policy"
+    );
+    assert!(clients.is_none_or(|table| !table.contains_key("acl")));
+
+    let mut wildcard = config;
+    wildcard.dns.bind = vec!["0.0.0.0".parse().unwrap()];
+    let warning = wildcard.dns_exposure_warning().expect("wildcard warns");
+    assert!(
+        warning.contains("clients.default_policy is \"allow\""),
+        "{warning}"
+    );
+    assert!(!warning.contains("catch-all allow"), "{warning}");
+}
+
+#[test]
+fn test_acl_deny_catch_all_allow_is_reported_as_open() {
+    for extra in [
+        "[clients]\ndefault_policy = \"deny\"\n[clients.acl]\nallow = [\"0.0.0.0/0\"]\n",
+        "[clients]\ndefault_policy = \"deny\"\n[clients.acl]\nallow_entry_ids = true\n[[clients.entries]]\nname = \"all\"\nids = [\"::/0\"]\n",
+    ] {
+        let config = Config::from_toml_str(&format!("{TEST_BASE}{extra}")).unwrap();
+        let mut config = config;
+        config.dns.bind = vec!["0.0.0.0".parse().unwrap()];
+        let warning = config.dns_exposure_warning().expect("wildcard warns");
+        assert!(
+            warning.contains("catch-all allow"),
+            "a deny policy with a catch-all allow is still open: {warning}"
+        );
+    }
 }
 
 #[test]

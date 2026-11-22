@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::config::{AclDefaultPolicy, AclDenyResponse, ClientsConfig};
 
 /// Maximum number of prefixes in each explicit `allow`/`deny` list.
-pub const MAX_ACL_PREFIXES: usize = 1024;
+pub use sito_core::net::MAX_ACL_PREFIXES;
 
 /// Address family of an ACL decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -252,9 +252,15 @@ impl AclIndex {
                     .to_string(),
             );
             let mut seen = HashSet::new();
-            for entry in &config.entries {
-                for id in &entry.ids {
-                    let Some(prefix) = parse_entry_id(id) else {
+            for (entry_index, entry) in config.entries.iter().enumerate() {
+                for (id_index, id) in entry.ids.iter().enumerate() {
+                    let prefix = parse_entry_id(id).map_err(|message| {
+                        AclConfigError::new(
+                            format!("clients.entries[{entry_index}].ids[{id_index}]"),
+                            message,
+                        )
+                    })?;
+                    let Some(prefix) = prefix else {
                         continue;
                     };
                     if prefix.prefix_len() == 0 {
@@ -274,14 +280,20 @@ impl AclIndex {
             sort_specific_first(&mut entry_allow);
         }
 
-        if config.default_policy == AclDefaultPolicy::Deny
-            && !allow.iter().any(|prefix| !prefix.is_loopback())
-            && !entry_allow.iter().any(|prefix| !prefix.is_loopback())
-        {
+        // A deny default with no *effective* non-loopback allow is a total
+        // lockout. An explicit deny that covers an entire allow prefix leaves
+        // that prefix with no admitted address, so it must not suppress the
+        // warning.
+        let has_effective_allow = allow
+            .iter()
+            .chain(entry_allow.iter())
+            .filter(|prefix| !prefix.is_loopback())
+            .any(|prefix| !is_fully_denied(prefix, &deny));
+        if config.default_policy == AclDefaultPolicy::Deny && !has_effective_allow {
             warnings.push(
-                "clients.default_policy = \"deny\" with no allow network outside loopback: \
-                 DNS clients (including the LAN) will be refused; add [clients.acl] allow \
-                 entries or client entry ids deliberately"
+                "clients.default_policy = \"deny\" with no effective allow network outside \
+                 loopback: DNS clients (including the LAN) will be refused; add \
+                 [clients.acl] allow entries or client entry ids deliberately"
                     .to_string(),
             );
         }
@@ -343,6 +355,17 @@ impl AclIndex {
     #[must_use]
     pub fn entry_allow_len(&self) -> usize {
         self.entry_allow.len()
+    }
+
+    /// True when an explicit or opted-in entry allow is a catch-all
+    /// (`0.0.0.0/0` or `::/0`), i.e. the effective policy still admits every
+    /// source in at least one family.
+    #[must_use]
+    pub fn has_catch_all_allow(&self) -> bool {
+        self.allow
+            .iter()
+            .chain(self.entry_allow.iter())
+            .any(|prefix| prefix.prefix_len() == 0)
     }
 
     /// Decides admission for the observed peer address.
@@ -476,23 +499,45 @@ fn parse_prefix(value: &str) -> Result<AclPrefix, String> {
 }
 
 /// Parses an entry id as an IP/CIDR allow rule. MAC, hostname, DoH path and
-/// SNI ids never parse here and therefore never admit.
-fn parse_entry_id(value: &str) -> Option<AclPrefix> {
+/// SNI ids return `Ok(None)` and therefore never admit.
+///
+/// A value whose address part is an IP literal but whose prefix part is
+/// malformed is an error: silently ignoring it would make an entry look like
+/// it admits a client when it does not.
+fn parse_entry_id(value: &str) -> Result<Option<AclPrefix>, String> {
     let value = value.trim();
     if value.is_empty() {
-        return None;
+        return Ok(None);
     }
     if let Ok(ip) = value.parse::<IpAddr>() {
-        return Some(AclPrefix::host(ip));
+        return Ok(Some(AclPrefix::host(ip)));
     }
-    // A CIDR id must start with a literal address, otherwise a DoH path such
-    // as `/dns-query/foo` would be considered structure.
-    let (address, prefix) = value.split_once('/')?;
-    if prefix.is_empty() || address.parse::<IpAddr>().is_err() {
-        return None;
+    let Some((address, prefix)) = value.split_once('/') else {
+        return Ok(None);
+    };
+    let address = address.trim();
+    let prefix = prefix.trim();
+    // A DoH path (`/dns-query/foo`) or a hostname/path id is not structure.
+    if address.parse::<IpAddr>().is_err() {
+        return Ok(None);
     }
-    let network = IpNetwork::parse(value).ok()?;
-    Some(AclPrefix::new(network))
+    if prefix.is_empty() {
+        return Err(format!(
+            "invalid client CIDR id '{value}': missing prefix length"
+        ));
+    }
+    let network = IpNetwork::parse(&format!("{address}/{prefix}"))
+        .map_err(|error| format!("invalid client CIDR id '{value}': {error}"))?;
+    Ok(Some(AclPrefix::new(network)))
+}
+
+/// True when every address in `prefix` is also covered by a deny prefix.
+fn is_fully_denied(prefix: &AclPrefix, deny: &[AclPrefix]) -> bool {
+    deny.iter().any(|denied| {
+        denied.family() == prefix.family()
+            && denied.prefix_len() <= prefix.prefix_len()
+            && denied.contains(prefix.network().network_address())
+    })
 }
 
 #[cfg(test)]
@@ -744,9 +789,59 @@ mod tests {
             index
                 .warnings()
                 .iter()
-                .any(|warning| warning.contains("no allow network outside loopback")),
+                .any(|warning| warning.contains("no effective allow network outside loopback")),
             "{:?}",
             index.warnings()
+        );
+    }
+
+    #[test]
+    fn test_acl_lockout_warning_sees_deny_covering_allow() {
+        let cfg = config(AclDefaultPolicy::Deny, &["10.1.2.0/24"], &["10.0.0.0/8"]);
+        let index = AclIndex::compile(&cfg).unwrap();
+        assert!(
+            index
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("no effective allow network")),
+            "an explicit deny covering the whole allow set is a total lockout: {:?}",
+            index.warnings()
+        );
+    }
+
+    #[test]
+    fn test_acl_entry_id_trimming_and_malformed_rejection() {
+        let mut cfg = config(AclDefaultPolicy::Deny, &[], &[]);
+        cfg.acl.allow_entry_ids = true;
+        cfg.entries = vec![entry("spaced", &[" 192.0.2.55 / 24 "])];
+        let index = AclIndex::compile(&cfg).unwrap();
+        assert_eq!(index.decide(ip("192.0.2.77")).action, AclAction::Allow);
+
+        for malformed in ["192.0.2.5/", "192.0.2.5/abc", "192.0.2.5/33"] {
+            let mut bad = config(AclDefaultPolicy::Deny, &[], &[]);
+            bad.acl.allow_entry_ids = true;
+            bad.entries = vec![entry("bad", &[malformed])];
+            let err = AclIndex::compile(&bad).unwrap_err();
+            assert!(err.field.starts_with("clients.entries[0].ids[0]"), "{err}");
+            assert!(err.message.contains(malformed), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_acl_detects_catch_all_allow() {
+        let cfg = config(AclDefaultPolicy::Deny, &["0.0.0.0/0"], &[]);
+        let index = AclIndex::compile(&cfg).unwrap();
+        assert!(index.has_catch_all_allow());
+
+        let mut entry_all = config(AclDefaultPolicy::Deny, &[], &[]);
+        entry_all.acl.allow_entry_ids = true;
+        entry_all.entries = vec![entry("all", &["::/0"])];
+        assert!(AclIndex::compile(&entry_all).unwrap().has_catch_all_allow());
+
+        assert!(
+            !AclIndex::compile(&config(AclDefaultPolicy::Deny, &["10.0.0.0/8"], &[]))
+                .unwrap()
+                .has_catch_all_allow()
         );
     }
 
