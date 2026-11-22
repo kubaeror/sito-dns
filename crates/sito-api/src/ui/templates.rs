@@ -206,6 +206,38 @@ pub struct BundledListView {
     pub last_error: Option<String>,
 }
 
+/// One catalog category shown in the filtering page catalog picker.
+#[derive(Debug, Clone)]
+pub struct CatalogCategoryView {
+    pub id: String,
+    pub name: String,
+    /// Upstream display order; categories are sorted by this value.
+    pub display_number: u32,
+    /// Number of filters in the category.
+    pub filter_count: usize,
+}
+
+/// One selectable filter from the embedded, release-bound catalog.
+///
+/// Only metadata is exposed; the filter-list body is downloaded at runtime by
+/// the existing filter scheduler after the operator selects it.
+#[derive(Debug, Clone)]
+pub struct CatalogFilterView {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub category_name: String,
+    pub description: String,
+    pub homepage: String,
+    /// `download_url`, falling back to `subscription_url` when needed.
+    pub source_url: String,
+    pub version: String,
+    pub deprecated: bool,
+    /// True when a configured list already matches this catalog entry by
+    /// case-insensitive name or URL.
+    pub already_added: bool,
+}
+
 #[derive(Template)]
 #[template(path = "filtering.html")]
 pub struct FilteringTemplate<'a> {
@@ -219,6 +251,12 @@ pub struct FilteringTemplate<'a> {
     pub custom_rules: &'a str,
     /// Metadata of the curated lists bundled into the binary plus runtime state.
     pub bundled_lists: Vec<BundledListView>,
+    /// Catalog categories in stable display order.
+    pub catalog_categories: Vec<CatalogCategoryView>,
+    /// Catalog filters in stable category/display order.
+    pub catalog_filters: Vec<CatalogFilterView>,
+    /// Total number of catalog filters, for rendering stable counts.
+    pub catalog_filter_count: usize,
 }
 
 #[derive(Template)]

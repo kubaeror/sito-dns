@@ -1105,6 +1105,426 @@ async fn test_filtering_page_redacts_subscription_urls_below_operator() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_catalog_page_views_sorted_and_already_added_flags() {
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let first = &catalog.filters[0];
+    let second = &catalog.filters[1];
+    let third = &catalog.filters[2];
+    let fourth = &catalog.filters[3];
+
+    let lists = vec![
+        sito_core::config::FilterListConfig {
+            name: catalog_list_name(first).to_uppercase(),
+            url: "https://custom.example/one.txt".to_string(),
+            enabled: true,
+            refresh_hours: None,
+        },
+        sito_core::config::FilterListConfig {
+            name: "Custom source".to_string(),
+            url: second.download_url.to_uppercase(),
+            enabled: true,
+            refresh_hours: None,
+        },
+        sito_core::config::FilterListConfig {
+            name: "Subscription source".to_string(),
+            url: fourth.subscription_url.clone(),
+            enabled: true,
+            refresh_hours: None,
+        },
+    ];
+
+    let (categories, filters) = catalog_page_views(Ok(catalog.clone()), &lists);
+
+    assert_eq!(filters.len(), catalog.filters.len());
+    let display_numbers: Vec<u32> = categories.iter().map(|c| c.display_number).collect();
+    let mut sorted_numbers = display_numbers.clone();
+    sorted_numbers.sort_unstable();
+    assert_eq!(
+        display_numbers, sorted_numbers,
+        "categories need stable order"
+    );
+    assert_eq!(
+        categories.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        vec!["general", "other", "regional", "security"]
+    );
+    assert_eq!(
+        categories.iter().map(|c| c.filter_count).sum::<usize>(),
+        catalog.filters.len()
+    );
+    let mut category_order: Vec<&str> = filters.iter().map(|f| f.category.as_str()).collect();
+    category_order.dedup();
+    assert_eq!(
+        category_order,
+        categories.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        "filters must be grouped in category display order"
+    );
+
+    let view = |id: &str| filters.iter().find(|f| f.id == id).expect("catalog filter");
+    let first_view = view(&first.id);
+    assert_eq!(first_view.name, first.name);
+    assert_eq!(first_view.source_url, first.download_url);
+    assert_eq!(first_view.category_name, "General");
+    assert_eq!(first_view.version, first.version);
+    assert!(first_view.already_added, "case-insensitive name match");
+    assert!(
+        view(&second.id).already_added,
+        "case-insensitive download URL match"
+    );
+    assert!(
+        view(&fourth.id).already_added,
+        "subscription URL match counts as already added"
+    );
+    assert!(!view(&third.id).already_added);
+
+    // A corrupt catalog degrades to an empty section, not a page failure.
+    let corrupt =
+        sito_clients::Catalog::parse("{ not json").expect_err("fixture must be invalid JSON");
+    let (categories, filters) = catalog_page_views(Err(corrupt), &lists);
+    assert!(categories.is_empty());
+    assert!(filters.is_empty());
+}
+
+#[test]
+fn test_catalog_lists_to_add_maps_dedupes_and_skips_existing() {
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let first = &catalog.filters[0];
+    let second = &catalog.filters[1];
+    let third = &catalog.filters[2];
+    let fourth = &catalog.filters[3];
+
+    let existing = vec![
+        sito_core::config::FilterListConfig {
+            name: catalog_list_name(first).to_lowercase(),
+            url: "https://custom.example/one.txt".to_string(),
+            enabled: true,
+            refresh_hours: None,
+        },
+        sito_core::config::FilterListConfig {
+            name: "Custom source".to_string(),
+            url: second.download_url.to_lowercase(),
+            enabled: true,
+            refresh_hours: None,
+        },
+        sito_core::config::FilterListConfig {
+            name: "Subscription source".to_string(),
+            url: fourth.subscription_url.clone(),
+            enabled: true,
+            refresh_hours: None,
+        },
+    ];
+
+    let selected = vec![
+        first.id.clone(),
+        second.id.clone(),
+        third.id.clone(),
+        third.id.clone(),
+    ];
+    let additions = catalog_lists_to_add(&catalog, &existing, &selected).expect("valid selection");
+    assert_eq!(
+        additions.len(),
+        1,
+        "already-added and repeated ids are skipped"
+    );
+    assert_eq!(additions[0].name, catalog_list_name(third));
+    assert_eq!(additions[0].url, catalog_filter_url(third));
+    assert!(additions[0].enabled);
+    assert_eq!(additions[0].refresh_hours, None);
+
+    let all_present = vec![first.id.clone(), second.id.clone(), fourth.id.clone()];
+    assert!(
+        catalog_lists_to_add(&catalog, &existing, &all_present)
+            .expect("valid selection")
+            .is_empty(),
+        "selecting only already-added entries must add nothing"
+    );
+
+    // Catalog names containing `/` are stored under a routing-safe name.
+    let slashed = catalog
+        .filter_by_id("hagezi_windows_office_tracker_blocklist")
+        .expect("catalog entry");
+    assert!(slashed.name.contains('/'));
+    let stored = catalog_list_name(slashed);
+    assert!(!stored.contains('/'));
+    assert!(crate::handlers::filtering::valid_filter_list_name(&stored));
+    let additions = catalog_lists_to_add(&catalog, &[], std::slice::from_ref(&slashed.id))
+        .expect("valid selection");
+    assert_eq!(additions[0].name, stored);
+}
+
+#[test]
+fn test_catalog_lists_to_add_rejects_unknown_deprecated_and_oversize() {
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+
+    let unknown = catalog_lists_to_add(&catalog, &[], &["not_a_catalog_filter".to_string()]);
+    assert!(matches!(
+        unknown,
+        Err(CatalogSelectionError::Unknown(id)) if id == "not_a_catalog_filter"
+    ));
+
+    let mut deprecated_catalog = catalog.clone();
+    deprecated_catalog.filters[0].deprecated = true;
+    let deprecated = catalog_lists_to_add(
+        &deprecated_catalog,
+        &[],
+        &[deprecated_catalog.filters[0].id.clone()],
+    );
+    assert!(matches!(
+        deprecated,
+        Err(CatalogSelectionError::Deprecated(id)) if id == deprecated_catalog.filters[0].id
+    ));
+
+    let over_limit: Vec<String> = catalog
+        .filters
+        .iter()
+        .take(MAX_CATALOG_SELECTION + 1)
+        .map(|filter| filter.id.clone())
+        .collect();
+    assert!(matches!(
+        catalog_lists_to_add(&catalog, &[], &over_limit),
+        Err(CatalogSelectionError::TooMany)
+    ));
+
+    // Repeating an id does not consume the cap twice.
+    let mut at_limit: Vec<String> = catalog
+        .filters
+        .iter()
+        .take(MAX_CATALOG_SELECTION)
+        .map(|filter| filter.id.clone())
+        .collect();
+    at_limit.extend(at_limit.clone());
+    assert_eq!(
+        catalog_lists_to_add(&catalog, &[], &at_limit)
+            .expect("selection at the cap")
+            .len(),
+        MAX_CATALOG_SELECTION
+    );
+}
+
+#[test]
+fn test_selected_catalog_ids_reads_only_selected_field() {
+    let pairs = vec![
+        ("csrf_token".to_string(), "csrf-value".to_string()),
+        ("selected".to_string(), " first ".to_string()),
+        ("other".to_string(), "ignored".to_string()),
+        ("selected".to_string(), String::new()),
+        ("selected".to_string(), "second".to_string()),
+    ];
+    assert_eq!(selected_catalog_ids(&pairs), vec!["first", "second"]);
+}
+
+#[tokio::test]
+async fn test_filtering_add_catalog_handler_adds_multiple_lists_once() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_catalog_add_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    ctx.auth_mgr
+        .create_user("oper_user", "pass", Role::Operator)
+        .await;
+    let LoginResult::Success(session) = ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1").await
+    else {
+        panic!("login failed");
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
+
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let first = &catalog.filters[0];
+    let second = &catalog.filters[1];
+    let pairs = vec![
+        ("csrf_token".to_string(), "ignored".to_string()),
+        ("selected".to_string(), first.id.clone()),
+        ("selected".to_string(), second.id.clone()),
+        // A repeated id must not add a second copy.
+        ("selected".to_string(), first.id.clone()),
+    ];
+
+    let resp =
+        filtering_add_catalog_handler(State(ctx.clone()), headers.clone(), Form(pairs.clone()))
+            .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let lists = ctx.config.load().filtering.lists.clone();
+    assert_eq!(lists.len(), 2);
+    assert_eq!(lists[0].name, catalog_list_name(first));
+    assert_eq!(lists[0].url, catalog_filter_url(first));
+    assert!(lists[0].enabled);
+    assert_eq!(lists[0].refresh_hours, None);
+    assert_eq!(lists[1].name, catalog_list_name(second));
+    assert_eq!(lists[1].url, catalog_filter_url(second));
+
+    // Selecting the same entries again is a no-op, not a conflict.
+    let resp = filtering_add_catalog_handler(State(ctx.clone()), headers, Form(pairs)).await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        ctx.config.load().filtering.lists.len(),
+        2,
+        "already-added catalog lists must not be duplicated"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_filtering_add_catalog_handler_rejects_invalid_selection_without_partial_write() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_catalog_reject_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    ctx.auth_mgr
+        .create_user("oper_user", "pass", Role::Operator)
+        .await;
+    let LoginResult::Success(session) = ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1").await
+    else {
+        panic!("login failed");
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
+
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let valid = catalog.filters[0].id.clone();
+
+    // One unknown id invalidates the whole batch.
+    let unknown = vec![
+        ("selected".to_string(), valid.clone()),
+        ("selected".to_string(), "not_a_catalog_filter".to_string()),
+    ];
+    let resp =
+        filtering_add_catalog_handler(State(ctx.clone()), headers.clone(), Form(unknown)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        ctx.config.load().filtering.lists.is_empty(),
+        "an unknown id must not partially write the selection"
+    );
+
+    // The selection cap is enforced at the handler boundary too.
+    let over_limit: Vec<(String, String)> = catalog
+        .filters
+        .iter()
+        .take(MAX_CATALOG_SELECTION + 1)
+        .map(|filter| ("selected".to_string(), filter.id.clone()))
+        .collect();
+    let resp =
+        filtering_add_catalog_handler(State(ctx.clone()), headers.clone(), Form(over_limit)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        ctx.config.load().filtering.lists.is_empty(),
+        "an oversized selection must not write configuration"
+    );
+
+    // Deprecated entries are rejected even when the id is otherwise valid.
+    let mut deprecated_catalog = catalog.clone();
+    deprecated_catalog.filters[0].deprecated = true;
+    let resp = apply_catalog_selection(
+        &ctx,
+        &deprecated_catalog,
+        &[deprecated_catalog.filters[0].id.clone()],
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        ctx.config.load().filtering.lists.is_empty(),
+        "a deprecated selection must not write configuration"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_filtering_add_catalog_handler_rbac_and_empty_selection() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_catalog_rbac_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    // Unauthenticated callers are redirected to the login page.
+    let resp =
+        filtering_add_catalog_handler(State(ctx.clone()), HeaderMap::new(), Form(vec![])).await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers().get(axum::http::header::LOCATION).unwrap(),
+        "/login"
+    );
+
+    ctx.auth_mgr
+        .create_user("view_user", "pass", Role::Viewer)
+        .await;
+    ctx.auth_mgr
+        .create_user("oper_user", "pass", Role::Operator)
+        .await;
+    let LoginResult::Success(view_session) =
+        ctx.auth_mgr.login("view_user", "pass", "127.0.0.1").await
+    else {
+        panic!("viewer login failed");
+    };
+    let LoginResult::Success(oper_session) =
+        ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1").await
+    else {
+        panic!("operator login failed");
+    };
+    let mut view_headers = HeaderMap::new();
+    view_headers.insert(COOKIE, view_session.to_cookie_header().parse().unwrap());
+    let mut oper_headers = HeaderMap::new();
+    oper_headers.insert(COOKIE, oper_session.to_cookie_header().parse().unwrap());
+
+    let resp = filtering_add_catalog_handler(State(ctx.clone()), view_headers, Form(vec![])).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = filtering_add_catalog_handler(State(ctx.clone()), oper_headers, Form(vec![])).await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(
+        ctx.config.load().filtering.lists.is_empty(),
+        "an empty selection must not change configuration"
+    );
+    assert!(
+        !ctx.config_path.exists(),
+        "an empty selection must not persist configuration"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_filtering_add_catalog_apply_failure_persists_nothing() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_catalog_persist_err_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let mut ctx = mock_context(&temp_dir).await;
+
+    ctx.auth_mgr
+        .create_user("oper_user", "pass", Role::Operator)
+        .await;
+    let LoginResult::Success(session) = ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1").await
+    else {
+        panic!("login failed");
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
+    ctx.config_path = std::path::PathBuf::from("/proc/forbidden_ui_test/config.toml");
+
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let selected: Vec<(String, String)> = catalog
+        .filters
+        .iter()
+        .take(2)
+        .map(|filter| ("selected".to_string(), filter.id.clone()))
+        .collect();
+    let resp = filtering_add_catalog_handler(State(ctx.clone()), headers, Form(selected)).await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        ctx.config.load().filtering.lists.is_empty(),
+        "a failed catalog apply must persist nothing: {:?}",
+        ctx.config.load().filtering.lists
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 #[tokio::test]
 async fn test_ui_handlers_persist_failure_returns_500_and_preserves_in_memory_state() {
     let temp_dir =
