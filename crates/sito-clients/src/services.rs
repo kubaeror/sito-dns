@@ -13,6 +13,11 @@ use tracing::{error, warn};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRegistry {
     services: HashMap<String, HashSet<String>>,
+    /// Release-bound catalog service rules, kept as a separate overlay so a
+    /// later `[integrations.lists]` refresh can replace the bundled/downloaded
+    /// map without discarding the embedded catalog services.
+    #[serde(skip)]
+    catalog_services: HashMap<String, HashSet<String>>,
     #[serde(skip)]
     lists: Vec<BundledList>,
 }
@@ -41,6 +46,7 @@ impl ServiceRegistry {
     pub fn empty() -> Self {
         Self {
             services: HashMap::new(),
+            catalog_services: HashMap::new(),
             lists: Vec::new(),
         }
     }
@@ -61,6 +67,11 @@ impl ServiceRegistry {
                 reason: e.to_string(),
             })?;
         registry.lists = vec![list];
+        // The bundled `services.json` is a minimal fallback; the release-bound
+        // catalog carries the full AdGuard service set. Merge it here so the
+        // runtime blocking engine, config validation and the UI all see the
+        // same service ids.
+        registry.attach_catalog_overlay();
         Ok(registry)
     }
 
@@ -83,7 +94,7 @@ impl ServiceRegistry {
         &self.lists
     }
 
-    /// Number of services in the registry.
+    /// Number of services in the registry, including catalog overlay services.
     ///
     /// This counts service ids, not blockable rules: a registry whose service
     /// entries all have empty rule arrays has a non-zero service count but
@@ -92,22 +103,86 @@ impl ServiceRegistry {
     #[must_use]
     pub fn service_count(&self) -> usize {
         self.services.len()
+            + self
+                .catalog_services
+                .keys()
+                .filter(|id| !self.services.contains_key(*id))
+                .count()
     }
 
-    /// Number of usable domain rules across every service.
+    /// Number of usable domain rules across every service, including catalog
+    /// overlay rules (same-id rules are counted once).
     ///
     /// This is the effective blocking coverage of the registry: regex/wildcard
     /// rules and malformed domains were dropped at parse time and are not
     /// counted.
     #[must_use]
     pub fn rule_count(&self) -> usize {
+        let mut count = self.base_rule_count();
+        for (id, rules) in &self.catalog_services {
+            count += self
+                .services
+                .get(id)
+                .map_or(rules.len(), |base| rules.difference(base).count());
+        }
+        count
+    }
+
+    /// Number of usable rules in the bundled/downloaded map only, excluding
+    /// the catalog overlay. Refresh truncation guards compare this value so the
+    /// catalog overlay cannot make a broken download look healthy.
+    pub(crate) fn base_rule_count(&self) -> usize {
         self.services.values().map(HashSet::len).sum()
     }
 
-    /// Whether a service id is present in this registry.
+    /// Whether a service id is present in this registry or the catalog overlay.
     #[must_use]
     pub fn contains_service(&self, service: &str) -> bool {
-        self.services.contains_key(&service.to_ascii_lowercase())
+        let key = service.to_ascii_lowercase();
+        self.services.contains_key(&key) || self.catalog_services.contains_key(&key)
+    }
+
+    /// Adds the release-bound catalog service rules as an overlay.
+    ///
+    /// Catalog rules pass through the same literal-domain cleaner as bundled
+    /// and downloaded service lists: regex/wildcard rules and malformed
+    /// domains are dropped with a warning. Catalog-only ids are still recorded
+    /// even when every rule is unsupported, so the id resolves and can be
+    /// selected (it simply blocks nothing).
+    ///
+    /// A corrupt catalog is logged and leaves the bundled registry untouched;
+    /// startup then continues on the minimal fallback instead of aborting.
+    pub(crate) fn attach_catalog_overlay(&mut self) {
+        let catalog = match crate::catalog::Catalog::embedded() {
+            Ok(catalog) => catalog,
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Embedded service catalog is invalid; service registry keeps the bundled fallback only"
+                );
+                return;
+            }
+        };
+
+        let mut skipped_rules = 0usize;
+        let mut overlay: HashMap<String, HashSet<String>> =
+            HashMap::with_capacity(catalog.services.len());
+        for service in catalog.services() {
+            let entry = overlay.entry(service.id.to_ascii_lowercase()).or_default();
+            for rule in &service.rules {
+                // The catalog is release-bound and validated at build time;
+                // cleaning still drops unsupported shapes, but per-rule
+                // warnings would repeat on every config validation pass. The
+                // summary below reports the count once.
+                if let Some(domain) =
+                    clean_domain_rule_logged(rule, &service.id, &mut skipped_rules, false)
+                {
+                    entry.insert(domain);
+                }
+            }
+        }
+        log_skipped_rules(skipped_rules);
+        self.catalog_services = overlay;
     }
 
     /// Parse service definitions from a JSON string.
@@ -133,6 +208,7 @@ impl ServiceRegistry {
             log_skipped_rules(skipped_rules);
             return Ok(Self {
                 services: normalized,
+                catalog_services: HashMap::new(),
                 lists: Vec::new(),
             });
         }
@@ -150,6 +226,7 @@ impl ServiceRegistry {
         log_skipped_rules(skipped_rules);
         Ok(Self {
             services,
+            catalog_services: HashMap::new(),
             lists: Vec::new(),
         })
     }
@@ -161,18 +238,24 @@ impl ServiceRegistry {
     /// label instead of a scan over every rule.
     pub fn is_service_domain(&self, service: &str, query_domain: &str) -> bool {
         let svc_key = service.to_ascii_lowercase();
-        let Some(rules) = self.services.get(&svc_key) else {
+        let base = self.services.get(&svc_key);
+        let overlay = self.catalog_services.get(&svc_key);
+        if base.is_none() && overlay.is_none() {
             return false;
-        };
+        }
 
         let q = query_domain.trim_end_matches('.').to_ascii_lowercase();
+        let matches = |domain: &str| {
+            base.is_some_and(|rules| rules.contains(domain))
+                || overlay.is_some_and(|rules| rules.contains(domain))
+        };
 
-        if rules.contains(&q) {
+        if matches(&q) {
             return true;
         }
         let mut suffix = q.as_str();
         while let Some((_, parent)) = suffix.split_once('.') {
-            if rules.contains(parent) {
+            if matches(parent) {
                 return true;
             }
             suffix = parent;
@@ -208,6 +291,17 @@ fn log_skipped_rules(skipped: usize) {
 /// regex rules (`/.../`), wildcards (`*`, `?`) and malformed domains. Storing
 /// them as domains would silently never match.
 fn clean_domain_rule(rule: &str, service: &str, skipped: &mut usize) -> Option<String> {
+    clean_domain_rule_logged(rule, service, skipped, true)
+}
+
+/// Shared cleaning implementation; `log` controls per-rule warnings so the
+/// release-bound catalog overlay can report only an aggregate count.
+fn clean_domain_rule_logged(
+    rule: &str,
+    service: &str,
+    skipped: &mut usize,
+    log: bool,
+) -> Option<String> {
     let trimmed = rule.trim();
     if trimmed.is_empty() {
         return None;
@@ -217,11 +311,13 @@ fn clean_domain_rule(rule: &str, service: &str, skipped: &mut usize) -> Option<S
         || trimmed.contains('?')
         || trimmed.contains('~')
     {
-        warn!(
-            service = %service,
-            rule = %trimmed,
-            "Skipping unsupported regex/wildcard service rule"
-        );
+        if log {
+            warn!(
+                service = %service,
+                rule = %trimmed,
+                "Skipping unsupported regex/wildcard service rule"
+            );
+        }
         *skipped += 1;
         return None;
     }
@@ -246,11 +342,13 @@ fn clean_domain_rule(rule: &str, service: &str, skipped: &mut usize) -> Option<S
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
-            warn!(
-                service = %service,
-                rule = %trimmed,
-                "Skipping malformed service domain rule"
-            );
+            if log {
+                warn!(
+                    service = %service,
+                    rule = %trimmed,
+                    "Skipping malformed service domain rule"
+                );
+            }
             *skipped += 1;
             return None;
         }
@@ -276,6 +374,80 @@ mod tests {
 
         assert!(reg.is_service_domain("steam", "steampowered.com"));
         assert!(reg.is_service_domain("discord", "discord.gg"));
+    }
+
+    #[test]
+    fn test_catalog_services_are_merged_into_bundled_registry() {
+        let catalog = crate::catalog::Catalog::embedded().expect("embedded catalog must be valid");
+        let reg = ServiceRegistry::try_bundled().expect("bundled services must load");
+
+        // Every release-bound catalog id resolves and is selectable.
+        for service in catalog.services() {
+            assert!(
+                reg.contains_service(&service.id),
+                "catalog service '{}' must be present in the runtime registry",
+                service.id
+            );
+        }
+
+        // A catalog-only service actually blocks matching domains and
+        // subdomains through the existing suffix matcher.
+        assert!(
+            catalog.service_by_id("4chan").is_some(),
+            "4chan is catalog-only, not in the bundled services.json"
+        );
+        assert!(reg.is_service_domain("4chan", "4chan.org"));
+        assert!(reg.is_service_domain("4chan", "boards.4chan.org"));
+        assert!(!reg.is_service_domain("4chan", "example.com"));
+
+        // The bundled fallback still works, including ids the catalog omits.
+        assert!(
+            catalog.service_by_id("zoom").is_none(),
+            "zoom is a bundled-only fallback service"
+        );
+        assert!(reg.contains_service("zoom"));
+        assert!(reg.is_service_domain("zoom", "zoom.us"));
+        assert!(!reg.is_service_domain("zoom", "example.com"));
+
+        // Overlapping bundled/catalog services keep their bundled coverage.
+        assert!(reg.is_service_domain("tiktok", "tiktok.com"));
+        assert!(reg.is_service_domain("tiktok", "www.musical.ly"));
+
+        let bundled = ServiceRegistry::from_json(crate::bundled::SERVICES_JSON)
+            .expect("bundled services JSON must parse");
+        let catalog_only = catalog
+            .services()
+            .filter(|service| !bundled.contains_service(&service.id))
+            .count();
+        assert_eq!(
+            reg.service_count(),
+            bundled.service_count() + catalog_only,
+            "the merged registry is the union of bundled and catalog service ids"
+        );
+        assert!(
+            reg.rule_count() > bundled.rule_count(),
+            "catalog rules must add blocking coverage"
+        );
+    }
+
+    #[test]
+    fn test_catalog_overlay_cleans_unsupported_rule_shapes() {
+        let reg = ServiceRegistry::try_bundled().expect("bundled services must load");
+
+        // The tiktok catalog entry contains wildcard rules that the literal
+        // suffix matcher cannot represent. They are dropped with a warning,
+        // while its simple `||domain^` rules still block.
+        assert!(reg.is_service_domain("tiktok", "tiktok.com"));
+        assert!(reg.is_service_domain("tiktok", "tiktokv.com"));
+        assert!(
+            !reg.is_service_domain("tiktok", "p16-tiktok-abc.ibyteimg.com"),
+            "wildcard-only catalog rules must not be stored as literal domains"
+        );
+
+        // Amazon has a `$dnstype` modifier and wildcard rules; the literal
+        // rules remain usable after the same cleaning path.
+        assert!(reg.is_service_domain("amazon", "amazon.com"));
+        assert!(!reg.is_service_domain("amazon", "awsdns-12.com"));
     }
 
     #[test]

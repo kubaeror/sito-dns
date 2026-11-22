@@ -228,7 +228,7 @@ impl RuntimeLists {
                     last_refresh_unix: None,
                     last_attempt_unix: None,
                     last_error: None,
-                    entries: list.entries,
+                    entries: services.service_count() as u64,
                     bundled: true,
                 },
             );
@@ -407,9 +407,14 @@ impl RuntimeLists {
         // usable domain rules that actually block queries.
         let (status_entries, effective, new_parental, new_services) = if category_key == "services"
         {
-            let registry = ServiceRegistry::from_json(content).map_err(|e| e.to_string())?;
+            let mut registry = ServiceRegistry::from_json(content).map_err(|e| e.to_string())?;
+            // The truncation/emptiness guard applies to the downloaded content
+            // only. The catalog overlay is added afterwards so a broken
+            // download is still rejected even though the embedded catalog
+            // would otherwise mask its zero rules.
+            let effective = registry.base_rule_count() as u64;
+            registry.attach_catalog_overlay();
             let status_entries = registry.service_count() as u64;
-            let effective = registry.rule_count() as u64;
             (status_entries, effective, None, Some(Arc::new(registry)))
         } else {
             let mut parental = (*self.parental.load_full()).clone();
@@ -440,7 +445,7 @@ impl RuntimeLists {
             statuses.get(&category_key).cloned()
         };
         let previous = if new_services.is_some() {
-            self.services.load().rule_count() as u64
+            self.services.load().base_rule_count() as u64
         } else {
             previous_status.as_ref().map_or(0, |status| status.entries)
         };
@@ -533,9 +538,10 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_services_json_replaces_registry() {
+    fn test_apply_services_json_replaces_downloaded_registry_and_keeps_catalog_overlay() {
         let store = store();
         assert!(store.services().is_service_domain("tiktok", "tiktok.com"));
+        assert!(store.services().is_service_domain("zoom", "zoom.us"));
 
         store
             .apply_content(
@@ -546,7 +552,15 @@ mod tests {
 
         let services = store.services();
         assert!(services.is_service_domain("custom", "custom.example"));
-        assert!(!services.is_service_domain("tiktok", "tiktok.com"));
+        assert!(
+            !services.is_service_domain("zoom", "zoom.us"),
+            "downloaded services content replaces the bundled-only fallback"
+        );
+        assert!(
+            services.is_service_domain("tiktok", "tiktok.com"),
+            "the catalog overlay must survive a services refresh"
+        );
+        assert!(services.is_service_domain("4chan", "4chan.org"));
     }
 
     #[test]
@@ -754,10 +768,13 @@ mod tests {
 
         let live = store.services();
         assert!(live.is_service_domain("tiktok", "tiktok.com"));
-        assert_eq!(live.service_count(), 35);
+        let expected_services = ServiceRegistry::try_bundled()
+            .expect("bundled services must load")
+            .service_count();
+        assert_eq!(live.service_count(), expected_services);
         let status = services_status(&store);
         assert!(status.bundled, "rejected content must keep the bundled row");
-        assert_eq!(status.entries, 35);
+        assert_eq!(status.entries, expected_services as u64);
     }
 
     #[test]
@@ -793,7 +810,7 @@ mod tests {
         }
         let first = format!(r#"[{{"id": "old", "rules": [{rules}]}}]"#);
         store.apply_content("services", &first).unwrap();
-        assert_eq!(store.services().rule_count(), 10);
+        assert_eq!(store.services().base_rule_count(), 10);
 
         // Four service ids (up from one) but only four rules: effective
         // coverage drops by more than half, which the service-count baseline
@@ -806,14 +823,22 @@ mod tests {
         ]"#;
         let err = store.apply_content("services", shrunk).unwrap_err();
         assert!(err.contains(">50% shrink"), "unexpected error: {err}");
-        assert_eq!(store.services().rule_count(), 10);
+        assert_eq!(store.services().base_rule_count(), 10);
         assert!(store.services().is_service_domain("old", "d0.example"));
 
         // The operator path may accept the intentional shrink.
         store.apply_content_forced("services", shrunk).unwrap();
-        assert_eq!(store.services().rule_count(), 4);
-        assert_eq!(store.services().service_count(), 4);
-        assert_eq!(services_status(&store).entries, 4);
+        assert_eq!(store.services().base_rule_count(), 4);
+        let merged_services = store.services();
+        assert!(
+            merged_services.service_count() >= 142,
+            "the catalog overlay must survive a downloaded services refresh"
+        );
+        assert!(merged_services.is_service_domain("4chan", "4chan.org"));
+        assert_eq!(
+            services_status(&store).entries,
+            merged_services.service_count() as u64
+        );
     }
 
     #[test]

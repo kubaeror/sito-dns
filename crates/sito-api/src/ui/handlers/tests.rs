@@ -4027,9 +4027,7 @@ fn test_clients_service_views_groups_and_catalog() {
     );
 
     let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
-    let registry =
-        sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
-    let views = clients_service_views_from(&clients, Ok(catalog.clone()), Some(&registry));
+    let views = clients_service_views_from(&clients, Ok(catalog.clone()));
 
     assert_eq!(
         views
@@ -4077,6 +4075,11 @@ fn test_clients_service_views_groups_and_catalog() {
         let mut previous_name = String::new();
         for service in &group.services {
             assert_eq!(service.group, group.id, "a service stays in its group");
+            assert!(
+                service.available,
+                "every embedded catalog service must be selectable: {}",
+                service.id
+            );
             let sort_key = service.name.to_lowercase();
             assert!(
                 sort_key >= previous_name,
@@ -4097,24 +4100,18 @@ fn test_clients_service_views_groups_and_catalog() {
     let tiktok_catalog = catalog.service_by_id("tiktok").expect("tiktok metadata");
     assert_eq!(tiktok.name, tiktok_catalog.name);
     assert_eq!(tiktok.rule_count, tiktok_catalog.rules.len());
-    assert!(
-        tiktok.available,
-        "tiktok is supported by the bundled service registry"
-    );
+    assert!(tiktok.available);
 
-    let unavailable = catalog
-        .services()
-        .find(|service| !registry.contains_service(&service.id))
-        .expect("the catalog contains services beyond the bundled registry");
-    let unavailable_view = views
+    // A catalog-only id (not in the minimal bundled services.json) is offered.
+    let catalog_only = views
         .catalog_groups
         .iter()
         .flat_map(|group| &group.services)
-        .find(|service| service.id == unavailable.id)
-        .expect("every catalog service must render");
+        .find(|service| service.id == "4chan")
+        .expect("catalog-only services must render");
     assert!(
-        !unavailable_view.available,
-        "catalog-only services must be marked unavailable for the picker"
+        catalog_only.available,
+        "catalog-only services must be selectable: {catalog_only:?}"
     );
 }
 
@@ -4131,7 +4128,7 @@ fn test_clients_service_views_corrupt_catalog_degrades() {
     let corrupt = sito_clients::Catalog::parse("{ not json")
         .expect_err("fixture must be invalid catalog JSON");
 
-    let views = clients_service_views_from(&clients, Err(corrupt), None);
+    let views = clients_service_views_from(&clients, Err(corrupt));
     assert_eq!(
         views
             .groups
@@ -4206,7 +4203,9 @@ async fn test_clients_group_services_handler_adds_and_removes() {
         ("csrf_token".to_string(), "ignored".to_string()),
         ("group".to_string(), "kids".to_string()),
         ("selected".to_string(), "tiktok".to_string()),
-        ("selected".to_string(), "disneyplus".to_string()),
+        // A catalog-only service (not in bundled services.json) must be
+        // accepted and persisted.
+        ("selected".to_string(), "4chan".to_string()),
     ];
     let resp = clients_group_services_handler(State(ctx.clone()), headers, Form(pairs)).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -4215,8 +4214,8 @@ async fn test_clients_group_services_handler_adds_and_removes() {
     let kids = after.groups.get("kids").expect("kids group must remain");
     assert_eq!(
         blocked_service_ids(kids),
-        vec!["tiktok", "disneyplus"],
-        "deselected services are removed and new ones appended"
+        vec!["tiktok", "4chan"],
+        "deselected services are removed and new catalog-only services appended"
     );
     assert!(
         kids.blocked_services
@@ -4233,6 +4232,11 @@ async fn test_clients_group_services_handler_adds_and_removes() {
     assert!(
         ctx.config_path.exists(),
         "a successful selection must persist config.toml"
+    );
+    let persisted = std::fs::read_to_string(&ctx.config_path).expect("persisted config.toml");
+    assert!(
+        persisted.contains("service = \"4chan\""),
+        "the selected catalog-only service must be persisted in blocked_services: {persisted}"
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -4380,20 +4384,13 @@ async fn test_clients_group_services_handler_preserves_schedules() {
 #[test]
 fn test_group_blocked_services_matches_ids_case_insensitively() {
     let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
-    let registry =
-        sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
     let existing = vec![sito_clients::BlockedServiceConfig {
         service: "TikTok".to_string(),
         schedule: Some(sito_clients::Schedule::parse("0 8 * * *").unwrap()),
     }];
 
-    let merged = group_blocked_services(
-        &existing,
-        &["tiktok".to_string()],
-        &catalog,
-        Some(&registry),
-    )
-    .expect("a case variant of a configured service must be accepted");
+    let merged = group_blocked_services(&existing, &["tiktok".to_string()], &catalog)
+        .expect("a case variant of a configured service must be accepted");
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].service, "TikTok");
     assert_eq!(
@@ -4411,7 +4408,6 @@ fn test_group_blocked_services_matches_ids_case_insensitively() {
             &existing,
             &["tiktok".to_string(), "TikTok".to_string()],
             &catalog,
-            Some(&registry),
         ),
         Err(GroupServicesError::DuplicateService("TikTok".to_string()))
     );
@@ -4501,27 +4497,6 @@ async fn test_clients_group_services_handler_rejects_unknown_group_and_service()
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    // Known catalog id that the bundled registry cannot enforce.
-    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
-    let registry =
-        sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
-    let catalog_only = catalog
-        .services()
-        .find(|service| !registry.contains_service(&service.id))
-        .expect("catalog has services beyond the bundled registry")
-        .id
-        .clone();
-    let resp = clients_group_services_handler(
-        State(ctx.clone()),
-        headers.clone(),
-        Form(vec![
-            ("group".to_string(), "kids".to_string()),
-            ("selected".to_string(), catalog_only),
-        ]),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
     // Every failed request leaves the previous selection intact.
     let after = load_clients_config(&ctx);
     let kids = after.groups.get("kids").expect("kids group must remain");
@@ -4529,6 +4504,84 @@ async fn test_clients_group_services_handler_rejects_unknown_group_and_service()
     assert!(
         !ctx.config_path.exists(),
         "validation failures must not persist configuration"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_group_blocked_services_accepts_every_catalog_service() {
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let selected: Vec<String> = catalog
+        .services()
+        .map(|service| service.id.clone())
+        .collect();
+    assert_eq!(
+        selected.len(),
+        142,
+        "the pinned catalog currently has 142 services"
+    );
+
+    let merged = group_blocked_services(&[], &selected, &catalog)
+        .expect("every embedded catalog service must be accepted");
+    assert_eq!(merged.len(), catalog.services.len());
+    assert_eq!(
+        merged
+            .iter()
+            .map(|blocked| blocked.service.as_str())
+            .collect::<Vec<_>>(),
+        selected,
+        "new selections keep the submitted catalog order"
+    );
+    assert!(
+        merged.iter().all(|blocked| blocked.schedule.is_none()),
+        "new catalog services start without a schedule"
+    );
+}
+
+#[tokio::test]
+async fn test_clients_group_services_handler_accepts_every_catalog_service() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_group_services_all_catalog_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    let headers = operator_form_headers(&ctx).await;
+
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let mut pairs = vec![("group".to_string(), "default".to_string())];
+    pairs.extend(
+        catalog
+            .services()
+            .map(|service| ("selected".to_string(), service.id.clone())),
+    );
+    let selected_count = catalog.services.len();
+
+    let resp = clients_group_services_handler(State(ctx.clone()), headers, Form(pairs)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "every embedded catalog service must be accepted in one selection"
+    );
+
+    let after = load_clients_config(&ctx);
+    let default_group = after
+        .groups
+        .get("default")
+        .expect("the implied default must be created");
+    assert_eq!(default_group.blocked_services.len(), selected_count);
+    assert_eq!(
+        default_group
+            .blocked_services
+            .iter()
+            .map(|blocked| blocked.service.as_str())
+            .collect::<Vec<_>>(),
+        catalog
+            .services()
+            .map(|service| service.id.as_str())
+            .collect::<Vec<_>>(),
+        "all catalog ids must be persisted in catalog order"
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -4598,10 +4651,8 @@ async fn test_clients_group_services_handler_rejects_oversized_selection() {
     let selected: Vec<String> = (0..=catalog.services.len())
         .map(|index| format!("service_{index}"))
         .collect();
-    let registry =
-        sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
     assert_eq!(
-        group_blocked_services(&[], &selected, &catalog, Some(&registry)),
+        group_blocked_services(&[], &selected, &catalog),
         Err(GroupServicesError::TooMany(
             MAX_GROUP_SERVICES_SELECTION.min(catalog.services.len())
         )),

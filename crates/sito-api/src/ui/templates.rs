@@ -86,9 +86,9 @@ pub struct CatalogServiceViewItem {
     pub group: String,
     /// Number of embedded `||domain^` rules for this service.
     pub rule_count: usize,
-    /// True when the bundled service registry can enforce this id. If the
-    /// registry itself is unavailable, every entry is marked available and the
-    /// handler falls back to catalog-only validation.
+    /// True when the id can be selected. Every embedded catalog service is
+    /// available because the runtime service registry includes the catalog
+    /// overlay; the field stays for picker filtering/compatibility.
     pub available: bool,
 }
 
