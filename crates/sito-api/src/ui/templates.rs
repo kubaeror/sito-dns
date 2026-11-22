@@ -461,6 +461,24 @@ pub struct AccountTemplate<'a> {
     pub new_token_scope: &'a str,
 }
 
+/// One client-network candidate rendered by the first-boot ACL step.
+#[derive(Debug, Clone)]
+pub struct AclCandidateView {
+    pub id: String,
+    pub interface: String,
+    pub address: String,
+    pub prefix: u8,
+    pub family: &'static str,
+    pub class: &'static str,
+    pub class_label: &'static str,
+    pub source_label: &'static str,
+    /// True for loopback (fixed) and prefixes the base template already allows.
+    pub selected: bool,
+    pub is_loopback: bool,
+    pub is_public: bool,
+    pub is_bridge_or_tunnel: bool,
+}
+
 #[derive(Template)]
 #[template(path = "wizard.html")]
 pub struct WizardTemplate<'a> {
@@ -476,6 +494,22 @@ pub struct WizardTemplate<'a> {
     pub setup_token: &'a str,
     /// Optional re-authentication ticket supplied by an Admin.
     pub reauth_token: &'a str,
+    /// True only for a genuine fresh install
+    /// (`is_first_run && !is_setup_complete()`). Recovery runs never render
+    /// the ACL step, so an existing `[clients.acl]` is never rewritten.
+    pub fresh_install_acl: bool,
+    /// Detected interface candidates plus loopback; only loopback/prefilled
+    /// entries are selected.
+    pub acl_candidates: Vec<AclCandidateView>,
+    /// Detected network candidates that are already allowed by the base
+    /// template but not exposed by a live interface.
+    pub acl_prefilled: Vec<AclCandidateView>,
+    /// The base template explicitly sets `default_policy = "allow"`.
+    pub acl_template_explicit_allow: bool,
+    /// The base template has `clients.acl.allow_entry_ids = true`, which the
+    /// fresh-install step deliberately does not carry through silently.
+    pub acl_base_allow_entry_ids: bool,
+    pub acl_manual: &'a str,
 }
 
 #[cfg(test)]

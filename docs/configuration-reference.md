@@ -89,12 +89,15 @@ allow_plaintext_doh = false
 | `allow_plaintext_doh` | boolean | `false` | Allow binding the plaintext DoH listener on non-loopback addresses. When `false`, plaintext DoH is restricted to loopback. |
 
 > [!WARNING]
-> `dns.bind` defaults to `["0.0.0.0", "::"]`, and 2.0 has no DNS client allow-list: a default-deny DNS client ACL is deferred, not part of Phase 2
-> core hardening. `rate_limit_per_ip` only limits rate; it does not authorize
-> clients. A wildcard bind therefore accepts recursive queries from any source
-> that can reach the host. Restrict the DNS ports to your LAN with a host
-> firewall, or bind specific LAN addresses. The server emits a startup warning
-> when a wildcard DNS bind is combined with an enabled DNS port.
+> `dns.bind` defaults to `["0.0.0.0", "::"]`. The ADR-0011 source-address ACL is
+> available in 2.0, but its typed default is `clients.default_policy = "allow"`
+> so upgrades preserve existing behavior. Only a fresh install that completes
+> the first-boot wizard starts with default deny. A wildcard bind with an
+> effective allow policy accepts recursive queries from any source that can
+> reach the host; `rate_limit_per_ip` only limits rate, it does not authorize
+> clients. Keep the DNS ports behind a host firewall (defense in depth) and
+> configure `[clients.acl]` deliberately. The server emits a startup warning
+> when a wildcard DNS bind is exposed without an effective deny ACL.
 
 ---
 
@@ -341,6 +344,70 @@ schedule = "0 0 15-21 * * MON-FRI"
 | `trust_routeros_lease_names` | boolean | `false` | Trust RouterOS DHCP lease host names/comments for client identification. Off by default because lease data is client-controlled. |
 | `trust_arp` | boolean | `false` | Trust the MAC address the local ARP table reports for a query's source IP as client identity, even when no `[[clients.entries]]` lists that MAC. Only the MAC is used: ARP hostnames and other attributes are ignored, and no client name/group is invented. Identity from this setting may match `$client` MAC rules and rewrite `exception_clients`. IP/CIDR, configured secrets and verified RouterOS leases keep precedence. Only hosts on the resolver's L2 segment can be identified this way. |
 | `timezone` | string | `"local"` | Timezone used to evaluate client schedules and time-of-day rules. `"local"`/`"system"` resolves the host zone at runtime, so DST transitions and skipped/repeated wall-clock times follow the host platform. `"UTC"` and fixed offsets (`"+02:00"`, `"-05:30"`, `"+0530"`, `"UTC+2"`) are accepted and never shift for DST. IANA names (e.g. `"Europe/Warsaw"`) are not supported (no tzdb dependency); deployments that need a stable clock should set `"UTC"` or a fixed offset explicitly. |
+| `default_policy` | string (`"allow"` or `"deny"`) | `"allow"` | Source-address admission when no deny rule, no explicit allow rule and (only when enabled) no client-entry IP/CIDR matches. The compatibility default is `"allow"`, so upgrades, hand-written configs and omitted keys behave exactly as before. Only the first-boot wizard writes `"deny"` automatically. Validation rejects any other value and names the key. This is admission only; it does not replace `clients.groups.default` or `filtering.fail_closed`. |
+| `acl` | table | `{}` (inert under allow) | `[clients.acl]` source-address admission rules. See [`[clients.acl]`](#clientsacl--dns-client-admission). |
+
+### `[clients.acl]` — DNS client admission
+
+The ACL applies to every DNS listener (UDP/53, TCP/53, DoT, DoH HTTP/1.1+HTTP/2, DoH3, DoQ) at one
+pipeline stage, before identity resolution and before cache, rewrites, filtering, DNSSEC or upstream
+work. It is **not** applied to the admin UI/API, the HA replication listener, the witness listener,
+outbound upstream traffic, or filter/ACME/update HTTP clients. It never admits on DoH path, SNI,
+HTTP header, MAC/ARP or RouterOS lease identity: only the observed peer address is used.
+
+```toml
+[clients]
+default_policy = "deny"
+
+[clients.acl]
+allow = ["127.0.0.1/32", "::1/128", "192.168.1.0/24"]
+deny = ["192.168.1.128/25"]
+allow_entry_ids = false
+deny_response = "refused"
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `acl.allow` | array of strings | `[]` | IPv4/IPv6 addresses or CIDR blocks whose source addresses may use the DNS listeners. Bare addresses become `/32`/`/128`. Host bits are canonicalized on load. Exact duplicates after canonicalization are rejected. Capped at 1024 prefixes. |
+| `acl.deny` | array of strings | `[]` | Addresses/CIDRs that are always denied. Deny is authoritative regardless of a more-specific allow or an opted-in client-entry CIDR. Exact duplicates and an exact allow/deny conflict are rejected. Capped at 1024 prefixes. |
+| `acl.allow_entry_ids` | boolean | `false` | Opt in to treating static IP/CIDR values in `clients.entries[].ids` as allow rules. Off by default: entries are identity/policy, not admission. MAC, hostname, DoH path/SNI and secret ids never admit. An entry id of `0.0.0.0/0`/`::/0` loads but emits a prominent warning. |
+| `acl.deny_response` | string (`"refused"` or `"drop"`) | `"refused"` | `"refused"` returns DNS RCODE 5 with the question echoed and no answer; `"drop"` sends no DNS response (DoH/DoH3 return HTTP 204). Any other value is a validation error naming the key. |
+
+Admission order is fixed: **deny first** (authoritative), then explicit `allow`, then opted-in
+client-entry IP/CIDR allow, then `default_policy`. Longest-prefix match is used only to report the
+most specific same-action rule; it never lets a `/32` allow override a broader deny. IPv4 and IPv6
+are independent families (`0.0.0.0/0` does not cover IPv6; `::/0` does not cover IPv4), and an
+IPv4-mapped IPv6 source is evaluated with the IPv4 rules.
+
+> [!IMPORTANT]
+> **Lockout and loopback.** There is no implicit loopback exception. Under
+> `default_policy = "deny"`, add `127.0.0.1/32` and `::1/128` (or the forwarding
+> proxy's address) deliberately. The wizard always writes loopback; a
+> hand-written deny config must do so itself. A deny policy with no allow rule
+> outside loopback emits a startup warning, but it is not an error. Denied
+> clients are absent from the detailed query log and the `unidentified_clients`
+> list by design: use `sito_dns_acl_decisions_total`,
+> `sito_dns_acl_matched_prefix_total`, `sito_dns_acl_dropped_total` and the
+> sampled ACL log lines to discover them. The admin UI/API is never filtered, so
+> an ACL mistake cannot lock out management.
+
+> [!WARNING]
+> The ACL is a **per observed source address** control, not a per-device control.
+> A NAT gateway/router doing DNS forwarding, a local forwarder
+> (dnsmasq/systemd-resolved/unbound/container DNS), and a reverse proxy in front
+> of DoH all collapse every downstream client to one observed address. Admitting
+> the gateway/proxy admits every client behind it; denying it denies all of them.
+> DoH ignores `X-Forwarded-For` on purpose, and `web.trusted_proxies` is an
+> admin-listener setting that is never consulted for DNS. Per-device admission
+> requires network segmentation or a separate identity control.
+
+> [!NOTE]
+> `[clients.acl]` is shared configuration in HA (included in the sanitized
+> bundle and shared-projection digest); `clients.client_id_secrets` remains
+> node-local and is stripped. A master pushes one policy to every DNS-serving
+> node, so a multi-site cluster must list every site's client CIDRs. A deny
+> policy is supported only after every DNS-serving node runs an ACL-aware build;
+> a mixed-version cluster must stay on `default_policy = "allow"`.
 
 > Every `[[clients.entries]]` `group` must name an existing
 > `[clients.groups.<name>]` table (or be omitted / `"default"`). An unknown
@@ -706,6 +773,45 @@ example `HA requires at least one synced slave (0/2 connected)` or
 readiness; the slave role ignores them and does not change its own readiness.
 With `replication_port = 0` no slave can connect, so setting either requirement
 keeps readiness not-ready (the listener itself remains intentionally disabled).
+
+#### DNS client ACL in HA
+
+`clients.default_policy` and every `[clients.acl]` key are **shared
+configuration**: they are included in the sanitized bundle and the
+shared-projection digest. `clients.client_id_secrets` stays node-local and is
+the only client field removed by the sanitizer. There is no `[ha]` ACL key, no
+per-node ACL override and no node-local allow file.
+
+- For the same observed source address and the same applied bundle, every
+  ACL-aware node makes the same decision. Different nodes may observe different
+  addresses (NAT, proxy, reverse path) and then legitimately differ; that is a
+  per-observed-source guarantee, not a per-device one.
+- A disconnected slave keeps serving the last applied ACL. There is no fallback
+  to allow on disconnect.
+- **Fresh/rebuilt slave:** a slave with no applied watermark does not bind DNS
+  listeners. It starts the admin/HA client, reports `acl_unprovisioned`, and
+  waits for the first valid bundle. A restart with a watermark serves the
+  persisted applied configuration immediately.
+- **Invalid bundle:** any ACL validation error (bad enum, CIDR, duplicate,
+  allow/deny conflict, over-cap list) rejects the whole bundle atomically. The
+  slave keeps its previous ACL/runtime generation and reports `Degraded`.
+- **Mixed versions:** a slave advertises the `client_acl` capability in its HA
+  `Hello`. While `default_policy = "deny"`, a connected slave that does not
+  advertise it makes master readiness report `acl_capability_missing` and logs a
+  warning. Upgrade every DNS-serving node before enabling deny; a mixed-version
+  cluster must stay on allow.
+- **Promotion:** a slave that applied a bundle already has the shared ACL; a
+  promotion does not reset it. An unprovisioned slave is not synced and cannot
+  be promoted as an ACL-serving node: the promotion flow never invents an ACL.
+  A first-boot slave cannot serve DNS while the master is unavailable; recover
+  the master or use the documented promotion/recovery procedure.
+- **Multi-site:** the allow list must contain every site's client networks.
+  A site-B network omitted from `[clients.acl] allow` is denied on every node
+  after the bundle applies. That is a shared-policy decision, not a local
+  default.
+- ACL metrics are per node and are not merged into the master's registry. Scrape
+  each node separately. Denied queries are intentionally absent from the query
+  log and unidentified-client discovery.
 
 #### `[ha.promotion]` — automatic promotion with a lease witness
 

@@ -61,6 +61,7 @@ mod system;
 mod upstreams;
 mod users;
 mod wizard;
+pub(crate) mod wizard_acl;
 
 pub use account::*;
 pub use clients::*;

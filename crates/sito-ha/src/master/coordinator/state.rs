@@ -44,6 +44,7 @@ impl MasterCoordinator {
             readiness: HaReadinessState::not_ready("master replication listener has not started"),
             require_slaves: Arc::new(AtomicBool::new(false)),
             require_all_slaves: Arc::new(AtomicBool::new(false)),
+            acl_enforcement: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -66,7 +67,47 @@ impl MasterCoordinator {
         if let Some(reason) = self.slave_requirement_violation() {
             return HaReadiness::not_ready(reason);
         }
+        if let Some(reason) = self.acl_capability_violation() {
+            return HaReadiness::not_ready(reason);
+        }
         listener
+    }
+
+    /// Applies the effective DNS client ACL policy to readiness checks.
+    ///
+    /// Only `default_policy = "deny"` needs every connected slave to be
+    /// ACL-aware; an allow-policy cluster keeps working with legacy peers.
+    #[must_use]
+    pub fn with_acl_enforcement(self, enforced: bool) -> Self {
+        self.acl_enforcement.store(enforced, Ordering::SeqCst);
+        self
+    }
+
+    /// Returns `acl_capability_missing` while a deny-enforcing master has a
+    /// connected slave that did not advertise the `client_acl` capability.
+    pub(crate) fn acl_capability_violation(&self) -> Option<String> {
+        if !self.acl_enforcement.load(Ordering::SeqCst) {
+            return None;
+        }
+        let slaves = sito_core::sync::lock_or_recover(&self.slaves);
+        let missing: Vec<&str> = slaves
+            .values()
+            .filter(|slave| {
+                !slave
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == crate::protocol::CAPABILITY_CLIENT_ACL)
+            })
+            .map(|slave| slave.instance.as_str())
+            .collect();
+        if missing.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "acl_capability_missing: connected slave(s) do not enforce the DNS client ACL ({}); keep default_policy = \"allow\" or upgrade every DNS-serving node before enabling deny",
+                missing.join(", ")
+            ))
+        }
     }
 
     /// Applies the opt-in slave readiness requirements from `[ha]`.

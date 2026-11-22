@@ -233,6 +233,20 @@ pub async fn run_server_with_lease(
     #[cfg(feature = "ha")]
     let mut ha_runtime = init_ha(&config, &config_path_buf, &metrics, &shutdown_rx)?;
     #[cfg(feature = "ha")]
+    let ha_acl_unprovisioned =
+        slave_acl_unprovisioned(&config.server.role, ha_runtime.tracker.as_ref());
+    #[cfg(feature = "ha")]
+    if ha_acl_unprovisioned {
+        if let Some(tracker) = ha_runtime.tracker.as_ref() {
+            tracker.mark_acl_unprovisioned();
+        }
+        warn!(
+            "HA slave has no applied configuration bundle/watermark: reporting acl_unprovisioned and holding DNS listeners until the master pushes the first valid bundle"
+        );
+    }
+    #[cfg(not(feature = "ha"))]
+    let ha_acl_unprovisioned = false;
+    #[cfg(feature = "ha")]
     let _ha_config = ha_runtime.config.clone();
     #[cfg(feature = "ha")]
     let (master_coordinator, slave_tracker, resync_sender) = (
@@ -275,8 +289,9 @@ pub async fn run_server_with_lease(
         config_path_buf.exists(),
     );
 
+    let dns_start_pending = setup_pending || ha_acl_unprovisioned;
     let (dns_start_tx, mut dns_start_rx) = tokio::sync::mpsc::unbounded_channel();
-    let dns_starter = if setup_pending {
+    let dns_starter = if dns_start_pending {
         Some(dns_start_tx)
     } else {
         None
@@ -484,16 +499,51 @@ pub async fn run_server_with_lease(
         );
     }
 
-    if setup_pending {
-        info!(
-            "Server running in setup-pending mode: DNS listeners (ports 53/853/443) are not bound until setup completes via web panel"
-        );
+    if dns_start_pending {
+        if setup_pending {
+            info!(
+                "Server running in setup-pending mode: DNS listeners (ports 53/853/443) are not bound until setup completes via web panel"
+            );
+        } else {
+            info!(
+                "HA slave is acl_unprovisioned: admin/HA client is running, DNS listeners stay unbound until the first valid bundle applies"
+            );
+        }
+
+        // A fresh slave must run its replication worker before the listeners
+        // exist so the first bundle can arrive. The worker's apply hook sees no
+        // listener manager yet, so it applies the non-listener components and
+        // persists the document; the gate below then starts listeners from the
+        // applied configuration. A setup-pending slave keeps the historical
+        // ordering (worker starts only after the wizard completes) so a bundle
+        // cannot bypass setup gating.
+        #[cfg(feature = "ha")]
+        let mut slave_worker_started = false;
+        #[cfg(feature = "ha")]
+        if ha_acl_unprovisioned && !setup_pending {
+            spawn_slave_worker_after_listeners(
+                &mut ha_runtime,
+                &server_ctx,
+                &apply_hooks,
+                &runtime,
+                &filter_engine,
+                &metrics,
+                &config_path_buf,
+                &shutdown_rx,
+            );
+            slave_worker_started = true;
+        }
+
         tokio::select! {
             res = wait_for_shutdown_signal(custom_shutdown) => {
                 res?;
             }
             Some(()) = dns_start_rx.recv() => {
-                info!("Setup wizard completed: binding and starting DNS listeners in-process...");
+                if setup_pending {
+                    info!("Setup wizard completed: binding and starting DNS listeners in-process...");
+                } else {
+                    info!("First HA bundle applied: binding and starting DNS listeners in-process...");
+                }
                 let current_cfg = config_arc.load();
                 // The wizard may have configured TLS/ACME after startup, when
                 // the initial acceptors were built from the empty config.
@@ -556,16 +606,18 @@ pub async fn run_server_with_lease(
                 *listener_manager.lock().await = Some(manager);
                 readiness.set_listeners_ready();
                 #[cfg(feature = "ha")]
-                spawn_slave_worker_after_listeners(
-                    &mut ha_runtime,
-                    &server_ctx,
-                    &apply_hooks,
-                    &runtime,
-                    &filter_engine,
-                    &metrics,
-                    &config_path_buf,
-                    &shutdown_rx,
-                );
+                if !slave_worker_started {
+                    spawn_slave_worker_after_listeners(
+                        &mut ha_runtime,
+                        &server_ctx,
+                        &apply_hooks,
+                        &runtime,
+                        &filter_engine,
+                        &metrics,
+                        &config_path_buf,
+                        &shutdown_rx,
+                    );
+                }
 
                 info!(
                     port = current_cfg.dns.port,

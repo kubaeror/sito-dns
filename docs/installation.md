@@ -23,10 +23,13 @@ release-candidate line differ in the admin default:
 * **2.0.0-rc.2 (release candidate):** `web.bind` defaults to `127.0.0.1` (the
   config v2 safe default). Existing v1 configurations migrated without
   `--adopt-safe-defaults` keep their old bind, including `0.0.0.0`.
-* **Both lines:** `dns.bind` defaults to `["0.0.0.0", "::"]` and there is no
-  DNS client allow-list. `dns.rate_limit_per_ip` limits request rate; it is
-  **not** an access control. Any host that can reach the DNS ports can recurse
-  through this server.
+* **Both lines:** `dns.bind` defaults to `["0.0.0.0", "::"]`. 2.0 adds the
+  ADR-0011 source-address ACL, but its typed default is `default_policy =
+  "allow"` so upgrades are unchanged. Only a fresh install completed through the
+  first-boot wizard starts with default deny. `dns.rate_limit_per_ip` limits
+  request rate; it is **not** an access control. Keep the DNS ports behind the
+  firewall examples below as defense in depth, and configure `[clients.acl]`
+  deliberately (see the [configuration reference](configuration-reference.md#clientsacl--dns-client-admission)).
 
 Sito logs a startup warning for each exposed listener. Reach the panel through
 an SSH tunnel or a TLS reverse proxy. The firewall examples below allow SSH
@@ -92,11 +95,15 @@ admin UI to `127.0.0.1:8080` and keeps configuration in a named volume, so the
 safe choice is the default; a bind-mounted `./config` needs an explicit chown.
 
 > [!NOTE]
-> The loopback admin default is already in the **2.0** config v2 schema. A
-> default-deny DNS client ACL is not part of Phase 2 core hardening and remains
-> deferred work; the startup warning and this firewall guidance are the
-> mitigation on both lines. 1.9.5 keeps its historical `0.0.0.0` admin default
-> so existing configurations continue to work. See the
+> The loopback admin default is already in the **2.0** config v2 schema. The
+> first-boot wizard's **Client Access Control** step starts a fresh install in
+> default deny with only loopback preselected; you choose the client networks.
+> An upgrade preserves the existing allow behavior until you opt in. Headless
+> installs (`--no-setup`, a hand-written minimal config, or `Config::default()`)
+> still get the compatibility default `default_policy = "allow"` and must set
+> `[clients.acl]` explicitly. The startup warning and this firewall guidance
+> remain the mitigation until then. 1.9.5 keeps its historical `0.0.0.0` admin
+> default so existing configurations continue to work. See the
 > [2.0 migration guide](2.0-migration.md) before moving an existing install.
 
 ---
@@ -218,6 +225,11 @@ package upgrade paths use the same `sito db migrate` command:
   `sito config migrate --backup`) when the target configuration is v2. If that
   file is missing, it refuses to restore the 1.9.x binary and keeps the 2.0
   binary installed with the service stopped.
+- `[clients] default_policy` and `[clients.acl]` are additive v2 keys with no
+  `config_version` bump. An older 2.0 RC binary without ACL support rejects
+  unknown keys, so before downgrading to such a binary remove
+  `clients.default_policy` and `[clients.acl]`, then re-run `check-config`.
+  A 1.9.x rollback uses the v1 backup as above.
 - The container image entrypoint runs that migration before the server when the
   data volume already has a `stats.db`, and exits without starting DNS/API if it
   fails. A fresh volume has no database and is created normally on first start.
@@ -351,13 +363,25 @@ data_dir = "/var/lib/sito"
 log_level = "info"
 
 [dns]
-# No default-deny DNS client ACL yet: restrict these ports at the firewall, or
-# bind specific LAN addresses.
+# The wizard writes a default-deny [clients.acl] on a fresh install. A
+# hand-written/headless config keeps allow unless you add [clients.acl]; keep
+# the firewall in place as defense in depth.
 bind = ["0.0.0.0", "::"]
 port = 53
 dot_port = 853
 doh_port = 443
 doq_port = 0
+
+[clients]
+# Required for a headless default-deny install (the wizard writes this for a
+# fresh GUI install). Add every client network; loopback is not implicit.
+default_policy = "deny"
+
+[clients.acl]
+allow = ["127.0.0.1/32", "::1/128", "192.168.0.0/24"]
+deny = []
+allow_entry_ids = false
+deny_response = "refused"
 
 [upstream]
 servers = ["tls://dns.quad9.net", "1.1.1.1:53"]
@@ -859,7 +883,9 @@ DNS response alone no longer masks an HA failure. See `docs/runbook-ha.md`
 
 Open `http://<host-ip>:8080` in your browser to run the first-time setup wizard (or use the SSH tunnel above when the LAN-only firewall is enabled). **On 2.0 the default `web.bind` is `127.0.0.1`, so the setup-pending wizard is loopback-only**: open `http://127.0.0.1:8080` through the SSH tunnel above, or explicitly configure a non-loopback `web.bind` for the setup window. See the setup-pending reachability note above. While setup is pending the server prints a one-time setup token to the console; open `http://<host-ip>:8080/wizard?setup_token=<token>` or send the `X-Setup-Token` header. Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` already exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` account.
 
-If the wizard is skipped with `--no-setup` **on a first boot with no `config.toml`**, a random administrator password is generated and printed once, and the panel binds to loopback. When a config file already exists, `--no-setup` neither creates nor rotates credentials. If credentials are lost later, stop the service so the running process cannot keep serving the old credentials, reset the account, then start it again:
+**Client Access Control (ADR-0011).** After the DNS-listener step the fresh-install wizard shows every usable interface plus the raw admin peer, classified as loopback, RFC 1918, IPv6 ULA, public, or bridge/tunnel. Only loopback is preselected; no non-loopback network is auto-added, and `X-Forwarded-For`/`trusted_proxies` is never used to seed one. Default deny is checked even when the base template says `default_policy = "allow"`; uncheck it to keep the template's allow policy. A loopback-only install needs the loopback-only acknowledgement; any public network needs the public exposure acknowledgement; allow-all requires both the checkbox and the exact text `ALLOW ALL`. Existing template `allow`/`deny` prefixes and `deny_response` are preserved, and `allow_entry_ids` stays off unless explicitly checked. The setup-token/re-auth recovery wizard on an existing install does **not** render or apply this step, so an existing ACL is never rewritten.
+
+If the wizard is skipped with `--no-setup` **on a first boot with no `config.toml`**, a random administrator password is generated and printed once, and the panel binds to loopback. A headless install is **not** default-deny: add `[clients] default_policy = "deny"` and the explicit `[clients.acl] allow` networks (including loopback) to `config.toml` before starting DNS. When a config file already exists, `--no-setup` neither creates nor rotates credentials. If credentials are lost later, stop the service so the running process cannot keep serving the old credentials, reset the account, then start it again:
 
 ```bash
 sudo systemctl stop sito

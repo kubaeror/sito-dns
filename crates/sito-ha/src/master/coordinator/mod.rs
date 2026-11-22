@@ -236,6 +236,10 @@ pub struct MasterCoordinator {
     /// `ha.require_all_slaves`: readiness needs every connected slave synced.
     /// Implies `require_slaves`.
     require_all_slaves: Arc<AtomicBool>,
+    /// True when this master's effective `clients.default_policy` is deny.
+    /// A connected slave that does not advertise `client_acl` makes readiness
+    /// report `acl_capability_missing`; an allow-policy cluster is unaffected.
+    acl_enforcement: Arc<AtomicBool>,
 }
 
 mod message;

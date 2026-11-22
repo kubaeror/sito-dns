@@ -15,6 +15,31 @@ pub(super) struct HaRuntime {
     pub(super) resync_receiver: Option<tokio::sync::mpsc::Receiver<()>>,
 }
 
+/// True when the shared client ACL denies by default.
+///
+/// Master readiness reports `acl_capability_missing` while a connected slave
+/// does not advertise the `client_acl` capability. An allow-policy cluster
+/// stays compatible with legacy peers.
+pub(super) fn acl_deny_effective(config: &Config) -> bool {
+    config
+        .clients
+        .as_ref()
+        .and_then(|value| value.clone().try_into::<sito_clients::ClientsConfig>().ok())
+        .is_some_and(|clients| clients.default_policy == sito_clients::AclDefaultPolicy::Deny)
+}
+
+/// True when a slave has no applied bundle yet and must not bind DNS.
+///
+/// ADR-0011: a fresh/headless/ rebuilt slave starts its admin/HA client, reports
+/// `acl_unprovisioned`, and serves DNS only after the first valid bundle. A
+/// restart with a watermark uses the persisted applied configuration.
+pub(super) fn slave_acl_unprovisioned(
+    role: &str,
+    tracker: Option<&sito_ha::SlaveStatusTracker>,
+) -> bool {
+    role == "slave" && tracker.is_some_and(|tracker| !tracker.has_applied_bundle())
+}
+
 /// Initializes the HA role. Master setup is complete on return; a slave only
 /// gets its tracker and resync channel here because its worker needs the
 /// server context and apply hooks built later in startup.
@@ -55,7 +80,8 @@ pub(super) fn init_ha(
             metrics.clone(),
         )
         .with_state_path(config.server.data_dir.join("ha_state.toml"))
-        .with_slave_requirements(ha_config.require_slaves, ha_config.require_all_slaves);
+        .with_slave_requirements(ha_config.require_slaves, ha_config.require_all_slaves)
+        .with_acl_enforcement(acl_deny_effective(config));
 
         if ha_config.replication_port == 0 {
             coordinator.mark_replication_disabled();
@@ -266,6 +292,14 @@ impl sito_ha::SlaveConfigApplier for HaConfigApplier {
                             fields = ?report.restart_required,
                             "HA push applied but reported restart-only fields; the acknowledgement may be incomplete"
                         );
+                    }
+                    // A fresh slave gates DNS until the first bundle applies.
+                    // The channel is closed/dropped once listeners start; a
+                    // later push simply finds no receiver.
+                    if let Some(starter) = self.ctx.dns_starter.as_ref()
+                        && starter.send(()).is_ok()
+                    {
+                        info!("First valid HA bundle applied; ungating DNS listener startup");
                     }
                     Ok(())
                 }

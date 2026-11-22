@@ -177,6 +177,16 @@ impl MasterCoordinator {
         version: u64,
         push_msg: &HaMessage,
     ) {
+        // Track whether the published shared configuration enforces a deny ACL,
+        // so readiness can require every connected slave to advertise
+        // `client_acl` after a hot reload as well as at startup.
+        let acl_enforced = bundle
+            .clients
+            .as_ref()
+            .and_then(|value| value.clone().try_into::<sito_clients::ClientsConfig>().ok())
+            .is_some_and(|clients| clients.default_policy == sito_clients::AclDefaultPolicy::Deny);
+        self.acl_enforcement
+            .store(acl_enforced, std::sync::atomic::Ordering::SeqCst);
         self.current_version.store(version, Ordering::SeqCst);
         *sito_core::sync::lock_or_recover(&self.active_bundle) = Some(bundle);
         *sito_core::sync::lock_or_recover(&self.active_push) = Some(push_msg.clone());

@@ -50,6 +50,7 @@ mime_guess = { workspace = true, optional = true }
 askama = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_urlencoded = "0.7"
 tower = { version = "0.5", features = ["util"] }
 
 [features]

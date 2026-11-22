@@ -142,6 +142,19 @@ impl<'a> SessionMachine<'a> {
             "Received authenticated Hello from replica slave"
         );
 
+        if coordinator.acl_enforcement.load(Ordering::SeqCst)
+            && !capabilities
+                .iter()
+                .any(|capability| capability == crate::protocol::CAPABILITY_CLIENT_ACL)
+        {
+            warn!(
+                instance = %slave_instance,
+                peer = %peer_addr,
+                "acl_capability_missing: connected slave does not advertise the '{}' capability while this master enforces a default-deny DNS client ACL; the slave would serve denied clients. Upgrade the slave or keep clients.default_policy = \"allow\"",
+                crate::protocol::CAPABILITY_CLIENT_ACL
+            );
+        }
+
         // Reject implausible peer versions before they can influence the local
         // sequence. An authenticated replica reporting `u64::MAX` (or any
         // value far beyond the master's counter) would otherwise seed the

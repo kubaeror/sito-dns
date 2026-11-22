@@ -116,6 +116,11 @@ NESTED_BY_SECTION: dict[int, list[tuple[str, str, str]]] = {
             "BlockedServiceConfig",
             "crates/sito-clients/src/config.rs",
         ),
+        (
+            "acl.",
+            "ClientAclConfig",
+            "crates/sito-clients/src/config.rs",
+        ),
     ],
     10: [("entries.", "RewriteEntryConfig", "crates/sito-rewrites/src/config.rs")],
     13: [
@@ -148,7 +153,7 @@ SKIP_REVERSE_BY_SECTION = {
     # Nested/array-of-table structs documented inline in a single row.
     6: {"sni_certs"},
     7: {"per_domain"},
-    9: {"entries", "groups"},
+    9: {"entries", "groups", "acl"},
     10: {"entries"},
     15: {"categories"},
 }

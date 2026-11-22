@@ -25,8 +25,9 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 > is explicitly deferred by the operator. The 2.0 administrative API is
 > `/api/v2` only; `/api/v1` was removed. The SQLite schema/PII migration
 > (`sito db migrate`) and installer/Docker database upgrades are delivered;
-> config auto-migration remains deferred. Other deferred work includes a
-> default-deny DNS client ACL, weighted upstream balancing, a second proof
+> config auto-migration remains deferred. The ADR-0011 default-deny DNS client
+> ACL is delivered for fresh wizard installs (upgrades stay allow until opted
+> in). Other deferred work includes weighted upstream balancing, a second proof
 > for user/token deletion, edit-time read-only HA enforcement, and the optional
 > external parental/service data. The current evidence matrix is
 > [`docs/2.0-claim-matrix.md`](docs/2.0-claim-matrix.md).
@@ -139,11 +140,16 @@ tunnel or a TLS reverse proxy. The server logs a startup warning for each
 exposed listener.
 
 The **2.0 line** already defaults `web.bind` to `127.0.0.1` (config v2 safe
-defaults), but still has no default-deny DNS client ACL: `dns.bind` remains
-`["0.0.0.0", "::"]`. A DNS client ACL remains future work. New 2.0 installs
-should keep the loopback admin bind; upgraded v1 files keep their old bind
-unless `--adopt-safe-defaults` is used. See the
-[2.0 migration guide](docs/2.0-migration.md).
+defaults) and adds the ADR-0011 source-address DNS client ACL. Only a fresh
+install completed through the first-boot wizard starts with
+`clients.default_policy = "deny"`; its **Client Access Control** step preselects
+loopback only and requires you to choose the client networks. Upgrades keep the
+compatibility default `default_policy = "allow"`, and `dns.bind` remains
+`["0.0.0.0", "::"]`, so keep the firewall guidance until you configure
+`[clients.acl]`. New 2.0 installs should keep the loopback admin bind; upgraded
+v1 files keep their old bind unless `--adopt-safe-defaults` is used. See the
+[2.0 migration guide](docs/2.0-migration.md) and the
+[ACL reference](docs/configuration-reference.md#clientsacl--dns-client-admission).
 
 ### Option 2: Docker / Docker Compose
 ```yaml

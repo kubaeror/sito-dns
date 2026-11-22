@@ -693,6 +693,12 @@ mod tests {
             setup_required: true,
             setup_token: "test-token",
             reauth_token: "",
+            fresh_install_acl: false,
+            acl_candidates: Vec::new(),
+            acl_prefilled: Vec::new(),
+            acl_template_explicit_allow: false,
+            acl_base_allow_entry_ids: false,
+            acl_manual: "",
         };
         assert!(wiz_tmpl.render().unwrap().contains("Welcome to sito DNS"));
     }

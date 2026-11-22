@@ -1160,3 +1160,38 @@ async fn test_doh_alt_svc_not_advertised_when_doh3_fails() {
     drop(occupied);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[cfg(feature = "ha")]
+#[test]
+fn test_slave_acl_gate_requires_an_applied_bundle() {
+    let tracker = sito_ha::SlaveStatusTracker::new("fresh".to_string(), 0, None);
+    assert!(
+        slave_acl_unprovisioned("slave", Some(&tracker)),
+        "a fresh slave must not bind DNS before the first bundle"
+    );
+    assert!(
+        !slave_acl_unprovisioned("master", Some(&tracker)),
+        "the gate only applies to the slave role"
+    );
+
+    tracker
+        .persist_watermark(1, 0, &"ab".repeat(32))
+        .expect("persist watermark");
+    assert!(
+        !slave_acl_unprovisioned("slave", Some(&tracker)),
+        "a restart/apply with a watermark serves the persisted ACL"
+    );
+}
+
+#[test]
+fn test_acl_deny_effective_uses_typed_clients_table() {
+    let mut config = sito_core::config::Config::default();
+    assert!(!acl_deny_effective(&config));
+    config.clients = Some(
+        "default_policy = \"deny\"\n"
+            .parse::<toml::Table>()
+            .map(toml::Value::Table)
+            .unwrap(),
+    );
+    assert!(acl_deny_effective(&config));
+}
