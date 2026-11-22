@@ -29,6 +29,16 @@
 //!
 //! Rollup counters are checked against the fixture totals before and after both
 //! paths, so a single row counted twice or lost fails the test.
+//!
+//! The chunk count a report returns is produced by the implementation itself,
+//! so on its own it only proves loop iterations. To independently pin
+//! transaction boundaries, each measured sweep runs with a second pooled
+//! connection polling `stats_hourly` and `PRAGMA data_version`. Committed
+//! rollup rows must become visible *while* the sweep is still running, and
+//! `data_version` (which changes when another connection commits) must change
+//! multiple times. A regression that wrapped the outer loop in one
+//! `BEGIN IMMEDIATE`/`COMMIT` while keeping the counter would show zero
+//! intermediate commits and fail.
 
 use super::*;
 use std::path::PathBuf;
@@ -68,10 +78,20 @@ const RETENTION_BOUND: Duration = Duration::from_secs(600);
 const CLEAR_BOUND: Duration = Duration::from_secs(600);
 const ANONYMIZE_BOUND: Duration = Duration::from_secs(600);
 
-/// A crash guard for unbounded memory: a design that materialized 1M rows plus
-/// their indexes in Rust would exceed this on the evidence host. The printed
+/// A gross memory-blowup guard, not a memory bound. The observed whole-process
+/// peak is 16-34 MiB (the progress probe contributes a polling connection);
+/// this ceiling is ~15x that and would catch a design that pulled the whole
+/// 1M-row table (or a large batch of it) into Rust. The printed
 /// `VmHWM`/`VmRSS` values are the actual observation.
-const PEAK_RSS_CEILING_KIB: u64 = 1_500_000;
+const PEAK_RSS_CEILING_KIB: u64 = 512_000;
+
+/// Exact timestamp-distribution shape of the 90-day fixture, computed from the
+/// deterministic seed formula. Most timestamps are shared by seven consecutive
+/// rows; the rest are the batch groups split by an hour (or uniform/heavy
+/// slice) boundary.
+const FIXTURE_DISTINCT_TIMESTAMPS: i64 = 144_711;
+const FIXTURE_TIMESTAMPS_WITH_SEVEN_ROWS: i64 = 141_004;
+const FIXTURE_MAX_ROWS_PER_TIMESTAMP: i64 = 7;
 
 struct FixtureSummary {
     base_hour_ms: i64,
@@ -89,11 +109,12 @@ fn fixture_base_hour_ms() -> i64 {
 
 /// Deterministic 1M-row / 90-day fixture.
 ///
-/// Distribution: uniform over 2,160 epoch hours (`ts` aligned to real hours),
-/// seven consecutive rows share one timestamp so the `(ts, id)` chunk boundary
-/// falls inside a same-timestamp batch, five qtypes, three verdicts, two
-/// upstreams, many clients/names and 5,000 domains. The heavy hour is day 30 at
-/// 12:00 and holds 60,000 extra rows plus the uniform rows for that hour.
+/// Distribution: uniform over 2,160 epoch hours (`ts` aligned to real hours);
+/// most seven-row batches share one timestamp (141,004 of 144,711 timestamps;
+/// the rest are batches split by an hour or slice boundary) so `(ts, id)` chunk
+/// boundaries fall inside same-timestamp batches; six qtypes, three verdicts,
+/// two upstreams, many clients/names and 5,000 domains. The heavy hour is day
+/// 30 at 12:00 and holds 60,000 extra rows plus the uniform rows for that hour.
 async fn seed_fixture(db: &StatsDb, rows: i64, base_hour_ms: i64) -> FixtureSummary {
     // Keep the full-fixture uniform/heavy ratio for smaller subsets.
     let uniform_rows = UNIFORM_ROWS * rows / FIXTURE_ROWS;
@@ -266,28 +287,197 @@ fn assert_bounded_memory(label: &str) {
     }
 }
 
-fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "sito-stats-capacity-{label}-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    std::fs::create_dir_all(&dir).expect("create capacity temp dir");
-    dir
+/// Removes the fixture directory when the test ends, including on panic, so a
+/// failed 1M run cannot leave a 200+ MiB database plus WAL behind. Declare it
+/// before the `StatsDb` so unwinding drops the pool first.
+struct TempDbDir(PathBuf);
+
+impl TempDbDir {
+    fn new(label: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "sito-stats-capacity-{label}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).expect("create capacity temp dir");
+        Self(dir)
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.0.join("stats.db")
+    }
 }
 
-async fn cleanup(db: StatsDb, dir: &PathBuf) {
-    db.pool().close().await;
-    drop(db);
-    let _ = std::fs::remove_dir_all(dir);
+impl Drop for TempDbDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Independent evidence of committed progress during a sweep.
+struct ProgressReport {
+    samples: u64,
+    /// Lower bound on commits made by the sweep: `PRAGMA data_version` (read on
+    /// a second connection) changes at most once per poll interval, so several
+    /// commits between samples collapse into one observation.
+    commits: u64,
+    /// Samples where the committed `stats_hourly` row count was strictly
+    /// between its initial and final value.
+    partial_rollups: u64,
+    initial_rollups: i64,
+    final_rollups: i64,
+}
+
+async fn progress_snapshot(conn: &mut SqliteConnection) -> (i64, i64) {
+    // `stats_hourly` is the rollup table: each committed chunk adds or updates
+    // at most one row, so its row count is a cheap committed-progress signal.
+    let rollups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_hourly")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("progress probe rollup count");
+    // Read on the same pinned connection: SQLite changes this value when any
+    // *other* connection commits, giving an independent commit-boundary signal.
+    let data_version: i64 = sqlx::query_scalar("PRAGMA data_version")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("progress probe data_version");
+    (rollups, data_version)
+}
+
+/// Runs `future` while a second pooled connection polls committed state.
+///
+/// The sweep future is polled by the same task via `select!` (no extra runtime
+/// thread), so this works on the default current-thread `#[tokio::test]`
+/// runtime. The returned duration covers only the sweep future; the probe adds
+/// a small amount of read load.
+async fn run_with_progress<F, T>(
+    db: &StatsDb,
+    label: &str,
+    future: F,
+) -> (T, Duration, ProgressReport)
+where
+    F: std::future::Future<Output = T>,
+{
+    let mut conn = db
+        .pool()
+        .acquire()
+        .await
+        .expect("progress probe connection");
+    let (initial_rollups, initial_version) = progress_snapshot(&mut conn).await;
+    let mut last_version = initial_version;
+    let mut commits = 0u64;
+    let mut samples = Vec::new();
+    // Sampling every 20 ms keeps the read load small (the probe must not distort
+    // the measured wall time) while still observing hundreds of commits on the
+    // multi-second sweeps.
+    let mut ticker = tokio::time::interval(Duration::from_millis(20));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    tokio::pin!(future);
+    let started = Instant::now();
+    let value = loop {
+        tokio::select! {
+            value = &mut future => break value,
+            _ = ticker.tick() => {
+                let (rollups, version) = progress_snapshot(&mut conn).await;
+                if version != last_version {
+                    commits += 1;
+                    last_version = version;
+                }
+                samples.push(rollups);
+            }
+        }
+    };
+    let elapsed = started.elapsed();
+    let (final_rollups, final_version) = progress_snapshot(&mut conn).await;
+    if final_version != last_version {
+        commits += 1;
+    }
+    let partial_rollups = samples
+        .iter()
+        .filter(|&&rollups| rollups > initial_rollups && rollups < final_rollups)
+        .count() as u64;
+    let report = ProgressReport {
+        samples: samples.len() as u64,
+        commits,
+        partial_rollups,
+        initial_rollups,
+        final_rollups,
+    };
+    println!(
+        "B6 progress probe ({label}): samples={}, distinct_commits_observed={}, \
+         partial_rollup_samples={}, rollup_rows {}->{}",
+        report.samples,
+        report.commits,
+        report.partial_rollups,
+        report.initial_rollups,
+        report.final_rollups
+    );
+    (value, elapsed, report)
+}
+
+/// Asserts that the second connection observed multiple distinct commits.
+/// `min_commits` is a conservative floor on the polling-observed count, which
+/// collapses commits that happen between two samples.
+fn assert_multiple_commits(report: &ProgressReport, label: &str, min_commits: u64) {
+    assert!(
+        report.commits >= min_commits,
+        "{label}: the second connection observed only {} distinct commits, expected at least \
+         {min_commits}; the run may have wrapped everything in one transaction",
+        report.commits
+    );
+}
+
+/// Asserts that a sweep was observably committed incrementally, not one
+/// transaction around the whole loop.
+fn assert_incremental_commits(report: &ProgressReport, label: &str, min_commits: u64) {
+    assert_multiple_commits(report, label, min_commits);
+    assert!(
+        report.partial_rollups >= 1,
+        "{label}: committed stats_hourly rows never appeared between {} and {} during the \
+         sweep; progress was not visible mid-run",
+        report.initial_rollups,
+        report.final_rollups
+    );
+}
+
+/// Exact fixture-shape assertions: 90 real hours, six qtypes, and the
+/// deterministic same-timestamp batch distribution.
+async fn assert_fixture_shape(db: &StatsDb) {
+    let (distinct, max_per_ts, seven_row_ts): (i64, i64, i64) = sqlx::query_as(
+        r"
+        SELECT COUNT(*), COALESCE(MAX(c), 0),
+               COALESCE(SUM(CASE WHEN c = 7 THEN 1 ELSE 0 END), 0)
+        FROM (SELECT ts, COUNT(*) AS c FROM query_log GROUP BY ts)
+        ",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("fixture timestamp distribution");
+    assert_eq!(
+        distinct, FIXTURE_DISTINCT_TIMESTAMPS,
+        "deterministic fixture must produce the documented timestamp distribution"
+    );
+    assert_eq!(max_per_ts, FIXTURE_MAX_ROWS_PER_TIMESTAMP);
+    assert_eq!(
+        seven_row_ts, FIXTURE_TIMESTAMPS_WITH_SEVEN_ROWS,
+        "most batch groups share one timestamp; only boundary groups split"
+    );
+
+    let qtypes: Vec<i64> =
+        sqlx::query_scalar("SELECT DISTINCT qtype FROM query_log ORDER BY qtype")
+            .fetch_all(db.pool())
+            .await
+            .expect("fixture qtypes");
+    assert_eq!(qtypes, vec![1, 12, 15, 16, 28, 65], "six qtypes");
 }
 
 /// Gated 1M-row / 90-day retention + chunked clear + backdated-row evidence.
 #[tokio::test]
 #[ignore = "1M-row / 90-day capacity evidence; run explicitly with --ignored --nocapture"]
 async fn test_1m_rows_90_days_retention_clear_and_backdated() {
-    let dir = temp_dir("1m-90d");
-    let db = StatsDb::open(dir.join("stats.db")).await.unwrap();
+    let dir = TempDbDir::new("1m-90d");
+    let db = StatsDb::open(dir.db_path()).await.unwrap();
     let base_hour_ms = fixture_base_hour_ms();
 
     // ---- Fixture ---------------------------------------------------------
@@ -332,6 +522,7 @@ async fn test_1m_rows_90_days_retention_clear_and_backdated() {
         (busy_rows - 1) / 5000 >= 10,
         "the heavy hour must be sub-chunked into >10 chunks"
     );
+    assert_fixture_shape(&db).await;
     print_memory("after seed");
 
     // Compact once so the retention/clear sizes start from a vacuumed file.
@@ -347,12 +538,14 @@ async fn test_1m_rows_90_days_retention_clear_and_backdated() {
     );
 
     // ---- 90-day retention ------------------------------------------------
-    let retention_started = Instant::now();
-    let retention = db
-        .cleanup_retention_with_policy(90, 365, false)
-        .await
-        .expect("90-day retention sweep");
-    let retention_elapsed = retention_started.elapsed();
+    let (retention, retention_elapsed, retention_progress) = run_with_progress(
+        &db,
+        "retention(90d)",
+        db.cleanup_retention_with_policy(90, 365, false),
+    )
+    .await;
+    let retention = retention.expect("90-day retention sweep");
+    assert_incremental_commits(&retention_progress, "retention(90d)", 5);
     let remaining = detailed_rows(&db).await;
     let after_retention_size = db.db_size_bytes().await.unwrap();
     let retention_rollups = rollup_totals(&db).await;
@@ -404,12 +597,14 @@ async fn test_1m_rows_90_days_retention_clear_and_backdated() {
 
     // ---- keep_aggregates clear (full remaining fixture) ------------------
     let expected_clear_chunks = expected_chunks(&db).await;
-    let clear_started = Instant::now();
-    let clear_report = db
-        .rollup_and_delete_range(i64::MIN, i64::MAX, false)
-        .await
-        .expect("chunked keep-aggregates clear");
-    let clear_elapsed = clear_started.elapsed();
+    let (clear_report, clear_elapsed, clear_progress) = run_with_progress(
+        &db,
+        "keep-aggregates clear",
+        db.rollup_and_delete_range(i64::MIN, i64::MAX, false),
+    )
+    .await;
+    let clear_report = clear_report.expect("chunked keep-aggregates clear");
+    assert_incremental_commits(&clear_progress, "keep-aggregates clear", 50);
     println!(
         "B6 keep-aggregates clear: {:?}, deleted={}, aggregated_hours={}, chunks={}",
         clear_elapsed,
@@ -429,8 +624,9 @@ async fn test_1m_rows_90_days_retention_clear_and_backdated() {
     assert_eq!(
         i64::try_from(clear_report.chunks).unwrap(),
         expected_clear_chunks,
-        "every committed transaction must hold at most 5,000 rows \
-         (expected {expected_clear_chunks} per-hour chunk ceilings)"
+        "the implementation's chunk counter must equal the per-hour 5,000-row \
+         ceiling sum (expected {expected_clear_chunks}); the progress probe \
+         above independently observed committed rollups mid-run"
     );
     assert_eq!(
         detailed_rows(&db).await,
@@ -470,6 +666,16 @@ async fn test_1m_rows_90_days_retention_clear_and_backdated() {
     let backdated_hour = fixture.base_hour_ms + 5 * HOUR_MS;
     let backdated_blocked = 250i64;
     let backdated_cached = 90i64;
+    let hour_already_aggregated: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM stats_hourly WHERE hour = ?)")
+            .bind(backdated_hour)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        hour_already_aggregated, 1,
+        "the backdated target hour must already have a rollup row before the insert"
+    );
     let before_backdated = rollup_totals(&db).await;
     let entries: Vec<QueryLogEntry> = (0..1_000i64)
         .map(|i| {
@@ -501,10 +707,20 @@ async fn test_1m_rows_90_days_retention_clear_and_backdated() {
         .rollup_and_delete_range(i64::MIN, i64::MAX, false)
         .await
         .expect("backdated clear");
-    let backdated_elapsed = backdated_started.elapsed();
+    let backdated_clear_elapsed = backdated_started.elapsed();
+    // The public clear path vacuums after >=1,000 deleted rows. Mirror it so
+    // the recorded wall time and DB size describe the public behavior, not
+    // just the range helper.
+    let backdated_vacuum_started = Instant::now();
+    db.vacuum().await.unwrap();
+    let backdated_vacuum_elapsed = backdated_vacuum_started.elapsed();
+    let backdated_elapsed = backdated_clear_elapsed + backdated_vacuum_elapsed;
     println!(
-        "B6 backdated clear: {:?}, deleted={}, hours={}, chunks={}",
+        "B6 backdated clear: total {:?} (clear {:?}, vacuum {:?}), deleted={}, hours={}, \
+         chunks={}",
         backdated_elapsed,
+        backdated_clear_elapsed,
+        backdated_vacuum_elapsed,
         backdated_report.deleted_records,
         backdated_report.aggregated_hours,
         backdated_report.chunks
@@ -556,8 +772,6 @@ async fn test_1m_rows_90_days_retention_clear_and_backdated() {
         "B6 final DB {:.1} MiB",
         db.db_size_bytes().await.unwrap() as f64 / (1024.0 * 1024.0)
     );
-
-    cleanup(db, &dir).await;
 }
 
 /// Gated full-backlog retention evidence: a 90-day/1M fixture drained by the
@@ -573,8 +787,8 @@ async fn test_1m_rows_90_days_retention_clear_and_backdated() {
 #[tokio::test]
 #[ignore = "1M-row full-backlog retention evidence; run explicitly with --ignored --nocapture"]
 async fn test_1m_rows_90_day_retention_full_backlog() {
-    let dir = temp_dir("1m-90d-backlog");
-    let db = StatsDb::open(dir.join("stats.db")).await.unwrap();
+    let dir = TempDbDir::new("1m-90d-backlog");
+    let db = StatsDb::open(dir.db_path()).await.unwrap();
     let base_hour_ms = fixture_base_hour_ms();
 
     let seed_started = Instant::now();
@@ -597,12 +811,14 @@ async fn test_1m_rows_90_day_retention_full_backlog() {
     assert_eq!(fixture.distinct_hours, FIXTURE_HOURS);
 
     // Newest fixture row is ~2 days old, so a 1-day deadline expires all rows.
-    let started = Instant::now();
-    let report = db
-        .cleanup_retention_with_policy(1, 365, false)
-        .await
-        .expect("full-backlog retention sweep");
-    let elapsed = started.elapsed();
+    let (report, elapsed, progress) = run_with_progress(
+        &db,
+        "retention(full 90-day backlog)",
+        db.cleanup_retention_with_policy(1, 365, false),
+    )
+    .await;
+    let report = report.expect("full-backlog retention sweep");
+    assert_incremental_commits(&progress, "retention(full 90-day backlog)", 50);
     let after_size = db.db_size_bytes().await.unwrap();
     println!(
         "B6 retention(1d deadline, 90-day backlog): {:?}, deleted={}, \
@@ -630,8 +846,9 @@ async fn test_1m_rows_90_day_retention_full_backlog() {
     assert_eq!(
         i64::try_from(report.chunks).unwrap(),
         expected,
-        "every committed transaction must hold at most 5,000 rows \
-         (one per quiet hour, more for the heavy hour)"
+        "the implementation's chunk counter must equal the per-hour 5,000-row \
+         ceiling sum (one per quiet hour, more for the heavy hour); the \
+         progress probe above independently observed committed rollups mid-run"
     );
     assert_eq!(detailed_rows(&db).await, 0);
     assert_eq!(
@@ -645,8 +862,6 @@ async fn test_1m_rows_90_day_retention_full_backlog() {
     );
     assert_bounded_memory("after full-backlog retention");
     print_memory("after full-backlog retention");
-
-    cleanup(db, &dir).await;
 }
 
 /// Gated 100k-row retroactive anonymization evidence (B4 path).
@@ -656,8 +871,8 @@ async fn test_100k_rows_anonymize_is_chunked_and_removes_pii() {
     const ROWS: i64 = 100_000;
     const CHUNK: usize = 1_000;
 
-    let dir = temp_dir("100k-anonymize");
-    let db = StatsDb::open(dir.join("stats.db")).await.unwrap();
+    let dir = TempDbDir::new("100k-anonymize");
+    let db = StatsDb::open(dir.db_path()).await.unwrap();
     let base_hour_ms = fixture_base_hour_ms();
 
     let seed_started = Instant::now();
@@ -683,9 +898,13 @@ async fn test_100k_rows_anonymize_is_chunked_and_removes_pii() {
     );
     assert!(would_change > 0, "the fixture must contain PII to rewrite");
 
-    let started = Instant::now();
-    let report = db.anonymize_query_log(CHUNK).await.unwrap();
-    let elapsed = started.elapsed();
+    let (report, elapsed, progress) =
+        run_with_progress(&db, "anonymize(100k)", db.anonymize_query_log(CHUNK)).await;
+    let report = report.unwrap();
+    // `stats_hourly` is not touched here, so there is no partial-rollup signal;
+    // `data_version` changes still prove that the rewrite committed repeatedly
+    // rather than in one transaction.
+    assert_multiple_commits(&progress, "anonymize(100k)", 10);
     let after_size = db.db_size_bytes().await.unwrap();
     let chunk_i64 = i64::try_from(CHUNK).unwrap();
     let expected_chunks = (ROWS + chunk_i64 - 1) / chunk_i64;
@@ -711,7 +930,7 @@ async fn test_100k_rows_anonymize_is_chunked_and_removes_pii() {
     assert_eq!(
         report.chunks,
         u64::try_from(expected_chunks).unwrap(),
-        "anonymization must commit one transaction per {CHUNK} rows"
+        "the chunk counter must match ceil(rows / {CHUNK})"
     );
     assert!(report.vacuumed);
 
@@ -740,5 +959,4 @@ async fn test_100k_rows_anonymize_is_chunked_and_removes_pii() {
 
     assert_bounded_memory("after anonymize");
     print_memory("after anonymize");
-    cleanup(db, &dir).await;
 }

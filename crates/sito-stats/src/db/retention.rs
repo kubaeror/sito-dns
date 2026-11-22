@@ -65,9 +65,11 @@
 //! multi-hour sweep. The 1M-row/90-day capacity evidence lives in the
 //! `#[ignore]`d `db::capacity_tests` module (it would dominate CI), which runs
 //! retention and the chunked clear on a deterministic 1M-row fixture and
-//! asserts exact rollup totals, one committed chunk per ceil(rows/5,000), and
-//! bounded process memory. The chunking keeps each write transaction bounded
-//! and the total sweep remains O(rows) with scheduled startup catch-up.
+//! asserts exact rollup totals, a chunk counter equal to the per-hour
+//! ceil(rows/5,000) sum, independently observed mid-run commits from a second
+//! connection, and bounded process memory. The chunking keeps each write
+//! transaction bounded and the total sweep remains O(rows) with scheduled
+//! startup catch-up.
 //! Measured dev-host results are recorded in `docs/2.0-migration.md`; they are
 //! not a production SLA.
 //!
