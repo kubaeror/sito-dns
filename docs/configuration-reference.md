@@ -121,6 +121,20 @@ serve_stale_hours = 12
 | `prefetch` | boolean | `true` | When `true`, automatically re-resolves frequently requested domains before TTL expires. |
 | `serve_stale_hours` | integer | `12` | Hours to serve expired cache records as fallback when upstreams are unreachable. Stale answers are served with all DNSSEC records removed and AD=0; while DNSSEC validation is active, entries cached without validation (`Unchecked`), with an inconclusive result (`Indeterminate`) or as a fail-closed `Bogus` SERVFAIL are not served. |
 
+> [!NOTE]
+> **A TTL-only live apply does not preserve warm entries.** A live config apply
+> publishes the new cache policy and advances the single cache-policy epoch, so
+> entries stored under the previous policy become unservable immediately and are
+> reclaimed lazily; the cache is **cold by design** after the apply and refills
+> as queries recur. New inserts are clamped with the new `min_ttl`/`max_ttl`/
+> `negative_ttl_max`/`serve_stale_hours` policy, and a `size_mb` change resizes
+> the cache. This is an accepted 2.0 residual: it can cause a transient hit-rate
+> drop but no stale answer or correctness/TTL over-serve issue. Direct
+> `DnsCache` users that keep the epoch get the immediate warm-entry re-clamp in
+> `DnsCache::update_config`; the runtime apply deliberately uses the O(1)
+> `DnsCache::update_config_for_generation` and then advances the epoch. See
+> [migration §10.2](2.0-migration.md#102-cache-ttl-residual-b8).
+
 ---
 
 ## 5. `[dns.dnssec]` — DNSSEC Validation
@@ -614,10 +628,13 @@ accumulator is cumulative for the hour (the temp tables are not cleared per
 chunk), so a heavy hitter below a chunk-local top-N but in the hour's top-N is
 preserved; only the counters are per-chunk deltas. Memory is therefore bounded
 to roughly one hour of distinct values and the writer lock is held for at most
-one chunk. A committed chunk already contains the rollup contribution of the
-rows it deleted, so an interrupted clear leaves a consistent prefix and
-re-running the command resumes from the oldest remaining row without double
-counting. Each chunk re-reads the current `stats_hourly` row inside the write
+one chunk. On the normal path a committed chunk already contains the rollup
+contribution of the rows it deleted, so an interrupted clear leaves a consistent
+prefix and re-running the command resumes from the oldest remaining row without
+double counting. The one exception is the deleted-rollup case below: a chunk
+still clears its detailed rows but writes no rollup because the hour's rollup
+row was deleted after the clear observed it. Each chunk re-reads the current
+`stats_hourly` row inside the write
 transaction, merges the pre-clear snapshot plus the run's cumulative counts,
 and adds any positive-only external top-list delta; a concurrent rollup update
 is therefore preserved, a deleted rollup row is not resurrected, and a zero-row
@@ -662,9 +679,20 @@ the expected detailed-log size. These are dev-host debug-build observations,
 deployment hardware. The exact commands, captured output and
 recommended sizing are in
 [the migration guide](2.0-migration.md#6-database). `stats_watermark` is still
-written for progress diagnostics/backward compatibility but is not read to skip
-rows: aggregation and deletion share a transaction, and backdated rows must be
-re-aggregated. Enabling `privacy.anonymize_querylog` is forward-only: old
+written for progress diagnostics and v1.9 schema compatibility, but no
+production path reads it to skip rows: the aggregate read, rollup upsert,
+watermark update and delete share one transaction per chunk. In the retention
+sweep a row is not deleted unless its rollup contribution committed, and a
+backdated row is re-aggregated on the next sweep. The `--keep-aggregates` clear
+shares that transaction but has one documented exception: `hour_had_rollup` is
+evaluated per hour when the clear reaches that hour. If the hour's
+`stats_hourly` row existed then but was deleted mid-run by rollup retention, the
+clear skips the upsert and clears the detailed rows without resurrecting the
+rollup; a row already absent when the clear reached its hour is recreated
+normally. This is an
+accepted 2.0 residual, not a missing read optimization;
+see [migration §10.1](2.0-migration.md#101-backendstats-residual-b7). Enabling
+`privacy.anonymize_querylog` is forward-only: old
 detailed rows are never rewritten automatically. Run `sito db anonymize --all`
 to rewrite them (review the plan with `--dry-run` first); see the migration
 guide.
@@ -1024,7 +1052,7 @@ applies the hot settings and reports the restart-only fields that remain.
 | `web.metrics_auth`, `web.trusted_proxies`, `web.public_url`, `web.tls_terminated_by_proxy` | Read from the live configuration when a request is handled. |
 | `dns.bind`, `dns.port`, `dns.dot_port`, `dns.doh_port`, `dns.doq_port`, `dns.doh3_port`, `dns.doh_dedicated_hostname`, `dns.dot_padding`, `dns.edns_udp_size`, `dns.max_tcp_connections`, `dns.allow_plaintext_doh` | DNS listeners are stopped and rebound in-process when the listener plan changes; a failed rebind restores the previous bindings. TLS listeners need the acceptors created at startup. |
 | `dns.rate_limit_per_ip` | Live rate limiters updated. |
-| `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | Cache configuration updated. |
+| `dns.cache.enabled`, `dns.cache.size_mb`, `dns.cache.min_ttl`, `dns.cache.max_ttl`, `dns.cache.negative_ttl_max`, `dns.cache.prefetch`, `dns.cache.serve_stale_hours` | The cache policy is published and the single cache-policy epoch is advanced immediately afterwards: entries from the previous generation become unservable immediately and are reclaimed lazily, so a TTL-only live apply leaves the cache **cold by design** and new inserts use the new TTLs. A `size_mb` change also resizes the cache. Direct `DnsCache` users keep the warm re-clamping `update_config` path. See [§4](#4-dnscache--caching-layer) and [migration §10.2](2.0-migration.md#102-cache-ttl-residual-b8). |
 | `dns.dnssec.mode`, `dns.dnssec.validate`, `dns.dnssec.ntp`, `dns.dnssec.nta`, `dns.dnssec.trust_anchors` | DNSSEC validator swapped for the new configuration; the response cache is flushed because cached validation decisions belong to the old policy. |
 | `upstream.servers`, `upstream.bootstrap`, `upstream.strategy`, `upstream.timeout_ms`, `upstream.probe_domain`, `upstream.pool_size`, `upstream.ecs`, `upstream.allow_private_targets`, `upstream.per_domain` | Upstream manager and per-client scoped upstream managers rebuilt, including a fresh bootstrap resolver and SSRF policy. |
 | `filtering.enabled`, `filtering.refresh_interval_hours`, `filtering.blocking_mode`, `filtering.blocking_ttl`, `filtering.cname_cloaking`, `filtering.fail_closed`, `filtering.anti_doh_bypass`, `filtering.max_rules`, `filtering.max_list_bytes`, `filtering.allow_empty_list`, `filtering.regex_compile_budget_ms`, `filtering.lists`, `filtering.custom_rules` | Filter engine reloaded with the new lists/rules; cached answers are flushed. List downloads continue asynchronously after the reload. |
