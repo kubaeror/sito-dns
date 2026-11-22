@@ -227,6 +227,15 @@ pub struct MasterCoordinator {
     /// Whether the replication listener is actually serving. Updated by
     /// `spawn_master_server` and surfaced by `/ha/status` and `/health`.
     readiness: HaReadinessState,
+    /// `ha.require_slaves`: readiness needs at least one synced slave.
+    ///
+    /// Shared across clones so the policy applied by `spawn_master_server`
+    /// from `HaConfig` is visible to the coordinator used by the API and
+    /// healthcheck (which is a clone made before the listener was spawned).
+    require_slaves: Arc<AtomicBool>,
+    /// `ha.require_all_slaves`: readiness needs every connected slave synced.
+    /// Implies `require_slaves`.
+    require_all_slaves: Arc<AtomicBool>,
 }
 
 mod message;

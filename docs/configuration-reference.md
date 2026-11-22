@@ -611,6 +611,8 @@ P2-59).
 [ha]
 replication_port = 8953
 # ping_interval_secs = 15        # master heartbeat; slaves silent for 3x are dropped
+# require_slaves = false         # master readiness needs >= 1 synced slave
+# require_all_slaves = false     # master readiness needs every connected slave synced
 
 # On Slave instance:
 # master_url = "wss://192.168.1.10:8953"
@@ -635,7 +637,23 @@ replication_port = 8953
 | `pinned_slave_fingerprints` | array of strings | `[]` | BLAKE3 fingerprints of slave certificates accepted by the master. |
 | `allow_unpinned_tls` | boolean | `false` | Explicit no-verification opt-out. It only applies when neither `master_fingerprint` nor `ca` is configured; a configured pin or CA is always enforced. |
 | `allow_insecure_ws` | boolean | `false` | Allow plaintext `ws://` replication. Requires a non-empty `slave_token`; must be set explicitly on both ends. |
+| `require_slaves` | boolean | `false` | (Master only) Make HA readiness not-ready until at least one connected slave is synced to the current configuration version. Ignored by the slave role. |
+| `require_all_slaves` | boolean | `false` | (Master only) Make HA readiness not-ready until every connected slave is synced to the current configuration version. Zero connected slaves is also not ready. Implies `require_slaves`. |
 | `stats_interval_secs` | integer | `30` | Interval between slave-to-master statistics reports. |
+
+`require_slaves` and `require_all_slaves` are opt-in: both default to `false`,
+so an upgraded master keeps the previous behavior and stays ready (given a
+healthy listener and last publish) even with no connected slaves. When enabled,
+"synced" means the slave's acknowledged version equals the master's current
+published version **and** no divergence (ahead, newer term, or payload fork) is
+latched for that slave; a slave ahead or behind does not count. `require_all_slaves`
+is the stronger policy and also fails with zero slaves. The unmet requirement
+appears in `readiness_reason` (and therefore in `/health`) with counts, for
+example `HA requires at least one synced slave (0/2 connected)` or
+`HA requires all slaves synced (1/2 synced)`. The fields only gate master
+readiness; the slave role ignores them and does not change its own readiness.
+With `replication_port = 0` no slave can connect, so setting either requirement
+keeps readiness not-ready (the listener itself remains intentionally disabled).
 
 HA protocol **v2** is required on every node. A `Hello` without
 `protocol_version`, a v1 `ConfigPush`, or a v1 `ha_state.toml`/

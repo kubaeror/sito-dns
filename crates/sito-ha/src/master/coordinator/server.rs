@@ -20,7 +20,9 @@ pub fn spawn_master_server(
     if coordinator.slave_token.is_none() {
         coordinator.slave_token.clone_from(&ha_config.slave_token);
     }
-    coordinator = coordinator.with_ping_interval_secs(ha_config.ping_interval_secs);
+    coordinator = coordinator
+        .with_ping_interval_secs(ha_config.ping_interval_secs)
+        .with_slave_requirements(ha_config.require_slaves, ha_config.require_all_slaves);
     tokio::spawn(async move {
         if ha_config.replication_port == 0 {
             // The startup no-op metric is recorded by the production call site
