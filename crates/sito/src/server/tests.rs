@@ -1183,6 +1183,7 @@ fn test_slave_acl_gate_requires_an_applied_bundle() {
     );
 }
 
+#[cfg(feature = "ha")]
 #[test]
 fn test_acl_deny_effective_uses_typed_clients_table() {
     let mut config = sito_core::config::Config::default();

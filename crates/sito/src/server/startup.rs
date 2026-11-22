@@ -570,6 +570,8 @@ pub async fn run_server_with_lease(
                             .tracker
                             .as_ref()
                             .is_some_and(sito_ha::SlaveStatusTracker::has_applied_bundle);
+                    #[cfg(not(feature = "ha"))]
+                    let bundle_ready = true;
                     #[cfg(feature = "ha")]
                     let start_ready = dns_start_ready(
                         setup_done,

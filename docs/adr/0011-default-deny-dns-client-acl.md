@@ -683,10 +683,12 @@ fresh_install_acl = is_first_run && !is_setup_complete() && !has_usable_admin()
 setup_recovery    = setup_token_required && !is_first_run
 ```
 
-`is_first_run` is itself the durable marker: the auth manager derives it from
-persisted user state, and it is false once a usable Admin exists or the
-bootstrap default admin is no longer active. No new config-file marker is
-required for D7b.
+`is_first_run` is the durable wizard-state marker: the auth manager derives it
+from persisted user state, and it is true while setup is incomplete **and** the
+bootstrap default admin is still active. It is **not** by itself proof that no
+other Admin exists: a template/operator-created Admin can coexist with the
+active bootstrap `admin` account, so `!has_usable_admin()` is part of the
+predicate. No new config-file marker is required for D7b.
 
 Concretely for D7b:
 
@@ -1033,8 +1035,9 @@ shown in parentheses.
 | Fresh template with `allow_entry_ids = true` | Wizard writes `false` unless `client_acl_allow_entry_ids` is checked; warning shown (`test_wizard_entry_ids_opt_in_is_explicit`) |
 | Fresh template with explicit `default_policy = "allow"` and first-run admin state | ACL step is still rendered, deny is preselected, the template's allow prefixes are prefilled/preserved, the template's allow is noted with a warning, and the operator must actively keep allow (`test_wizard_fresh_template_explicit_allow_still_shows_acl`) |
 | Fresh template with existing `[clients.acl] allow` prefixes | Prefixes are prefilled/selected; accepting default deny keeps them, so a routed/NAT allow network is not silently dropped (`test_wizard_fresh_template_prefills_existing_allow`) |
-| Fresh template that pre-creates an admin | `is_first_run = false`; wizard not applicable; startup warning reports effective allow on wildcard bind (`test_fresh_provisioned_template_warns_open_resolver`) |
-| Fresh-install predicate | `is_first_run = true`, `setup_token_required = true`, `is_setup_complete = false` -> ACL step applied (`test_wizard_fresh_install_predicate`) |
+| Fresh template that pre-creates an admin | `has_usable_admin = true` (and usually `is_first_run = false`); wizard not applicable; startup warning reports effective allow on wildcard bind (`test_fresh_provisioned_template_warns_open_resolver`) |
+| Fresh-install predicate | `is_first_run = true`, `setup_token_required = true`, `is_setup_complete = false`, `has_usable_admin = false` -> ACL step applied (`test_wizard_fresh_install_predicate`) |
+| Provisioned install with active bootstrap admin plus a usable Admin | ACL step absent; existing ACL unchanged (`test_wizard_usable_admin_with_active_bootstrap_is_not_fresh`) |
 | Setup-token recovery on an existing install (`setup_token_required = true`, `is_first_run = false`, existing ACL) | ACL step is not rendered/applied; existing `default_policy` and ACL remain unchanged (`test_wizard_setup_token_recovery_preserves_existing_acl`) |
 | Re-auth recovery on an existing install | Same as setup-token recovery; ACL untouched (`test_wizard_reauth_recovery_preserves_existing_acl`) |
 | Wizard completion without a reachable bootstrap/recovery path | Still 403; no ACL path (`test_wizard_forbidden_after_setup_even_for_admin`) |
@@ -1146,7 +1149,7 @@ missing map entry, an unknown-key rejection, or a `check-config` regression.
      `client_acl_public_ack`, `client_acl_allow_entry_ids`,
      `client_acl_allow_all` + exact `client_acl_allow_all_confirm`;
    - **do not use `bootstrapping` as the fresh-install marker.** Compute
-     `fresh_install_acl = is_first_run && !is_setup_complete()` and
+     `fresh_install_acl = is_first_run && !is_setup_complete() && !has_usable_admin()` and
      `setup_recovery = setup_token_required && !is_first_run`; apply the ACL
      step only for `fresh_install_acl` and never for `setup_recovery`;
    - on a first-run template with existing ACL keys, prefill and preserve the
