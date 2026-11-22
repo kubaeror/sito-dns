@@ -125,8 +125,11 @@ instead.
 
 Neither `parental = true` nor the wizard enables a catalog list, and the
 catalog itself is metadata only: the list body is downloaded by the normal
-subscription machinery, and a failed or empty download keeps the previous
-snapshot rather than silently removing protection. See
+subscription machinery. By default a failed download, an empty body or a list
+that parses to zero rules is rejected and the previous snapshot is kept rather
+than silently removing protection; setting
+`filtering.allow_empty_list = true` opts into accepting empty bodies at the
+cost of losing that protection. See
 [catalog.md § Choose from catalog](catalog.md#choose-from-catalog-web-ui) for
 the dialog behaviour and limits.
 
@@ -160,11 +163,13 @@ Behaviour to rely on:
   ids cannot be introduced at runtime;
 - domain sources accept plain domains, ABP `||domain^` rules and hosts-format
   lines. Malformed lines and boilerplate hosts entries are skipped;
-- a failed fetch, empty result or invalid parse keeps the previous content and
-  records `last_error`. A periodic refresh that shrinks a previously refreshed
-  category by more than 50% is rejected; an operator can force an intentional
-  shrink with `POST /api/v2/integrations/lists/{category}/refresh` (empty
-  content is still refused);
+- a failed fetch, a zero-yield result or invalid `services` JSON keeps the
+  previous content and records `last_error`. For domain sources, parsing skips
+  malformed lines and applies the valid remainder, so only content that yields
+  no usable entries is rejected. A periodic refresh that shrinks a previously
+  refreshed category by more than 50% is rejected; an operator can force an
+  intentional shrink with `POST /api/v2/integrations/lists/{category}/refresh`
+  (empty content is still refused);
 - `GET /api/v2/integrations/lists` reports, per category, whether the active
   content is the bundled fallback, the deployed source URL, entry count, last
   refresh/attempt and the most recent error. The Filtering page shows the same
@@ -184,8 +189,11 @@ list, catalog entry or integration source is enabled by default.
 **Wizard.** The first-time setup wizard covers administrator, listeners,
 upstreams, cache/DNSSEC, filtering subscriptions and web statistics. It has no
 client-group or parental step, creates no group, and writes the same off
-defaults; `--no-setup` does the same headless. Configure parental control after
-setup with the snippet above. See
+defaults when it persists `config.toml`. `--no-setup` on a fresh install also
+leaves parental off, but it starts from built-in defaults without persisting a
+config file, and it disables filtering when no list or custom rule is
+configured so DNS resolution still works. Either way, configure parental
+control after setup with the snippet above. See
 [the README's first-time setup section](../README.md#-first-time-setup-wizard).
 
 **Migration.** `clients.groups.*.parental` and
@@ -213,10 +221,13 @@ See the [HA runbook](runbook-ha.md) for bundle, drift and promotion details.
    It rejects unknown categories, malformed groups and invalid list sources
    before a restart. It validates ids against the bundled registries; it does
    not prove the downloaded content is complete.
-2. **Effective configuration.** `GET /api/v2/config` (or
-   `GET /api/v2/clients/groups`) shows each group's `parental_control` and
-   `parental_categories`. The Clients page shows group assignments but no
-   parental control.
+2. **Group policy and on-disk config.** `GET /api/v2/clients/groups` (requires
+   **Operator** or higher) returns each group's DTO from the live configuration
+   with `parental_control` and `parental_categories`, including the implicit
+   `default` group. `GET /api/v2/config` (requires **Admin**) returns the
+   masked on-disk TOML as `config_toml`, where the same setting is the group
+   key `parental`; it does not expose the `parental_control` DTO field. The
+   Clients page shows group assignments but no parental control.
 3. **Active list data.** `GET /api/v2/integrations/lists` and the Filtering
    page's Built-in Curated Lists table show whether `adult`/`gambling` are
    bundled or refreshed, from which source, with how many entries and the last
