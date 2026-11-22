@@ -165,6 +165,65 @@ expect_step_absent "${RELEASE}" "${SCAN_STEP}" ':latest' "per-platform scan neve
 expect_step_absent "${RELEASE}" "${SCAN_STEP}" 'continue-on-error' "per-platform scan cannot continue on error"
 expect_step_absent "${RELEASE}" "${SCAN_STEP}" 'deferred' "per-platform scan is no longer deferred"
 
+# The release smoke must exercise the exact attested digest (no tag drift, no
+# rebuild) and keep the live DNS/health gates while also proving the 2.0 API
+# surface and the fresh-install schema version.
+SMOKE_STEP="Smoke-test the published image"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'image="\$\{IMAGE\}@\$\{DIGEST\}"' "release smoke pins the attested digest"
+expect_step_absent "${RELEASE}" "${SMOKE_STEP}" '\$\{IMAGE\}:' "release smoke never runs a mutable tag"
+expect_step_absent "${RELEASE}" "${SMOKE_STEP}" 'docker (build|buildx build)' "release smoke never rebuilds the image"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'trap cleanup EXIT' "release smoke cleans up containers and temp dirs"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'docker volume create "\$\{data_volume\}"' "release smoke uses an image-owned data volume"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'docker volume create "\$\{api_data_volume\}"' "release smoke gives the API container its own data volume"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" '\$\{data_volume\}:/var/lib/sito' "release smoke mounts the DNS data volume at the image path"
+# The API volume must be mounted by all three containers: reset-admin, the
+# long-running server, and the schema check. A single remaining occurrence
+# means one of those was silently dropped.
+api_volume_mounts="$(step_section "${SMOKE_STEP}" "${RELEASE}" | grep -c '\${api_data_volume}:/var/lib/sito' || true)"
+if [ "${api_volume_mounts}" -lt 3 ]; then
+    echo "not ok - release smoke mounts the API data volume in all three containers (found ${api_volume_mounts})" >&2
+    failures=$((failures + 1))
+else
+    echo "ok - release smoke mounts the API data volume in all three containers"
+fi
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'docker volume rm -f "\$\{data_volume\}" "\$\{api_data_volume\}"' "release smoke removes both data volumes"
+expect_step_absent "${RELEASE}" "${SMOKE_STEP}" '\$\{tmp\}/data:/var/lib/sito' "release smoke never bind-mounts a runner-owned data dir"
+expect_step_absent "${RELEASE}" "${SMOKE_STEP}" '\$\{api_tmp\}/data:/var/lib/sito' "release smoke never bind-mounts a runner-owned API data dir"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'expected_version="sito \$\{GITHUB_REF_NAME#v\}"' "release smoke derives the expected version from the tag"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" '\[ "\$\{version_out\}" = "\$\{expected_version\}" \]' "release smoke asserts the image --version output"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" '\[ "\$\{shipped_version\}" = "\$\{expected_version\}" \]' "release smoke asserts the shipped-entrypoint --version output"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'check-config' "release smoke keeps the config check"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'smoke\.test' "release smoke keeps the live DNS rewrite"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'reset-admin' "release smoke creates a real admin account"
+# Both the DNS-only and the web-enabled config need the local `localhost`
+# rewrite: the image healthcheck resolves `localhost.` and must not depend on
+# an upstream answer.
+localhost_rewrites="$(step_section "${SMOKE_STEP}" "${RELEASE}" | grep -c 'domain = "localhost"' || true)"
+if [ "${localhost_rewrites}" -lt 2 ]; then
+    echo "not ok - release smoke needs a local localhost rewrite in both containers (found ${localhost_rewrites})" >&2
+    failures=$((failures + 1))
+else
+    echo "ok - release smoke keeps the healthcheck rewrite local in both containers"
+fi
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'http://127\.0\.0\.1:18080/api/v2/status' "release smoke probes the mounted API v2 status"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'case "\$\{v2_status\}" in' "release smoke classifies the API v2 status"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" '200\|401\) ;;' "release smoke accepts only 200 or 401 from API v2"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'expected 200 or 401' "release smoke documents the API v2 acceptance set"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'http://127\.0\.0\.1:18080/api/v1/status' "release smoke probes the removed API v1 status"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" '\[ "\$\{v1_status\}" = "404" \]' "release smoke requires API v1 to be exactly 404"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" '\[ "\$\{api_health\}" = "200" \] && break' "release smoke waits for /health HTTP 200"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" '\[ "\$\{api_health\}" = "200" \] \|\|' "release smoke requires /health HTTP 200"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'grep -Eq ."status".*"ok"' "release smoke requires /health status: ok"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'api_health_status="\$\(docker inspect' "release smoke reads the image health status"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'for _ in \$\(seq 1 90\); do' "release smoke waits for the web-enabled healthcheck"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" '\[ "\$\{api_health_status\}" = "unhealthy" \]' "release smoke fails fast on an unhealthy web-enabled container"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" '\[ "\$\{api_health_status\}" = "healthy" \] \|\|' "release smoke requires a healthy web-enabled healthcheck"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'db migrate --config /etc/sito/config\.toml --dry-run' "release smoke inspects the fresh stats schema read-only"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'if ! schema_out="\$\(docker run' "release smoke captures a failed schema inspection"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'already at schema version 2' "release smoke requires schema v2"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" '/api/v1/status=\$\{v1_status\}' "release smoke reports the observed API v1 status"
+expect_step_match "${RELEASE}" "${SMOKE_STEP}" 'healthcheck: \$\{api_health_status\}' "release smoke reports the web-enabled healthcheck"
+
 expect_match "${CI}" 'branches: \[main, release/1\.9\.x\]' "CI runs on the release branch"
 expect_match "${SECURITY}" 'branches: \[main, release/1\.9\.x\]' "security runs on the release branch"
 expect_match "${CI}" 'bash contrib/tests/test-installer\.sh' "CI runs the installer E2E"
@@ -233,7 +292,8 @@ expect_match "${RELEASE_DOC}" '^\| 10 \| Image signature and attestations \| .*c
 expect_match "${RELEASE_DOC}" '^\| 11 \| Root-gated HA ownership \(E5\) \| .*ha-ownership\.yml' "checklist row 11 pins the root-gated HA lane"
 expect_match "${RELEASE_DOC}" '^\| 12 \| 24-hour fuzz \| .*fuzz_seconds=17280' "checklist row 12 pins the 24-hour fuzz campaign"
 expect_match "${RELEASE_DOC}" '^\| 13 \| Thresholded benchmark \| .*bench\.yml' "checklist row 13 pins the thresholded benchmark gate"
-expect_match "${RELEASE_DOC}" '^\| 14 \| Live DNS and health smoke \| .*Smoke-test the published image' "checklist row 14 pins the live DNS/health smoke"
+expect_match "${RELEASE_DOC}" '^\| 14 \| Live image smoke: DNS, health, API v2 and schema v2 \| .*Smoke-test the published image' "checklist row 14 pins the live image smoke"
+expect_match "${RELEASE_DOC}" '^\| 14 \| .*API v2 is mounted.*API v1 is 404.*fresh data dir is schema v2' "checklist row 14 requires API v2, API v1 absence and schema v2"
 expect_match "${RELEASE_DOC}" '^\| 15 \| Security review \| .*phase3-security-review\.md' "checklist row 15 pins the security review"
 expect_match "${RELEASE_DOC}" '^\| 16 \| `latest` still on 1\.9\.5 \| .*1\.9\.5' "checklist row 16 pins the pre-final latest rule"
 expect_match "${CI_DOC}" 'check_test_matrix\.py' "docs/ci.md documents the test-matrix docs check"
