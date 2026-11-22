@@ -103,13 +103,15 @@ pub fn validate_typed_sections(config: &Config) -> anyhow::Result<()> {
 /// `parental_categories` and `blocked_services.service` are plain strings in
 /// the TOML schema; without this check a typo is accepted but silently matches
 /// nothing at query time. The registries are built once per validation pass.
+/// The service registry includes the release-bound embedded catalog overlay,
+/// so every catalog service id is accepted.
 ///
 /// Limitation: the check uses the **bundled** registries, because this
 /// validation path has no live [`sito_clients::RuntimeLists`] handle. Service
 /// ids supplied only by a runtime-refreshed `[integrations.lists]` source are
-/// therefore not accepted as client references; startup validation uses the
-/// same bundled data. Threading the live store through validation is a
-/// follow-up, not part of this fix.
+/// therefore not accepted as client references unless the embedded catalog
+/// also declares them; startup validation uses the same data. Threading the
+/// live store through validation is a follow-up, not part of this fix.
 fn validate_client_curated_references(clients: &sito_clients::ClientsConfig) -> anyhow::Result<()> {
     if clients.groups.is_empty() {
         return Ok(());
@@ -260,10 +262,11 @@ mod tests {
         let valid = Config::from_toml_str(
             "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n\
              [clients.groups.kids]\nparental_categories = [\"adult\"]\n\
-             [[clients.groups.kids.blocked_services]]\nservice = \"tiktok\"\n",
+             [[clients.groups.kids.blocked_services]]\nservice = \"tiktok\"\n\
+             [[clients.groups.kids.blocked_services]]\nservice = \"4chan\"\n",
         )
         .expect("parses");
-        validate_typed_sections(&valid).expect("bundled categories and services are accepted");
+        validate_typed_sections(&valid).expect("bundled and catalog-only services are accepted");
 
         let invalid_category = Config::from_toml_str(
             "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n\
