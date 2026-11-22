@@ -142,6 +142,20 @@ impl AuthManager {
             && self.default_admin_active.load(Ordering::SeqCst)
     }
 
+    /// Returns true when any Admin account has a non-bootstrap credential.
+    ///
+    /// A first-run install may still have the bootstrap `admin/adminadmin`
+    /// account active *and* an additional usable Admin (for example a template
+    /// or an operator-created account). That install is provisioned, not a
+    /// fresh wizard install: the ADR-0011 ACL step must not rewrite its
+    /// existing `[clients.acl]`.
+    pub fn has_usable_admin(&self) -> bool {
+        let admin_default_active = self.default_admin_active.load(Ordering::SeqCst);
+        lock(&self.users).values().any(|user| {
+            user.role == Role::Admin && !(user.username == "admin" && admin_default_active)
+        })
+    }
+
     /// Checks whether a user with the given username exists.
     pub fn has_user(&self, username: &str) -> bool {
         lock(&self.users).contains_key(username)

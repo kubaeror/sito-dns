@@ -54,10 +54,14 @@ site, then publish it from the master.
 **Fresh/headless/rebuild slave.** A slave with no applied
 `ha_watermark.toml`/bundle starts its admin/HA client, reports
 `acl_unprovisioned`, and **does not bind DNS listeners**. It serves only after
-the first valid bundle applies; a restart with a watermark serves the persisted
-applied configuration immediately. If the master is unreachable, a first-boot
-slave cannot serve DNS: restore the master (or use the promotion/recovery
-procedure) instead of expecting a temporary allow.
+the first valid bundle is applied, persisted and the watermark write succeeds;
+a rejected bundle or a failed watermark write keeps DNS unbound. A restart with
+a watermark serves the persisted applied configuration immediately. If the
+master is unreachable, a first-boot slave cannot serve DNS: restore the master
+(or use the documented recovery procedure) instead of expecting a temporary
+allow. Setup completion does not bypass this rule: a setup-pending slave starts
+its replication worker after the wizard completes and still waits for the first
+watermarked bundle before binding DNS.
 
 **Invalid bundle.** An invalid ACL (bad enum/CIDR, duplicate canonical prefix,
 allow/deny exact conflict, over-cap list, malformed clients table) rejects the
@@ -65,19 +69,22 @@ whole bundle atomically. The slave keeps its previous runtime generation and
 ACL, reports `Degraded`, and does not ACK `applied: true`.
 
 **Mixed versions.** An ACL-aware slave advertises `client_acl` in its `Hello`.
-While a master has `default_policy = "deny"`, a connected slave without the
-capability makes master readiness report `acl_capability_missing` and logs a
-warning. Upgrade every DNS-serving node before enabling deny; a mixed-version
-cluster must stay on `default_policy = "allow"`. Legacy v2 peers that cannot
-report `have_bundle_hash` also cannot participate in promotion candidate
-reconciliation; keep such peers on allow and upgrade before enabling automatic
-promotion.
+While the published configuration has `default_policy = "deny"`, a connected
+slave without the capability makes master readiness report
+`acl_capability_missing` and logs a warning (at Hello and when an allow→deny
+publish transition is made). Upgrade every DNS-serving node before enabling
+deny; a mixed-version cluster must stay on `default_policy = "allow"`. Legacy v2
+peers that cannot report `have_bundle_hash` also cannot participate in promotion
+candidate reconciliation; that flow is not part of this ACL change and remains
+release-gated until the promotion engine is merged.
 
-**Promotion.** A slave that already applied the bundle keeps its shared ACL
-through promotion; promotion does not re-evaluate or reset it. An unprovisioned
-slave is not `Synced` and must not be promoted as an ACL-serving node: promotion
-never invents an ACL. A promoted node writes the shared configuration it
-received, so verify the all-site allow plan before promotion.
+**Promotion.** Automatic promotion is governed by ADR-0010 and is not part of
+this ACL change. A node that has already applied the bundle keeps that shared
+ACL if a promotion flow later runs. The ACL startup gate does not invent a
+policy for an unprovisioned node, but the claim that an unprovisioned slave
+cannot be promoted is not enforced by this tree until the promotion engine is
+merged; keep promotion disabled until then. A promoted node writes the shared
+configuration it received, so verify the all-site allow plan before promotion.
 
 **Discovery.** Denied queries are absent from the detailed query log and the
 `unidentified_clients` list by design. Use

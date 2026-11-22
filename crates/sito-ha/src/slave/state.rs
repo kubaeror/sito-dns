@@ -31,6 +31,12 @@ pub struct SlaveStatusTracker {
     /// True when the on-disk configuration no longer matches the digest of the
     /// document that was last applied from the master.
     local_config_drift: Arc<std::sync::atomic::AtomicBool>,
+    /// Startup DNS gate sender. A fresh slave signals this only after the first
+    /// bundle is applied, persisted **and** watermarked, so a failed watermark
+    /// write cannot ungated listeners.
+    dns_starter: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
+    /// Ensures the gate is signalled at most once.
+    dns_ready_signaled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SlaveStatusTracker {
@@ -47,6 +53,8 @@ impl SlaveStatusTracker {
             watermark: Arc::new(Mutex::new(None)),
             watermark_path: Arc::new(Mutex::new(None)),
             local_config_drift: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dns_starter: Arc::new(Mutex::new(None)),
+            dns_ready_signaled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -134,6 +142,27 @@ impl SlaveStatusTracker {
             "acl_unprovisioned: no applied configuration bundle/watermark yet; DNS listeners are not bound until the master pushes the first valid bundle"
                 .to_string(),
         ));
+    }
+
+    /// Installs the startup DNS-gate sender. Safe to call more than once; the
+    /// latest sender wins.
+    pub fn set_dns_starter(&self, starter: tokio::sync::mpsc::UnboundedSender<()>) {
+        *sito_core::sync::lock_or_recover(&self.dns_starter) = Some(starter);
+    }
+
+    /// Signals the startup DNS gate exactly once, after the first bundle has
+    /// been applied, persisted and watermarked.
+    ///
+    /// A missing receiver (gate already opened) is not an error. This is a
+    /// no-op for a slave that already served from a persisted watermark.
+    pub fn signal_dns_ready(&self) {
+        if self.dns_ready_signaled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let sender = sito_core::sync::lock_or_recover(&self.dns_starter).clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
     }
 
     /// Returns true when a same-version payload fork has been latched.

@@ -790,21 +790,27 @@ per-node ACL override and no node-local allow file.
   to allow on disconnect.
 - **Fresh/rebuilt slave:** a slave with no applied watermark does not bind DNS
   listeners. It starts the admin/HA client, reports `acl_unprovisioned`, and
-  waits for the first valid bundle. A restart with a watermark serves the
-  persisted applied configuration immediately.
+  waits for the first valid bundle. Listeners start only after the bundle is
+  applied, persisted **and** the watermark write succeeds, so a rejected bundle
+  or a failed watermark write keeps DNS unbound. A restart with a watermark
+  serves the persisted applied configuration immediately. A first-boot slave
+  cannot serve DNS while the master is unavailable; recover the master or use
+  the documented recovery procedure.
 - **Invalid bundle:** any ACL validation error (bad enum, CIDR, duplicate,
   allow/deny conflict, over-cap list) rejects the whole bundle atomically. The
   slave keeps its previous ACL/runtime generation and reports `Degraded`.
 - **Mixed versions:** a slave advertises the `client_acl` capability in its HA
-  `Hello`. While `default_policy = "deny"`, a connected slave that does not
-  advertise it makes master readiness report `acl_capability_missing` and logs a
-  warning. Upgrade every DNS-serving node before enabling deny; a mixed-version
-  cluster must stay on allow.
-- **Promotion:** a slave that applied a bundle already has the shared ACL; a
-  promotion does not reset it. An unprovisioned slave is not synced and cannot
-  be promoted as an ACL-serving node: the promotion flow never invents an ACL.
-  A first-boot slave cannot serve DNS while the master is unavailable; recover
-  the master or use the documented promotion/recovery procedure.
+  `Hello`. While the published configuration has `default_policy = "deny"`, a
+  connected slave that does not advertise it makes master readiness report
+  `acl_capability_missing` and logs a warning (on the Hello and on the
+  allow→deny publish transition). Upgrade every DNS-serving node before enabling
+  deny; a mixed-version cluster must stay on allow.
+- **Promotion:** automatic promotion is governed by ADR-0010 and is not part of
+  this ACL change. A node that has already applied a bundle keeps that shared
+  ACL if a promotion flow later runs; the ACL step itself never invents a policy
+  for an unprovisioned node. The claim matrix keeps promotion integration
+  release-gated until the promotion engine is merged and enforces the
+  applied-bundle requirement.
 - **Multi-site:** the allow list must contain every site's client networks.
   A site-B network omitted from `[clients.acl] allow` is denied on every node
   after the bundle applies. That is a shared-policy decision, not a local

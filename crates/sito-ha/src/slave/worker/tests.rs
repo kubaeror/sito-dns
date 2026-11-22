@@ -2620,3 +2620,62 @@ fn test_stats_report_carries_window_deltas_not_lifetime_totals() {
         other => panic!("expected a StatsReport, got {other:?}"),
     }
 }
+
+/// The startup DNS gate opens only after apply + persist + watermark. A
+/// watermark-write failure must not ungated a fresh slave.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_ha_dns_gate_opens_after_watermark_only() {
+    let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+    let bundle = test_bundle(
+        1,
+        "config_version = 2\n[server]\nrole = \"slave\"\n",
+        None,
+        None,
+    );
+    let push = build_and_sign_push(&bundle, &signing_key).unwrap();
+
+    // `/proc/self` exists but rejects creating the atomic temp file, so the
+    // apply/persist succeeds and the watermark write fails.
+    let tracker = SlaveStatusTracker::new("gate-fail".to_string(), 0, None)
+        .with_watermark_path(
+            std::path::PathBuf::from("/proc/self")
+                .join(format!("sito_ha_gate_{}.toml", rand::random::<u64>())),
+        )
+        .unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tracker.set_dns_starter(tx);
+    let handles = test_handles(None).await;
+    apply_config_push(&push, &tracker, &handles, &signing_key.public_key())
+        .await
+        .expect_err("watermark write must fail");
+    assert!(
+        rx.try_recv().is_err(),
+        "a failed watermark write must not ungated the DNS listeners"
+    );
+    assert!(!tracker.has_applied_bundle());
+
+    // A valid apply + watermark opens the gate exactly once.
+    let dir = std::env::temp_dir().join(format!("sito_ha_gate_ok_{}", rand::random::<u64>()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let tracker = SlaveStatusTracker::new("gate-ok".to_string(), 0, None)
+        .with_watermark_path(dir.join("ha_watermark.toml"))
+        .unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tracker.set_dns_starter(tx);
+    apply_config_push(&push, &tracker, &handles, &signing_key.public_key())
+        .await
+        .unwrap();
+    assert!(tracker.has_applied_bundle());
+    assert!(
+        rx.try_recv().is_ok(),
+        "a fully applied/watermarked bundle must open the DNS gate"
+    );
+    tracker.signal_dns_ready();
+    assert!(
+        rx.try_recv().is_err(),
+        "the gate must be signalled at most once"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}

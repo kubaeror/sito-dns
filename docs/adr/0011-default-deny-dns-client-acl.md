@@ -679,7 +679,7 @@ and can rewrite an existing `[clients.acl]`, cutting clients off.
 The ACL step is gated by this explicit predicate:
 
 ```text
-fresh_install_acl = is_first_run && !is_setup_complete()
+fresh_install_acl = is_first_run && !is_setup_complete() && !has_usable_admin()
 setup_recovery    = setup_token_required && !is_first_run
 ```
 
@@ -694,21 +694,28 @@ Concretely for D7b:
   completed and the bootstrap default admin is still active. `!is_setup_complete()`
   is redundant with the current implementation but must be asserted explicitly
   so a future change to `is_first_run` cannot silently widen the gate.
+- `!has_usable_admin()` is required as well. `is_first_run()` is true while the
+  bootstrap `admin/adminadmin` account is active even when another usable Admin
+  already exists (for example a template- or operator-created Admin). That is a
+  provisioned install, not a fresh wizard install, and its existing
+  `[clients.acl]` must not be rewritten.
 - `setup_recovery` is the setup-token / re-auth path for an existing install
   whose Admin is unavailable. **It must not render or apply the ACL step.** The
   existing `[clients] default_policy` and `[clients.acl]` are left byte-for-byte
   untouched (except for unrelated settings the operator changes through the
   same wizard).
 - `!bootstrapping` is still a `403` and is not an ACL path.
-- A template that pre-creates an Admin is a provisioned install: `is_first_run`
-  is false, so the wizard is not the install path and must set its intended ACL
-  explicitly. The installation guide will say so and the startup warning will
-  report an effective allow policy on a wildcard bind.
+- A template that pre-creates an Admin is a provisioned install: `has_usable_admin()`
+  is true (and usually `is_first_run` is false), so the wizard is not the install
+  path and must set its intended ACL explicitly. The installation guide will say
+  so and the startup warning will report an effective allow policy on a wildcard
+  bind.
 - A first-run template with existing ACL keys still gets the step
-  (`is_first_run` true). Its allow/deny prefixes and `default_policy` are
-  prefilled; deny is preselected for the fresh-install policy but the operator
-  can keep the template's allow policy explicitly. No prefix is discarded by
-  accepting the default.
+  (`is_first_run` true and no usable Admin). Its allow/deny prefixes and
+  `default_policy` are prefilled; deny is preselected for the fresh-install
+  policy but the operator can keep the template's allow policy explicitly. No
+  prefix is discarded by accepting the default; prefilled prefixes are rendered
+  as locked/kept rather than as checkboxes that appear removable.
 - If D7b needs to distinguish "ACL configured once" after setup completes, it
   must add a persisted `acl_configured`/`bootstrap_completed` marker and test
   its save/restore/HA behavior. It must not infer that state from the mere

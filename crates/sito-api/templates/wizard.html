@@ -102,8 +102,9 @@
         <input type="hidden" name="client_acl_present" value="1">
         <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 12px;">
           Only clients whose source address matches a selected network may use the DNS
-          listeners. Loopback is the only network selected by default; nothing else is
-          auto-detected into the allow list. The admin UI/API is never filtered by this ACL.
+          listeners. Loopback and any allow prefixes already in the base template are
+          selected; no other network is auto-detected into the allow list. The admin
+          UI/API is never filtered by this ACL.
         </div>
         {% if acl_template_explicit_allow %}
         <div style="font-size: 0.85rem; color: var(--accent-danger); background: rgba(239, 68, 68, 0.1); border: 1px solid var(--accent-danger); padding: 10px 14px; border-radius: var(--radius-md); margin-bottom: 12px;">
@@ -132,7 +133,7 @@
           <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
             {% for candidate in acl_candidates %}
             <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer; padding: 6px 8px; border: 1px solid var(--border-color); border-radius: var(--radius-md);">
-              {% if candidate.is_loopback %}
+              {% if candidate.locked %}
               <input type="hidden" name="client_acl_selected__{{ loop.index0 }}" value="{{ candidate.id }}">
               <input type="checkbox" checked disabled style="width: 16px; height: 16px; margin-top: 2px;">
               {% else %}
@@ -146,18 +147,20 @@
                 <span class="mono">{{ candidate.address }}/{{ candidate.prefix }}</span>
                 <span style="color: var(--text-muted);">({{ candidate.family }}, {{ candidate.source_label }})</span>
                 <span style="display: inline-block; margin-left: 6px; font-size: 0.7rem; padding: 1px 6px; border-radius: 999px; background: var(--bg-tertiary); color: var(--text-secondary);">{{ candidate.class_label }}</span>
+                {% if candidate.kept_from_template %}<span style="display: inline-block; margin-left: 6px; font-size: 0.7rem; padding: 1px 6px; border-radius: 999px; background: var(--bg-tertiary); color: var(--text-secondary);">kept from base template (cannot be removed here)</span>{% endif %}
                 {% if candidate.is_public %}<span style="color: var(--accent-danger); font-size: 0.75rem;"> public address: requires the public acknowledgement below</span>{% endif %}
               </span>
             </label>
             {% endfor %}
             {% for candidate in acl_prefilled %}
             <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer; padding: 6px 8px; border: 1px dashed var(--border-color); border-radius: var(--radius-md);">
-              <input type="checkbox" name="client_acl_selected__prefill_{{ loop.index0 }}" value="{{ candidate.id }}" checked style="width: 16px; height: 16px; margin-top: 2px;">
+              <input type="hidden" name="client_acl_selected__prefill_{{ loop.index0 }}" value="{{ candidate.id }}">
+              <input type="checkbox" checked disabled style="width: 16px; height: 16px; margin-top: 2px;">
               <span style="font-size: 0.825rem;">
                 <strong>{{ candidate.interface }}</strong>
                 <span class="mono">{{ candidate.address }}/{{ candidate.prefix }}</span>
                 <span style="color: var(--text-muted);">({{ candidate.family }}, {{ candidate.class_label }})</span>
-                <span style="display: block; color: var(--text-muted); font-size: 0.75rem;">Kept from the base template even if you accept default deny.</span>
+                <span style="display: block; color: var(--text-muted); font-size: 0.75rem;">Kept from the base template; remove it only by editing the configuration after setup.</span>
               </span>
             </label>
             {% endfor %}
@@ -180,7 +183,7 @@
             </label>
             <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer;">
               <input type="checkbox" name="client_acl_allow_entry_ids" style="width: 16px; height: 16px; margin-top: 2px;">
-              <span style="font-size: 0.85rem;">Also admit static IP/CIDR values from <code>[[clients.entries]]</code>. Off by default: entries are identity/policy, not admission.{% if acl_base_allow_entry_ids %} The base template had this enabled; this fresh-install step does not carry it through unless you check this box.{% endif %}</span>
+              <span style="font-size: 0.85rem;">Also admit static IP/CIDR values from <code>[[clients.entries]]</code>. Off by default: entries are identity/policy, not admission.{% if acl_base_allow_entry_ids %} The base template enabled this. It is written only if you keep default deny and check this box; unchecking default deny preserves the template ACL unchanged.{% endif %}</span>
             </label>
           </div>
         </div>

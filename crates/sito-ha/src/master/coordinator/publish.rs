@@ -185,8 +185,15 @@ impl MasterCoordinator {
             .as_ref()
             .and_then(|value| value.clone().try_into::<sito_clients::ClientsConfig>().ok())
             .is_some_and(|clients| clients.default_policy == sito_clients::AclDefaultPolicy::Deny);
-        self.acl_enforcement
-            .store(acl_enforced, std::sync::atomic::Ordering::SeqCst);
+        let was_enforced = self
+            .acl_enforcement
+            .swap(acl_enforced, std::sync::atomic::Ordering::SeqCst);
+        if acl_enforced
+            && !was_enforced
+            && let Some(reason) = self.acl_capability_violation()
+        {
+            warn!("{reason}");
+        }
         self.current_version.store(version, Ordering::SeqCst);
         *sito_core::sync::lock_or_recover(&self.active_bundle) = Some(bundle);
         *sito_core::sync::lock_or_recover(&self.active_push) = Some(push_msg.clone());

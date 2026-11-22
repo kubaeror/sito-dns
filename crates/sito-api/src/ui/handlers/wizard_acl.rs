@@ -372,6 +372,12 @@ pub(crate) fn build_acl(
                 .to_string(),
         );
     }
+    if networks.iter().any(|net| is_catch_all_network(*net)) {
+        return Err(
+            "A manual entry or base-template allow prefix is a catch-all (0.0.0.0/0 or ::/0). Enable client_acl_allow_all and type the exact confirmation 'ALLOW ALL'; a public acknowledgement alone is not enough for an open resolver."
+                .to_string(),
+        );
+    }
     if !input.public_ack && networks.iter().any(|net| is_public_network(*net)) {
         return Err(
             "A public client network is selected or entered; client_acl_public_ack must be checked to confirm the resolver will be reachable from the public Internet."
@@ -473,6 +479,16 @@ fn is_public_network(network: IpNetwork) -> bool {
     match network.network_address() {
         IpAddr::V4(_) => !v4_network_is_private(network) && !is_loopback_network(network),
         IpAddr::V6(_) => !v6_network_is_ula(network) && !is_loopback_network(network),
+    }
+}
+
+fn is_catch_all_network(network: IpNetwork) -> bool {
+    if network.prefix() != 0 {
+        return false;
+    }
+    match network.network_address() {
+        IpAddr::V4(addr) => addr.is_unspecified(),
+        IpAddr::V6(addr) => addr.is_unspecified(),
     }
 }
 

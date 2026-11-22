@@ -17,6 +17,22 @@ pub(super) fn should_gate_dns(
     requested_setup_pending || (setup_token_required && persisted_config)
 }
 
+/// Final gate immediately before binding DNS listeners.
+///
+/// Setup completion alone is not enough on a fresh HA slave: the first valid
+/// bundle must have been applied and watermarked. This is the same predicate
+/// used by the startup select, exposed for regression tests that exercise the
+/// gate around `DnsListenerManager::start`.
+#[cfg(feature = "ha")]
+pub(super) fn dns_start_ready(
+    setup_done: bool,
+    ha_acl_gate: bool,
+    tracker: Option<&sito_ha::SlaveStatusTracker>,
+) -> bool {
+    setup_done
+        && (!ha_acl_gate || tracker.is_some_and(sito_ha::SlaveStatusTracker::has_applied_bundle))
+}
+
 /// Runs the DNS server with an optional custom shutdown receiver (useful for testing).
 pub async fn run_server_with_shutdown(
     config: Config,
@@ -296,6 +312,10 @@ pub async fn run_server_with_lease(
     } else {
         None
     };
+    #[cfg(feature = "ha")]
+    if let (Some(tracker), Some(starter)) = (ha_runtime.tracker.as_ref(), dns_starter.as_ref()) {
+        tracker.set_dns_starter(starter.clone());
+    }
 
     // Rate limiters created by listeners; shared so hot reloads can update them.
     let rate_limiters: Arc<std::sync::Mutex<Vec<Arc<sito_transport::RateLimiter>>>> =
@@ -534,17 +554,64 @@ pub async fn run_server_with_lease(
             slave_worker_started = true;
         }
 
-        tokio::select! {
-            res = wait_for_shutdown_signal(custom_shutdown) => {
-                res?;
-            }
-            Some(()) = dns_start_rx.recv() => {
-                if setup_pending {
-                    info!("Setup wizard completed: binding and starting DNS listeners in-process...");
-                } else {
-                    info!("First HA bundle applied: binding and starting DNS listeners in-process...");
+        let shutdown = wait_for_shutdown_signal(custom_shutdown);
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                res = &mut shutdown => {
+                    res?;
+                    break;
                 }
-                let current_cfg = config_arc.load();
+                Some(()) = dns_start_rx.recv() => {
+                    let setup_done = !server_ctx.is_setup_pending();
+                    #[cfg(feature = "ha")]
+                    let bundle_ready = !ha_acl_unprovisioned
+                        || ha_runtime
+                            .tracker
+                            .as_ref()
+                            .is_some_and(sito_ha::SlaveStatusTracker::has_applied_bundle);
+                    #[cfg(feature = "ha")]
+                    let start_ready = dns_start_ready(
+                        setup_done,
+                        ha_acl_unprovisioned,
+                        ha_runtime.tracker.as_ref(),
+                    );
+                    #[cfg(not(feature = "ha"))]
+                    let start_ready = setup_done;
+
+                    if !start_ready {
+                        info!(
+                            setup_done,
+                            bundle_ready,
+                            "DNS start gate not satisfied yet; keeping listeners unbound"
+                        );
+                        // A setup-pending slave starts its worker only after the
+                        // wizard completes, so a bundle cannot bypass setup
+                        // gating. It still must wait for the first bundle before
+                        // serving DNS.
+                        #[cfg(feature = "ha")]
+                        if setup_done && !bundle_ready && !slave_worker_started {
+                            spawn_slave_worker_after_listeners(
+                                &mut ha_runtime,
+                                &server_ctx,
+                                &apply_hooks,
+                                &runtime,
+                                &filter_engine,
+                                &metrics,
+                                &config_path_buf,
+                                &shutdown_rx,
+                            );
+                            slave_worker_started = true;
+                        }
+                        continue;
+                    }
+
+                    if setup_pending {
+                        info!("Setup wizard completed and HA provisioning satisfied: binding and starting DNS listeners in-process...");
+                    } else {
+                        info!("HA provisioning satisfied: binding and starting DNS listeners in-process...");
+                    }
+                    let current_cfg = config_arc.load();
                 // The wizard may have configured TLS/ACME after startup, when
                 // the initial acceptors were built from the empty config.
                 // Re-initialize so DoT/DoH/DoQ listen immediately instead of
@@ -626,6 +693,8 @@ pub async fn run_server_with_lease(
                 );
 
                 wait_for_shutdown_signal(None).await?;
+                    break;
+                }
             }
         }
     } else {

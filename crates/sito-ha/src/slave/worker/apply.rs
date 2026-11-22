@@ -276,6 +276,10 @@ pub async fn apply_config_push(
     // Mark tracker as synced (a successful apply is the only path that clears
     // a `Degraded` state).
     tracker.mark_synced_with_term(bundle.version, bundle.term);
+    // Only now, after the apply, the durable persist and the watermark write,
+    // may a fresh slave start its DNS listeners. A rejected bundle or a failed
+    // watermark write never reaches this point.
+    tracker.signal_dns_ready();
     #[allow(clippy::cast_precision_loss)]
     handles
         .metrics

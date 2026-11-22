@@ -22,8 +22,13 @@ pub struct SetupTokenQuery {
 
 /// ADR-0011's true fresh-install predicate. `bootstrapping` also covers
 /// setup-token/re-auth recovery, which must not render or apply the ACL step.
+///
+/// `is_first_run()` alone is not enough: it is true while the bootstrap
+/// `admin/adminadmin` account is active even when another usable Admin already
+/// exists (a provisioned/template install). Such an install must keep its
+/// existing `[clients.acl]`.
 pub(crate) fn fresh_install_acl(auth: &crate::auth::AuthManager) -> bool {
-    auth.is_first_run() && !auth.is_setup_complete()
+    auth.is_first_run() && !auth.is_setup_complete() && !auth.has_usable_admin()
 }
 
 pub async fn wizard_page(
@@ -65,14 +70,20 @@ pub async fn wizard_page(
             let candidates = live
                 .into_iter()
                 .map(|candidate| {
-                    let selected = candidate.is_loopback() || prefill_ids.contains(&candidate.id);
-                    acl_candidate_view(&candidate, selected)
+                    let kept_from_template = prefill_ids.contains(&candidate.id);
+                    let selected = candidate.is_loopback() || kept_from_template;
+                    acl_candidate_view(
+                        &candidate,
+                        selected,
+                        candidate.is_loopback() || kept_from_template,
+                        kept_from_template,
+                    )
                 })
                 .collect();
             let prefilled = prefill
                 .into_iter()
                 .filter(|candidate| !live_ids.contains(&candidate.id))
-                .map(|candidate| acl_candidate_view(&candidate, true))
+                .map(|candidate| acl_candidate_view(&candidate, true, true, true))
                 .collect();
             (
                 candidates,
@@ -108,6 +119,8 @@ pub async fn wizard_page(
 fn acl_candidate_view(
     candidate: &wizard_acl::AclCandidate,
     selected: bool,
+    locked: bool,
+    kept_from_template: bool,
 ) -> crate::ui::templates::AclCandidateView {
     crate::ui::templates::AclCandidateView {
         id: candidate.id.clone(),
@@ -119,6 +132,8 @@ fn acl_candidate_view(
         class_label: candidate.class.label(),
         source_label: candidate.source.label(),
         selected,
+        locked,
+        kept_from_template,
         is_loopback: candidate.is_loopback(),
         is_public: candidate.is_public(),
         is_bridge_or_tunnel: candidate.class.is_bridge_or_tunnel(),

@@ -474,6 +474,11 @@ pub struct AclCandidateView {
     pub source_label: &'static str,
     /// True for loopback (fixed) and prefixes the base template already allows.
     pub selected: bool,
+    /// Selected entries the operator cannot uncheck in this step: fixed
+    /// loopback and prefixes preserved from the base template.
+    pub locked: bool,
+    /// This network comes from the base template's `[clients.acl] allow`.
+    pub kept_from_template: bool,
     pub is_loopback: bool,
     pub is_public: bool,
     pub is_bridge_or_tunnel: bool,

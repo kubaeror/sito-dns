@@ -293,14 +293,9 @@ impl sito_ha::SlaveConfigApplier for HaConfigApplier {
                             "HA push applied but reported restart-only fields; the acknowledgement may be incomplete"
                         );
                     }
-                    // A fresh slave gates DNS until the first bundle applies.
-                    // The channel is closed/dropped once listeners start; a
-                    // later push simply finds no receiver.
-                    if let Some(starter) = self.ctx.dns_starter.as_ref()
-                        && starter.send(()).is_ok()
-                    {
-                        info!("First valid HA bundle applied; ungating DNS listener startup");
-                    }
+                    // DNS ungating lives in the slave worker after the
+                    // watermark is persisted, not here: a failed watermark
+                    // write must keep a fresh slave's listeners unbound.
                     Ok(())
                 }
                 Err(e) => Err(e.detail),
