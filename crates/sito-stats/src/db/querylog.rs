@@ -179,10 +179,10 @@ impl StatsDb {
     /// Clears the query log with an explicit rollup client-name policy (the
     /// API passes the live configuration so a hot-reloaded setting applies).
     ///
-    /// `keep_aggregates = true` folds the whole `query_log` range into hourly
-    /// rollups in one transaction before deleting it; that operator-requested
-    /// path is deliberately not hour-bounded and is documented as the
-    /// whole-range memory/lock residual (P2-61). The default
+    /// `keep_aggregates = true` folds the remaining `query_log` rows into
+    /// hourly rollups in bounded per-hour chunks before deleting them, each
+    /// chunk in its own transaction. An interrupted clear leaves the
+    /// already-committed chunks in place and is safely resumable. The default
     /// `keep_aggregates = false` deletes both tables atomically without
     /// aggregating.
     ///

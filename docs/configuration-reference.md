@@ -568,7 +568,9 @@ key before any retention task starts.
 > Clearing the query log (`DELETE /api/v2/querylog`, `sito clear-query-log`, or
 > the UI “Clear Logs” button) deletes both `query_log` and `stats_hourly` by
 > default. Pass `?keep_aggregates=true` (API) or `--keep-aggregates` (CLI) to
-> preserve rollups. Large clears are vacuumed and
+> preserve rollups. The keep-aggregates clear folds rows into hourly rollups in
+> bounded 5,000-row chunks, commits each chunk, and is safely resumable if
+> interrupted. Large clears are vacuumed and
 > SQLite runs with `secure_delete=ON`. Rollup client IPs are keyed BLAKE3
 > hashes using `<data_dir>/stats-salt` (0600); client names are omitted unless
 > `rollup_client_names = true`. Switching `rollup_client_names` from `true` to
@@ -596,18 +598,22 @@ key before any retention task starts.
 commits each hour separately, so a backlog is pruned without holding the
 writer lock for the whole sweep; the per-connection temp tables hold at most
 one hour of distinct domains, clients and upstreams and are cleared after each
-hour. The `keep_aggregates=true` clear is the exception: it folds the whole
-query-log range into rollups in one immediate transaction and loads every
-affected hour's top lists into memory before deleting, so a very large first
-clear can be slow and memory-heavy (documented residual, P2-61). A 1M-row,
-90-day soak is likewise a documented capacity-testing residual rather than a
-unit-test guarantee; the row-bounded chunks keep each transaction bounded but
-the sweep is still linear in the number of expired rows. `stats_watermark` is
-still written for progress diagnostics/backward compatibility but is not read
-to skip rows: aggregation and deletion share a transaction, and backdated rows
-must be re-aggregated. Enabling `privacy.anonymize_querylog` is forward-only;
-old detailed rows are not rewritten (retroactive anonymization is deferred,
-P2-59).
+hour. The `keep_aggregates=true` clear uses the same bounded shape: it processes
+the oldest remaining hour in row-bounded `(ts, id)` chunks of 5,000 rows,
+commits each chunk separately, and then moves to the next hour. Memory is
+therefore bounded to roughly one hour of distinct values and the writer lock is
+held for at most one chunk. A committed chunk already contains the rollup
+contribution of the rows it deleted, so an interrupted clear leaves a
+consistent prefix and re-running the command resumes from the oldest remaining
+row without double counting; the clear is still documented as requiring the
+service stopped. A 1M-row, 90-day soak is a documented capacity-testing
+residual rather than a unit-test guarantee; the row-bounded chunks keep each
+transaction bounded but the sweep is still linear in the number of expired
+rows. `stats_watermark` is still written for progress diagnostics/backward
+compatibility but is not read to skip rows: aggregation and deletion share a
+transaction, and backdated rows must be re-aggregated. Enabling
+`privacy.anonymize_querylog` is forward-only; old detailed rows are not
+rewritten (retroactive anonymization is deferred, P2-59).
 
 > Query logging is always enabled when `[stats]` is present. Prometheus metrics
 > are exposed at `/metrics` and require a Viewer-or-higher bearer token or
