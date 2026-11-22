@@ -15,11 +15,20 @@ impl StatsDb {
     /// The snapshot is produced by `VACUUM INTO`, so committed WAL content is
     /// included without copying a live `-wal` file. `dest` must not exist.
     ///
-    /// SQLite creates the output file with the process umask, so the snapshot
-    /// is staged inside a private (0700) directory next to `dest`, then
-    /// fsynced, made 0600, and hard-linked to `dest`. The final `hard_link`
-    /// fails with [`std::io::ErrorKind::AlreadyExists`] instead of silently
-    /// overwriting a backup that appeared concurrently.
+    /// The snapshot is produced by `VACUUM INTO`, so committed WAL content is
+    /// included without copying a live `-wal` file. `dest` must not exist.
+    ///
+    /// SQLite creates the output file with the process umask and may create
+    /// `-wal`/`-shm` sidecars next to a source database it opens, so the
+    /// The source (and any committed WAL) is first copied into a private
+    /// (0700) staging directory and the snapshot is made from that copy. The
+    /// live database and its sidecars are therefore never opened or modified.
+    /// The caller must guarantee that no process is writing to `source` while
+    /// the copy is taken (`sito db migrate` holds the service lease).
+    ///
+    /// The snapshot is fsynced, made 0600, and hard-linked to `dest`; the final
+    /// `hard_link` fails with [`std::io::ErrorKind::AlreadyExists`] instead of
+    /// silently overwriting a backup that appeared concurrently.
     pub async fn snapshot_to(
         source: impl AsRef<Path>,
         dest: impl AsRef<Path>,
@@ -53,22 +62,35 @@ impl StatsDb {
         ));
         create_private_dir(&staging)?;
 
+        let staged_source = staging.join("source.db");
         let staged = staging.join("snapshot.db");
-        let result = vacuum_into(source, &staged)
-            .await
-            .and_then(|()| -> Result<(), StatsError> {
-                // Repair the mode even on Unix builds where `VACUUM INTO`
-                // created the file with a permissive umask.
-                set_private_permissions(&staged)?;
-                sync_file(&staged)?;
-                std::fs::hard_link(&staged, dest)?;
-                fsync_dir(parent);
-                Ok(())
-            });
+        let result = async {
+            std::fs::copy(source, &staged_source)?;
+            let wal = with_suffix(source, "-wal");
+            if wal.is_file() {
+                std::fs::copy(&wal, with_suffix(&staged_source, "-wal"))?;
+            }
+
+            vacuum_into(&staged_source, &staged).await?;
+            // Repair the mode even on Unix builds where `VACUUM INTO` created
+            // the file with a permissive umask.
+            set_private_permissions(&staged)?;
+            sync_file(&staged)?;
+            std::fs::hard_link(&staged, dest)?;
+            fsync_dir(parent);
+            Ok(())
+        }
+        .await;
 
         let _ = std::fs::remove_dir_all(&staging);
         result
     }
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 /// Opens `source` without creating it and writes a `VACUUM INTO` snapshot.
@@ -163,8 +185,16 @@ mod tests {
             PathBuf::from(format!("{}-wal", source.display())).exists(),
             "the probe write should still be in the WAL at this point"
         );
+        let wal_path = PathBuf::from(format!("{}-wal", source.display()));
+        let wal_before = std::fs::read(&wal_path).unwrap();
 
         StatsDb::snapshot_to(&source, &dest).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(&wal_path).unwrap(),
+            wal_before,
+            "snapshotting must not modify the live WAL"
+        );
 
         #[cfg(unix)]
         {

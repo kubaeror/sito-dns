@@ -134,6 +134,27 @@ fn backups(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Assert that a read-only/inspection path left no SQLite sidecars or private
+/// staging directories next to the database.
+fn assert_no_sidecars_or_staging(dir: &Path) {
+    for sidecar in ["stats.db-wal", "stats.db-shm", "stats.db-journal"] {
+        assert!(
+            !dir.join(sidecar).exists(),
+            "{sidecar} must not be created by inspection/refusal"
+        );
+    }
+    let leftovers: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".sito-db-inspect-") || name.ends_with(".backup-tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "private staging must be removed: {leftovers:?}"
+    );
+}
+
 fn db_bytes(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
@@ -203,6 +224,7 @@ async fn cli_db_migrate_current_is_idempotent_and_skips_backup() {
         stdout_of(&first)
     );
     assert!(backups(&dir).is_empty(), "no backup for a current DB");
+    assert_no_sidecars_or_staging(&dir);
 
     let second = migrate(&config_path, &[]);
     assert!(second.status.success(), "second run must also succeed");
@@ -212,6 +234,7 @@ async fn cli_db_migrate_current_is_idempotent_and_skips_backup() {
         before,
         "already-current runs must not write to the database"
     );
+    assert_no_sidecars_or_staging(&dir);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -372,11 +395,12 @@ async fn cli_db_migrate_refuses_newer_schema_without_writes() {
         "refusal must be forward-only: {stderr}"
     );
     assert!(
-        stderr.contains("No files were changed"),
+        stderr.contains("No database files were changed"),
         "refusal must state there were no writes: {stderr}"
     );
     assert!(backups(&dir).is_empty(), "no backup for a refused DB");
     assert_eq!(db_bytes(&db_path), before, "refusal must not touch the DB");
+    assert_no_sidecars_or_staging(&dir);
     assert_eq!(stored_marker(&db_path).await.as_deref(), Some("3"));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -452,6 +476,7 @@ async fn cli_db_migrate_refuses_to_overwrite_a_backup() {
         b"operator's existing backup",
         "the existing backup must not be overwritten"
     );
+    assert_no_sidecars_or_staging(&dir);
     assert_eq!(
         stored_marker(&db_path).await,
         None,
@@ -520,6 +545,73 @@ async fn cli_db_migrate_no_backup_migrates_without_a_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_db_migrate_restores_ownership_of_created_files() {
+    use std::os::unix::fs::{MetadataExt, chown};
+
+    let (dir, config_path) = fixture("ownership");
+    let db_path = dir.join("stats.db");
+    legacy_db(&db_path).await;
+
+    // As root (CI containers), hand the whole fixture to an unprivileged
+    // uid/gid so a root-owned `-wal`/`-shm`/salt/backup is actually detected.
+    // As the normal test user the chown is refused; the assertions then still
+    // pin the invariant that every created file keeps the database's owner.
+    let fixture_paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    let chowned = chown(&dir, Some(65534), Some(65534)).is_ok();
+    if chowned {
+        for path in &fixture_paths {
+            chown(path, Some(65534), Some(65534)).unwrap();
+        }
+    }
+    let before = std::fs::metadata(&db_path).unwrap();
+    let expected = if chowned {
+        (65534, 65534)
+    } else {
+        (before.uid(), before.gid())
+    };
+
+    let output = migrate(&config_path, &[]);
+    assert!(
+        output.status.success(),
+        "migration must succeed: {}",
+        stderr_of(&output)
+    );
+
+    let mut checked = 0;
+    let mut candidates = vec![
+        db_path.clone(),
+        backup_path(&db_path, 1),
+        dir.join("stats-salt"),
+    ];
+    candidates.push(dir.join("stats.db-wal"));
+    candidates.push(dir.join("stats.db-shm"));
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (meta.uid(), meta.gid()),
+            expected,
+            "'{}' must keep the database owner",
+            path.display()
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 2,
+        "the database and its backup must both be checked"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn cli_db_migrate_corrupt_marker_fails_closed() {
     let (dir, config_path) = fixture("corrupt");
@@ -544,6 +636,7 @@ async fn cli_db_migrate_corrupt_marker_fails_closed() {
         before,
         "a corrupt marker must not be rewritten"
     );
+    assert_no_sidecars_or_staging(&dir);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

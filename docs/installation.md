@@ -173,6 +173,12 @@ sudo sito db migrate --config /etc/sito/config.toml
 sudo systemctl start sito
 ```
 
+The command preserves the data-directory ownership even under `sudo`: every
+file it creates or changes (`stats.db`, `-wal`/`-shm`, `stats-salt`, the
+`.bak`) is restored to the owner of the existing `stats.db`, so the
+`User=sito` service can open it again. Running it as the service user
+(`sudo -u sito sito db migrate ...`) also avoids the issue.
+
 The backup is `<server.data_dir>/stats.db.v<found>.bak` (normally
 `/var/lib/sito/stats.db.v1.bak`), mode `0600`, and an existing backup is never
 overwritten — move it aside first. The upgrade is forward-only: there is no

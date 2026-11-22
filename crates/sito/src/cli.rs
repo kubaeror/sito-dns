@@ -630,6 +630,106 @@ async fn inspect_db_without_writes(db_path: &Path) -> Result<SchemaInspection, a
     result
 }
 
+/// Ownership of a data-directory file, captured before the command writes
+/// anything.
+///
+/// When `sito db migrate` is run with `sudo`, SQLite creates `-wal`/`-shm`
+/// sidecars and `stats-salt` as root. The systemd unit runs the server as the
+/// unprivileged `sito` user, which then cannot open or write those files. The
+/// owner of the existing `stats.db` (or the data directory) is therefore
+/// restored on every file the migration creates or modifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileOwner {
+    uid: u32,
+    gid: u32,
+}
+
+fn file_owner(path: &Path) -> Option<FileOwner> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|meta| FileOwner {
+            uid: meta.uid(),
+            gid: meta.gid(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Restores `owner` on every existing path in `paths`.
+///
+/// Missing paths are skipped: not every candidate (for example `-shm`) exists
+/// after a clean close. Files that already carry the expected owner are left
+/// untouched, so a non-root invocation never attempts a privileged `chown`.
+fn restore_ownership(paths: &[PathBuf], owner: Option<FileOwner>) -> Result<(), anyhow::Error> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for path in paths {
+            let Ok(meta) = std::fs::symlink_metadata(path) else {
+                continue;
+            };
+            if !meta.file_type().is_file() {
+                continue;
+            }
+            if meta.uid() == owner.uid && meta.gid() == owner.gid {
+                continue;
+            }
+            std::os::unix::fs::chown(path, Some(owner.uid), Some(owner.gid)).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to restore ownership of '{}' to {}:{}: {e}. Run this command as the \
+                     service user, or fix the ownership manually.",
+                    path.display(),
+                    owner.uid,
+                    owner.gid
+                )
+            })?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+    }
+    Ok(())
+}
+
+/// Every path the migration can create or modify under `server.data_dir`.
+fn migration_created_paths(
+    db_path: &Path,
+    data_dir: &Path,
+    backup_path: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        paths.push(path_with_suffix(db_path, suffix));
+    }
+    // `load_or_create_salt` creates `<data_dir>/stats-salt` during the open.
+    paths.push(data_dir.join("stats-salt"));
+    if let Some(backup) = backup_path {
+        paths.push(backup.to_path_buf());
+    }
+    paths
+}
+
+/// Restores ownership on drop as a backstop for panics/early returns.
+struct OwnershipGuard {
+    paths: Vec<PathBuf>,
+    owner: Option<FileOwner>,
+}
+
+impl Drop for OwnershipGuard {
+    fn drop(&mut self) {
+        let _ = restore_ownership(&self.paths, self.owner);
+    }
+}
+
 /// Executes the `db migrate` subcommand (B2).
 ///
 /// Explicit and forward-only: the database is inspected read-only, a newer
@@ -661,6 +761,10 @@ pub async fn run_db_migrate(
         );
     }
 
+    // Capture the owner before anything is created: a `sudo` migration must
+    // not leave root-owned files behind for the unprivileged service.
+    let owner = file_owner(&db_path).or_else(|| file_owner(data_dir));
+
     // Held through inspect, backup and migrate. No `--force`: the running
     // server holds SQLite connections and must be stopped.
     let _access = begin_reset(
@@ -670,33 +774,26 @@ pub async fn run_db_migrate(
         DB_MIGRATE_FORCE_HINT,
     )?;
 
-    // Read-only, non-mutating version check. Corrupt markers fail closed here
-    // with `InvalidSchemaVersion`. A dry run inspects a private copy so SQLite
-    // cannot leave `-wal`/`-shm` sidecars next to the real database.
-    let inspection = if options.dry_run {
-        inspect_db_without_writes(&db_path).await?
-    } else {
-        StatsDb::inspect_schema_version(&db_path)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to inspect stats database '{}': {e}",
-                    db_path.display()
-                )
-            })?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Stats database '{}' disappeared before it could be inspected",
-                    db_path.display()
-                )
-            })?
-    };
+    // Best effort at this point: the lease file is removed on a clean exit,
+    // but a crash must not leave a root-owned `sito.pid` that blocks the
+    // service user from starting the server.
+    restore_ownership(
+        &[data_dir.join(crate::service_lock::SERVICE_LOCK_FILE)],
+        owner,
+    )?;
+
+    // Inspect a private copy for every path, not just `--dry-run`:
+    // `StatsDb::inspect_schema_version` opens the database in place and SQLite
+    // creates `-wal`/`-shm` sidecars even through a read-only connection.
+    // Refusals and the already-current no-op therefore must not touch the real
+    // files at all. Corrupt markers fail closed with `InvalidSchemaVersion`.
+    let inspection = inspect_db_without_writes(&db_path).await?;
 
     if inspection.is_too_new() {
         anyhow::bail!(
             "Refusing to migrate '{}': it records schema version {} but this binary supports \
              at most {}. Downgrading is not supported; upgrade the sito binary instead. \
-             No files were changed.",
+             No database files were changed.",
             db_path.display(),
             inspection.found,
             inspection.supported
@@ -705,7 +802,7 @@ pub async fn run_db_migrate(
 
     if inspection.is_current() {
         println!(
-            "Stats database '{}' is already at schema version {} (the version supported by this binary); nothing to do.",
+            "Stats database '{}' is already at schema version {} (the version supported by this binary); nothing to do. No database files were changed.",
             db_path.display(),
             inspection.found
         );
@@ -763,21 +860,44 @@ pub async fn run_db_migrate(
                     backup_path.display()
                 )
             })?;
+        // The snapshot is created by this (possibly root) process. Give it the
+        // same owner as the database so a later operator/service operation
+        // does not trip over a root-owned file.
+        restore_ownership(std::slice::from_ref(&backup_path), owner)?;
         println!("Backup written to '{}' (mode 0600).", backup_path.display());
         Some(backup_path)
     };
 
-    let db = match StatsDb::open_with_options(
+    let owned_paths = migration_created_paths(&db_path, data_dir, backup_path.as_deref());
+    let _owner_guard = OwnershipGuard {
+        paths: owned_paths.clone(),
+        owner,
+    };
+
+    let open_result = StatsDb::open_with_options(
         &db_path,
         StatsOpenOptions {
             migration_mode: MigrationMode::Auto,
             ..StatsOpenOptions::default()
         },
     )
-    .await
-    {
-        Ok(db) => db,
+    .await;
+    // The live database, its WAL/SHM sidecars and a newly created stats-salt
+    // may all have been created as root while the service runs as `sito`.
+    let ownership = restore_ownership(&owned_paths, owner);
+
+    let db = match open_result {
+        Ok(db) => {
+            ownership?;
+            db
+        }
         Err(e) => {
+            let ownership_note = match ownership {
+                Ok(()) => String::new(),
+                Err(ownership_error) => {
+                    format!(" Restoring file ownership also failed: {ownership_error}")
+                }
+            };
             let rollback = match &backup_path {
                 Some(path) => format!(
                     " The pre-migration database is at '{}'; restore it if the failed migration changed anything.",
@@ -786,7 +906,7 @@ pub async fn run_db_migrate(
                 None => String::from(" No backup was requested (--no-backup)."),
             };
             anyhow::bail!(
-                "Failed to migrate stats database '{}': {e}.{rollback} \
+                "Failed to migrate stats database '{}': {e}.{rollback}{ownership_note} \
                  The database file was not deleted.",
                 db_path.display()
             );
@@ -1948,6 +2068,27 @@ mod tests {
             }
             other => panic!("expected db migrate, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cli_db_migrate_restore_ownership_skips_matching_and_missing_files() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = temp_config_dir("db_owner");
+        let db_path = dir.join("stats.db");
+        std::fs::write(&db_path, b"owner probe").unwrap();
+        let owner = file_owner(&db_path).expect("the probe file has an owner");
+
+        // Files that already carry the owner are left alone (no privileged
+        // chown), and missing candidates are skipped.
+        restore_ownership(&[db_path.clone(), dir.join("stats.db-wal")], Some(owner))
+            .expect("restoring the current owner must succeed");
+        let meta = std::fs::metadata(&db_path).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (owner.uid, owner.gid));
+
+        assert_eq!(file_owner(&dir.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
