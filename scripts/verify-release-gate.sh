@@ -15,6 +15,10 @@
 #   RELEASE_TAG             Tag being published (for example v1.9.4). Required.
 #   GITHUB_REPOSITORY       owner/repo. Required for the checks API.
 #   GH_TOKEN / GITHUB_TOKEN Token used by `gh api`.
+#   gh                      Requires the GitHub CLI. Newer releases are queried
+#                           with `gh api --paginate --slurp`; older releases
+#                           that do not know `--slurp` fall back to plain
+#                           `gh api --paginate`.
 #   RELEASE_REQUIRED_BRANCH Override the derived branch (tests/ops escape hatch).
 #   SITO_GATE_SKIP_FETCH=1  Do not fetch the branch from origin (tests/offline).
 set -euo pipefail
@@ -104,10 +108,37 @@ fi
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 checks_file="${tmp_dir}/checks.json"
+checks_err="${tmp_dir}/checks.err"
+checks_slurp_err="${tmp_dir}/checks-slurp.err"
 statuses_file="${tmp_dir}/statuses.json"
 
-gh api --paginate --slurp \
-    "repos/${repo}/commits/${tag_commit}/check-runs?per_page=100" >"${checks_file}"
+checks_endpoint="repos/${repo}/commits/${tag_commit}/check-runs?per_page=100"
+
+# `gh api --slurp` is only available in newer GitHub CLI releases. Prefer it
+# because it emits one JSON array, but fall back to plain `--paginate` for older
+# releases, which emit one JSON object per page. Only the specific
+# "unknown flag --slurp" error triggers the fallback; auth, network and API
+# errors are fatal and are never retried or hidden.
+if gh api --paginate --slurp "${checks_endpoint}" \
+    >"${checks_file}" 2>"${checks_slurp_err}"; then
+    :
+elif grep -Eqi -- \
+    '^[[:space:]]*(error:[[:space:]]*)?unknown flag.*--slurp|^[[:space:]]*flag provided but not defined: -+slurp' \
+    "${checks_slurp_err}"; then
+    echo "gh does not support '--slurp'; retrying with plain --paginate" >&2
+    if ! gh api --paginate "${checks_endpoint}" \
+        >"${checks_file}" 2>"${checks_err}"; then
+        cat "${checks_slurp_err}" >&2
+        cat "${checks_err}" >&2
+        echo "::error::failed to fetch check runs for ${tag_commit}" >&2
+        exit 1
+    fi
+else
+    cat "${checks_slurp_err}" >&2
+    echo "::error::failed to fetch check runs for ${tag_commit}" >&2
+    exit 1
+fi
+
 gh api "repos/${repo}/commits/${tag_commit}/status" >"${statuses_file}"
 
 python3 - "${checks_file}" "${statuses_file}" "${tag_commit}" <<'PY'
@@ -116,10 +147,43 @@ import sys
 
 checks_path, statuses_path, sha = sys.argv[1:4]
 
-with open(checks_path, encoding="utf-8") as handle:
-    pages = json.load(handle)
-if isinstance(pages, dict):
-    pages = [pages]
+
+def read_pages(path):
+    """Return check-run page objects from any supported `gh api` shape.
+
+    `--slurp` emits an array of page objects; a single page can also be a plain
+    object; plain `--paginate` concatenates one object per page. Parse a stream
+    of JSON values so all three forms work.
+    """
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+
+    decoder = json.JSONDecoder()
+    pages = []
+    index = 0
+    while True:
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        value, index = decoder.raw_decode(text, index)
+        if isinstance(value, list):
+            pages.extend(value)
+        elif isinstance(value, dict):
+            pages.append(value)
+        else:
+            raise ValueError(f"unexpected JSON value in {path}")
+    if not pages:
+        raise ValueError(f"no check-run pages found in {path}")
+    return pages
+
+
+try:
+    pages = read_pages(checks_path)
+except ValueError as exc:
+    print(f"::error::cannot parse check-run response: {exc}", file=sys.stderr)
+    sys.exit(1)
+
 runs = []
 for page in pages:
     runs.extend(page.get("check_runs", []))
