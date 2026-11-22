@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use utoipa::ToSchema;
 
+mod backup;
 mod querylog;
 mod retention;
 mod schema;

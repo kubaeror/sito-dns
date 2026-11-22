@@ -45,6 +45,7 @@ async-trait.workspace = true
 sito-cache = { workspace = true, features = ["test-hooks"] }
 sito-test-support.workspace = true
 rcgen.workspace = true
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 time.workspace = true
 
 [features]

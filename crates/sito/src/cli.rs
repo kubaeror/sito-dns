@@ -5,7 +5,7 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 use rand::RngExt;
 use sito_core::config::Config;
-use sito_stats::StatsDb;
+use sito_stats::{MigrationMode, SchemaInspection, StatsDb, StatsOpenOptions};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -164,6 +164,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Statistics database maintenance
+    Db {
+        #[command(subcommand)]
+        command: DbCommands,
+    },
     /// Check for and install software updates
     Update {
         /// Optional path to configuration file (defaults to main --config; the
@@ -250,6 +255,25 @@ pub enum ConfigCommands {
         /// Print the machine-readable migration report as JSON
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// Statistics database subcommands.
+#[derive(Subcommand, Debug)]
+pub enum DbCommands {
+    /// Migrate the stats database to the schema version supported by this binary
+    Migrate {
+        /// Optional path to configuration file (defaults to the main --config)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Inspect and print the planned migration without modifying the
+        /// database or creating a backup
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the 0600 pre-migration backup. Rolling back then requires your
+        /// own copy of the database.
+        #[arg(long)]
+        no_backup: bool,
     },
 }
 
@@ -493,6 +517,311 @@ pub fn run_config_migrate(
         None => println!("No backup written; pass --backup to keep the v1 document."),
     }
     Ok(())
+}
+
+/// Options for `sito db migrate`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DbMigrateOptions {
+    /// Inspect and report only; never creates a backup or writes to the DB.
+    pub dry_run: bool,
+    /// Skip the 0600 `<stats.db>.v<found>.bak` snapshot.
+    pub no_backup: bool,
+}
+
+/// Result of a successful `sito db migrate` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbMigrateOutcome {
+    /// The database already records the supported schema version.
+    AlreadyCurrent { found: i64, supported: i64 },
+    /// `--dry-run`: nothing was created or modified.
+    DryRun {
+        found: i64,
+        supported: i64,
+        db_path: PathBuf,
+        /// `None` when `--no-backup` was passed.
+        backup_path: Option<PathBuf>,
+    },
+    /// The database was upgraded. `backup_path` is `None` with `--no-backup`.
+    Migrated {
+        found: i64,
+        supported: i64,
+        backup_path: Option<PathBuf>,
+    },
+}
+
+/// `<stats.db>.v<found>.bak`, matching the `<config>.v1.bak` convention.
+fn stats_backup_path(db_path: &Path, found: i64) -> PathBuf {
+    path_with_suffix(db_path, &format!(".v{found}.bak"))
+}
+
+/// Appends a literal suffix to the final path component (keeps non-UTF-8 paths).
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Creates a 0700 staging directory so a database copy is unreadable to other
+/// local users even before its own 0600 mode is applied.
+fn create_private_directory(path: &Path) -> Result<(), anyhow::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir(path)?;
+    Ok(())
+}
+
+/// Inspects the schema version without touching the data directory.
+///
+/// `StatsDb::inspect_schema_version` opens the database in place; SQLite
+/// creates `-wal`/`-shm` sidecars for a WAL-mode database even through a
+/// read-only connection. `--dry-run` promises not to create those files, so it
+/// inspects a private copy (including any committed `-wal` content) instead.
+async fn inspect_db_without_writes(db_path: &Path) -> Result<SchemaInspection, anyhow::Error> {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let staging = parent.join(format!(
+        ".sito-db-inspect-{}-{:016x}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    create_private_directory(&staging)?;
+
+    let copy = staging.join("stats.db");
+    let result = async {
+        std::fs::copy(db_path, &copy).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to copy '{}' for the dry-run inspection: {e}",
+                db_path.display()
+            )
+        })?;
+        let wal = path_with_suffix(db_path, "-wal");
+        if wal.is_file() {
+            std::fs::copy(&wal, path_with_suffix(&copy, "-wal")).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to copy '{}' for the dry-run inspection: {e}",
+                    wal.display()
+                )
+            })?;
+        }
+
+        StatsDb::inspect_schema_version(&copy)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to inspect stats database '{}': {e}",
+                    db_path.display()
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Stats database '{}' disappeared before it could be inspected",
+                    db_path.display()
+                )
+            })
+    }
+    .await;
+
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// Executes the `db migrate` subcommand (B2).
+///
+/// Explicit and forward-only: the database is inspected read-only, a newer
+/// schema is refused, a current schema is a no-op, and a real migration takes
+/// a consistent 0600 backup first. The service lease is held from the
+/// inspection through the migration so a supervisor cannot start a second
+/// writer mid-run, and there is deliberately no `--force` override.
+pub async fn run_db_migrate(
+    config_path: &Path,
+    options: DbMigrateOptions,
+) -> Result<DbMigrateOutcome, anyhow::Error> {
+    let content = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read configuration file '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+    let config = Config::from_toml_str(&content)
+        .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+
+    let data_dir = &config.server.data_dir;
+    let db_path = data_dir.join("stats.db");
+    if !db_path.is_file() {
+        anyhow::bail!(
+            "Stats database '{}' does not exist, so there is nothing to migrate. \
+             A first install creates it when the server starts; this command never creates an empty database.",
+            db_path.display()
+        );
+    }
+
+    // Held through inspect, backup and migrate. No `--force`: the running
+    // server holds SQLite connections and must be stopped.
+    let _access = begin_reset(
+        data_dir,
+        "migrate the stats database",
+        false,
+        DB_MIGRATE_FORCE_HINT,
+    )?;
+
+    // Read-only, non-mutating version check. Corrupt markers fail closed here
+    // with `InvalidSchemaVersion`. A dry run inspects a private copy so SQLite
+    // cannot leave `-wal`/`-shm` sidecars next to the real database.
+    let inspection = if options.dry_run {
+        inspect_db_without_writes(&db_path).await?
+    } else {
+        StatsDb::inspect_schema_version(&db_path)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to inspect stats database '{}': {e}",
+                    db_path.display()
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Stats database '{}' disappeared before it could be inspected",
+                    db_path.display()
+                )
+            })?
+    };
+
+    if inspection.is_too_new() {
+        anyhow::bail!(
+            "Refusing to migrate '{}': it records schema version {} but this binary supports \
+             at most {}. Downgrading is not supported; upgrade the sito binary instead. \
+             No files were changed.",
+            db_path.display(),
+            inspection.found,
+            inspection.supported
+        );
+    }
+
+    if inspection.is_current() {
+        println!(
+            "Stats database '{}' is already at schema version {} (the version supported by this binary); nothing to do.",
+            db_path.display(),
+            inspection.found
+        );
+        return Ok(DbMigrateOutcome::AlreadyCurrent {
+            found: inspection.found,
+            supported: inspection.supported,
+        });
+    }
+
+    let backup_path = stats_backup_path(&db_path, inspection.found);
+
+    if options.dry_run {
+        println!(
+            "Stats database '{}': schema version {} found, {} supported.",
+            db_path.display(),
+            inspection.found,
+            inspection.supported
+        );
+        println!("Would migrate to schema version {}.", inspection.supported);
+        println!("Target database: '{}'", db_path.display());
+        if options.no_backup {
+            println!("Backup: none (--no-backup).");
+        } else {
+            println!(
+                "Backup would be written to '{}' (mode 0600).",
+                backup_path.display()
+            );
+        }
+        println!("Dry run: the database, WAL/SHM and backup were not created or modified.");
+        return Ok(DbMigrateOutcome::DryRun {
+            found: inspection.found,
+            supported: inspection.supported,
+            db_path,
+            backup_path: (!options.no_backup).then_some(backup_path),
+        });
+    }
+
+    let backup_path = if options.no_backup {
+        println!(
+            "Skipping the backup (--no-backup); rolling back after a failure requires your own copy."
+        );
+        None
+    } else {
+        if backup_path.exists() {
+            anyhow::bail!(
+                "Refusing to overwrite the existing backup '{}'. Move or remove it, then run this command again.",
+                backup_path.display()
+            );
+        }
+        StatsDb::snapshot_to(&db_path, &backup_path)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to write the 0600 backup '{}': {e}",
+                    backup_path.display()
+                )
+            })?;
+        println!("Backup written to '{}' (mode 0600).", backup_path.display());
+        Some(backup_path)
+    };
+
+    let db = match StatsDb::open_with_options(
+        &db_path,
+        StatsOpenOptions {
+            migration_mode: MigrationMode::Auto,
+            ..StatsOpenOptions::default()
+        },
+    )
+    .await
+    {
+        Ok(db) => db,
+        Err(e) => {
+            let rollback = match &backup_path {
+                Some(path) => format!(
+                    " The pre-migration database is at '{}'; restore it if the failed migration changed anything.",
+                    path.display()
+                ),
+                None => String::from(" No backup was requested (--no-backup)."),
+            };
+            anyhow::bail!(
+                "Failed to migrate stats database '{}': {e}.{rollback} \
+                 The database file was not deleted.",
+                db_path.display()
+            );
+        }
+    };
+
+    let resulting = db.schema_version().await.map_err(|e| {
+        anyhow::anyhow!(
+            "Migrated '{}', but could not verify its schema version: {e}",
+            db_path.display()
+        )
+    })?;
+    db.pool().close().await;
+
+    if resulting != inspection.supported {
+        anyhow::bail!(
+            "Migrated '{}' but it now reports schema version {} instead of {}",
+            db_path.display(),
+            resulting,
+            inspection.supported
+        );
+    }
+
+    println!(
+        "Migrated stats database '{}' from schema version {} to {}.",
+        db_path.display(),
+        inspection.found,
+        resulting
+    );
+
+    Ok(DbMigrateOutcome::Migrated {
+        found: inspection.found,
+        supported: inspection.supported,
+        backup_path,
+    })
 }
 
 /// Executes the `clear-query-log` subcommand.
@@ -1289,6 +1618,8 @@ const CLEAR_QUERY_LOG_FORCE_HINT: &str = "Use --force only if you understand tha
      keeps its open SQLite connections; stop the service when possible.";
 const CLEAR_QUERY_LOG_LIVE_STATE: &str = "The running server keeps its open SQLite connections and \
      may have cached dashboard aggregates until they expire";
+const DB_MIGRATE_FORCE_HINT: &str = "Database migration needs exclusive access to the stats \
+     database, so this command has no --force override; stop the service and run it again.";
 
 const ADMIN_LIVE_STATE: &str = "Existing web sessions and API tokens remain valid, and the running \
      server still accepts the old admin password and rejects the new one";
@@ -1570,6 +1901,52 @@ mod tests {
                 assert!(json);
             }
             other => panic!("expected config migrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_db_migrate_flags() {
+        let cli = Cli::try_parse_from([
+            "sito",
+            "db",
+            "migrate",
+            "--dry-run",
+            "--no-backup",
+            "--config",
+            "/tmp/config.toml",
+        ])
+        .expect("parse db migrate");
+        match cli.command {
+            Some(Commands::Db {
+                command:
+                    DbCommands::Migrate {
+                        config,
+                        dry_run,
+                        no_backup,
+                    },
+            }) => {
+                assert_eq!(config, Some(PathBuf::from("/tmp/config.toml")));
+                assert!(dry_run);
+                assert!(no_backup);
+            }
+            other => panic!("expected db migrate, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["sito", "db", "migrate"]).expect("parse bare db migrate");
+        match cli.command {
+            Some(Commands::Db {
+                command:
+                    DbCommands::Migrate {
+                        config,
+                        dry_run,
+                        no_backup,
+                    },
+            }) => {
+                assert_eq!(config, None);
+                assert!(!dry_run);
+                assert!(!no_backup);
+            }
+            other => panic!("expected db migrate, got {other:?}"),
         }
     }
 

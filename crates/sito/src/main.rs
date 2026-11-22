@@ -148,6 +148,25 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
             },
+            Commands::Db { command } => match command {
+                sito::cli::DbCommands::Migrate {
+                    config,
+                    dry_run,
+                    no_backup,
+                } => {
+                    let config_path = config.unwrap_or(default_config_path.clone());
+                    if let Err(e) = sito::cli::run_db_migrate(
+                        &config_path,
+                        sito::cli::DbMigrateOptions { dry_run, no_backup },
+                    )
+                    .await
+                    {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+            },
             Commands::Update {
                 config,
                 check,

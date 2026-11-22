@@ -3160,6 +3160,7 @@ dependencies = [
  "sito-test-support",
  "sito-transport",
  "sito-upstream",
+ "sqlx",
  "time",
  "tokio",
  "toml",
