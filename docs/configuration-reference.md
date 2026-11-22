@@ -631,14 +631,43 @@ retention scheduler's top lists. The CLI path takes the service lease and
 refuses a live server unless `--force`; the API/UI path necessarily runs live,
 so rows written after their hour was processed can survive until the next
 clear/retention—stop the service and use the CLI when a complete clear is
-required. A 1M-row, 90-day soak is a documented capacity-testing residual
-rather than a unit-test guarantee; the row-bounded chunks keep each transaction
-bounded but the sweep is still linear in the number of cleared (or expired)
-rows. `stats_watermark` is still written for progress diagnostics/backward
-compatibility but is not read to skip rows: aggregation and deletion share a
-transaction, and backdated rows must be re-aggregated. Enabling
-`privacy.anonymize_querylog` is forward-only; old detailed rows are not
-rewritten (retroactive anonymization is deferred, P2-59).
+required. A deterministic 1M-row / 90-day fixture (60,435-row heavy hour,
+mostly seven-row same-timestamp batches, 2,160 hours) is measured by gated
+tests in `crates/sito-stats/src/db/capacity_tests.rs`:
+
+```bash
+cargo test -p sito-stats --all-features --lib db::capacity_tests \
+    -- --ignored --nocapture --test-threads=1
+```
+
+Those tests are `#[ignore]`d and are not part of default CI. Hand-collected
+samples from a shared Linux x86_64 dev host in the unoptimized `test` profile:
+a 90-day steady-state retention sweep pruned 20,997-21,248 rows in 2.1-4.1 s
+across 49 chunks; a full-backlog retention sweep drained all 1,000,000 rows in
+35.6-52.9 s across 2,172 chunks; the `keep_aggregates` clear folded the
+remaining ~978,800 rows in 35.4-169.9 s across 2,124 chunks (the 169.9 s sample
+ran while another local service used >16 CPUs). These are observations, not
+bounds. The implementation commits each ≤5,000-row chunk in its own
+`BEGIN IMMEDIATE` transaction; the test pins the chunk counter to the per-hour
+ceiling sum **and** independently observes committed `stats_hourly` progress
+and `PRAGMA data_version` changes from a second connection mid-sweep, so a
+single transaction around the whole loop would fail. Whole-process peak RSS
+stayed at 16-34 MiB across every phase (including the polling connection)
+instead of growing with the row count. The compacted 1M-row database was
+213 MiB (about 0.21 GiB per 1M rows including indexes) and the 2,160 hourly
+rollups were 34 MiB; a bulk load or full sweep transiently needs about 2x the
+compacted size for WAL and `VACUUM` scratch, so reserve at least three times
+the expected detailed-log size. These are dev-host debug-build observations,
+**not a production SLA**; scale data size linearly and measure wall time on the
+deployment hardware. The exact commands, captured output and
+recommended sizing are in
+[the migration guide](2.0-migration.md#6-database). `stats_watermark` is still
+written for progress diagnostics/backward compatibility but is not read to skip
+rows: aggregation and deletion share a transaction, and backdated rows must be
+re-aggregated. Enabling `privacy.anonymize_querylog` is forward-only: old
+detailed rows are never rewritten automatically. Run `sito db anonymize --all`
+to rewrite them (review the plan with `--dry-run` first); see the migration
+guide.
 
 > Query logging is always enabled when `[stats]` is present. Prometheus metrics
 > are exposed at `/metrics` and require a Viewer-or-higher bearer token or
