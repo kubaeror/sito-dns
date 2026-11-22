@@ -203,36 +203,61 @@ unauthenticated fallback.
 
 ## 5. Offline recovery: lease-admin set
 
-Use this only when the witness record is **behind** the cluster (for example
-after restoring a backup or an operator bypass). Never hand-edit
-`ha_state.toml` above the witness.
+Use this only when the witness record is **behind** the cluster: its term is
+lower than the cluster's current term, or its published version is older than
+the cluster's current published baseline (for example after restoring a backup
+or an operator bypass). Never hand-edit `ha_state.toml` above the witness.
+
+The record stores the **last successfully published bundle baseline**, not the
+next version. Set `--version` and `--bundle-hash` to the cluster's current published `(published_version, published_hash)` — the content every master and
+candidate already has. It must be strictly greater than the old witness
+version, but it must **not** be above the cluster baseline:
+
+- `acquire` requires the candidate's published version to be at least the
+  witness version, and at equality the same hash. A witness version above the
+  cluster makes every master/candidate fail
+  `candidate_behind`/`master_state_behind`.
+- Never pass the pending/publish-next version. Pass the published baseline that
+  the node would send to `/v1/lease/acquire`.
+
+Example: the old witness record is term 8 / version 127 / hash A, while the
+cluster's current published baseline is version 128 / hash B.
 
 1. Stop the witness. The tool refuses with `state_locked` while the witness
    process holds `lease.lock`.
 2. Back up the state directory.
-3. Raise the record above the cluster high-water mark:
+3. Raise the record to the cluster baseline:
 
 ```bash
 sudo sito ha lease-admin set \
   --state-dir /var/lib/sito-lease \
   --term 9 \
-  --version 129 \
-  --bundle-hash blake3:<64-hex-published-bundle-hash> \
+  --version 128 \
+  --bundle-hash blake3:<64-hex-cluster-published-hash-B> \
   --confirm
 ```
+
+`--term` must be strictly greater than the old witness term (9 here); the next
+acquire uses `term + 1` (10). `--version 128` is the cluster's published
+baseline, not `129`: the next acquire presents `version = 128`, and the witness
+accepts equality with the same hash. If the cluster has actually published
+129/hash C, use `--version 129 --bundle-hash C` instead.
 
 The tool:
 
 - requires `--confirm`;
 - refuses a term or version that is not **strictly greater** than the current
   record (`term_not_raised`/`version_not_raised`);
-- refuses a version more than 1,000,000 above the current record;
 - backs up the previous `lease.json` (to `lease.json.bak` or
   `lease.json.bak.<unix_ms>`) before writing;
 - writes an immediately expired record with the cluster id from the existing
   record, so the next acquire takes over at `term + 1`.
 
 4. Start the witness and let the current/next master acquire.
+
+> **The tool only raises.** It cannot lower a version. If the witness was set
+> above the cluster's published baseline, restore the state backup; do not try
+> to “fix” it by raising the cluster or by editing `lease.json` by hand.
 
 ## 6. Failure behavior and monitoring
 
@@ -271,8 +296,8 @@ The tool:
 | Symptom | Meaning / action |
 |---|---|
 | `state_locked` on startup | Another witness process (or `lease-admin`) holds `lease.lock`. Stop it; do not delete the lock file. |
-| `state_missing` | `initialized` exists without `lease.json`. Restore the backup; do not delete `initialized`. |
-| `state_corrupt` | `lease.json` is unreadable/invalid. Restore the backup or use `lease-admin set` after an explicit backup. |
+| `state_missing` | `initialized` exists without `lease.json`. Restore the backup; `lease-admin set` needs a readable record and cannot recreate one. |
+| `state_corrupt` | `lease.json` is unreadable/invalid. The witness refuses to start and `lease-admin set` cannot parse the record either; restore the state backup. If no backup exists, an explicit manual reinitialization is required after every node is disabled. |
 | `state_cluster_mismatch` | `--cluster-id` differs from the record. Fix the configuration or restore the matching state; never edit the cluster id in place. |
 | `token_file_permissions` | `--token-file` is not exactly `0600`. |
 | TLS handshake failures | Wrong CA/SAN/fingerprint, expired certificate, or client `server_name` mismatch. |

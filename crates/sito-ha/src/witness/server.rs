@@ -20,6 +20,7 @@ use axum::{Json, Router};
 use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
@@ -32,6 +33,11 @@ use super::{MAX_REQUEST_BODY, WitnessError, validate_cluster_id};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Read/write inactivity timeout for one HTTP connection.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum concurrent witness TCP connections (handshaking or serving).
+///
+/// The witness only serves two HA nodes, so 256 is generous while bounding the
+/// unauthenticated slow-handshake surface.
+const MAX_CONNECTIONS: usize = 256;
 /// Token file mode required by the ADR.
 const TOKEN_FILE_MODE: u32 = 0o600;
 
@@ -229,6 +235,7 @@ pub async fn start_witness_server(
     let tls_listener = WitnessTlsListener {
         inner: listener,
         acceptor: TlsAcceptor::from(tls),
+        connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
     };
 
     let join = tokio::spawn(async move {
@@ -466,31 +473,39 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     if token.is_empty() { None } else { Some(token) }
 }
 
-/// A TCP listener that performs TLS before handing the stream to axum.
+/// A TCP listener that accepts immediately and lets axum's per-connection task
+/// perform the TLS handshake lazily.
+///
+/// Doing the handshake inside `Listener::accept` would serialize every
+/// connection behind the 5 s handshake timeout, so one silent TCP client could
+/// stall authenticated acquire/renew requests.
 struct WitnessTlsListener {
     inner: TcpListener,
     acceptor: TlsAcceptor,
+    connections: Arc<Semaphore>,
 }
 
 impl axum::serve::Listener for WitnessTlsListener {
-    type Io = TimeoutIo<TlsStream<TcpStream>>;
+    type Io = LazyTlsStream;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
             match self.inner.accept().await {
                 Ok((stream, addr)) => {
-                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(stream))
-                        .await
-                    {
-                        Ok(Ok(tls)) => return (TimeoutIo::new(tls, IO_TIMEOUT), addr),
-                        Ok(Err(error)) => {
-                            tracing::debug!(%addr, %error, "witness TLS handshake failed");
-                        }
-                        Err(_) => {
-                            tracing::debug!(%addr, "witness TLS handshake timed out");
-                        }
-                    }
+                    let Ok(permit) = Arc::clone(&self.connections).try_acquire_owned() else {
+                        tracing::warn!(
+                            %addr,
+                            limit = MAX_CONNECTIONS,
+                            "witness connection limit reached; dropping connection"
+                        );
+                        drop(stream);
+                        continue;
+                    };
+                    return (
+                        LazyTlsStream::new(stream, self.acceptor.clone(), permit),
+                        addr,
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(%error, "witness TCP accept failed");
@@ -502,6 +517,136 @@ impl axum::serve::Listener for WitnessTlsListener {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
+    }
+}
+
+type HandshakeFuture =
+    Pin<Box<dyn Future<Output = io::Result<TimeoutIo<TlsStream<TcpStream>>>> + Send + 'static>>;
+
+/// A TCP stream that performs its TLS handshake on first read/write.
+///
+/// axum spawns one task per accepted connection, so the handshake timeout only
+/// occupies that connection's task, never the accept loop.
+struct LazyTlsStream {
+    handshake: Option<HandshakeFuture>,
+    inner: Option<TimeoutIo<TlsStream<TcpStream>>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl LazyTlsStream {
+    fn new(stream: TcpStream, acceptor: TlsAcceptor, permit: OwnedSemaphorePermit) -> Self {
+        let handshake = Box::pin(async move {
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                Ok(Ok(tls)) => Ok(TimeoutIo::new(tls, IO_TIMEOUT)),
+                Ok(Err(error)) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("witness TLS handshake failed: {error}"),
+                )),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "witness TLS handshake timed out",
+                )),
+            }
+        });
+        Self {
+            handshake: Some(handshake),
+            inner: None,
+            _permit: permit,
+        }
+    }
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.inner.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        let handshake = {
+            let Some(handshake) = self.handshake.as_mut() else {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "witness TLS handshake already failed",
+                )));
+            };
+            handshake.as_mut().poll(cx)
+        };
+        match handshake {
+            Poll::Ready(Ok(tls)) => {
+                self.inner = Some(tls);
+                self.handshake = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                tracing::debug!(%error, "witness TLS handshake failed");
+                self.handshake = None;
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncRead for LazyTlsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_ready(cx) {
+            Poll::Ready(Ok(())) => match this.inner.as_mut() {
+                Some(inner) => Pin::new(inner).poll_read(cx, buf),
+                None => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "witness TLS stream is not ready",
+                ))),
+            },
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for LazyTlsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match this.poll_ready(cx) {
+            Poll::Ready(Ok(())) => match this.inner.as_mut() {
+                Some(inner) => Pin::new(inner).poll_write(cx, buf),
+                None => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "witness TLS stream is not ready",
+                ))),
+            },
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.inner.as_mut() {
+            Some(inner) => Pin::new(inner).poll_flush(cx),
+            // A connection that never completed its handshake has nothing to
+            // flush; closing it must not start a handshake.
+            None => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.inner.as_mut() {
+            Some(inner) => Pin::new(inner).poll_shutdown(cx),
+            None => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(TimeoutIo::is_write_vectored)
     }
 }
 

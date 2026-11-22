@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -831,6 +832,39 @@ async fn tls_rejects_wrong_ca_wrong_san_and_wrong_pin() {
 }
 
 #[tokio::test]
+async fn silent_tcp_client_does_not_delay_authenticated_requests() {
+    let witness = TestWitness::start().await;
+    let first = first_grant(&witness).await;
+
+    // Hold a TCP connection open without sending a ClientHello. The accept
+    // loop must return immediately and run the handshake in this connection's
+    // own task; the old serialized accept loop would block here for 5 s.
+    let silent = TcpStream::connect(witness.addr())
+        .await
+        .expect("silent TCP client");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let info = tokio::time::timeout(Duration::from_secs(2), witness.get("/v1/info"))
+        .await
+        .expect("a silent handshake must not delay GET /v1/info");
+    assert_eq!(info.status, 200);
+
+    witness.clock.advance(1_000);
+    let renewed = tokio::time::timeout(
+        Duration::from_secs(2),
+        witness.post(
+            "/v1/lease/renew",
+            &renew(&first.holder, 1, first.revision, 0, "none", TTL),
+        ),
+    )
+    .await
+    .expect("a silent handshake must not delay POST /v1/lease/renew");
+    assert_eq!(renewed.status, 200);
+
+    drop(silent);
+}
+
+#[tokio::test]
 async fn token_file_permissions_are_enforced_at_startup() {
     #[cfg(unix)]
     {
@@ -1061,6 +1095,87 @@ async fn lease_admin_set_refuses_while_the_witness_holds_the_lock_and_on_lower_v
     )
     .unwrap_err();
     assert_eq!(version_error.code(), "version_not_raised");
+}
+
+#[tokio::test]
+async fn lease_admin_set_uses_the_cluster_published_baseline_not_a_higher_version() {
+    let mut witness = TestWitness::start().await;
+    let first = first_grant(&witness).await;
+
+    // The witness baseline is behind the cluster: 127/A here, 128/B in the
+    // master's published state.
+    let witness_hash = hash(0xaa);
+    let high = witness
+        .post(
+            "/v1/lease/renew",
+            &renew(&first.holder, 1, first.revision, 127, &witness_hash, TTL),
+        )
+        .await
+        .record();
+    assert_eq!(high.version, 127);
+    witness.stop().await;
+
+    let cluster_hash = hash(0xbb);
+    let outcome = lease_admin_set_with_clock(
+        &witness.state_dir,
+        9,
+        128,
+        &cluster_hash,
+        witness.clock.clone(),
+    )
+    .unwrap();
+    assert_eq!(outcome.record.version, 128);
+
+    witness.restart().await;
+    let acquired = witness
+        .post(
+            "/v1/lease/acquire",
+            &acquire(
+                &holder("node-b"),
+                "node-b",
+                Some((outcome.record.term, outcome.record.revision)),
+                10,
+                128,
+                &cluster_hash,
+                TTL,
+            ),
+        )
+        .await;
+    assert_eq!(
+        acquired.status, 200,
+        "the cluster's published baseline (128/B) must be acquirable at equality: {:?}",
+        acquired.body
+    );
+    assert_eq!(acquired.record().version, 128);
+}
+
+#[test]
+fn runbook_recovery_guidance_matches_the_acquire_baseline_rule() {
+    let runbook = include_str!("../../../../docs/runbook-witness.md");
+    assert!(
+        runbook.contains("current published `(published_version, published_hash)`"),
+        "the runbook must tell operators to use the cluster's published baseline"
+    );
+    assert!(
+        runbook.contains("must **not** be above the cluster baseline"),
+        "the runbook must warn that a witness version above the cluster wedges promotion"
+    );
+    assert!(
+        runbook.contains("only raises"),
+        "the runbook must say lease-admin set cannot lower a too-high version"
+    );
+    assert!(
+        !runbook.contains("above the cluster high-water mark"),
+        "stale guidance raises the witness above the cluster and wedges promotion"
+    );
+    assert!(
+        !runbook.contains("1,000,000 above the current record"),
+        "lease-admin set does not implement a lead cap; the runbook must not claim one"
+    );
+    assert!(
+        !runbook.contains("use `lease-admin set` after an explicit backup"),
+        "lease-admin set cannot read a corrupt record, so it cannot repair state_corrupt"
+    );
 }
 
 // --- body limits and malformed requests ----------------------------------
