@@ -80,11 +80,18 @@ pub(super) async fn init_runtime_components(
     // Ensure data directory exists
     tokio::fs::create_dir_all(&config.server.data_dir).await?;
 
+    // Startup policy is parsed once. Never migrate silently: an older database
+    // is refused unless SITO_DB_AUTO_MIGRATE opts into the backup path.
+    let auto_migrate = crate::db_startup::DbAutoMigrate::from_env()?;
+
     // Initialize Stats SQLite DB
-    let db_path = config.server.data_dir.join("stats.db");
     let stats_config = config.get_stats_config();
-    let stats_db =
-        StatsDb::open_with_rollup_client_names(&db_path, stats_config.rollup_client_names).await?;
+    let stats_db = crate::db_startup::prepare_stats_db(
+        &config.server.data_dir,
+        stats_config.rollup_client_names,
+        auto_migrate,
+    )
+    .await?;
 
     // Initialize Prometheus metrics registry with 18 metrics per Table 14.2
     let metrics = MetricsRegistry::new(
