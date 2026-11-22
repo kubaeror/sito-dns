@@ -22,6 +22,8 @@ use utoipa::ToSchema;
 
 mod anonymize;
 mod backup;
+#[cfg(test)]
+mod capacity_tests;
 mod cursor;
 mod querylog;
 mod retention;

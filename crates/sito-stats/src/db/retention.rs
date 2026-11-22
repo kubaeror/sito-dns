@@ -62,11 +62,14 @@
 //! # Scale residual (90 days / 1M rows)
 //!
 //! `test_retention_handles_multiple_hours_across_days` covers a multi-day,
-//! multi-hour sweep. A true 1M-row/90-day soak is not part of the unit suite
-//! (it would dominate CI); the chunking keeps each write transaction bounded
-//! and the total sweep remains O(rows) with scheduled startup catch-up. Use
-//! `benches/stats_bench.rs` or a production-sized database for capacity
-//! testing. This is a documented residual rather than an untested claim.
+//! multi-hour sweep. The 1M-row/90-day capacity evidence lives in the
+//! `#[ignore]`d `db::capacity_tests` module (it would dominate CI), which runs
+//! retention and the chunked clear on a deterministic 1M-row fixture and
+//! asserts exact rollup totals, one committed chunk per ceil(rows/5,000), and
+//! bounded process memory. The chunking keeps each write transaction bounded
+//! and the total sweep remains O(rows) with scheduled startup catch-up.
+//! Measured dev-host results are recorded in `docs/2.0-migration.md`; they are
+//! not a production SLA.
 //!
 //! # `stats_watermark`
 //!
