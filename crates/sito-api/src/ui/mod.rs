@@ -829,6 +829,10 @@ mod tests {
         assert!(html.contains("netflix"));
         assert!(html.contains("ads"));
         assert!(html.contains("3 selected"));
+        // Catalog rows show the embedded rule count used by the picker.
+        assert!(html.contains("3 rules"));
+        assert!(html.contains("2 rules"));
+        assert!(html.contains("0 rules"));
         assert!(
             html.contains("No blocked services"),
             "a group with no services must show an empty state"
@@ -1219,6 +1223,39 @@ mod tests {
         assert!(!html.contains("<b>General</b>"));
         assert!(html.contains("&#60;script&#62;"));
         assert!(html.contains("&#60;b&#62;General&#60;/b&#62;"));
+    }
+
+    #[test]
+    fn test_filtering_help_text_states_catalog_and_parental_boundaries() {
+        let html = filtering_template_with_catalog(
+            vec![catalog_category("general", "General", 1)],
+            vec![catalog_filter(
+                "adguard_dns_filter",
+                "AdGuard DNS filter",
+                "AdGuard DNS filter",
+                false,
+                false,
+                false,
+            )],
+        )
+        .render()
+        .expect("render filtering help text");
+
+        // Catalog modal: release-bound metadata, runtime list bodies and license.
+        assert!(html.contains("release-bound and is never fetched at runtime"));
+        assert!(html.contains("List bodies are downloaded after you add them"));
+        assert!(html.contains("GPL-3.0-only"));
+
+        // Curated lists: parental is a per-group policy, off by default, and
+        // the catalog has no dedicated parental filter.
+        assert!(html.contains("off by default for every group"));
+        assert!(html.contains("catalog has no dedicated parental filter"));
+        assert!(html.contains("no separate refresh button"));
+
+        // The simulator evaluates only the global policy.
+        assert!(html.contains("In-process simulator"));
+        assert!(html.contains("global filter lists and custom rules"));
+        assert!(html.contains("not part of this check"));
     }
 
     #[test]

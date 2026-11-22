@@ -285,10 +285,11 @@
   <div class="card">
     <div class="card-header">
       <div class="card-title">Rule Testing & Simulation</div>
-      <span class="badge badge-info">Zero-latency simulator</span>
+      <span class="badge badge-info">In-process simulator</span>
     </div>
     <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 16px;">
-      Check whether a domain would be blocked or allowed according to your current lists and custom rules.
+      Check a domain against the global filter lists and custom rules. Client-group
+      lists, parental categories and blocked services are not part of this check.
     </p>
     <form hx-post="/ui/filtering/simulate" hx-target="#sim-result" hx-swap="innerHTML">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
