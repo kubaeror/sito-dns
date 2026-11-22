@@ -555,6 +555,12 @@ pub struct DisableTotpRequest {
 pub struct CreateTokenRequest {
     pub name: String,
     pub scope: String,
+    /// Optional lifetime in days. Omitted/`null` uses
+    /// `auth.token_default_ttl_days`; `0` requests a non-expiring token and is
+    /// accepted only when `auth.token_max_ttl_days = 0`. A positive value must
+    /// not exceed `auth.token_max_ttl_days` when a maximum is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_days: Option<u64>,
 }
 
 /// API token metadata safe for API/UI responses (never includes the hash).

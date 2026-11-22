@@ -346,6 +346,61 @@ fn test_default_api_token_ttl_is_bounded() {
 }
 
 #[test]
+fn test_api_token_max_ttl_defaults_and_validation() {
+    let auth = AuthConfig::default();
+    assert_eq!(
+        auth.token_max_ttl_days, 365,
+        "new API tokens must be capped at one year by default"
+    );
+    assert_eq!(auth.token_default_ttl_days, 90);
+    auth.validate()
+        .expect("the defaults must satisfy the policy");
+
+    // An explicit maximum is accepted up to the documented bound.
+    let cfg = Config::from_toml_str(
+        "config_version = 2\n[auth]\ntoken_max_ttl_days = 30\ntoken_default_ttl_days = 20\n",
+    )
+    .expect("a bounded maximum must parse");
+    let parsed: AuthConfig = cfg.auth.unwrap().try_into().unwrap();
+    assert_eq!(parsed.token_max_ttl_days, 30);
+    parsed.validate().expect("default <= max is valid");
+
+    // The default lifetime may not exceed the maximum.
+    let err = Config::from_toml_str(
+        "config_version = 2\n[auth]\ntoken_max_ttl_days = 30\ntoken_default_ttl_days = 31\n",
+    )
+    .expect_err("default > max must be rejected");
+    assert!(
+        err.to_string().contains("auth.token_default_ttl_days"),
+        "the error must name the offending default: {err}"
+    );
+
+    // `token_max_ttl_days = 0` is the explicit no-maximum opt-out and permits
+    // a longer default (including the historical `0` = no expiry).
+    for default in [0, 90, 10_000] {
+        let parsed = AuthConfig {
+            token_max_ttl_days: 0,
+            token_default_ttl_days: default,
+            ..AuthConfig::default()
+        };
+        parsed
+            .validate()
+            .expect("max = 0 must disable the cap entirely");
+    }
+
+    // Values above the documented cap are rejected even though 0 is allowed.
+    let err = Config::from_toml_str(&format!(
+        "config_version = 2\n[auth]\ntoken_max_ttl_days = {}\n",
+        MAX_TOKEN_MAX_TTL_DAYS + 1
+    ))
+    .expect_err("over-cap max must be rejected");
+    assert!(
+        err.to_string().contains("auth.token_max_ttl_days"),
+        "the error must name the field: {err}"
+    );
+}
+
+#[test]
 fn test_api_rate_limit_defaults_parses_and_is_bounded() {
     let auth = AuthConfig::default();
     assert_eq!(
@@ -1087,6 +1142,7 @@ session_ttl_hours = 24
 login_rate_limit = 5
 session_persist = true
 token_default_ttl_days = 90
+token_max_ttl_days = 365
 api_rate_limit_per_minute = 600
 
 [stats]

@@ -57,6 +57,7 @@ impl AuthManager {
         bootstrap_allowed: bool,
         session_persist: bool,
         token_default_ttl_days: u64,
+        token_max_ttl_days: u64,
     ) -> Result<Self, AuthStorageError> {
         Self::with_config_and_storage_full(
             Some(data_dir.as_ref().join("users.toml")),
@@ -65,6 +66,7 @@ impl AuthManager {
             bootstrap_allowed,
             session_persist,
             token_default_ttl_days,
+            token_max_ttl_days,
         )
     }
 
@@ -89,6 +91,7 @@ impl AuthManager {
             bootstrap_allowed,
             true,
             0,
+            0,
         )
     }
 
@@ -99,6 +102,7 @@ impl AuthManager {
         bootstrap_allowed: bool,
         session_persist: bool,
         token_default_ttl_days: u64,
+        token_max_ttl_days: u64,
     ) -> Result<Self, AuthStorageError> {
         let secs = session_ttl_hours.saturating_mul(3600);
         let session_ttl_secs = i64::try_from(secs).unwrap_or(DEFAULT_SESSION_TTL_SECS);
@@ -147,6 +151,7 @@ impl AuthManager {
             tokens_revision: Arc::new(AtomicU64::new(0)),
             sessions_revision: Arc::new(AtomicU64::new(0)),
             token_default_ttl_days,
+            token_max_ttl_days,
             api_rate_limiter: Arc::new(crate::auth::rate_limit::ApiRateLimiter::new(
                 sito_core::config::DEFAULT_API_RATE_LIMIT_PER_MINUTE,
             )),

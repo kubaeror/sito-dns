@@ -392,6 +392,12 @@ pub struct AccountTemplate<'a> {
     /// its own privilege level.
     pub can_create_operator_token: bool,
     pub can_create_admin_token: bool,
+    /// Configured default token lifetime in days (`0` = no expiry), shown in
+    /// the create-token form help.
+    pub token_default_ttl_days: u64,
+    /// Configured maximum token lifetime in days (`0` = no maximum), shown in
+    /// the create-token form help and used as the input's `max` bound.
+    pub token_max_ttl_days: u64,
     pub error_message: &'a str,
     pub notice_message: &'a str,
     /// Plaintext token from the request that just created it. Rendered exactly

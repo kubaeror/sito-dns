@@ -261,6 +261,7 @@ pub async fn run_server_with_lease(
         bootstrap_allowed,
         auth_cfg.session_persist,
         auth_cfg.token_default_ttl_days,
+        auth_cfg.token_max_ttl_days,
     )?);
     auth_mgr.set_api_rate_limit(auth_cfg.api_rate_limit_per_minute);
     auth_mgr.spawn_pruner(shutdown_rx.clone());

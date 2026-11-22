@@ -412,6 +412,7 @@ mod tests {
                 username: "viewer".to_string(),
                 role: Role::Viewer,
                 token_id: None,
+                owner: None,
             })
         };
         let peer = std::net::SocketAddr::from(([198, 51, 100, 251], 12_345));

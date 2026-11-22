@@ -3550,6 +3550,7 @@ async fn test_account_admin_token_requires_reauth() {
             scope: "admin".to_string(),
             reauth_password: None,
             reauth_code: None,
+            expires_in_days: None,
         }),
     )
     .await;
@@ -3565,6 +3566,7 @@ async fn test_account_admin_token_requires_reauth() {
             scope: "admin".to_string(),
             reauth_password: Some("adminadmin".to_string()),
             reauth_code: None,
+            expires_in_days: None,
         }),
     )
     .await;
@@ -3598,6 +3600,7 @@ async fn test_account_tokens_create_and_revoke() {
             scope: "viewer".to_string(),
             reauth_password: None,
             reauth_code: None,
+            expires_in_days: None,
         }),
     )
     .await;
@@ -3638,6 +3641,100 @@ async fn test_account_tokens_create_and_revoke() {
     let resp = account_token_delete_handler(State(ctx.clone()), headers, Path(token_id)).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert!(ctx.auth_mgr.list_tokens().is_empty());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_account_token_create_form_applies_expiry() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_token_expiry_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+    let headers = session_headers(&session);
+
+    // The rendered form exposes the optional lifetime field.
+    let page = response_body(account_page(State(ctx.clone()), headers.clone()).await).await;
+    assert!(page.contains("name=\"expires_in_days\""));
+    assert!(page.contains("Expires In (days)"));
+
+    // An explicit lifetime is applied and the token stays owned by the user.
+    let resp = account_token_create_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers.clone(),
+        Form(CreateAccountTokenForm {
+            name: "seven-days".to_string(),
+            scope: "viewer".to_string(),
+            reauth_password: None,
+            reauth_code: None,
+            expires_in_days: Some("7".to_string()),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let token = ctx
+        .auth_mgr
+        .list_tokens()
+        .into_iter()
+        .find(|token| token.name == "seven-days")
+        .expect("token listed");
+    assert_eq!(token.owner.as_deref(), Some("admin"));
+    let remaining_days =
+        (token.expires_at.expect("expiry") - chrono::Utc::now().timestamp()) / 86_400;
+    assert_eq!(remaining_days, 7);
+
+    // A malformed value is a 400 and creates nothing.
+    let resp = account_token_create_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers.clone(),
+        Form(CreateAccountTokenForm {
+            name: "typo".to_string(),
+            scope: "viewer".to_string(),
+            reauth_password: None,
+            reauth_code: None,
+            expires_in_days: Some("next-week".to_string()),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !ctx.auth_mgr
+            .list_tokens()
+            .iter()
+            .any(|token| token.name == "typo")
+    );
+
+    // With no configured maximum (`0` in the mock manager), `0` means no
+    // expiry.
+    let resp = account_token_create_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers,
+        Form(CreateAccountTokenForm {
+            name: "forever".to_string(),
+            scope: "viewer".to_string(),
+            reauth_password: None,
+            reauth_code: None,
+            expires_in_days: Some("0".to_string()),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let forever = ctx
+        .auth_mgr
+        .list_tokens()
+        .into_iter()
+        .find(|token| token.name == "forever")
+        .expect("token listed");
+    assert!(forever.expires_at.is_none());
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -3713,6 +3810,7 @@ async fn test_account_token_scope_capped_at_user_role() {
             scope: "admin".to_string(),
             reauth_password: Some("adminadmin".to_string()),
             reauth_code: None,
+            expires_in_days: None,
         }),
     )
     .await;
@@ -3731,6 +3829,7 @@ async fn test_account_token_scope_capped_at_user_role() {
             scope: "viewer".to_string(),
             reauth_password: None,
             reauth_code: None,
+            expires_in_days: None,
         }),
     )
     .await;

@@ -128,6 +128,9 @@ session_persist = true
 # Default API-token lifetime in days; 0 = no expiry. 90 keeps credentials from
 # living forever by omission.
 token_default_ttl_days = 90
+# Maximum API-token lifetime in days; 0 = no maximum. Applies to the optional
+# per-token expires_in_days at creation. Existing tokens are never shortened.
+token_max_ttl_days = 365
 # Account-wide ceiling for authenticated /api/v2 requests per minute; 0 disables.
 # Sessions and tokens of one account share the bucket; ownerless tokens are
 # limited per token. Hot-applied without a restart.

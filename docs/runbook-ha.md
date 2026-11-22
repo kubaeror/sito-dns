@@ -543,6 +543,7 @@ When a slave node fails or must be reprovisioned from bare metal:
    login_rate_limit = 5
    session_persist = true
    token_default_ttl_days = 90
+   token_max_ttl_days = 365
 
    [ha]
    master_url = "wss://192.168.1.10:8953"

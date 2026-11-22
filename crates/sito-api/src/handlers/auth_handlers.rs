@@ -614,7 +614,7 @@ pub async fn list_tokens(
     params(("X-Reauth-Token" = Option<String>, Header, description = "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers minting an Admin-scoped token; API-token callers are exempt.", nullable = false)),
     responses(
         (status = 201, description = "API token created", body = CreateTokenResponse),
-        (status = 400, description = "Invalid scope", body = ProblemDetails),
+        (status = 400, description = "Invalid scope or token expiry policy", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
@@ -665,7 +665,7 @@ pub async fn create_token(
 
     let (_meta, resp) = ctx
         .auth_mgr
-        .create_token(name, scope, owner.as_deref())
+        .create_token_with_expiry(name, scope, owner.as_deref(), req.expires_in_days)
         .await
         .map_err(|e| ProblemDetails::bad_request(e.to_string()))?;
     Ok((StatusCode::CREATED, Json(resp)).into_response())
@@ -1765,6 +1765,7 @@ mod tests {
             Json(CreateTokenRequest {
                 name: "admin-token".to_string(),
                 scope: "admin".to_string(),
+                expires_in_days: None,
             }),
         )
         .await
@@ -2085,6 +2086,7 @@ mod tests {
             Json(CreateTokenRequest {
                 name: "child-admin".to_string(),
                 scope: "admin".to_string(),
+                expires_in_days: None,
             }),
         )
         .await
@@ -2550,6 +2552,7 @@ mod tests {
             Json(CreateTokenRequest {
                 name: "  ci-deploy  ".to_string(),
                 scope: "viewer".to_string(),
+                expires_in_days: None,
             }),
         )
         .await
@@ -2566,6 +2569,84 @@ mod tests {
             .expect("token listed");
         assert_eq!(token.name, "ci-deploy");
         assert_eq!(token.owner.as_deref(), Some("admin"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_token_applies_expiry_policy() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_token_expiry");
+        let mut ctx = crate::test_support::mock_context(&temp_dir).await;
+        // Default 90 days, maximum 30 days: the policy applies before the
+        // handler's owner/quota logic.
+        ctx.auth_mgr = std::sync::Arc::new(
+            crate::auth::AuthManager::with_config_and_storage_full(
+                None, 24, 5, true, false, 90, 30,
+            )
+            .unwrap(),
+        );
+
+        // An explicit lifetime within the maximum is stored.
+        let resp = create_token(
+            admin(),
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Json(CreateTokenRequest {
+                name: "short".to_string(),
+                scope: "viewer".to_string(),
+                expires_in_days: Some(7),
+            }),
+        )
+        .await
+        .expect("short token created");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = ctx
+            .auth_mgr
+            .list_tokens()
+            .into_iter()
+            .find(|token| token.name == "short")
+            .expect("short token listed");
+        let remaining_days =
+            (created.expires_at.expect("expiry") - chrono::Utc::now().timestamp()) / 86_400;
+        assert_eq!(remaining_days, 7);
+
+        // Above the maximum is a 400 and stores nothing.
+        let err = create_token(
+            admin(),
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Json(CreateTokenRequest {
+                name: "too-long".to_string(),
+                scope: "viewer".to_string(),
+                expires_in_days: Some(31),
+            }),
+        )
+        .await
+        .expect_err("above the maximum must fail");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST.as_u16());
+        assert!(err.detail.contains("token_max_ttl_days"));
+        assert!(
+            !ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.name == "too-long")
+        );
+
+        // `0` requests no expiry and is rejected while a maximum exists.
+        let err = create_token(
+            admin(),
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Json(CreateTokenRequest {
+                name: "forever".to_string(),
+                scope: "viewer".to_string(),
+                expires_in_days: Some(0),
+            }),
+        )
+        .await
+        .expect_err("no-expiry request under a maximum must fail");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST.as_u16());
+        assert!(err.detail.contains("token_max_ttl_days"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -2596,6 +2677,7 @@ mod tests {
             Json(CreateTokenRequest {
                 name: "child".to_string(),
                 scope: "viewer".to_string(),
+                expires_in_days: None,
             }),
         )
         .await
@@ -2631,6 +2713,7 @@ mod tests {
             Json(CreateTokenRequest {
                 name: "escaped".to_string(),
                 scope: "viewer".to_string(),
+                expires_in_days: None,
             }),
         )
         .await
