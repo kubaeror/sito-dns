@@ -340,6 +340,25 @@ body {
   border: 1px solid var(--border-color);
 }
 
+/* Query-log history controls (outside the table body by design). */
+.query-history-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.query-history-note {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.query-history-controls .btn:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

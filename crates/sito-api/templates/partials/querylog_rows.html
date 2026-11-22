@@ -1,5 +1,5 @@
 {% for entry in entries %}
-<tr id="query-{{ entry.ts }}">
+<tr id="query-{{ entry.row_key }}" data-querylog-row-key="{{ entry.row_key }}">
   <td class="mono" style="font-size: 0.75rem; white-space: nowrap;">{{ entry.time_str }}</td>
   <td class="mono td-strong">
     <div>{{ entry.client_ip }}</div>

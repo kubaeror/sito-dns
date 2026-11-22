@@ -194,6 +194,7 @@ mod tests {
     #[test]
     fn test_render_querylog_and_rows() {
         let rows = vec![QueryLogRowItem {
+            row_key: "id-42".to_string(),
             ts: 1_700_000_000_000,
             time_str: "12:34:56".to_string(),
             client_ip: "192.168.1.5".to_string(),
@@ -206,11 +207,17 @@ mod tests {
             upstream: Some("1.1.1.1".to_string()),
         }];
 
-        let partial = QueryLogRowsPartialTemplate { entries: &rows };
+        let partial = QueryLogRowsPartialTemplate {
+            entries: &rows,
+            next_cursor: None,
+            history_mode: false,
+            controls_oob: true,
+        };
         let partial_html = partial.render().expect("render querylog rows partial");
         assert!(partial_html.contains("google.com"));
         assert!(partial_html.contains("Allowed"));
         assert!(partial_html.contains("1.2 ms"));
+        assert!(partial_html.contains("id=\"query-id-42\""));
 
         let full = QueryLogTemplate {
             csrf_token: "",
@@ -220,10 +227,209 @@ mod tests {
             active_tab: "querylog",
             version: "1.2.1",
             entries: &rows,
+            next_cursor: None,
+            history_mode: false,
+            controls_oob: false,
         };
         let full_html = full.render().expect("render querylog page");
         assert!(full_html.contains("Real-time DNS Query Log"));
         assert!(full_html.contains("Search Domain"));
+    }
+
+    fn querylog_row(row_key: &str, ts: i64, qname: &str) -> QueryLogRowItem {
+        QueryLogRowItem {
+            row_key: row_key.to_string(),
+            ts,
+            time_str: "12:34:56".to_string(),
+            client_ip: "192.168.1.5".to_string(),
+            client_name: None,
+            qname: qname.to_string(),
+            qtype_str: "A".to_string(),
+            verdict: "allowed".to_string(),
+            latency_str: "1.2 ms".to_string(),
+            rule: None,
+            upstream: None,
+        }
+    }
+
+    fn querylog_page_html(next_cursor: Option<&'static str>) -> String {
+        let rows = vec![querylog_row("id-1", 1_700_000_000_000, "example.com")];
+        QueryLogTemplate {
+            csrf_token: "csrf-token",
+            is_authenticated: true,
+            username: "admin",
+            user_role: "admin",
+            active_tab: "querylog",
+            version: "1.2.1",
+            entries: &rows,
+            next_cursor,
+            history_mode: false,
+            controls_oob: false,
+        }
+        .render()
+        .expect("render querylog page")
+    }
+
+    /// A5: the Load-more control exists exactly when the page has a cursor,
+    /// and it lives below the table rather than inside `<tbody>`.
+    #[test]
+    fn test_querylog_page_history_controls_follow_next_cursor() {
+        let with_more = querylog_page_html(Some("cursor-abc"));
+        assert!(with_more.contains("id=\"query-history-controls\""));
+        assert!(with_more.contains("data-querylog-load-older"));
+        assert!(with_more.contains("Load older"));
+        assert!(
+            with_more.contains("hx-vals='{\"cursor\": \"cursor-abc\"}'"),
+            "Load older must carry the cursor: {with_more}"
+        );
+        assert!(
+            with_more.contains("hx-include=\"#filter-form, #domain-search\""),
+            "Load older must include the active filters: {with_more}"
+        );
+        assert!(
+            with_more.contains("hx-disabled-elt=\"this\""),
+            "Load older must disable itself while a request is in flight: {with_more}"
+        );
+        assert!(
+            with_more.contains("data-history-mode=\"false\""),
+            "a full page load starts in live mode: {with_more}"
+        );
+        assert!(!with_more.contains("No more entries"));
+        assert!(
+            !with_more.contains("data-querylog-back-live"),
+            "Back to live is only meaningful in history mode"
+        );
+
+        let tbody_start = with_more.find("<tbody").expect("tbody");
+        let tbody_end = with_more.find("</tbody>").expect("tbody close");
+        let tbody = &with_more[tbody_start..tbody_end];
+        assert!(
+            !tbody.contains("query-history-controls")
+                && !tbody.contains("data-querylog-load-older"),
+            "controls must never be nested in the table body: {tbody}"
+        );
+        assert!(
+            with_more[tbody_end..].contains("id=\"query-history-controls\""),
+            "the controls area must render below the table: {with_more}"
+        );
+
+        // The cursor lives on the explicit Load older control, not in the
+        // filter form: a filter change therefore cannot continue a history walk.
+        let form_start = with_more
+            .find("<form id=\"filter-form\"")
+            .expect("filter form");
+        let form_end = form_start + with_more[form_start..].find("</form>").expect("form close");
+        assert!(
+            !with_more[form_start..form_end].contains("cursor"),
+            "filters must not carry a pagination cursor"
+        );
+
+        let exhausted = querylog_page_html(None);
+        assert!(
+            !exhausted.contains("data-querylog-load-older"),
+            "no Load older control may render without a cursor: {exhausted}"
+        );
+        assert!(
+            exhausted.contains("No more entries"),
+            "the exhausted state must be explicit: {exhausted}"
+        );
+    }
+
+    /// A5: history pages return rows plus an OOB controls fragment; the OOB
+    /// fragment is never part of the row markup.
+    #[test]
+    fn test_querylog_partial_history_mode_is_oob_and_row_ordered() {
+        let rows = vec![querylog_row("id-1", 1_700_000_000_000, "example.com")];
+        let html = QueryLogRowsPartialTemplate {
+            entries: &rows,
+            next_cursor: Some("older-cursor"),
+            history_mode: true,
+            controls_oob: true,
+        }
+        .render()
+        .expect("render history rows response");
+
+        assert!(
+            html.contains("hx-swap-oob=\"true\""),
+            "the controls must be an OOB swap: {html}"
+        );
+        assert!(html.contains("data-history-mode=\"true\""), "{html}");
+        assert!(html.contains("data-querylog-load-older"), "{html}");
+        assert!(html.contains("data-querylog-back-live"), "{html}");
+        assert!(html.contains("History — live polling paused"), "{html}");
+        assert!(
+            html.contains("hx-vals='{\"cursor\": \"older-cursor\"}'"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("<tbody"),
+            "the response is a fragment: {html}"
+        );
+
+        let rows_end = html.rfind("</tr>").expect("rendered row");
+        let controls_start = html
+            .find("id=\"query-history-controls\"")
+            .expect("controls fragment");
+        assert!(
+            controls_start > rows_end,
+            "OOB controls follow the rows, never inside them: {html}"
+        );
+
+        // The last page has no cursor: the button disappears and the state is
+        // explained instead.
+        let last = QueryLogRowsPartialTemplate {
+            entries: &rows,
+            next_cursor: None,
+            history_mode: true,
+            controls_oob: true,
+        }
+        .render()
+        .expect("render last history page");
+        assert!(!last.contains("data-querylog-load-older"), "{last}");
+        assert!(last.contains("No more entries"), "{last}");
+        assert!(last.contains("data-querylog-back-live"), "{last}");
+    }
+
+    /// A5: rows appended by "Load older" need stable unique keys, including
+    /// when several entries share a millisecond timestamp. The client-side
+    /// de-duplication hook keys off these attributes.
+    #[test]
+    fn test_querylog_rows_have_unique_keys_for_same_millisecond() {
+        let rows = vec![
+            querylog_row("id-7", 1_700_000_000_000, "one.example"),
+            querylog_row("id-8", 1_700_000_000_000, "two.example"),
+        ];
+        let html = QueryLogRowsPartialTemplate {
+            entries: &rows,
+            next_cursor: None,
+            history_mode: false,
+            controls_oob: true,
+        }
+        .render()
+        .expect("render rows");
+
+        for key in ["id-7", "id-8"] {
+            let attribute = format!("data-querylog-row-key=\"{key}\"");
+            assert_eq!(
+                html.matches(&attribute).count(),
+                1,
+                "each row key must render exactly once: {html}"
+            );
+        }
+        assert_eq!(
+            html.matches("<tr ").count(),
+            2,
+            "repeated pages must remain distinguishable rows: {html}"
+        );
+
+        let app_js = crate::ui::static_files::StaticAssets::get("app.js")
+            .expect("app.js is embedded")
+            .data;
+        let app_js = String::from_utf8_lossy(&app_js);
+        assert!(
+            app_js.contains("data-querylog-row-key") && app_js.contains("dedupeQueryLogRows"),
+            "the client must de-duplicate appended rows by their row key"
+        );
     }
 
     #[test]

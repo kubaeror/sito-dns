@@ -118,6 +118,8 @@ pub struct TokenViewItem {
 
 #[derive(Debug, Clone)]
 pub struct QueryLogRowItem {
+    /// Stable, unique key for this DB row (`id-<rowid>` when available).
+    pub row_key: String,
     pub ts: i64,
     pub time_str: String,
     pub client_ip: String,
@@ -180,12 +182,24 @@ pub struct QueryLogTemplate<'a> {
     pub active_tab: &'a str,
     pub version: &'a str,
     pub entries: &'a [QueryLogRowItem],
+    /// Cursor for the page below this one, or `None` on the last page.
+    pub next_cursor: Option<&'a str>,
+    /// History mode pauses the 3 s live poll.
+    pub history_mode: bool,
+    /// True when the history controls are returned as an HTMX OOB swap.
+    pub controls_oob: bool,
 }
 
 #[derive(Template)]
-#[template(path = "partials/querylog_rows.html")]
+#[template(path = "partials/querylog_rows_response.html")]
 pub struct QueryLogRowsPartialTemplate<'a> {
     pub entries: &'a [QueryLogRowItem],
+    /// Cursor for the page below this one, or `None` on the last page.
+    pub next_cursor: Option<&'a str>,
+    /// True while the operator browses older pages.
+    pub history_mode: bool,
+    /// Response fragments always carry the controls as an OOB swap.
+    pub controls_oob: bool,
 }
 
 /// One curated list row on the filtering page.

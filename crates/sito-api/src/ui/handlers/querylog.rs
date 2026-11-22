@@ -13,6 +13,20 @@ pub struct QueryLogParams {
     pub client: Option<String>,
     pub status: Option<String>,
     pub qtype: Option<String>,
+    /// Opaque keyset cursor for the next/older page.
+    ///
+    /// The live refresh and filter controls deliberately never send this, so a
+    /// filter change or refresh starts again at the newest page.
+    pub cursor: Option<String>,
+}
+
+/// One rendered query-log page plus the cursor for the page below it.
+///
+/// The UI keeps the cursor out of the filter form: it is attached to the
+/// explicit "Load older" control only, so filters/refresh reset pagination.
+pub(crate) struct QueryLogRowsPage {
+    pub entries: Vec<QueryLogRowItem>,
+    pub next_cursor: Option<String>,
 }
 
 /// Builds the query-log filter used by the live UI refresh.
@@ -49,19 +63,25 @@ pub(crate) fn live_query_log_filter(p: &QueryLogParams) -> QueryLogFilter {
     }
 }
 
-pub(crate) async fn fetch_query_rows(
-    ctx: &ServerContext,
-    p: &QueryLogParams,
-) -> Vec<QueryLogRowItem> {
-    let filter = live_query_log_filter(p);
+/// Builds the page filter, carrying the explicit history cursor when one was
+/// supplied. An empty cursor is treated as absent so the live page stays the
+/// default for filter and refresh requests.
+pub(crate) fn query_log_filter(p: &QueryLogParams) -> QueryLogFilter {
+    let mut filter = live_query_log_filter(p);
+    filter.cursor = p.cursor.clone().filter(|cursor| !cursor.is_empty());
+    filter
+}
+
+pub(crate) async fn fetch_query_rows(ctx: &ServerContext, p: &QueryLogParams) -> QueryLogRowsPage {
+    let filter = query_log_filter(p);
 
     let page_res = ctx.stats_db.query_logs(&filter).await;
-    let entries = match page_res {
-        Ok(page) => page.items,
-        Err(_) => Vec::new(),
+    let (entries, next_cursor) = match page_res {
+        Ok(page) => (page.items, page.next_cursor),
+        Err(_) => (Vec::new(), None),
     };
 
-    entries
+    let entries = entries
         .into_iter()
         .map(|e| {
             let dt = DateTime::<Utc>::from_timestamp_millis(e.ts).unwrap_or_default();
@@ -72,6 +92,12 @@ pub(crate) async fn fetch_query_rows(
                 "<1 ms".to_string()
             };
             QueryLogRowItem {
+                // Stable client-side key for de-duplicating rows appended by
+                // "Load older"; the DB row id is unique even when two queries
+                // share a millisecond timestamp.
+                row_key: e
+                    .id
+                    .map_or_else(|| format!("ts-{}", e.ts), |id| format!("id-{id}")),
                 ts: e.ts,
                 time_str,
                 client_ip: e.client_ip,
@@ -84,7 +110,12 @@ pub(crate) async fn fetch_query_rows(
                 upstream: e.upstream,
             }
         })
-        .collect()
+        .collect();
+
+    QueryLogRowsPage {
+        entries,
+        next_cursor,
+    }
 }
 
 pub async fn querylog_page(
@@ -96,7 +127,17 @@ pub async fn querylog_page(
         return Redirect::to("/login").into_response();
     };
 
-    let entries = fetch_query_rows(&ctx, &params).await;
+    // A full page load always starts in live mode at the newest page, even if a
+    // stale `?cursor=` is present in the URL. History is only entered through
+    // the explicit HTMX Load older control.
+    let page = fetch_query_rows(
+        &ctx,
+        &QueryLogParams {
+            cursor: None,
+            ..params
+        },
+    )
+    .await;
     let csrf = get_csrf_token(&ctx, &headers);
 
     HtmlTemplate(QueryLogTemplate {
@@ -106,7 +147,11 @@ pub async fn querylog_page(
         user_role: &user.role.to_string(),
         active_tab: "querylog",
         version: env!("CARGO_PKG_VERSION"),
-        entries: &entries,
+        entries: &page.entries,
+        next_cursor: page.next_cursor.as_deref(),
+        // A full page load always starts in live mode at the newest page.
+        history_mode: false,
+        controls_oob: false,
     })
     .into_response()
 }
@@ -119,6 +164,15 @@ pub async fn querylog_rows_partial(
     if get_session_user(&ctx, &headers).is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let entries = fetch_query_rows(&ctx, &params).await;
-    HtmlTemplate(QueryLogRowsPartialTemplate { entries: &entries }).into_response()
+    let page = fetch_query_rows(&ctx, &params).await;
+    HtmlTemplate(QueryLogRowsPartialTemplate {
+        entries: &page.entries,
+        next_cursor: page.next_cursor.as_deref(),
+        // A request that carried a cursor is an explicit history page; the
+        // response must keep polling paused. Requests without a cursor are
+        // live refresh/filter/back-to-live responses.
+        history_mode: params.cursor.as_deref().is_some_and(|c| !c.is_empty()),
+        controls_oob: true,
+    })
+    .into_response()
 }
