@@ -20,7 +20,7 @@ The upstream indexes are:
 - <https://adguardteam.github.io/HostlistsRegistry/assets/filters.json>
 - <https://adguardteam.github.io/HostlistsRegistry/assets/services.json>
 
-AdguardTeam/HostlistsRegistry is licensed under GPL-3.0 and sito is
+AdguardTeam/HostlistsRegistry is licensed under GPL-3.0-only and sito is
 GPL-3.0-only, so embedding the metadata is license-compatible. Attribution and
 the upstream URLs are recorded in `THIRD_PARTY_NOTICES` at the repository root
 and in the catalog's own `source` block.
@@ -175,11 +175,13 @@ its chip.
   for that group, and the group table shows each existing schedule;
 - configured services that are missing from the embedded catalog (bundled-only
   ids such as `ads`, `hbo`, `primevideo`, `zoom`, or a legacy custom id) appear
-  in an **Other configured services** section, checked and with their
-  schedule. Leaving one checked preserves it; unchecking removes it;
-- every row shows its rule count; a catalog service with no usable blocking
-  rule is disabled and marked **Unavailable** instead of being offered as a
-  silent no-op;
+  in an **Other configured services** section, checked and showing any existing
+  schedule. Leaving one checked preserves it; unchecking removes it. These ids
+  can be retained or removed for their group, but they are not offered as new
+  selections for another group;
+- every catalog row shows its rule count; a catalog service that this build
+  cannot enforce (no usable blocking rule) is disabled and marked
+  **Unavailable** instead of being offered as a silent no-op;
 - the dialog shows a live selected count and allows an empty selection, which
   clears that group's blocked services;
 - saving submits the hidden `group` plus repeated `selected` ids and the CSRF

@@ -234,7 +234,12 @@
           <td class="td-strong">{{ list.id }}</td>
           <td class="mono" style="font-size: 0.8rem;">{{ list.version }}</td>
           <td style="text-align: right; font-weight: 600;">{{ list.entries }}</td>
-          <td>{{ list.license }}</td>
+          <td>
+            {{ list.license }}
+            {% if list.id == "services" && list.kind == "services" %}
+            <div style="font-size: 0.75rem; color: var(--text-muted);">plus GPL-3.0-only catalog entries</div>
+            {% endif %}
+          </td>
           <td>
             {{ list.state }}
             <div style="font-size: 0.75rem; color: var(--text-muted);">Last refresh: {{ list.last_refresh }}</div>
@@ -285,10 +290,11 @@
   <div class="card">
     <div class="card-header">
       <div class="card-title">Rule Testing & Simulation</div>
-      <span class="badge badge-info">Zero-latency simulator</span>
+      <span class="badge badge-info">In-process simulator</span>
     </div>
     <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 16px;">
-      Check whether a domain would be blocked or allowed according to your current lists and custom rules.
+      Check a domain against the global filter lists and custom rules.
+      Client-group custom rules, parental categories and blocked services are not part of this check.
     </p>
     <form hx-post="/ui/filtering/simulate" hx-target="#sim-result" hx-swap="innerHTML">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

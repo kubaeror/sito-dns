@@ -481,18 +481,32 @@ mod tests {
             version: "1.2.1",
             lists: &[],
             custom_rules: "||ad.com^",
-            bundled_lists: vec![crate::ui::templates::BundledListView {
-                id: "adult".to_string(),
-                kind: "domains".to_string(),
-                version: "2026.09.2".to_string(),
-                source: "https://example.com/adult.txt".to_string(),
-                license: "CC0-1.0".to_string(),
-                entries: 40,
-                state: "built-in (minimal)".to_string(),
-                last_refresh: "—".to_string(),
-                last_attempt: "2023-11-14 22:13 UTC".to_string(),
-                last_error: Some("fetch failed".to_string()),
-            }],
+            bundled_lists: vec![
+                crate::ui::templates::BundledListView {
+                    id: "adult".to_string(),
+                    kind: "domains".to_string(),
+                    version: "2026.09.2".to_string(),
+                    source: "https://example.com/adult.txt".to_string(),
+                    license: "CC0-1.0".to_string(),
+                    entries: 40,
+                    state: "built-in (minimal)".to_string(),
+                    last_refresh: "—".to_string(),
+                    last_attempt: "2023-11-14 22:13 UTC".to_string(),
+                    last_error: Some("fetch failed".to_string()),
+                },
+                crate::ui::templates::BundledListView {
+                    id: "services".to_string(),
+                    kind: "services".to_string(),
+                    version: "2026.09.2".to_string(),
+                    source: "https://example.com/services.json".to_string(),
+                    license: "CC0-1.0".to_string(),
+                    entries: 146,
+                    state: "built-in (minimal)".to_string(),
+                    last_refresh: "—".to_string(),
+                    last_attempt: "—".to_string(),
+                    last_error: None,
+                },
+            ],
             catalog_categories: vec![crate::ui::templates::CatalogCategoryView {
                 id: "general".to_string(),
                 name: "General".to_string(),
@@ -524,6 +538,10 @@ mod tests {
         );
         assert!(filtering_html.contains("adult"));
         assert!(filtering_html.contains("CC0-1.0"));
+        assert!(
+            filtering_html.contains("plus GPL-3.0-only catalog entries"),
+            "the merged services row must not imply its catalog-only entries are CC0-1.0"
+        );
         assert!(filtering_html.contains("Last attempt: 2023-11-14 22:13 UTC"));
         assert!(filtering_html.contains("Last error: fetch failed"));
         assert!(filtering_html.contains("+ Add from catalog"));
@@ -829,6 +847,10 @@ mod tests {
         assert!(html.contains("netflix"));
         assert!(html.contains("ads"));
         assert!(html.contains("3 selected"));
+        // Catalog rows show the embedded rule count used by the picker.
+        assert!(html.contains("3 rules"));
+        assert!(html.contains("2 rules"));
+        assert!(html.contains("0 rules"));
         assert!(
             html.contains("No blocked services"),
             "a group with no services must show an empty state"
@@ -1219,6 +1241,43 @@ mod tests {
         assert!(!html.contains("<b>General</b>"));
         assert!(html.contains("&#60;script&#62;"));
         assert!(html.contains("&#60;b&#62;General&#60;/b&#62;"));
+    }
+
+    #[test]
+    fn test_filtering_help_text_states_catalog_and_parental_boundaries() {
+        let html = filtering_template_with_catalog(
+            vec![catalog_category("general", "General", 1)],
+            vec![catalog_filter(
+                "adguard_dns_filter",
+                "AdGuard DNS filter",
+                "AdGuard DNS filter",
+                false,
+                false,
+                false,
+            )],
+        )
+        .render()
+        .expect("render filtering help text");
+
+        // Catalog modal: release-bound metadata, runtime list bodies and license.
+        assert!(html.contains("release-bound and is never fetched at runtime"));
+        assert!(html.contains("List bodies are downloaded after you add them"));
+        assert!(html.contains("GPL-3.0-only"));
+
+        // Curated lists: parental is a per-group policy, off by default, and
+        // the catalog has no dedicated parental filter.
+        assert!(html.contains("off by default for every group"));
+        assert!(html.contains("catalog has no dedicated parental filter"));
+        assert!(html.contains("no separate refresh button"));
+
+        // The simulator evaluates only the global policy; group membership,
+        // group custom rules, parental categories and services are outside it.
+        assert!(html.contains("In-process simulator"));
+        assert!(html.contains("global filter lists and custom rules"));
+        assert!(html.contains("Client-group custom rules"));
+        assert!(
+            html.contains("parental categories and blocked services are not part of this check")
+        );
     }
 
     #[test]
