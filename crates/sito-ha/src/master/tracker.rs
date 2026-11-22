@@ -20,6 +20,16 @@ pub struct ActiveSlave {
     pub sender: mpsc::Sender<HaMessage>,
     /// Capabilities advertised in the slave's Hello (e.g. `stats-v1`).
     pub capabilities: Vec<String>,
+    /// Term advertised in the slave's `Hello` at registration.
+    ///
+    /// ADR-0010 reconciliation uses the term/version/hash report the peer sent
+    /// before the master's first publish, never a later inferred value.
+    pub have_term: u64,
+    /// Version advertised in the slave's `Hello` at registration.
+    pub have_version: u64,
+    /// Signed-payload hash advertised in the slave's `Hello`, if the peer
+    /// reported one (old v2 peers omit it).
+    pub have_bundle_hash: Option<String>,
     /// Monotonic id of the connection that registered this entry. A
     /// reconnecting slave replaces the entry; the superseded session must not
     /// remove or update the newer one during cleanup.

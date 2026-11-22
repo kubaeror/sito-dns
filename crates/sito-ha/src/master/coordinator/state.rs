@@ -44,7 +44,78 @@ impl MasterCoordinator {
             readiness: HaReadinessState::not_ready("master replication listener has not started"),
             require_slaves: Arc::new(AtomicBool::new(false)),
             require_all_slaves: Arc::new(AtomicBool::new(false)),
+            promotion_bookkeeping: Arc::new(Mutex::new(None)),
+            hello_only: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Installs (or clears) the ADR-0010 promotion bookkeeping persisted with
+    /// the master state.
+    ///
+    /// The caller (the promotion engine or its runtime adapter) is responsible
+    /// for writing the state file when the bookkeeping changes; this method
+    /// only ensures subsequent normal publishes preserve it.
+    pub fn set_promotion_bookkeeping(
+        &self,
+        bookkeeping: Option<crate::promotion::state::PromotionBookkeeping>,
+    ) {
+        *sito_core::sync::lock_or_recover(&self.promotion_bookkeeping) = bookkeeping;
+    }
+
+    /// Returns a copy of the current promotion bookkeeping.
+    pub fn promotion_bookkeeping(&self) -> Option<crate::promotion::state::PromotionBookkeeping> {
+        sito_core::sync::lock_or_recover(&self.promotion_bookkeeping).clone()
+    }
+
+    /// Records the published baseline after a successful publish.
+    ///
+    /// A normal publish advances the cluster sequence, so the published
+    /// baseline must advance with it; otherwise a later promotion would send an
+    /// older baseline to the witness. Only updates when promotion bookkeeping
+    /// is installed (promotion enabled).
+    pub fn record_published_baseline(&self, version: u64, payload_hash: &str) {
+        let mut bookkeeping = sito_core::sync::lock_or_recover(&self.promotion_bookkeeping);
+        if let Some(ref mut bookkeeping) = *bookkeeping {
+            bookkeeping.publication_state = sito_ha_types::status::PublicationState::Published;
+            bookkeeping.published_version = version;
+            bookkeeping.published_hash = payload_hash.trim_start_matches("blake3:").to_string();
+            bookkeeping.pending_hash = None;
+        }
+    }
+
+    /// Starts hello-only reconciliation mode.
+    ///
+    /// While active the listener admits TLS/WebSocket/Hello and answers
+    /// ping/pong, but never enqueues a `ConfigPush`. This prevents a forked
+    /// slave from applying a pending bundle before reconciliation completes.
+    pub fn begin_hello_only(&self) {
+        self.hello_only.store(true, Ordering::SeqCst);
+    }
+
+    /// Leaves hello-only mode. Normal push-on-Hello resumes.
+    pub fn end_hello_only(&self) {
+        self.hello_only.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the listener is currently hello-only.
+    #[must_use]
+    pub fn is_hello_only(&self) -> bool {
+        self.hello_only.load(Ordering::SeqCst)
+    }
+
+    /// Snapshot of the peer reports collected during a reconciliation window.
+    #[must_use]
+    pub fn hello_only_peer_reports(&self) -> Vec<crate::promotion::reconcile::PeerReport> {
+        let slaves = sito_core::sync::lock_or_recover(&self.slaves);
+        slaves
+            .values()
+            .map(|slave| crate::promotion::reconcile::PeerReport {
+                instance: slave.instance.clone(),
+                have_term: slave.have_term,
+                have_version: slave.have_version,
+                have_bundle_hash: slave.have_bundle_hash.clone(),
+            })
+            .collect()
     }
 
     /// Current readiness of the master replication path.
@@ -242,11 +313,27 @@ impl MasterCoordinator {
         let Some(path) = path else {
             return Ok(None);
         };
-        let state = PersistedMasterState {
+        let mut state = PersistedMasterState {
             protocol_version: crate::protocol::PROTOCOL_VERSION,
             bundle: bundle.clone(),
             signing_key_pubkey: Some(self.signing_key.public_key_hex()),
+            publication_state: None,
+            published_version: None,
+            published_hash: None,
+            pending_hash: None,
+            promotion_origin: None,
+            lease_holder: None,
+            cluster_id: None,
+            node_id: None,
+            promoted_at_unix_ms: None,
+            last_applied_version: None,
+            last_applied_hash: None,
         };
+        if let Some(ref bookkeeping) =
+            *sito_core::sync::lock_or_recover(&self.promotion_bookkeeping)
+        {
+            bookkeeping.apply_to(&mut state);
+        }
         let payload = serde_json::to_vec_pretty(&state).map_err(|e| {
             std::io::Error::other(format!("failed to serialize HA master state: {e}"))
         })?;
@@ -367,13 +454,32 @@ impl MasterCoordinator {
                 ),
             });
         }
-        if let Some(expected) = state.signing_key_pubkey {
+        if let Some(ref expected) = state.signing_key_pubkey {
             let actual = self.signing_key.public_key_hex();
-            if expected != actual {
+            if *expected != actual {
                 return Err(HaError::Validation {
                     field: "ha_signing_key".to_string(),
                     reason: format!(
                         "HA state at {} was written by signing key {expected}, but the loaded key is {actual}. ha_signing.key was lost or replaced. Restore the original key from backup, or delete the state file and re-enroll every slave with this master's new master_pubkey after an explicit higher-version promotion",
+                        path.display()
+                    ),
+                });
+            }
+        }
+        // Restore promotion bookkeeping before the bundle is re-sealed: a
+        // normal restart must not drop the published baseline.
+        match crate::promotion::state::PromotionBookkeeping::from_state(&state) {
+            Ok(bookkeeping) => {
+                *sito_core::sync::lock_or_recover(&self.promotion_bookkeeping) = bookkeeping;
+            }
+            Err(error) => {
+                // A file that claims promotion bookkeeping but is malformed is
+                // corrupt state: fail closed instead of silently discarding the
+                // published baseline.
+                return Err(HaError::Validation {
+                    field: "ha_state".to_string(),
+                    reason: format!(
+                        "invalid promotion bookkeeping in {}: {error}",
                         path.display()
                     ),
                 });

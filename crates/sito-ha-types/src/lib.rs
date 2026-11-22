@@ -20,7 +20,9 @@ pub use hash::{
 };
 pub use protocol::{AckConflict, HaMessage, PROTOCOL_VERSION, UpstreamReport};
 pub use readiness::{HaReadiness, HaReadinessState};
-pub use status::{PublishOutcome, ResyncOutcome, SlaveState, SlaveStatsSummary, SlaveSummary};
+pub use status::{
+    PublicationState, PublishOutcome, ResyncOutcome, SlaveState, SlaveStatsSummary, SlaveSummary,
+};
 
 /// Parses a 32-byte Ed25519 public key from hex or standard base64.
 ///

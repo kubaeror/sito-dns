@@ -27,6 +27,8 @@ pub(super) struct SessionState {
     pub peer_addr: SocketAddr,
     pub capabilities: Vec<String>,
     pub have_version: u64,
+    pub have_term: u64,
+    pub have_bundle_hash: Option<String>,
 }
 
 impl SessionState {
@@ -36,6 +38,8 @@ impl SessionState {
         peer_addr: SocketAddr,
         capabilities: Vec<String>,
         have_version: u64,
+        have_term: u64,
+        have_bundle_hash: Option<String>,
     ) -> Self {
         Self {
             slave_instance,
@@ -43,6 +47,8 @@ impl SessionState {
             peer_addr,
             capabilities,
             have_version,
+            have_term,
+            have_bundle_hash,
         }
     }
 }
@@ -214,6 +220,8 @@ impl<'a> SessionMachine<'a> {
             peer_addr,
             capabilities,
             have_version,
+            have_term,
+            have_bundle_hash,
         );
         Ok(Self {
             coordinator,
@@ -254,6 +262,9 @@ impl<'a> SessionMachine<'a> {
                     last_stats: None,
                     sender: tx.clone(),
                     capabilities: self.state.capabilities.clone(),
+                    have_term: self.state.have_term,
+                    have_version: self.state.have_version,
+                    have_bundle_hash: self.state.have_bundle_hash.clone(),
                     connection_id,
                 },
             );
@@ -264,6 +275,20 @@ impl<'a> SessionMachine<'a> {
             self.coordinator
                 .metrics
                 .set_ha_config_version(slave_instance, 0.0);
+        }
+
+        // Hello-only reconciliation mode accepts the connection and records
+        // the peer's report but sends no `ConfigPush`: a forked slave must not
+        // apply a pending bundle before the window's checks complete.
+        if self.coordinator.is_hello_only() {
+            info!(
+                instance = %slave_instance,
+                have_version = self.state.have_version,
+                have_term = self.state.have_term,
+                have_bundle_hash = ?self.state.have_bundle_hash,
+                "Reconciliation window: registered hello-only slave; no push queued"
+            );
+            return rx;
         }
 
         // Always enqueue the current push on connect; a slave that is already

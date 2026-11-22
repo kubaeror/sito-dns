@@ -89,13 +89,46 @@ struct PublishedEnvelope {
 /// bare `ConfigBundle` at the top level) fails with missing fields instead of
 /// silently reading v2 state. `protocol_version` is required and checked on
 /// restore; v1 files are rejected with an actionable `protocol_mismatch`.
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedMasterState {
-    protocol_version: u32,
-    bundle: ConfigBundle,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedMasterState {
+    pub(crate) protocol_version: u32,
+    pub(crate) bundle: ConfigBundle,
     /// Hex Ed25519 public key that signed the persisted bundle/state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    signing_key_pubkey: Option<String>,
+    pub(crate) signing_key_pubkey: Option<String>,
+    /// ADR-0010 publication state of the active bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) publication_state: Option<sito_ha_types::status::PublicationState>,
+    /// Last published bundle version (the witness baseline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) published_version: Option<u64>,
+    /// Last published signed-payload hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) published_hash: Option<String>,
+    /// Hash of the staged bundle while `publication_state` is pending/publishing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_hash: Option<String>,
+    /// `"automatic"` or `"restart"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) promotion_origin: Option<String>,
+    /// Witness holder that performed the promotion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lease_holder: Option<String>,
+    /// Cluster identifier used by the promotion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cluster_id: Option<String>,
+    /// Stable node identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) node_id: Option<String>,
+    /// Unix milliseconds at which the promotion started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) promoted_at_unix_ms: Option<i64>,
+    /// Last applied configuration version on this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_applied_version: Option<u64>,
+    /// Last applied signed-payload hash on this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_applied_hash: Option<String>,
 }
 
 /// Maximum amount by which an authenticated peer may report being ahead of the
@@ -236,6 +269,17 @@ pub struct MasterCoordinator {
     /// `ha.require_all_slaves`: readiness needs every connected slave synced.
     /// Implies `require_slaves`.
     require_all_slaves: Arc<AtomicBool>,
+    /// ADR-0010 publish-baseline bookkeeping preserved across state writes.
+    ///
+    /// `None` means the node has not enabled promotion; the state file then
+    /// keeps its pre-promotion shape. When promotion is active every state
+    /// write carries the published baseline so a normal configuration publish
+    /// cannot silently drop it.
+    promotion_bookkeeping: Arc<Mutex<Option<crate::promotion::state::PromotionBookkeeping>>>,
+    /// True while the master listener is in hello-only reconciliation mode:
+    /// accept TLS/WebSocket and Hello, answer ping/pong, but send no
+    /// `ConfigPush` and do not install the active bundle.
+    hello_only: Arc<AtomicBool>,
 }
 
 mod message;

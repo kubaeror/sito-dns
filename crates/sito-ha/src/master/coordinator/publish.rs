@@ -193,6 +193,18 @@ impl MasterCoordinator {
         }
     }
 
+    /// Advances the in-memory/durable promotion baseline from a prepared push.
+    fn record_published_from_push(&self, push: &HaMessage) {
+        if let HaMessage::ConfigPush {
+            version,
+            payload_hash_blake3,
+            ..
+        } = push
+        {
+            self.record_published_baseline(*version, payload_hash_blake3);
+        }
+    }
+
     /// Sets and signs a new configuration bundle, immediately broadcasting it to all connected slaves.
     ///
     /// This synchronous variant is startup/test-only: `init_ha` publishes the
@@ -215,8 +227,18 @@ impl MasterCoordinator {
         let (bundle, version, push_msg, _previous) = self.prepare_bundle(bundle)?;
         // Persist before publishing: a failed write must leave both the
         // in-memory active bundle/push and the version sequence untouched.
+        let bundle_for_state = bundle.clone();
+        let promotion_baseline = self.promotion_bookkeeping().is_some();
         self.persist_bundle(&bundle)?;
         self.publish_prepared(bundle, version, &push_msg);
+        if promotion_baseline {
+            // ADR-0010: after a successful publish the durable published
+            // baseline advances with the active bundle. The witness is renewed
+            // by the promotion engine only after this second write, so an
+            // unpublished version is never advertised.
+            self.record_published_from_push(&push_msg);
+            self.persist_bundle(&bundle_for_state)?;
+        }
         self.record_published_version(version);
 
         // Broadcast to all active slaves
@@ -308,6 +330,8 @@ impl MasterCoordinator {
         // visible through `active_push`/`current_version`, so a newly
         // connecting slave can never receive a bundle the master did not
         // durably publish.
+        let bundle_for_state = bundle.clone();
+        let promotion_baseline = self.promotion_bookkeeping().is_some();
         if let Err(e) = self.persist_bundle_async(&bundle).await {
             error!(error = %e, "Failed to persist HA master state");
             return Err(HaError::Io(e));
@@ -345,6 +369,16 @@ impl MasterCoordinator {
             });
         }
 
+        if promotion_baseline {
+            // ADR-0010: persist the advanced published baseline only after the
+            // active bundle is published in memory. A failure here is a publish
+            // failure and no broadcast is attempted with an unrecorded baseline.
+            self.record_published_from_push(&push_msg);
+            if let Err(e) = self.persist_bundle_async(&bundle_for_state).await {
+                error!(error = %e, "Failed to persist the published promotion baseline");
+                return Err(HaError::Io(e));
+            }
+        }
         self.record_published_version(version);
 
         // Broadcast to all active slaves. Keep connected/queued/coalesced
@@ -379,6 +413,20 @@ impl MasterCoordinator {
     /// `connected` only: it must not disappear from the publish outcome (that
     /// would turn "all channels closed" into a misleading `NoSlaves`).
     pub(super) fn broadcast_with_counts(&self, msg: &HaMessage) -> BroadcastOutcome {
+        if self.is_hello_only() {
+            // The reconcile window is silent: no ConfigPush may reach a peer
+            // before the ahead/fork/hash checks complete.
+            let connected = sito_core::sync::lock_or_recover(&self.slaves).len();
+            debug!(
+                connected,
+                "Suppressing HA broadcast during hello-only reconciliation"
+            );
+            return BroadcastOutcome {
+                connected,
+                queued: 0,
+                coalesced: 0,
+            };
+        }
         let message_bytes = wire_size(msg);
         let mut queued = 0;
         let mut coalesced = 0;

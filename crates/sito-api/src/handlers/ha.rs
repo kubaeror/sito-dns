@@ -273,6 +273,9 @@ mod tests {
                 sender: tx,
                 capabilities: vec![],
                 connection_id: 1,
+                have_term: 0,
+                have_version: 0,
+                have_bundle_hash: None,
             },
         );
         // The receiver is gone: every delivery attempt fails.
@@ -386,6 +389,9 @@ mod tests {
                 sender: tx,
                 capabilities: vec![],
                 connection_id: 2,
+                have_term: 0,
+                have_version: 0,
+                have_bundle_hash: None,
             },
         );
         let response = resync_master(Some(&coordinator), "master").unwrap();

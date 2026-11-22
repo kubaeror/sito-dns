@@ -30,6 +30,15 @@ pub(super) fn init_ha(
         .validate(&config.server.role)
         .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
 
+    // ADR-0010: with promotion disabled the entire section is inert. A
+    // disabled `candidate = true` remains accepted for upgrade compatibility,
+    // but it must not silently look like an active candidate.
+    if !ha_config.promotion.enabled && ha_config.promotion.candidate {
+        tracing::warn!(
+            "ha.promotion.candidate = true is ignored because ha.promotion.enabled = false; set enabled = true on every HA node to use automatic promotion"
+        );
+    }
+
     let (master_coordinator, slave_tracker, resync_sender, resync_receiver) = if config.server.role
         == "master"
     {

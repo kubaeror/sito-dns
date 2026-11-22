@@ -164,6 +164,17 @@ fn test_restore_preserves_term_and_rejects_v1_state() {
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         bundle: promoted,
         signing_key_pubkey: None,
+        publication_state: None,
+        published_version: None,
+        published_hash: None,
+        pending_hash: None,
+        promotion_origin: None,
+        lease_holder: None,
+        cluster_id: None,
+        node_id: None,
+        promoted_at_unix_ms: None,
+        last_applied_version: None,
+        last_applied_hash: None,
     };
     std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
     let restored = MasterCoordinator::new(
@@ -746,6 +757,9 @@ fn install_slave(coordinator: &MasterCoordinator, instance: &str, synced_version
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 }
@@ -967,6 +981,9 @@ async fn test_broadcast_falls_back_to_async_delivery_when_queue_full() {
             sender: tx.clone(),
             capabilities: vec!["stats-v1".to_string()],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 
@@ -1004,6 +1021,9 @@ async fn test_broadcast_respects_per_slave_queue_byte_budget() {
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
     // Pretend the session has a full byte budget queued even though the
@@ -1395,6 +1415,9 @@ async fn test_pending_coalesced_task_does_not_charge_reconnected_session() {
             sender: old_tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
     let old_key = ("slave-1".to_string(), 1);
@@ -1444,6 +1467,9 @@ async fn test_pending_coalesced_task_does_not_charge_reconnected_session() {
                 sender: new_tx,
                 capabilities: vec![],
                 connection_id: 2,
+                have_term: 0,
+                have_version: 0,
+                have_bundle_hash: None,
             },
         );
     }
@@ -1590,6 +1616,9 @@ fn test_publish_history_is_capped_and_evicted_fork_ack_is_ignored() {
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 
@@ -1643,6 +1672,9 @@ async fn test_publish_outcome_reports_connected_closed_and_queued() {
             sender,
             capabilities: vec![],
             connection_id,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         }
     }
 
@@ -1786,6 +1818,9 @@ fn test_unregister_superseded_session_keeps_live_entry() {
         sender,
         capabilities: vec![],
         connection_id,
+        have_term: 0,
+        have_version: 0,
+        have_bundle_hash: None,
     };
 
     coordinator
@@ -1830,6 +1865,9 @@ async fn test_stale_repushes_are_cleaned_up_on_disconnect() {
             sender: tx,
             capabilities: vec![],
             connection_id: 7,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 
@@ -2028,6 +2066,9 @@ async fn test_slave_ahead_ack_marks_diverged_without_republishing() {
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 
@@ -2084,6 +2125,9 @@ async fn test_same_version_fork_ack_marks_divergence_and_unsyncs_slave() {
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 
@@ -2132,6 +2176,9 @@ async fn test_two_slaves_both_record_fork_for_same_published_envelope() {
                 sender: tx,
                 capabilities: vec![],
                 connection_id,
+                have_term: 0,
+                have_version: 0,
+                have_bundle_hash: None,
             },
         );
     }
@@ -2185,6 +2232,9 @@ async fn test_term_divergence_survives_other_slave_and_clears_on_own_ack() {
             sender: tx_a,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
     let (tx_b, _rx_b) = mpsc::channel::<HaMessage>(8);
@@ -2200,6 +2250,9 @@ async fn test_term_divergence_survives_other_slave_and_clears_on_own_ack() {
             sender: tx_b,
             capabilities: vec![],
             connection_id: 2,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 
@@ -2288,6 +2341,9 @@ async fn test_fork_divergence_does_not_block_publishing_and_clears_on_accept() {
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
     let (other_tx, mut other_rx) = mpsc::channel::<HaMessage>(8);
@@ -2303,6 +2359,9 @@ async fn test_fork_divergence_does_not_block_publishing_and_clears_on_accept() {
             sender: other_tx,
             capabilities: vec![],
             connection_id: 2,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 
@@ -2378,6 +2437,9 @@ async fn test_fabricated_fork_ack_without_matching_push_is_ignored() {
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 
@@ -2431,6 +2493,9 @@ async fn test_same_term_ahead_divergence_clears_only_on_slave_ack() {
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 
@@ -2492,6 +2557,9 @@ async fn test_ack_from_newer_term_marks_master_stale() {
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 
@@ -2649,6 +2717,9 @@ fn test_unregister_removes_divergence_metric_series() {
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
     coordinator.mark_diverged(
@@ -2696,6 +2767,9 @@ fn test_disconnected_divergence_is_never_recreated() {
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
     coordinator.mark_diverged(
@@ -2721,6 +2795,9 @@ fn test_disconnected_divergence_is_never_recreated() {
             sender: tx,
             capabilities: vec![],
             connection_id: 2,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
     coordinator.mark_diverged(
@@ -2755,6 +2832,9 @@ fn test_slave_summary_flags_diverged_slave() {
         sender: mpsc::channel::<HaMessage>(1).0,
         capabilities: vec![],
         connection_id: 1,
+        have_term: 0,
+        have_version: 0,
+        have_bundle_hash: None,
     };
     let diverged = entry.to_summary(5, false);
     assert!(diverged.diverged);
@@ -2949,6 +3029,17 @@ fn test_restore_rejects_u64_max_state_instead_of_freezing() {
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         bundle: test_bundle(u64::MAX),
         signing_key_pubkey: None,
+        publication_state: None,
+        published_version: None,
+        published_hash: None,
+        pending_hash: None,
+        promotion_origin: None,
+        lease_holder: None,
+        cluster_id: None,
+        node_id: None,
+        promoted_at_unix_ms: None,
+        last_applied_version: None,
+        last_applied_hash: None,
     };
     std::fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
 
@@ -3046,6 +3137,9 @@ async fn test_ack_u64_max_does_not_freeze_publishing() {
             sender: tx,
             capabilities: vec![],
             connection_id: 1,
+            have_term: 0,
+            have_version: 0,
+            have_bundle_hash: None,
         },
     );
 
@@ -3074,4 +3168,114 @@ async fn test_ack_u64_max_does_not_freeze_publishing() {
         3,
         "publishing must keep working after an implausible ACK"
     );
+}
+
+#[test]
+fn hello_only_reconciliation_withholds_config_push_and_records_hash() {
+    let coordinator = test_coordinator();
+    coordinator.update_bundle(test_bundle(2)).unwrap();
+    coordinator.begin_hello_only();
+
+    let hello = HelloFields {
+        instance: "slave-1".to_string(),
+        have_version: 1,
+        have_term: 1,
+        capabilities: vec![],
+        token: None,
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: Some("ab".repeat(32)),
+    };
+    let session = SessionMachine::admit(&coordinator, "127.0.0.1:1000".parse().unwrap(), hello)
+        .expect("fresh v2 slave admitted");
+    let mut rx = session.register();
+    assert!(
+        rx.try_recv().is_err(),
+        "hello-only registration must not enqueue a ConfigPush"
+    );
+    coordinator.broadcast(&HaMessage::Ping { ts: 1 });
+    assert!(
+        rx.try_recv().is_err(),
+        "broadcasts during the reconcile window must be suppressed"
+    );
+
+    let reports = coordinator.hello_only_peer_reports();
+    let report = reports
+        .iter()
+        .find(|report| report.instance == "slave-1")
+        .expect("peer report is recorded");
+    assert_eq!(report.have_term, 1);
+    assert_eq!(report.have_version, 1);
+    assert_eq!(
+        report.have_bundle_hash.as_deref(),
+        Some("ab".repeat(32).as_str())
+    );
+
+    coordinator.end_hello_only();
+    let hello = HelloFields {
+        instance: "slave-2".to_string(),
+        have_version: 0,
+        have_term: 0,
+        capabilities: vec![],
+        token: None,
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: None,
+    };
+    let session = SessionMachine::admit(&coordinator, "127.0.0.1:1001".parse().unwrap(), hello)
+        .expect("fresh v2 slave admitted");
+    let mut rx = session.register();
+    assert!(
+        rx.try_recv().is_ok(),
+        "after the window the normal push-on-Hello resumes"
+    );
+}
+
+#[test]
+fn normal_publish_preserves_promotion_published_baseline() {
+    use crate::promotion::state::{PromotionBookkeeping, PublicationBaseline};
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_coord_promotion_state_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let path = dir.join("ha_state.toml");
+    let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+    let coordinator = MasterCoordinator::new(
+        "test-master".to_string(),
+        1,
+        key.clone(),
+        sito_stats::MetricsRegistry::new("test", "test"),
+    )
+    .with_state_path(path.clone());
+    coordinator.set_promotion_bookkeeping(Some(PromotionBookkeeping::published(
+        PublicationBaseline::new(5, &"ab".repeat(32)).unwrap(),
+    )));
+    coordinator.update_bundle(test_bundle(6)).unwrap();
+
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(value["published_version"], 6);
+    assert!(
+        value["published_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64)
+    );
+    assert_eq!(value["publication_state"], "published");
+
+    let restored = MasterCoordinator::new(
+        "test-master".to_string(),
+        1,
+        key,
+        sito_stats::MetricsRegistry::new("test", "test"),
+    )
+    .with_state_path(path.clone());
+    restored.restore_state().unwrap();
+    let bookkeeping = restored
+        .promotion_bookkeeping()
+        .expect("bookkeeping must survive a restart");
+    assert_eq!(bookkeeping.published_version, 6);
+    assert_eq!(bookkeeping.published_hash.len(), 64);
+    let _ = std::fs::remove_dir_all(&dir);
 }
