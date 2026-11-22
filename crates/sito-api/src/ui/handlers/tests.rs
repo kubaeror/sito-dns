@@ -4027,7 +4027,9 @@ fn test_clients_service_views_groups_and_catalog() {
     );
 
     let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
-    let views = clients_service_views_from(&clients, Ok(catalog.clone()));
+    let registry =
+        sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
+    let views = clients_service_views_from(&clients, Ok(catalog.clone()), Some(&registry));
 
     assert_eq!(
         views
@@ -4113,6 +4115,61 @@ fn test_clients_service_views_groups_and_catalog() {
         catalog_only.available,
         "catalog-only services must be selectable: {catalog_only:?}"
     );
+
+    // The iCloud Private Relay service uses `$dnsrewrite=NXDOMAIN` rules; it
+    // must still be available with all three literal domains.
+    let icloud = views
+        .catalog_groups
+        .iter()
+        .flat_map(|group| &group.services)
+        .find(|service| service.id == "icloud_private_relay")
+        .expect("icloud_private_relay must be in the catalog");
+    assert!(icloud.available);
+    assert_eq!(icloud.rule_count, 3);
+}
+
+#[test]
+fn test_clients_service_views_marks_zero_rule_catalog_service_unavailable() {
+    let mut catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let group = catalog.service_groups[0].clone();
+    catalog.services.push(sito_clients::CatalogService {
+        id: "zero_rule_candidate".to_string(),
+        name: "Zero rule candidate".to_string(),
+        group,
+        rules: vec![
+            "/regex-only/".to_string(),
+            "*.wild.example".to_string(),
+            "||mask.example^$dnsrewrite=NOERROR;;".to_string(),
+        ],
+    });
+
+    let registry =
+        sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
+    let views = clients_service_views_from(
+        &sito_clients::ClientsConfig::default(),
+        Ok(catalog),
+        Some(&registry),
+    );
+
+    let zero = views
+        .catalog_groups
+        .iter()
+        .flat_map(|group| &group.services)
+        .find(|service| service.id == "zero_rule_candidate")
+        .expect("the synthetic catalog service must render");
+    assert!(
+        !zero.available,
+        "a catalog service with zero usable rules must be unavailable"
+    );
+    assert!(
+        views
+            .catalog_groups
+            .iter()
+            .flat_map(|group| &group.services)
+            .filter(|service| service.id != "zero_rule_candidate")
+            .all(|service| service.available),
+        "real catalog services with usable rules stay available"
+    );
 }
 
 #[test]
@@ -4128,7 +4185,7 @@ fn test_clients_service_views_corrupt_catalog_degrades() {
     let corrupt = sito_clients::Catalog::parse("{ not json")
         .expect_err("fixture must be invalid catalog JSON");
 
-    let views = clients_service_views_from(&clients, Err(corrupt));
+    let views = clients_service_views_from(&clients, Err(corrupt), None);
     assert_eq!(
         views
             .groups
@@ -4384,12 +4441,14 @@ async fn test_clients_group_services_handler_preserves_schedules() {
 #[test]
 fn test_group_blocked_services_matches_ids_case_insensitively() {
     let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let registry =
+        sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
     let existing = vec![sito_clients::BlockedServiceConfig {
         service: "TikTok".to_string(),
         schedule: Some(sito_clients::Schedule::parse("0 8 * * *").unwrap()),
     }];
 
-    let merged = group_blocked_services(&existing, &["tiktok".to_string()], &catalog)
+    let merged = group_blocked_services(&existing, &["tiktok".to_string()], &catalog, &registry)
         .expect("a case variant of a configured service must be accepted");
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].service, "TikTok");
@@ -4408,6 +4467,7 @@ fn test_group_blocked_services_matches_ids_case_insensitively() {
             &existing,
             &["tiktok".to_string(), "TikTok".to_string()],
             &catalog,
+            &registry,
         ),
         Err(GroupServicesError::DuplicateService("TikTok".to_string()))
     );
@@ -4522,8 +4582,13 @@ fn test_group_blocked_services_accepts_every_catalog_service() {
         "the pinned catalog currently has 142 services"
     );
 
-    let merged = group_blocked_services(&[], &selected, &catalog)
-        .expect("every embedded catalog service must be accepted");
+    let merged = group_blocked_services(
+        &[],
+        &selected,
+        &catalog,
+        &sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid"),
+    )
+    .expect("every embedded catalog service must be accepted");
     assert_eq!(merged.len(), catalog.services.len());
     assert_eq!(
         merged
@@ -4536,6 +4601,40 @@ fn test_group_blocked_services_accepts_every_catalog_service() {
     assert!(
         merged.iter().all(|blocked| blocked.schedule.is_none()),
         "new catalog services start without a schedule"
+    );
+}
+
+#[test]
+fn test_group_blocked_services_rejects_zero_rule_catalog_service() {
+    let mut catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let group = catalog.service_groups[0].clone();
+    catalog.services.push(sito_clients::CatalogService {
+        id: "zero_rule_candidate".to_string(),
+        name: "Zero rule candidate".to_string(),
+        group,
+        rules: vec![
+            "/regex-only/".to_string(),
+            "*.wild.example".to_string(),
+            "||mask.example^$dnsrewrite=NOERROR;;".to_string(),
+        ],
+    });
+    let registry =
+        sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
+
+    let err = group_blocked_services(
+        &[],
+        &["zero_rule_candidate".to_string()],
+        &catalog,
+        &registry,
+    )
+    .expect_err("a zero-rule catalog service must be rejected");
+    assert_eq!(
+        err,
+        GroupServicesError::UnavailableService("zero_rule_candidate".to_string())
+    );
+    assert!(
+        err.to_string().contains("no usable blocking rules"),
+        "the rejection must explain the zero-rule guard: {err}"
     );
 }
 
@@ -4651,8 +4750,10 @@ async fn test_clients_group_services_handler_rejects_oversized_selection() {
     let selected: Vec<String> = (0..=catalog.services.len())
         .map(|index| format!("service_{index}"))
         .collect();
+    let registry =
+        sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
     assert_eq!(
-        group_blocked_services(&[], &selected, &catalog),
+        group_blocked_services(&[], &selected, &catalog, &registry),
         Err(GroupServicesError::TooMany(
             MAX_GROUP_SERVICES_SELECTION.min(catalog.services.len())
         )),

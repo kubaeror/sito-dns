@@ -175,18 +175,35 @@ pub(crate) struct ClientsServiceViews {
 
 /// Builds blocked-service picker data from the embedded catalog.
 pub(crate) fn clients_service_views(clients: &sito_clients::ClientsConfig) -> ClientsServiceViews {
-    clients_service_views_from(clients, sito_clients::Catalog::embedded())
+    let registry = match sito_clients::ServiceRegistry::try_bundled() {
+        Ok(registry) => Some(registry),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Bundled service registry is invalid; catalog services are unavailable"
+            );
+            None
+        }
+    };
+    clients_service_views_from(
+        clients,
+        sito_clients::Catalog::embedded(),
+        registry.as_ref(),
+    )
 }
 
 /// Testable core of [`clients_service_views`].
 ///
 /// Configured groups are always rendered. A corrupt embedded catalog is logged
 /// and degrades to an empty service picker instead of failing the whole page.
-/// Every embedded catalog service is offered: the runtime service registry
-/// includes the catalog overlay, so these ids are selectable and enforceable.
+/// `registry` decides availability: the runtime registry includes every
+/// catalog service with at least one usable blocking rule, while a catalog
+/// service with zero usable rules is marked unavailable instead of being
+/// offered as a silent no-op.
 pub(crate) fn clients_service_views_from(
     clients: &sito_clients::ClientsConfig,
     catalog: Result<sito_clients::Catalog, sito_clients::CatalogError>,
+    registry: Option<&sito_clients::ServiceRegistry>,
 ) -> ClientsServiceViews {
     let mut group_names: Vec<String> = clients.groups.keys().cloned().collect();
     // `default` is implied even when it has no explicit configuration.
@@ -247,7 +264,8 @@ pub(crate) fn clients_service_views_from(
                         name: service.name.clone(),
                         group: service.group.clone(),
                         rule_count: service.rules.len(),
-                        available: true,
+                        available: registry
+                            .is_some_and(|registry| registry.contains_service(&service.id)),
                     });
             }
             let mut groups = Vec::with_capacity(by_group.len());
@@ -298,6 +316,8 @@ pub(crate) enum GroupServicesError {
     TooMany(usize),
     #[error("unknown catalog service id '{0}'")]
     UnknownService(String),
+    #[error("catalog service '{0}' has no usable blocking rules and cannot be selected")]
+    UnavailableService(String),
 }
 
 /// Reads `group` and the repeated `selected` fields from a form body.
@@ -345,14 +365,15 @@ pub(crate) fn parse_group_services_form(
 /// Retained services keep their configured order and existing `schedule`;
 /// removed services disappear; new services are appended in submitted order
 /// with `schedule: None`. Duplicate ids are rejected rather than silently
-/// deduplicated, and every id must exist in the embedded catalog. Ids are
-/// matched case-insensitively because the service registry is
-/// case-insensitive; new entries are stored with the catalog's canonical
-/// lowercase id.
+/// deduplicated, and every id must exist in the embedded catalog with at least
+/// one usable blocking rule. Ids are matched case-insensitively because the
+/// service registry is case-insensitive; new entries are stored with the
+/// catalog's canonical lowercase id.
 pub(crate) fn group_blocked_services(
     existing: &[sito_clients::BlockedServiceConfig],
     selected: &[String],
     catalog: &sito_clients::Catalog,
+    registry: &sito_clients::ServiceRegistry,
 ) -> Result<Vec<sito_clients::BlockedServiceConfig>, GroupServicesError> {
     let by_lower: std::collections::HashMap<String, &str> = catalog
         .services()
@@ -392,6 +413,9 @@ pub(crate) fn group_blocked_services(
     for id in &selected_ids {
         if catalog.service_by_id(id).is_none() {
             return Err(GroupServicesError::UnknownService((*id).to_string()));
+        }
+        if !registry.contains_service(id) {
+            return Err(GroupServicesError::UnavailableService((*id).to_string()));
         }
     }
 
@@ -456,6 +480,19 @@ pub async fn clients_group_services_handler(
             );
         }
     };
+    let registry = match sito_clients::ServiceRegistry::try_bundled() {
+        Ok(registry) => registry,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Bundled service registry is invalid; group service selection is unavailable"
+            );
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Bundled service registry is unavailable",
+            );
+        }
+    };
 
     let _apply_guard = ctx.lock_config_apply().await;
     let mut clients_cfg = load_clients_config(&ctx);
@@ -468,10 +505,11 @@ pub async fn clients_group_services_handler(
         .get(&submission.group)
         .map(|group| group.blocked_services.clone())
         .unwrap_or_default();
-    let blocked_services = match group_blocked_services(&existing, &submission.selected, &catalog) {
-        Ok(blocked_services) => blocked_services,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
-    };
+    let blocked_services =
+        match group_blocked_services(&existing, &submission.selected, &catalog, &registry) {
+            Ok(blocked_services) => blocked_services,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+        };
 
     // Replace only this group's blocked services (creating the implied
     // `default` group when needed); every other group field is preserved.

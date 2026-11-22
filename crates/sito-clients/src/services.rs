@@ -146,29 +146,33 @@ impl ServiceRegistry {
     ///
     /// Catalog rules pass through the same literal-domain cleaner as bundled
     /// and downloaded service lists: regex/wildcard rules and malformed
-    /// domains are dropped with a warning. Catalog-only ids are still recorded
-    /// even when every rule is unsupported, so the id resolves and can be
-    /// selected (it simply blocks nothing).
+    /// domains are dropped with a warning, and `$dnsrewrite=NXDOMAIN` actions
+    /// are reduced to their literal domain (the service-blocking engine only
+    /// needs the domain). A service whose every rule is unsupported is omitted
+    /// from the overlay so it cannot be selected as a silent no-op; the UI and
+    /// handler report it as unavailable instead.
     ///
     /// A corrupt catalog is logged and leaves the bundled registry untouched;
     /// startup then continues on the minimal fallback instead of aborting.
     pub(crate) fn attach_catalog_overlay(&mut self) {
-        let catalog = match crate::catalog::Catalog::embedded() {
-            Ok(catalog) => catalog,
+        match crate::catalog::Catalog::embedded() {
+            Ok(catalog) => self.attach_catalog_overlay_from(&catalog),
             Err(e) => {
                 error!(
                     error = %e,
                     "Embedded service catalog is invalid; service registry keeps the bundled fallback only"
                 );
-                return;
             }
-        };
+        }
+    }
 
+    /// Testable core of [`Self::attach_catalog_overlay`].
+    pub(crate) fn attach_catalog_overlay_from(&mut self, catalog: &crate::catalog::Catalog) {
         let mut skipped_rules = 0usize;
         let mut overlay: HashMap<String, HashSet<String>> =
             HashMap::with_capacity(catalog.services.len());
         for service in catalog.services() {
-            let entry = overlay.entry(service.id.to_ascii_lowercase()).or_default();
+            let mut rules = HashSet::new();
             for rule in &service.rules {
                 // The catalog is release-bound and validated at build time;
                 // cleaning still drops unsupported shapes, but per-rule
@@ -177,8 +181,11 @@ impl ServiceRegistry {
                 if let Some(domain) =
                     clean_domain_rule_logged(rule, &service.id, &mut skipped_rules, false)
                 {
-                    entry.insert(domain);
+                    rules.insert(domain);
                 }
+            }
+            if !rules.is_empty() {
+                overlay.insert(service.id.to_ascii_lowercase(), rules);
             }
         }
         log_skipped_rules(skipped_rules);
@@ -302,10 +309,26 @@ fn clean_domain_rule_logged(
     skipped: &mut usize,
     log: bool,
 ) -> Option<String> {
-    let trimmed = rule.trim();
+    let mut trimmed = rule.trim();
     if trimmed.is_empty() {
         return None;
     }
+
+    // `$dnsrewrite=NXDOMAIN` is AdGuard's block action for the domain; the
+    // service-blocking engine only needs the literal domain, so drop the
+    // modifier instead of rejecting the rule as malformed. Other modifiers
+    // (`$dnstype`, `$denyallow`, ...) change semantics and stay unsupported.
+    if let Some((domain, modifiers)) = trimmed.split_once('$')
+        && modifiers
+            .to_ascii_lowercase()
+            .starts_with("dnsrewrite=nxdomain")
+    {
+        trimmed = domain.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+    }
+
     if (trimmed.starts_with('/') && trimmed.ends_with('/'))
         || trimmed.contains('*')
         || trimmed.contains('?')
@@ -427,6 +450,69 @@ mod tests {
         assert!(
             reg.rule_count() > bundled.rule_count(),
             "catalog rules must add blocking coverage"
+        );
+    }
+
+    #[test]
+    fn test_catalog_dnsrewrite_nxdomain_rules_are_literal_domains() {
+        let reg = ServiceRegistry::try_bundled().expect("bundled services must load");
+        assert!(reg.contains_service("icloud_private_relay"));
+        for domain in [
+            "mask.icloud.com",
+            "mask-h2.icloud.com",
+            "mask-canary.icloud.com",
+        ] {
+            assert!(
+                reg.is_service_domain("icloud_private_relay", domain),
+                "{domain} must be blocked by the catalog rule"
+            );
+            assert!(
+                reg.is_service_domain("icloud_private_relay", &format!("sub.{domain}")),
+                "subdomains of {domain} must be blocked"
+            );
+        }
+        assert!(!reg.is_service_domain("icloud_private_relay", "icloud.com"));
+    }
+
+    #[test]
+    fn test_catalog_overlay_omits_services_with_no_usable_rules() {
+        use crate::catalog::CatalogService;
+
+        let mut catalog = crate::catalog::Catalog::embedded().expect("embedded catalog");
+        let group = catalog.service_groups[0].clone();
+        catalog.services.push(CatalogService {
+            id: "zero_rule_service".to_string(),
+            name: "Zero rule service".to_string(),
+            group: group.clone(),
+            rules: vec![
+                "/regex.*/".to_string(),
+                "*.wild.example".to_string(),
+                "||mask.example^$dnsrewrite=NOERROR;;".to_string(),
+            ],
+        });
+        catalog.services.push(CatalogService {
+            id: "partial_rule_service".to_string(),
+            name: "Partial rule service".to_string(),
+            group,
+            rules: vec![
+                "||good.example^".to_string(),
+                "*.dropped.example".to_string(),
+            ],
+        });
+
+        let mut reg = ServiceRegistry::from_json("{}").expect("empty service map");
+        reg.attach_catalog_overlay_from(&catalog);
+
+        assert!(
+            !reg.contains_service("zero_rule_service"),
+            "a service with no usable rules must not resolve"
+        );
+        assert!(reg.contains_service("partial_rule_service"));
+        assert!(reg.is_service_domain("partial_rule_service", "good.example"));
+        assert!(!reg.is_service_domain("partial_rule_service", "x.dropped.example"));
+        assert!(
+            reg.is_service_domain("4chan", "4chan.org"),
+            "real catalog services must still be merged"
         );
     }
 
