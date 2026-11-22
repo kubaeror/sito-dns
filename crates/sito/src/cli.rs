@@ -1098,25 +1098,36 @@ pub fn run_ha_gen_certs(
     Ok(())
 }
 
-/// Reads the update signature policy from `config_path`.
+/// Reads and validates the configuration `sito update` needs to run.
 ///
 /// Fails closed: an unreadable or invalid configuration is an error, because
 /// falling back to `checksum-only` would silently disable signature
 /// enforcement on a host that had it enabled.
-fn update_signature_policy(config_path: &Path) -> Result<bool, anyhow::Error> {
+fn load_update_config(config_path: &Path) -> Result<Config, anyhow::Error> {
     let content = std::fs::read_to_string(config_path).map_err(|e| {
         anyhow::anyhow!(
-            "Refusing to update: cannot read configuration '{}' to determine the signature policy: {e}",
+            "Refusing to update: cannot read configuration '{}' to determine the update policy: {e}",
             config_path.display()
         )
     })?;
-    let cfg = Config::from_toml_str(&content).map_err(|e| {
+    Config::from_toml_str(&content).map_err(|e| {
         anyhow::anyhow!(
             "Refusing to update: configuration '{}' is invalid: {e}",
             config_path.display()
         )
-    })?;
-    Ok(cfg.server.update_require_signature)
+    })
+}
+
+/// Reads the update signature policy from `config_path`.
+fn update_signature_policy(config_path: &Path) -> Result<bool, anyhow::Error> {
+    Ok(load_update_config(config_path)?
+        .server
+        .update_require_signature)
+}
+
+/// Returns the configured data directory that owns the shared update lock.
+fn update_data_dir(config_path: &Path) -> Result<PathBuf, anyhow::Error> {
+    Ok(load_update_config(config_path)?.server.data_dir)
 }
 
 /// Refuses to start an update when the persisted policy requires signatures
@@ -1157,8 +1168,14 @@ pub async fn run_update(
     repo: Option<&str>,
     config_path: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
+    // Resolve the configuration first: the data directory it names owns the
+    // cross-process update lock shared with a running server/API. Failing
+    // closed here also means `--check` can never race a server apply.
+    let config_path = resolve_update_config_path(config_path)?;
+    let data_dir = update_data_dir(&config_path)?;
+
     println!("Checking for updates...");
-    let info = sito_api::updater::check_for_update(repo)
+    let info = sito_api::updater::check_for_update(repo, &data_dir)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to check for updates: {e}"))?;
 
@@ -1177,7 +1194,6 @@ pub async fn run_update(
     // cannot know whether signatures are required, so refuse instead of
     // silently downgrading to checksum-only verification. Resolving here also
     // means `sudo sito update` works from any cwd after the service is stopped.
-    let config_path = resolve_update_config_path(config_path)?;
     let require_signature = update_preflight(&config_path, sito_api::updater::cosign_available())?;
 
     if info.version_comparison_unknown && !force {
@@ -1203,7 +1219,7 @@ pub async fn run_update(
     if require_signature {
         println!("Signature verification is required by configuration.");
     }
-    let msg = sito_api::updater::apply_update(repo, force, require_signature)
+    let msg = sito_api::updater::apply_update(repo, force, require_signature, &data_dir)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to apply update: {e}"))?;
 
@@ -1903,6 +1919,35 @@ mod tests {
         )
         .unwrap();
         assert!(!update_signature_policy(&opt_out).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_lock_path_is_derived_from_configured_data_dir() {
+        let dir = temp_config_dir("update_lock_path");
+        let data_dir = dir.join("state");
+        let cfg = dir.join("config.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "config_version = 2\n[server]\ndata_dir = \"{}\"\n",
+                data_dir.display()
+            ),
+        )
+        .unwrap();
+
+        // The CLI and the server both read server.data_dir from the same
+        // validated configuration, so this is the lock path they share.
+        let resolved = update_data_dir(&cfg).unwrap();
+        assert_eq!(resolved, data_dir);
+        assert_eq!(
+            sito_api::updater::update_lock_path(&resolved),
+            data_dir.join(sito_api::updater::UPDATE_LOCK_FILE)
+        );
+
+        // A missing/invalid config must not guess a different lock directory.
+        assert!(update_data_dir(&dir.join("missing.toml")).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

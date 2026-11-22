@@ -43,6 +43,7 @@ pub struct ApplyUpdateResponse {
 )]
 pub async fn check_update(
     _viewer: RequireViewer,
+    State(ctx): State<ServerContext>,
     Query(params): Query<CheckUpdateQuery>,
 ) -> Result<Json<UpdateInfo>, ProblemDetails> {
     if let Some(ref repo) = params.repo
@@ -53,7 +54,8 @@ pub async fn check_update(
         )));
     }
 
-    match updater::check_for_update(params.repo.as_deref()).await {
+    let data_dir = ctx.config.load().server.data_dir.clone();
+    match updater::check_for_update(params.repo.as_deref(), &data_dir).await {
         Ok(info) => Ok(Json(info)),
         Err(e) => Err(ProblemDetails::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -97,7 +99,8 @@ pub async fn apply_update(
     }
 
     let require_signature = ctx.config.load().server.update_require_signature;
-    match updater::apply_update(repo.as_deref(), force, require_signature).await {
+    let data_dir = ctx.config.load().server.data_dir.clone();
+    match updater::apply_update(repo.as_deref(), force, require_signature, &data_dir).await {
         Ok(message) => Ok(Json(ApplyUpdateResponse {
             message,
             status: "success".to_string(),

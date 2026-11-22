@@ -5,7 +5,10 @@
 
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -21,6 +24,111 @@ pub const ALLOWED_UPDATE_REPOS: &[&str] = &["kubaeror/sito-dns"];
 /// Returns true if the specified repository slug is allowed for updates.
 pub fn is_allowed_repo(repo: &str) -> bool {
     ALLOWED_UPDATE_REPOS.contains(&repo)
+}
+
+/// Maximum number of redirect hops the updater will follow.
+///
+/// GitHub release assets redirect from `github.com` to
+/// `objects.githubusercontent.com` (and occasionally other
+/// `*.githubusercontent.com` hosts); a small fixed cap keeps a hostile or
+/// misconfigured endpoint from turning an update into an unbounded request
+/// chain.
+const MAX_UPDATE_REDIRECTS: usize = 5;
+
+/// Why a redirect target was rejected by the updater HTTP policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RedirectRejection {
+    InsecureScheme { url: String },
+    DisallowedHost { url: String },
+    Loop { url: String },
+    TooManyRedirects { max: usize },
+}
+
+impl fmt::Display for RedirectRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InsecureScheme { url } => {
+                write!(f, "update redirect to non-HTTPS URL rejected: '{url}'")
+            }
+            Self::DisallowedHost { url } => {
+                write!(
+                    f,
+                    "update redirect to non-allowlisted host rejected: '{url}'"
+                )
+            }
+            Self::Loop { url } => write!(f, "update redirect loop detected at '{url}'"),
+            Self::TooManyRedirects { max } => {
+                write!(f, "update redirect chain exceeded {max} hops")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RedirectRejection {}
+
+/// Validates one redirect hop against the updater's download policy.
+///
+/// `previous` is the chain of URLs already requested (including the initial
+/// request), matching `reqwest::redirect::Attempt::previous()`.
+fn validate_redirect(previous: &[Url], next: &Url) -> Result<(), RedirectRejection> {
+    if next.scheme() != "https" {
+        return Err(RedirectRejection::InsecureScheme {
+            url: next.to_string(),
+        });
+    }
+    if !is_allowed_download_host(next.as_str()) {
+        return Err(RedirectRejection::DisallowedHost {
+            url: next.to_string(),
+        });
+    }
+    if previous.iter().any(|visited| visited == next) {
+        return Err(RedirectRejection::Loop {
+            url: next.to_string(),
+        });
+    }
+    // `previous` includes the initial URL, so allow at most
+    // `MAX_UPDATE_REDIRECTS` followed hops before refusing the next one.
+    if previous.len() > MAX_UPDATE_REDIRECTS {
+        return Err(RedirectRejection::TooManyRedirects {
+            max: MAX_UPDATE_REDIRECTS,
+        });
+    }
+    Ok(())
+}
+
+/// Builds a reqwest redirect policy that revalidates every hop.
+fn updater_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        match validate_redirect(attempt.previous(), attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(rejection) => attempt.error(rejection),
+        }
+    })
+}
+
+/// Builds the HTTP client used for every updater request.
+///
+/// The client carries no credentials or authorization headers: GitHub release
+/// assets are public, and keeping the request header set uniform avoids
+/// leaking anything across a redirect to another allowlisted host.
+fn updater_http_client(timeout: Duration) -> Result<reqwest::Client, UpdateError> {
+    let current_version = env!("CARGO_PKG_VERSION");
+    Ok(reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(format!("sito/{current_version}"))
+        .redirect(updater_redirect_policy())
+        .build()?)
+}
+
+/// Validates a URL before the updater's first request. Redirect hops are
+/// checked separately by [`validate_redirect`].
+fn ensure_allowed_download_url(url: &str, asset_kind: &str) -> Result<(), UpdateError> {
+    if is_allowed_download_host(url) {
+        return Ok(());
+    }
+    Err(UpdateError::Other(format!(
+        "{asset_kind} URL '{url}' does not point at an allowed GitHub host"
+    )))
 }
 
 #[derive(Debug, Error)]
@@ -211,7 +319,21 @@ fn versions_comparable(latest: &str, current: &str) -> bool {
 }
 
 /// Queries GitHub Releases for the latest release information.
-pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateError> {
+///
+/// The call is serialized with every other update check/apply through the
+/// cross-process lock in `data_dir` so the CLI and a running server cannot
+/// query or download a release at the same time.
+pub async fn check_for_update(
+    repo: Option<&str>,
+    data_dir: &Path,
+) -> Result<UpdateInfo, UpdateError> {
+    let _guard = try_acquire_update_operation(data_dir)?;
+    check_for_update_locked(repo).await
+}
+
+/// Performs the release query assuming the caller already holds the update
+/// lock.
+async fn check_for_update_locked(repo: Option<&str>) -> Result<UpdateInfo, UpdateError> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let repo_name = repo.unwrap_or(DEFAULT_GITHUB_REPO);
     if !is_allowed_repo(repo_name) {
@@ -220,11 +342,9 @@ pub async fn check_for_update(repo: Option<&str>) -> Result<UpdateInfo, UpdateEr
         )));
     }
     let url = format!("https://api.github.com/repos/{repo_name}/releases/latest");
+    ensure_allowed_download_url(&url, "Update check")?;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(format!("sito/{current_version}"))
-        .build()?;
+    let client = updater_http_client(Duration::from_secs(10))?;
 
     let response = client.get(&url).send().await?;
 
@@ -717,12 +837,7 @@ async fn apply_signature_policy(
                 asset.name, asset.size
             )));
         }
-        if !is_allowed_download_host(&asset.browser_download_url) {
-            return Err(UpdateError::Other(format!(
-                "Signature asset URL '{}' does not point at an allowed GitHub host",
-                asset.browser_download_url
-            )));
-        }
+        ensure_allowed_download_url(&asset.browser_download_url, "Signature asset")?;
     }
 
     // cosign needs real files; use a unique temporary directory and always clean up.
@@ -1174,6 +1289,105 @@ async fn install_binary_atomically(
     replace_with_backup(&temp_exe, current_exe).await
 }
 
+/// Name of the cross-process update lock inside `server.data_dir`.
+pub const UPDATE_LOCK_FILE: &str = "update.lock";
+
+/// Returns the shared update lock path for a configured data directory.
+pub fn update_lock_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(UPDATE_LOCK_FILE)
+}
+
+/// Cross-process exclusive update lease backed by `flock`.
+///
+/// The file's existence is not authoritative; the advisory lock is. A stale
+/// lock file left behind by a crash is harmless because the kernel releases
+/// the lock when the last descriptor closes. The file is intentionally never
+/// removed and carries no meaningful content, so a waiter can never be fooled
+/// by a leftover path or read a stale PID.
+///
+/// On Unix this uses `flock(LOCK_EX | LOCK_NB)`. On non-Unix platforms the
+/// standard library's per-handle file lock is used as a best-effort fallback;
+/// only Unix is supported for coordinated CLI/server updates.
+#[derive(Debug)]
+pub struct UpdateLock {
+    _file: File,
+    path: PathBuf,
+}
+
+impl UpdateLock {
+    /// Acquires the update lock for `data_dir`, creating the directory and the
+    /// 0600 lock file when needed.
+    ///
+    /// Returns [`UpdateError::UpdateInProgress`] immediately when another
+    /// process (or another independently opened descriptor) holds the lock.
+    pub fn acquire(data_dir: &Path) -> Result<Self, UpdateError> {
+        std::fs::create_dir_all(data_dir)?;
+        let path = update_lock_path(data_dir);
+
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+
+        try_lock_file(&file)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+
+        // Drop any stale content from an earlier writer: the path must never
+        // communicate update state, only the advisory lock does.
+        file.set_len(0)?;
+        debug!(path = %path.display(), "Acquired cross-process update lock");
+        Ok(Self { _file: file, path })
+    }
+}
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        // `flock` is released when the descriptor is closed after this method
+        // returns. The path is deliberately left in place for the next owner.
+        debug!(path = %self.path.display(), "Releasing cross-process update lock");
+    }
+}
+
+/// Attempts a non-blocking exclusive lock on `file`.
+#[cfg(unix)]
+fn try_lock_file(file: &File) -> Result<(), UpdateError> {
+    use std::os::unix::io::AsRawFd;
+
+    // SAFETY: `file` owns a valid descriptor for the lifetime of the call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return Err(UpdateError::UpdateInProgress);
+    }
+    Err(err.into())
+}
+
+/// Attempts a non-blocking exclusive lock on `file` (non-Unix fallback).
+#[cfg(not(unix))]
+fn try_lock_file(file: &File) -> Result<(), UpdateError> {
+    use std::fs::TryLockError;
+
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(UpdateError::UpdateInProgress),
+        Err(TryLockError::Error(err)) => Err(err.into()),
+    }
+}
+
 /// The in-process update lock prevents two admin requests (or an admin and a
 /// CLI invocation in the same process) from replacing the binary concurrently.
 fn update_lock() -> &'static tokio::sync::Mutex<()> {
@@ -1185,6 +1399,22 @@ fn try_acquire_update_lock() -> Result<tokio::sync::MutexGuard<'static, ()>, Upd
     update_lock()
         .try_lock()
         .map_err(|_| UpdateError::UpdateInProgress)
+}
+
+/// Serializes an update operation across threads (the in-process mutex) and
+/// across processes (the `flock` lease in `data_dir`).
+struct UpdateOperationGuard {
+    _threads: tokio::sync::MutexGuard<'static, ()>,
+    _process: UpdateLock,
+}
+
+fn try_acquire_update_operation(data_dir: &Path) -> Result<UpdateOperationGuard, UpdateError> {
+    let threads = try_acquire_update_lock()?;
+    let process = UpdateLock::acquire(data_dir)?;
+    Ok(UpdateOperationGuard {
+        _threads: threads,
+        _process: process,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1218,11 +1448,8 @@ pub async fn apply_update(
     repo: Option<&str>,
     force: bool,
     require_signature: bool,
+    data_dir: &Path,
 ) -> Result<String, UpdateError> {
-    // Acquire before any network work so a second request fails fast with a
-    // conflict instead of racing the download/verification/replace sequence.
-    let _update_guard = try_acquire_update_lock()?;
-
     if is_running_in_docker() {
         return Err(UpdateError::DockerEnvironment(
             "In-app binary update is disabled inside Docker. Use container image management."
@@ -1237,13 +1464,17 @@ pub async fn apply_update(
         ));
     }
 
+    // Acquire before any network work so a second request fails fast with a
+    // conflict instead of racing the download/verification/replace sequence.
+    let _update_guard = try_acquire_update_operation(data_dir)?;
+
     let repo_name = repo.unwrap_or(DEFAULT_GITHUB_REPO);
     if !is_allowed_repo(repo_name) {
         return Err(UpdateError::Other(format!(
             "Repository '{repo_name}' is not in the allowed repositories list"
         )));
     }
-    let update_info = check_for_update(Some(repo_name)).await?;
+    let update_info = check_for_update_locked(Some(repo_name)).await?;
 
     if update_decision(&update_info, force)? == UpdateDecision::UpToDate {
         return Ok(format!(
@@ -1252,12 +1483,9 @@ pub async fn apply_update(
         ));
     }
 
-    let current_version = env!("CARGO_PKG_VERSION");
     let url = format!("https://api.github.com/repos/{repo_name}/releases/latest");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .user_agent(format!("sito/{current_version}"))
-        .build()?;
+    ensure_allowed_download_url(&url, "Release metadata")?;
+    let client = updater_http_client(Duration::from_secs(60))?;
 
     let release_resp = client.get(&url).send().await?;
     let release_text = release_resp.text().await?;
@@ -1301,18 +1529,8 @@ pub async fn apply_update(
             archive.name, archive.size
         )));
     }
-    if !is_allowed_download_host(&archive.browser_download_url) {
-        return Err(UpdateError::Other(format!(
-            "Release asset URL '{}' does not point at an allowed GitHub host",
-            archive.browser_download_url
-        )));
-    }
-    if !is_allowed_download_host(&sha_asset.browser_download_url) {
-        return Err(UpdateError::Other(format!(
-            "Checksum asset URL '{}' does not point at an allowed GitHub host",
-            sha_asset.browser_download_url
-        )));
-    }
+    ensure_allowed_download_url(&archive.browser_download_url, "Release asset")?;
+    ensure_allowed_download_url(&sha_asset.browser_download_url, "Checksum asset")?;
 
     info!(asset = %archive.name, url = %archive.browser_download_url, "Downloading release archive");
     let archive_path =
@@ -1460,6 +1678,148 @@ mod tests {
         }
         drop(first);
         assert!(try_acquire_update_lock().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cross_process_update_lock_is_exclusive_and_reusable() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = test_scratch_dir("update-lock");
+        let path = update_lock_path(&dir);
+        // Stale content from a crashed/old writer must be ignored and wiped.
+        std::fs::write(&path, b"stale-pid 1234").unwrap();
+        let lock = UpdateLock::acquire(&dir).unwrap();
+        assert_eq!(path, dir.join(UPDATE_LOCK_FILE));
+        assert!(path.is_file(), "the lock file must be created");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "lock file content must not be meaningful"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the update lock must be mode 0600");
+        }
+
+        // Simulate another process: a separately opened descriptor is an
+        // independent lock owner even inside the same process.
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // SAFETY: `contender` owns a valid descriptor.
+        let rc = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, -1, "an independent descriptor must not lock");
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        let err = UpdateLock::acquire(&dir).expect_err("second acquisition must fail");
+        assert!(matches!(err, UpdateError::UpdateInProgress), "got {err:?}");
+
+        drop(lock);
+        // The stale file is harmless; the released advisory lock allows reuse.
+        assert!(path.is_file(), "the lock file must not be deleted");
+        let reacquired = UpdateLock::acquire(&dir).expect("lock must be reusable");
+        drop(reacquired);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn parsed(url: &str) -> Url {
+        Url::parse(url).unwrap()
+    }
+
+    #[test]
+    fn test_redirect_allows_github_release_asset_hosts() {
+        let previous = [parsed(
+            "https://github.com/kubaeror/sito-dns/releases/download/v2.0.0/sito.tar.gz",
+        )];
+        for target in [
+            "https://objects.githubusercontent.com/github-production-release-asset/file",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/file",
+        ] {
+            assert_eq!(
+                validate_redirect(&previous, &parsed(target)),
+                Ok(()),
+                "legitimate GitHub asset redirect {target} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_redirect_rejects_cross_host_target() {
+        let previous = [parsed("https://github.com/kubaeror/sito-dns/releases")];
+        let rejection =
+            validate_redirect(&previous, &parsed("https://evil.example/asset")).unwrap_err();
+        assert!(matches!(
+            rejection,
+            RedirectRejection::DisallowedHost { .. }
+        ));
+    }
+
+    #[test]
+    fn test_redirect_rejects_https_downgrade() {
+        let previous = [parsed("https://github.com/kubaeror/sito-dns/releases")];
+        for target in [
+            "http://github.com/kubaeror/sito-dns/releases",
+            "http://objects.githubusercontent.com/file",
+        ] {
+            let rejection = validate_redirect(&previous, &parsed(target)).unwrap_err();
+            assert!(
+                matches!(rejection, RedirectRejection::InsecureScheme { .. }),
+                "downgrade to {target} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_redirect_rejects_loops_and_excess_hops() {
+        let github = parsed("https://github.com/kubaeror/sito-dns/releases");
+        let objects = parsed("https://objects.githubusercontent.com/file");
+        let rejection = validate_redirect(&[github.clone(), objects.clone()], &github).unwrap_err();
+        assert!(matches!(rejection, RedirectRejection::Loop { .. }));
+
+        let mut previous: Vec<Url> = (0..=MAX_UPDATE_REDIRECTS)
+            .map(|i| parsed(&format!("https://github.com/hop/{i}")))
+            .collect();
+        let too_many = parsed("https://github.com/hop/final");
+        let rejection = validate_redirect(&previous, &too_many).unwrap_err();
+        assert!(matches!(
+            rejection,
+            RedirectRejection::TooManyRedirects { .. }
+        ));
+
+        // A chain exactly at the cap is still accepted.
+        previous.pop();
+        assert_eq!(validate_redirect(&previous, &too_many), Ok(()));
+    }
+
+    #[test]
+    fn test_initial_update_url_is_validated_before_request() {
+        assert!(
+            ensure_allowed_download_url(
+                "https://api.github.com/repos/kubaeror/sito-dns/releases/latest",
+                "Update check"
+            )
+            .is_ok()
+        );
+        for url in [
+            "http://api.github.com/repos/kubaeror/sito-dns/releases/latest",
+            "https://evil.example/asset",
+            "https://github.com.evil.example/asset",
+        ] {
+            assert!(
+                ensure_allowed_download_url(url, "Release asset").is_err(),
+                "initial URL {url} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -1858,6 +2218,40 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         }
         response.extend_from_slice(b"0\r\n\r\n");
         response
+    }
+
+    fn http_redirect_response(location: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn test_download_rejects_disallowed_redirect_before_writing_bytes() {
+        let response = http_redirect_response("https://evil.example/asset");
+        let (url, server) = serve_http_once(response).await;
+
+        let dir = test_scratch_dir("redirect");
+        let dest = dir.join("archive.tar.gz");
+        let client = updater_http_client(Duration::from_secs(5)).unwrap();
+
+        let err = download_capped(&client, &url, &dest, MAX_UPDATE_ARCHIVE_BYTES)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(matches!(err, UpdateError::Network(_)), "got {err:?}");
+        assert!(
+            !dest.exists(),
+            "a rejected redirect must not create or write the destination"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "no download residue after a rejected redirect"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
