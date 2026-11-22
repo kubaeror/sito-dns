@@ -59,6 +59,46 @@ pub struct ClientDiscoveryViewItem {
     pub last_seen: String,
 }
 
+/// One blocked-service entry configured for a client group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedServiceViewItem {
+    pub service: String,
+    /// Cron expression when the entry is schedule-limited, for display.
+    pub schedule: Option<String>,
+}
+
+/// One client group with its configured blocked services.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientGroupServicesViewItem {
+    pub name: String,
+    /// True for the implicit `default` group when no explicit group exists.
+    pub is_default: bool,
+    /// Configured entries in configuration order, deduplicated by service id.
+    pub blocked_services: Vec<BlockedServiceViewItem>,
+}
+
+/// One catalog service offered by the blocked-service picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogServiceViewItem {
+    pub id: String,
+    pub name: String,
+    /// Catalog service group id (`social_network`, `streaming`, ...).
+    pub group: String,
+    /// Number of embedded `||domain^` rules for this service.
+    pub rule_count: usize,
+    /// True when the bundled service registry can enforce this id. If the
+    /// registry itself is unavailable, every entry is marked available and the
+    /// handler falls back to catalog-only validation.
+    pub available: bool,
+}
+
+/// One catalog service group with its services in stable display order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogServiceGroupViewItem {
+    pub id: String,
+    pub services: Vec<CatalogServiceViewItem>,
+}
+
 /// One row on the user-management page.
 #[derive(Debug, Clone)]
 pub struct UserViewItem {
@@ -302,6 +342,14 @@ pub struct ClientsTemplate<'a> {
     pub max_entries: usize,
     /// Age after which discovered entries are pruned.
     pub retention_hours: u64,
+    /// Client groups (including the implied `default`) with their blocked
+    /// services; consumed by the blocked-services picker (F2c2).
+    pub group_services: Vec<ClientGroupServicesViewItem>,
+    /// Embedded catalog services grouped for the picker; empty when the
+    /// catalog is corrupt (the page still renders).
+    pub catalog_service_groups: Vec<CatalogServiceGroupViewItem>,
+    /// Total catalog services available to the picker.
+    pub catalog_service_count: usize,
 }
 
 #[derive(Template)]

@@ -74,6 +74,10 @@ pub fn ui_router() -> Router<ServerContext> {
         .route("/ui/rewrites/delete", post(handlers::rewrites_delete_handler))
         .route("/ui/clients/add", post(handlers::clients_add_handler))
         .route("/ui/clients/delete", post(handlers::clients_delete_handler))
+        .route(
+            "/ui/clients/group-services",
+            post(handlers::clients_group_services_handler),
+        )
         .route("/ui/upstreams/add", post(handlers::upstreams_add_handler))
         .route("/ui/upstreams/test", post(handlers::upstreams_test_handler))
         .route("/ui/settings/save", post(handlers::settings_save_handler))
@@ -90,11 +94,13 @@ mod tests {
     use crate::models::StatusResponse;
     use crate::ui::static_files::StaticAssets;
     use crate::ui::templates::{
-        AccountTemplate, ClientDiscoveryViewItem, ClientViewItem, ClientsTemplate,
-        DashboardStatsPartialTemplate, DashboardTemplate, FilteringTemplate, LoginTemplate,
-        QueryLogRowItem, QueryLogRowsPartialTemplate, QueryLogTemplate, RewriteViewItem,
-        RewritesTemplate, SettingsTemplate, SystemTemplate, TokenViewItem, TotpSetupView,
-        UpstreamViewItem, UpstreamsTemplate, UserViewItem, UsersTemplate, WizardTemplate,
+        AccountTemplate, BlockedServiceViewItem, CatalogServiceGroupViewItem,
+        CatalogServiceViewItem, ClientDiscoveryViewItem, ClientGroupServicesViewItem,
+        ClientViewItem, ClientsTemplate, DashboardStatsPartialTemplate, DashboardTemplate,
+        FilteringTemplate, LoginTemplate, QueryLogRowItem, QueryLogRowsPartialTemplate,
+        QueryLogTemplate, RewriteViewItem, RewritesTemplate, SettingsTemplate, SystemTemplate,
+        TokenViewItem, TotpSetupView, UpstreamViewItem, UpstreamsTemplate, UserViewItem,
+        UsersTemplate, WizardTemplate,
     };
     use sito_stats::GlobalStats;
 
@@ -335,6 +341,25 @@ mod tests {
             discovered_pages: 1,
             max_entries: sito_clients::MAX_UNIDENTIFIED_CLIENTS,
             retention_hours: sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS,
+            group_services: vec![ClientGroupServicesViewItem {
+                name: "default".to_string(),
+                is_default: true,
+                blocked_services: vec![BlockedServiceViewItem {
+                    service: "tiktok".to_string(),
+                    schedule: Some("0 8 * * *".to_string()),
+                }],
+            }],
+            catalog_service_groups: vec![CatalogServiceGroupViewItem {
+                id: "social_network".to_string(),
+                services: vec![CatalogServiceViewItem {
+                    id: "tiktok".to_string(),
+                    name: "TikTok".to_string(),
+                    group: "social_network".to_string(),
+                    rule_count: 3,
+                    available: true,
+                }],
+            }],
+            catalog_service_count: 1,
         };
         let clients_html = clients_tmpl.render().unwrap();
         assert!(clients_html.contains("Work PC"));

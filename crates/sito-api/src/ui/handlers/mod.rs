@@ -37,7 +37,8 @@ use crate::models::{AcmeStatus, FilterListDto, StatusResponse};
 use crate::probe::probe_upstream_target;
 use crate::state::ServerContext;
 use crate::ui::templates::{
-    AccountTemplate, ClientDiscoveryViewItem, ClientViewItem, ClientsTemplate,
+    AccountTemplate, BlockedServiceViewItem, CatalogServiceGroupViewItem, CatalogServiceViewItem,
+    ClientDiscoveryViewItem, ClientGroupServicesViewItem, ClientViewItem, ClientsTemplate,
     DashboardStatsPartialTemplate, DashboardTemplate, FilteringTemplate, HtmlTemplate,
     LoginTemplate, QueryLogRowItem, QueryLogRowsPartialTemplate, QueryLogTemplate, RewriteViewItem,
     RewritesTemplate, SettingsTemplate, SystemTemplate, TokenViewItem, TotpSetupView,
