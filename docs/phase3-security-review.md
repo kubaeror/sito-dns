@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-21
 **Commit:** `67269ea32a78becd87198d8edf650d72e58e216b` (`67269ea`)
-**Scope:** 2.0.0-rc.1 candidate on `feat/2.0-phase3-security`, read-only code review
+**Scope:** 2.0.0-rc.2 candidate on `feat/2.0-phase3-security`, read-only code review
 **Companion documents:** [security audit and threat model](security-audit.md),
 [P0/P1 test matrix](audit6-test-matrix.md), [2.0 claim matrix](2.0-claim-matrix.md)
 

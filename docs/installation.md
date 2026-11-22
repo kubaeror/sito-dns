@@ -2,7 +2,7 @@
 
 This guide covers deploying **sito** on Linux hosts using the automated one-line installer, manual systemd service configuration, Docker, or Docker Compose.
 
-> **Development status:** the `main` line is the **2.0.0-rc.1 candidate**
+> **Development status:** the `main` line is the **2.0.0-rc.2 candidate**
 > (Phase 2 core hardening and Phase 3 verification are delivered). The published
 > stable release remains **1.9.5**, and the pinned examples below intentionally
 > target it. Pre-release builds are not published as stable artifacts. The
@@ -20,7 +20,7 @@ release-candidate line differ in the admin default:
 * **1.9.5 (stable):** `web.bind` defaults to `0.0.0.0`, the admin UI is served
   over plain HTTP, and port `8080` accepts setup and login requests from every
   reachable source. There is no TLS in the admin listener itself.
-* **2.0.0-rc.1 (release candidate):** `web.bind` defaults to `127.0.0.1` (the
+* **2.0.0-rc.2 (release candidate):** `web.bind` defaults to `127.0.0.1` (the
   config v2 safe default). Existing v1 configurations migrated without
   `--adopt-safe-defaults` keep their old bind, including `0.0.0.0`.
 * **Both lines:** `dns.bind` defaults to `["0.0.0.0", "::"]` and there is no
@@ -132,7 +132,7 @@ The installer automatically:
 ### 1.1 The 2.0 release-candidate line
 
 The one-line installer and published container tags above install the **stable
-1.9.5** release. The `2.0.0-rc.1` release-candidate line is built from source
+1.9.5** release. The `2.0.0-rc.2` release-candidate line is built from source
 (or from a prerelease image when one is published):
 
 ```bash

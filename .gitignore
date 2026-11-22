@@ -24,3 +24,6 @@ node_modules/
 
 __pycache__/
 *.pyc
+
+# Local SDD/agent ledger (not part of the release tree)
+.superpowers/

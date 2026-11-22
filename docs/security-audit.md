@@ -1,8 +1,8 @@
 # Security Review and Threat Model (current)
 
 This document summarizes the **implemented** security controls and known
-limitations of the current development tree (**2.0.0-rc.1 candidate**;
-workspace version `2.0.0-rc.1`, tag pending). Phase 3 verification at the rc.1
+limitations of the current development tree (**2.0.0-rc.2 candidate**;
+workspace version `2.0.0-rc.2`, tag pending). Phase 3 verification at the rc.1
 candidate is recorded in the
 [Phase 3 security review](phase3-security-review.md), which is the current
 evidence for the audit streams and residuals. This page replaces an earlier
