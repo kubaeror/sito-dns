@@ -150,6 +150,42 @@ pub(super) fn apply_ecs_policy(query: &mut Message, policy: UpstreamEcs) {
     edns.options_mut().insert(EdnsOption::Subnet(clamped));
 }
 
+/// EDNS options that are meaningful only between the client and this resolver.
+///
+/// * COOKIE (RFC 7873) is scoped to a client/resolver pair; forwarding it would
+///   hand a client identifier to the upstream.
+/// * NSID (RFC 5001) asks the *responding* server for its identity; it is a
+///   client-to-this-resolver request and must not be relayed.
+/// * Padding (RFC 7830) is a client-side traffic-analysis countermeasure for
+///   the client-to-resolver hop; it is meaningless on the resolver-to-upstream
+///   link and would only waste bandwidth.
+/// * DAU/DHU/N3U (RFC 6975) advertise the algorithms the *client* can consume;
+///   the upstream must answer for this resolver, not for the client.
+const CLIENT_ONLY_EDNS_OPTIONS: [EdnsCode; 6] = [
+    EdnsCode::Cookie,
+    EdnsCode::NSID,
+    EdnsCode::Padding,
+    EdnsCode::DAU,
+    EdnsCode::DHU,
+    EdnsCode::N3U,
+];
+
+/// Removes client-only EDNS options (COOKIE, NSID, Padding, DAU, DHU, N3U)
+/// from an outbound query.
+///
+/// ECS, the DO bit, the payload size and every unknown option are left alone:
+/// ECS is policy-driven (`apply_ecs_policy`), DO/payload describe what this
+/// resolver can receive from the upstream, and unknown options may be
+/// upstream-relevant.
+pub(super) fn strip_client_edns_options(query: &mut Message) {
+    let Some(edns) = query.edns.as_mut() else {
+        return;
+    };
+    for code in CLIENT_ONLY_EDNS_OPTIONS {
+        edns.options_mut().remove(code);
+    }
+}
+
 /// Builds the query used for cache lookups/inserts: the client's DO/CD/opcode
 /// flags plus the ECS actually forwarded upstream (`off` deduplicates keys,
 /// `forward` keys on the clamped subnet).
@@ -161,6 +197,11 @@ pub(super) fn build_cache_query(query: &Message, config: &Config) -> Message {
 
 /// Builds the query sent upstream, optionally forcing DO so validation has
 /// signatures to check.
+///
+/// Client-only EDNS options (COOKIE, NSID, Padding, DAU, DHU, N3U) are always
+/// stripped: they are scoped to the client-to-resolver hop and must not leak
+/// upstream. ECS is policy-driven, and a query without EDNS stays without EDNS
+/// unless `force_dnssec` needs an OPT record to carry DO.
 pub(super) fn build_upstream_query(
     query: &Message,
     config: &Config,
@@ -173,6 +214,7 @@ pub(super) fn build_upstream_query(
         edns.set_max_payload(config.dns.edns_udp_size.max(1232));
         upstream_query.set_edns(edns);
     }
+    strip_client_edns_options(&mut upstream_query);
     apply_ecs_policy(&mut upstream_query, config.upstream.ecs);
     upstream_query
 }
