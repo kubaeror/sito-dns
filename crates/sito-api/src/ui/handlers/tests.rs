@@ -1941,6 +1941,127 @@ async fn test_ui_handlers_persist_failure_returns_500_and_preserves_in_memory_st
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// The catalog dialog keeps the custom-URL fallback. Exercise that fallback at
+/// the handler/config level (add, duplicate-name conflict, toggle both ways,
+/// delete) so the existing Filtering list controls remain covered alongside the
+/// catalog path.
+#[tokio::test]
+async fn test_filtering_custom_url_add_toggle_and_delete_round_trip() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_filtering_custom_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    ctx.auth_mgr
+        .create_user("oper_user", "pass", Role::Operator)
+        .await;
+    let LoginResult::Success(session) = ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1").await
+    else {
+        panic!("login failed");
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
+
+    let list_path = temp_dir.join("custom-url.txt");
+    std::fs::write(&list_path, "||custom.example^\n").unwrap();
+    let url = format!("file://{}", list_path.display());
+
+    let resp = filtering_add_handler(
+        State(ctx.clone()),
+        headers.clone(),
+        Form(AddFilterListForm {
+            name: "Custom source".to_string(),
+            url: url.clone(),
+            refresh_hours: Some(12),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let lists = ctx.config.load().filtering.lists.clone();
+    assert_eq!(lists.len(), 1);
+    assert_eq!(lists[0].name, "Custom source");
+    assert_eq!(lists[0].url, url);
+    assert!(lists[0].enabled);
+    assert_eq!(lists[0].refresh_hours, Some(12));
+    assert!(
+        ctx.config_path.exists(),
+        "a custom URL must be persisted like a catalog selection"
+    );
+    let persisted: toml::Value = toml::from_str(
+        &std::fs::read_to_string(&ctx.config_path).expect("read persisted config.toml"),
+    )
+    .expect("persisted config.toml must parse");
+    let persisted_list = persisted["filtering"]["lists"]
+        .as_array()
+        .and_then(|lists| lists.first())
+        .expect("persisted filtering list");
+    assert_eq!(
+        persisted_list["name"].as_str(),
+        Some("Custom source"),
+        "persisted name"
+    );
+    assert_eq!(
+        persisted_list["url"].as_str(),
+        Some(url.as_str()),
+        "persisted URL"
+    );
+    assert_eq!(
+        persisted_list["refresh_hours"].as_integer(),
+        Some(12),
+        "persisted refresh interval"
+    );
+    assert_eq!(persisted_list["enabled"].as_bool(), Some(true));
+
+    // The same name is a conflict and must not add a second list.
+    let resp = filtering_add_handler(
+        State(ctx.clone()),
+        headers.clone(),
+        Form(AddFilterListForm {
+            name: "Custom source".to_string(),
+            url: "https://example.com/other.txt".to_string(),
+            refresh_hours: None,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(ctx.config.load().filtering.lists.len(), 1);
+
+    let resp = filtering_toggle_handler(
+        State(ctx.clone()),
+        headers.clone(),
+        Path("Custom source".to_string()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(!ctx.config.load().filtering.lists[0].enabled);
+
+    let resp = filtering_toggle_handler(
+        State(ctx.clone()),
+        headers.clone(),
+        Path("Custom source".to_string()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(ctx.config.load().filtering.lists[0].enabled);
+
+    let resp = filtering_delete_handler(
+        State(ctx.clone()),
+        headers,
+        Path("Custom source".to_string()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        ctx.config.load().filtering.lists.len(),
+        0,
+        "deleting the custom list must remove it from the live config"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 /// WP-0.7 (P1-15): disabling 2FA requires a fresh re-authentication ticket.
 /// The ticket proves the current password and second factor; a stolen
 /// session alone cannot turn the factor off.

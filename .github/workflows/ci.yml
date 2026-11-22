@@ -65,6 +65,7 @@ jobs:
               - 'crates/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'THIRD_PARTY_NOTICES'
               - 'rust-toolchain.toml'
               - 'rustfmt.toml'
               # Structural budgets are code checks even though the scripts and
@@ -79,6 +80,7 @@ jobs:
               - 'scripts/check-bench-regression.py'
               - 'scripts/check_bench_regression.py'
               - 'scripts/test_check_bench_regression.py'
+              - 'scripts/generate-catalog.py'
               - 'scripts/save-bench-baseline.sh'
               - 'benches/**'
               - 'fuzz/Cargo.toml'
@@ -192,6 +194,8 @@ jobs:
           # set; the diff below then verifies the committed spec is current.
           SITO_UPDATE_OPENAPI: "1"
         run: cargo test --workspace --all-features --locked
+      - name: Verify the embedded catalog and pin are current
+        run: python3 scripts/generate-catalog.py --check
       - name: Verify docs/openapi.json is up to date
         run: git diff --exit-code docs/openapi.json
       - name: Verify configuration reference matches the config structs

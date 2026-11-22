@@ -95,10 +95,39 @@ tag-push row leaves the release as a draft and blocks publication.
 | 14 | Live DNS and health smoke | `docker-build-push` → `Smoke-test the published image` | log line `release image answered smoke.test; healthcheck: healthy` | the attested digest answers a local rewrite and the image healthcheck turns healthy | rc.4 image, final (release manager) |
 | 15 | Security review | `docs/phase3-security-review.md`, `docs/security-audit.md` | review signed off against the final tree with the open P0/P1 list | no open P0; every open P1 accepted with an owner and review date | final (security reviewer) |
 | 16 | `latest` still on 1.9.5 | commands in [`latest` stays on 1.9.5](#latest-stays-on-195-until-the-final-tag) | `latest` image digest and GitHub latest release tag | both equal `v1.9.5` before the final tag; only `v2.0.0` moves them | rc.3, rc.4, final-before-tag (release manager) |
+| 17 | Catalog release-bound integrity (F2e) | `python3 scripts/generate-catalog.py --check`; focused `sito-clients`/`sito-api` catalog tests; CI `test` job step | `catalog check passed`, green focused tests, green `Verify the embedded catalog and pin are current` step | the committed catalog matches `CATALOG_SHA256`, canonical bytes are current, and the loader has no network path | rc.4, final (catalog owner) |
 
 The E4 per-architecture scan, E5 root HA lane and E6 release-gate fallback are
 linked to their own policy tests and lanes above; this page records their
 release evidence rather than redefining their internals.
+
+### Catalog release-bound integrity (F2e)
+
+The catalog is refreshable only by a new release. Run these on the release
+candidate (and confirm the CI `test` job ran the same check on the tagged SHA):
+
+```bash
+python3 scripts/generate-catalog.py --check
+cargo test -p sito-clients --all-features catalog
+cargo test -p sito-api --all-features catalog
+```
+
+Expected evidence:
+
+- `catalog check passed: ... is up to date` from the offline check. It never
+  uses the network; the SHA-256 pin and canonical bytes catch any hand edit.
+- The focused tests pass, including
+  `catalog_module_has_no_network_path` and
+  `catalog_attribution_names_embedded_source`. The no-network test is a
+  source/manifest tripwire, not a formal proof.
+- The green CI step `Verify the embedded catalog and pin are current` in the
+  `test` job.
+- If the release intentionally refreshed metadata, the same PR records the
+  `catalog.json` diff, the new `CATALOG_SHA256`, the license/attribution review
+  and the `catalog_version` decision from the
+  [catalog refresh runbook](catalog.md#release-time-refresh-runbook). List
+  bodies must still be runtime downloads; no catalog fetch or
+  `sito catalog update` command may appear.
 
 ## Tag and publication rules
 
