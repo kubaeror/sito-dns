@@ -186,6 +186,12 @@ impl StatsDb {
     /// `keep_aggregates = false` deletes both tables atomically without
     /// aggregating.
     ///
+    /// This path is also used by the API/UI clear on a running server. The CLI
+    /// takes the service lease and refuses a live server (unless `--force`);
+    /// the API cannot stop the writer, so a row inserted after its hour was
+    /// processed can survive until the next clear/retention. Use the stopped
+    /// CLI path when a complete clear is required.
+    ///
     /// `rollup_client_names` is the caller's captured policy, not an override:
     /// a live `false` from [`StatsDb::set_rollup_client_names`] is
     /// authoritative and strips client names in this path too.
@@ -219,9 +225,19 @@ impl StatsDb {
         };
 
         self.invalidate_stats_cache();
-        if total_deleted >= VACUUM_MIN_DELETED_ROWS
-            && let Err(e) = self.vacuum().await
-        {
+
+        // The threshold is per run. A keep-aggregates clear that was interrupted
+        // and resumed in several sub-threshold runs would otherwise never
+        // vacuum, so also vacuum when the completing run empties the detailed
+        // log. `EXISTS` is an index/table probe, not a count.
+        let mut vacuum_needed = total_deleted >= VACUUM_MIN_DELETED_ROWS;
+        if keep_aggregates && !vacuum_needed && deleted > 0 {
+            let remaining: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM query_log)")
+                .fetch_one(&self.pool)
+                .await?;
+            vacuum_needed = remaining == 0;
+        }
+        if vacuum_needed && let Err(e) = self.vacuum().await {
             tracing::warn!(error = %e, "stats clear vacuum failed");
         }
         Ok(deleted)

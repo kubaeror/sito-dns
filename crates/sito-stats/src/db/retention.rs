@@ -21,20 +21,33 @@
 //! for the next hour until the requested range is empty. Each chunk is its own
 //! `BEGIN IMMEDIATE` transaction, so the writer lock is held for at most
 //! [`RETENTION_ROWS_PER_CHUNK`] rows and the per-connection temp tables hold at
-//! most one hour of distinct domains/clients/upstreams. Every committed chunk
+//! most one chunk of distinct domains/clients/upstreams. Every committed chunk
 //! already contains the rollup contributions of the rows it deleted, so a
 //! crash or interruption loses only the uncommitted chunk and re-running the
-//! clear safely continues: the next pass starts again at the oldest remaining
-//! hour and merges into the already-stored rollups. The clear remains
-//! documented as requiring the service stopped (the CLI takes the service
-//! lease), so no producer can interleave an insert between the aggregate read
-//! and the delete.
+//! clear safely continues from the oldest remaining row.
+//!
+//! Unlike retention's cumulative snapshot, a clear chunk re-reads the current
+//! `stats_hourly` row **inside** its transaction and merges only that chunk's
+//! delta into it. This keeps counters and top lists exact across a retry after
+//! a partial hour (the stored row already has the committed chunks) and
+//! preserves an update made by a concurrent rollup writer between chunks. A
+//! zero-row chunk is ignored: it never creates or increments a rollup. If a
+//! rollup row existed at hour start but was deleted mid-run (rollup retention),
+//! later chunks delete the detailed rows without resurrecting it.
+//!
+//! [`StatsDb::cleanup_retention_inner`] and this clear share an in-process
+//! maintenance lock, so a live API/UI clear cannot interleave with the
+//! retention scheduler and overwrite its top lists. The CLI clear additionally
+//! takes the service lease and refuses a live server (unless `--force`); the
+//! API path cannot stop the writer, so a row inserted after its hour was
+//! processed can survive until the next clear/retention. Use the stopped CLI
+//! path when a complete clear is required.
 //!
 //! Chunking no longer makes the clear atomic across the whole range (it never
 //! could without one long transaction); it is atomic *per chunk*: the
-//! aggregate read, temp-table accumulation, rollup upsert, watermark update and
-//! delete of those rows share one transaction. A row is therefore never
-//! deleted without its rollup contribution being committed.
+//! aggregate read, temp-table accumulation, rollup merge/upsert, watermark
+//! update and delete of those rows share one transaction. A row is therefore
+//! never deleted without its rollup contribution being committed.
 //!
 //! # Scale residual (90 days / 1M rows)
 //!
@@ -144,6 +157,11 @@ impl StatsDb {
         rollup_retention_days: Option<u32>,
         rollup_client_names: bool,
     ) -> Result<RetentionReport, StatsError> {
+        // Serialize with the keep-aggregates clear (including a live API/UI
+        // clear). Both paths read existing rollup state and then replace top
+        // lists; interleaving would let one overwrite the other's contribution.
+        let _maintenance = self.maintenance_lock.lock().await;
+
         let now_ms = chrono::Utc::now().timestamp_millis();
         let retention_ms = i64::from(retention_days) * 24 * 3600 * 1000;
         let cutoff = now_ms.saturating_sub(retention_ms);
@@ -166,11 +184,12 @@ impl StatsDb {
                     .await?;
             let Some(next_ts) = next_ts else { break };
 
-            // `div_euclid` floors negative timestamps too, so a negative `ts`
-            // row cannot produce an hour bucket above the row and spin forever.
-            let hour = next_ts.div_euclid(3_600_000) * 3_600_000;
-            let end = hour.saturating_add(3_600_000).min(cutoff);
-            if end <= hour {
+            // `hour_bounds` floors negative timestamps and clamps only the
+            // unrepresentable edges of `i64`, so it cannot panic or wrap for
+            // `i64::MIN`.
+            let (hour, bucket_end) = hour_bounds(next_ts);
+            let end = bucket_end.min(cutoff);
+            if end <= hour || next_ts < hour {
                 break;
             }
 
@@ -187,6 +206,7 @@ impl StatsDb {
             // cannot resurrect them.
             let existing_rollups = load_existing_rollups(&mut conn, &[hour]).await?;
             let existing_tops = existing_rollups.get(&hour).cloned().unwrap_or_default();
+            let chunk_base = ChunkRollupBase::Snapshot(existing_tops);
 
             let mut lower = (hour, 0i64);
             loop {
@@ -214,7 +234,7 @@ impl StatsDb {
                     .rollup_and_delete_chunk(
                         &mut conn,
                         &RetentionChunk { hour, lower, upper },
-                        &existing_tops,
+                        &chunk_base,
                         done,
                         rollup_client_names,
                     )
@@ -493,16 +513,24 @@ impl StatsDb {
     ///
     /// A committed chunk has already written the rollup contributions of the
     /// rows it deleted, so an interrupted clear leaves a consistent prefix.
-    /// Re-running the clear starts again at the oldest remaining hour, merges
-    /// the remaining rows into the stored rollups and finishes the clear
-    /// without double counting: per-chunk counters are added, while the top
-    /// lists are replaced with `existing + cumulative temp counts`.
+    /// Re-running the clear starts again at the oldest remaining hour and adds
+    /// only that run's remaining rows. Each chunk re-reads the current
+    /// `stats_hourly` row inside its own transaction and merges the chunk's
+    /// delta into it, so a concurrent rollup writer (retention) cannot have its
+    /// update replaced by a stale snapshot; counters are added and top lists
+    /// are merged, never replaced with a pre-run snapshot.
     pub(super) async fn rollup_and_delete_range(
         &self,
         start: i64,
         end: i64,
         rollup_client_names: bool,
     ) -> Result<RetentionReport, StatsError> {
+        // Serialize with retention. The API/UI clear runs while the server (and
+        // its retention scheduler) is live; without this lock a sweep could
+        // replace the top lists this clear just merged, or delete a rollup row
+        // the clear is about to update.
+        let _maintenance = self.maintenance_lock.lock().await;
+
         let mut report = RetentionReport::default();
         let mut conn = self.pool.acquire().await?;
         Self::ensure_retention_temp_tables(&mut conn).await?;
@@ -513,9 +541,10 @@ impl StatsDb {
 
         loop {
             // The oldest row still inside the requested range. After each hour
-            // is deleted this walks forward, so the scan never revisits a
-            // processed hour unless a concurrent producer backdates a row into
-            // it (the service is documented as stopped for this operation).
+            // is deleted this walks forward. A producer inserting a backdated
+            // row into an already-processed hour is picked up on the next
+            // iteration (the API/UI clear runs live; the CLI path holds the
+            // service lease).
             let next_ts: Option<i64> =
                 sqlx::query_scalar("SELECT MIN(ts) FROM query_log WHERE ts >= ? AND ts < ?")
                     .bind(start)
@@ -524,12 +553,13 @@ impl StatsDb {
                     .await?;
             let Some(next_ts) = next_ts else { break };
 
-            // `div_euclid` floors negative timestamps too, so a negative `ts`
-            // row cannot produce an hour bucket above the row and spin forever.
-            let hour = next_ts.div_euclid(3_600_000) * 3_600_000;
+            // `hour_bounds` floors negative timestamps and clamps only the
+            // unrepresentable edges of `i64`, so it cannot panic or wrap for
+            // `i64::MIN`.
+            let (hour, bucket_end) = hour_bounds(next_ts);
             let hour_start = hour.max(start);
-            let hour_end = hour.saturating_add(3_600_000).min(end);
-            if hour_end <= hour_start || next_ts >= hour_end {
+            let hour_end = bucket_end.min(end);
+            if hour_end <= hour_start || next_ts < hour_start || next_ts >= hour_end {
                 // Only reachable for a malformed timestamp at the very top of
                 // `i64`, where the exclusive upper bound saturates to
                 // `i64::MAX` (the previous whole-range path also left
@@ -538,19 +568,15 @@ impl StatsDb {
                 break;
             }
 
-            // Accumulate exact per-hour counts across chunks. The table is
-            // cleared per hour, so its size is bounded by one hour of distinct
-            // domains/clients/upstreams, not the whole clear range.
-            Self::clear_retention_temp_hour(&mut conn, hour).await?;
-
-            // Snapshot the pre-clear top lists once per hour. Each chunk writes
-            // `pre_clear + cumulative temp counts` (replacing the previous
-            // chunk's value), so writing every chunk is crash-safe without
-            // double counting. A live `rollup_client_names` flip is still
-            // honoured because `merge_hour_rollup` re-reads the live policy
-            // inside each chunk transaction.
-            let existing_rollups = load_existing_rollups(&mut conn, &[hour]).await?;
-            let existing_tops = existing_rollups.get(&hour).cloned().unwrap_or_default();
+            // Whether this hour already has a rollup row before the clear
+            // touches it. If it does and the row disappears while the clear is
+            // running (rollup retention), later chunks must not resurrect it.
+            let hour_had_rollup: i64 =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM stats_hourly WHERE hour = ?)")
+                    .bind(hour)
+                    .fetch_one(&mut *conn)
+                    .await?;
+            let mut allow_insert = hour_had_rollup == 0;
 
             let hour_upper = (hour_end, i64::MIN);
             let mut lower = (hour_start, i64::MIN);
@@ -574,15 +600,26 @@ impl StatsDb {
                 .await?;
                 let (upper, done) = boundary.map_or((hour_upper, true), |cursor| (cursor, false));
 
+                // This path merges only the chunk's own counts, so the temp
+                // tables are cleared before every chunk (they hold at most one
+                // chunk of distinct values).
+                Self::clear_retention_temp_hour(&mut conn, hour).await?;
+                let base = ChunkRollupBase::CurrentRow { allow_insert };
                 let deleted = self
                     .rollup_and_delete_chunk(
                         &mut conn,
                         &RetentionChunk { hour, lower, upper },
-                        &existing_tops,
+                        &base,
                         done,
                         rollup_client_names,
                     )
                     .await?;
+                if deleted > 0 {
+                    // A row now exists (either the pre-existing one or one this
+                    // clear inserted); a later disappearance is an external
+                    // delete, not a missing first insert.
+                    allow_insert = false;
+                }
                 report.deleted_records = report.deleted_records.saturating_add(deleted);
                 report.chunks = report.chunks.saturating_add(1);
 
@@ -600,11 +637,17 @@ impl StatsDb {
     /// Aggregates and deletes one row-bounded `(ts, id)` chunk. The exact
     /// accumulated top lists are written on every chunk so a crash cannot lose
     /// contributions from already-deleted rows.
+    ///
+    /// `base` selects how the chunk's top lists are merged:
+    /// [`ChunkRollupBase::Snapshot`] for retention's cumulative sweep, and
+    /// [`ChunkRollupBase::CurrentRow`] for the keep-aggregates clear, which
+    /// re-reads the live row inside this transaction so a concurrent rollup
+    /// writer's contribution is merged rather than replaced.
     pub(super) async fn rollup_and_delete_chunk(
         &self,
         conn: &mut SqliteConnection,
         chunk: &RetentionChunk,
-        existing_tops: &(Option<String>, Option<String>, Option<String>),
+        base: &ChunkRollupBase,
         final_hour: bool,
         rollup_client_names: bool,
     ) -> Result<u64, StatsError> {
@@ -637,6 +680,13 @@ impl StatsDb {
         let cached: i64 = row.get::<Option<i64>, _>("cached").unwrap_or(0);
         let max_seen_id = row.get::<Option<i64>, _>("max_id").unwrap_or(0);
         let max_seen_ts = row.get::<Option<i64>, _>("max_ts").unwrap_or(0);
+
+        // A bounded clear can discover a chunk whose rows were removed by a
+        // concurrent writer. Do not create or increment a rollup for zero rows.
+        if queries == 0 && matches!(base, ChunkRollupBase::CurrentRow { .. }) {
+            drop(tx);
+            return Ok(0);
+        }
 
         // Accumulate exact per-hour counts for this chunk. The temp tables are
         // updated in the same transaction as the delete, so a crash cannot
@@ -715,32 +765,57 @@ impl StatsDb {
 
         // Write the accumulated top lists on every chunk, not only the final
         // one. If the process dies after a non-final chunk, the top-list
-        // contributions of the deleted rows are already durable; the next
-        // sweep merges the remaining rows into them.
+        // contributions of the deleted rows are already durable.
         let tops = Self::load_temp_hour_tops(&mut tx, hour).await?;
-        let merged = self.merge_hour_rollup(existing_tops.clone(), tops, rollup_client_names);
-        sqlx::query(
-            r"
-            INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients, top_upstreams)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(hour) DO UPDATE SET
-                queries = queries + excluded.queries,
-                blocked = blocked + excluded.blocked,
-                cached = cached + excluded.cached,
-                top_domains = excluded.top_domains,
-                top_clients = excluded.top_clients,
-                top_upstreams = excluded.top_upstreams
-            ",
-        )
-        .bind(hour)
-        .bind(queries)
-        .bind(blocked)
-        .bind(cached)
-        .bind(encode_tops(&merged.domains))
-        .bind(encode_tops(&merged.clients))
-        .bind(encode_tops(&merged.upstreams))
-        .execute(&mut *tx)
-        .await?;
+        let (baseline, write_rollup) = match base {
+            ChunkRollupBase::Snapshot(snapshot) => (snapshot.clone(), true),
+            ChunkRollupBase::CurrentRow { allow_insert } => {
+                // Re-read inside this transaction: a concurrent retention
+                // update committed before `BEGIN IMMEDIATE` is preserved, and
+                // no writer can interleave until this transaction ends.
+                let current: Option<StoredTops> = sqlx::query_as(
+                    r"
+                    SELECT top_domains, top_clients, top_upstreams
+                    FROM stats_hourly WHERE hour = ?
+                    ",
+                )
+                .bind(hour)
+                .fetch_optional(&mut *tx)
+                .await?;
+                match current {
+                    Some(stored) => (stored, true),
+                    // The row was deleted after this clear observed it (for
+                    // example by rollup retention). Delete the detailed rows
+                    // but do not resurrect a rollup row that retention removed.
+                    None => (StoredTops::default(), *allow_insert),
+                }
+            }
+        };
+        if write_rollup {
+            let merged = self.merge_hour_rollup(baseline, tops, rollup_client_names);
+            sqlx::query(
+                r"
+                INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients, top_upstreams)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(hour) DO UPDATE SET
+                    queries = queries + excluded.queries,
+                    blocked = blocked + excluded.blocked,
+                    cached = cached + excluded.cached,
+                    top_domains = excluded.top_domains,
+                    top_clients = excluded.top_clients,
+                    top_upstreams = excluded.top_upstreams
+                ",
+            )
+            .bind(hour)
+            .bind(queries)
+            .bind(blocked)
+            .bind(cached)
+            .bind(encode_tops(&merged.domains))
+            .bind(encode_tops(&merged.clients))
+            .bind(encode_tops(&merged.upstreams))
+            .execute(&mut *tx)
+            .await?;
+        }
 
         // Delete exactly the rows that were aggregated above (same predicate in
         // the same transaction).
@@ -981,6 +1056,22 @@ mod tests {
         );
         assert_eq!(detailed_rows(&db).await, 0);
 
+        // The watermark is a diagnostic: it records the highest id/ts seen and
+        // a backdated (older-ts) row must not lower it. It is never read to
+        // skip rows.
+        let (last_id, last_ts): (i64, i64) = sqlx::query_as(
+            "SELECT last_id, last_ts FROM stats_watermark WHERE key = 'hourly_aggregation'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(last_id > 0);
+        assert_eq!(
+            last_ts,
+            hour + 200,
+            "the watermark keeps the highest processed timestamp"
+        );
+
         // Idempotent rerun: nothing left to aggregate, no totals change.
         assert_eq!(db.delete_query_logs_keep_aggregates().await.unwrap(), 0);
         assert_eq!(hour_totals(&db, hour).await, (3, 1, 0));
@@ -1193,6 +1284,438 @@ mod tests {
         if let Ok(meta) = std::fs::metadata(&wal_path) {
             assert_eq!(meta.len(), 0, "the WAL must be truncated after the clear");
         }
+
+        db.pool().close().await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// B5 fix: `i64::MIN` and negative timestamps must neither panic nor wrap.
+    /// The unrepresentable bucket below `i64::MIN` is clamped, negative
+    /// timestamps are floored, and exact hour-boundary rows land in the right
+    /// bucket.
+    #[tokio::test]
+    async fn test_keep_aggregates_clear_handles_extreme_and_boundary_timestamps() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let h = hour_of(1_600_000_000_000);
+        db.insert_batch(&[
+            entry(i64::MIN, "min.example", "allowed"),
+            entry(i64::MIN + 1, "min.example", "blocked"),
+            entry(i64::MIN + HOUR_MS - 1, "min.example", "allowed"),
+            entry(i64::MIN + HOUR_MS, "next-min.example", "allowed"),
+            entry(-1, "neg-zero.example", "allowed"),
+            entry(-HOUR_MS, "neg-hour.example", "blocked"),
+            entry(-HOUR_MS - 1, "neg-prev.example", "allowed"),
+            entry(h, "boundary.example", "allowed"),
+            entry(h + HOUR_MS - 1, "boundary.example", "allowed"),
+            entry(h + HOUR_MS, "next-boundary.example", "allowed"),
+            entry(h + HOUR_MS + 1, "next-boundary.example", "blocked"),
+        ])
+        .await
+        .unwrap();
+
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.rollup_and_delete_range(i64::MIN, i64::MAX, false),
+        )
+        .await
+        .expect("i64::MIN must not panic or spin hour discovery")
+        .unwrap();
+        assert_eq!(report.deleted_records, 11);
+        assert_eq!(report.aggregated_hours, 6);
+        assert_eq!(detailed_rows(&db).await, 0);
+
+        // The first 775,808 ms above `i64::MIN` belong to the unrepresentable
+        // bucket below it and are clamped to `i64::MIN`; the next representable
+        // bucket starts at `i64::MIN + 775_808` (`-9223372036854000000`).
+        assert_eq!(hour_totals(&db, i64::MIN).await, (2, 1, 0));
+        assert_eq!(hour_totals(&db, i64::MIN + 775_808).await, (2, 0, 0));
+        assert_eq!(hour_totals(&db, -HOUR_MS).await, (2, 1, 0));
+        assert_eq!(hour_totals(&db, -2 * HOUR_MS).await, (1, 0, 0));
+        assert_eq!(hour_totals(&db, h).await, (2, 0, 0));
+        assert_eq!(hour_totals(&db, h + HOUR_MS).await, (2, 1, 0));
+    }
+
+    /// B5 fix: the shared hour-bucket helper is also used by retention, so the
+    /// retention sweep must handle `i64::MIN` and negative timestamps too.
+    #[tokio::test]
+    async fn test_retention_handles_extreme_and_negative_timestamps() {
+        let db = StatsDb::in_memory().await.unwrap();
+        db.insert_batch(&[
+            entry(i64::MIN, "ret-min.example", "allowed"),
+            entry(i64::MIN + 1, "ret-min.example", "blocked"),
+            entry(-1, "ret-neg.example", "allowed"),
+            entry(-HOUR_MS, "ret-neg.example", "allowed"),
+        ])
+        .await
+        .unwrap();
+
+        let report = db.cleanup_detailed_retention(90).await.unwrap();
+        assert_eq!(report.deleted_records, 4);
+        assert_eq!(report.aggregated_hours, 2);
+        assert_eq!(detailed_rows(&db).await, 0);
+        assert_eq!(hour_totals(&db, i64::MIN).await, (2, 1, 0));
+        assert_eq!(hour_totals(&db, -HOUR_MS).await, (2, 0, 0));
+    }
+
+    /// B5 fix: after a mid-hour failure the stored rollup has partial top
+    /// lists. The retry must merge the remaining chunks into that live row
+    /// (per-chunk deltas), not replace them with only the remaining rows.
+    #[tokio::test]
+    async fn test_keep_aggregates_clear_resume_preserves_top_lists() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let h = hour_of(1_600_000_000_000);
+        let rows = 3 * RETENTION_ROWS_PER_CHUNK;
+
+        // 27 heavy hits: 18 in the first two chunks, 9 in the failed third
+        // chunk. A single-domain counter test cannot see the top-list loss.
+        let mut heavy = std::collections::HashSet::new();
+        for k in 0..18 {
+            heavy.insert(k * 500);
+        }
+        for k in 0..9 {
+            heavy.insert(10_000 + k * 500);
+        }
+        let entries: Vec<QueryLogEntry> = (0..rows)
+            .map(|i| {
+                if heavy.contains(&i) {
+                    entry(h + i, "heavy.example", "allowed")
+                } else {
+                    entry(h + i, &format!("light-{i}.example"), "allowed")
+                }
+            })
+            .collect();
+        db.insert_batch(&entries).await.unwrap();
+
+        sqlx::query("CREATE TABLE clear_fail_counter (n INTEGER NOT NULL)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO clear_fail_counter (n) VALUES (0)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            r"
+            CREATE TRIGGER fail_clear_third_chunk
+            BEFORE INSERT ON stats_hourly
+            BEGIN
+                UPDATE clear_fail_counter SET n = n + 1;
+                SELECT CASE
+                    WHEN (SELECT n FROM clear_fail_counter) > 2
+                    THEN RAISE(ABORT, 'injected clear failure')
+                END;
+            END
+            ",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(
+            db.rollup_and_delete_range(i64::MIN, i64::MAX, false)
+                .await
+                .is_err()
+        );
+        let partial = hour_top_domains(&db, h).await;
+        assert_eq!(
+            partial
+                .iter()
+                .find(|(qname, _, _)| qname == "heavy.example")
+                .map(|(_, total, _)| *total),
+            Some(18),
+            "the two committed chunks must have stored 18 heavy hits: {partial:?}"
+        );
+
+        sqlx::query("DROP TRIGGER fail_clear_third_chunk")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let report = db
+            .rollup_and_delete_range(i64::MIN, i64::MAX, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.deleted_records,
+            u64::try_from(RETENTION_ROWS_PER_CHUNK).unwrap()
+        );
+        assert_eq!(hour_totals(&db, h).await, (rows, 0, 0));
+        let tops = hour_top_domains(&db, h).await;
+        assert_eq!(
+            tops.iter()
+                .find(|(qname, _, _)| qname == "heavy.example")
+                .map(|(_, total, _)| *total),
+            Some(27),
+            "the retry must add the remaining 9 heavy hits to the stored 18: {tops:?}"
+        );
+        assert_eq!(detailed_rows(&db).await, 0);
+    }
+
+    async fn run_clear_chunk(
+        db: &StatsDb,
+        hour: i64,
+        lower: (i64, i64),
+        upper: (i64, i64),
+        allow_insert: bool,
+    ) -> u64 {
+        let mut conn = db.pool.acquire().await.unwrap();
+        StatsDb::ensure_retention_temp_tables(&mut conn)
+            .await
+            .unwrap();
+        StatsDb::clear_retention_temp_hour(&mut conn, hour)
+            .await
+            .unwrap();
+        db.rollup_and_delete_chunk(
+            &mut conn,
+            &RetentionChunk { hour, lower, upper },
+            &ChunkRollupBase::CurrentRow { allow_insert },
+            true,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// B5 fix: a concurrent rollup writer (retention) may update `stats_hourly`
+    /// between two clear chunks. The next chunk must merge that live row, not
+    /// replace it with a pre-run snapshot.
+    #[tokio::test]
+    async fn test_keep_aggregates_clear_merges_concurrent_rollup_update() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let h = hour_of(1_600_000_000_000);
+        sqlx::query(
+            "INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients, top_upstreams) \
+             VALUES (?, 5, 0, 0, ?, '[]', '[]')",
+        )
+        .bind(h)
+        .bind(r#"[["baseline.example",5,0]]"#)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let entries: Vec<QueryLogEntry> = (0..10)
+            .map(|i| entry(h + i, "clear.example", "allowed"))
+            .collect();
+        db.insert_batch(&entries).await.unwrap();
+
+        let deleted = run_clear_chunk(&db, h, (h, i64::MIN), (h + 5, i64::MIN), false).await;
+        assert_eq!(deleted, 5);
+        assert_eq!(hour_totals(&db, h).await, (10, 0, 0));
+
+        // Simulate retention committing an unrelated update before the next
+        // clear chunk begins. Its +2 and external domain must survive.
+        sqlx::query(
+            "UPDATE stats_hourly SET queries = queries + 2, top_domains = ? WHERE hour = ?",
+        )
+        .bind(r#"[["clear.example",5,0],["baseline.example",5,0],["external.example",2,0]]"#)
+        .bind(h)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let deleted = run_clear_chunk(&db, h, (h + 5, i64::MIN), (h + 10, i64::MIN), false).await;
+        assert_eq!(deleted, 5);
+        assert_eq!(
+            hour_totals(&db, h).await,
+            (17, 0, 0),
+            "clear counters add to the concurrent update (5 + 5 + 2 + 5)"
+        );
+        let tops: std::collections::HashMap<String, i64> = hour_top_domains(&db, h)
+            .await
+            .into_iter()
+            .map(|(qname, total, _)| (qname, total))
+            .collect();
+        assert_eq!(tops.get("clear.example"), Some(&10));
+        assert_eq!(tops.get("baseline.example"), Some(&5));
+        assert_eq!(
+            tops.get("external.example"),
+            Some(&2),
+            "a concurrent rollup update must not be replaced by stale top lists"
+        );
+        assert_eq!(detailed_rows(&db).await, 0);
+    }
+
+    /// B5 fix: if rollup retention deletes the row between clear chunks, later
+    /// chunks must delete the detailed rows without resurrecting the rollup.
+    /// Zero-row chunks must not create an empty rollup either.
+    #[tokio::test]
+    async fn test_keep_aggregates_clear_does_not_resurrect_deleted_rollup() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let h = hour_of(1_600_000_000_000);
+        sqlx::query(
+            "INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients, top_upstreams) \
+             VALUES (?, 1, 0, 0, '[]', '[]', '[]')",
+        )
+        .bind(h)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let entries: Vec<QueryLogEntry> = (0..10)
+            .map(|i| entry(h + i, "gone.example", "allowed"))
+            .collect();
+        db.insert_batch(&entries).await.unwrap();
+
+        assert_eq!(
+            run_clear_chunk(&db, h, (h, i64::MIN), (h + 5, i64::MIN), false).await,
+            5
+        );
+        sqlx::query("DELETE FROM stats_hourly WHERE hour = ?")
+            .bind(h)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            run_clear_chunk(&db, h, (h + 5, i64::MIN), (h + 10, i64::MIN), false).await,
+            5
+        );
+        let rollups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_hourly WHERE hour = ?")
+            .bind(h)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rollups, 0, "a deleted rollup must not be re-created");
+        assert_eq!(detailed_rows(&db).await, 0);
+
+        // Empty-range chunk with insertion allowed: still no empty rollup row.
+        assert_eq!(
+            run_clear_chunk(&db, h, (h + 100, i64::MIN), (h + 200, i64::MIN), true).await,
+            0
+        );
+        let rollups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_hourly WHERE hour = ?")
+            .bind(h)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rollups, 0, "zero-row chunks must not create a rollup");
+    }
+
+    /// B5 fix: a live API/UI clear and the retention scheduler share the
+    /// in-process maintenance lock. Whichever runs first, rollup totals and
+    /// top lists must be preserved exactly once.
+    #[tokio::test]
+    async fn test_keep_aggregates_clear_and_retention_serialize() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let old_hour = hour_of(now - 100 * 86_400_000);
+        let recent_hour = hour_of(now - 86_400_000);
+        let mut entries = Vec::new();
+        for i in 0..5 {
+            entries.push(entry(old_hour + i, "old.example", "allowed"));
+        }
+        for i in 0..7 {
+            entries.push(entry(
+                recent_hour + i,
+                "recent.example",
+                if i == 0 { "blocked" } else { "allowed" },
+            ));
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let retention = db.cleanup_retention_with_policy(90, 365, false);
+        let clear = db.delete_query_logs_with_policy(true, false);
+        let (retention, clear) = tokio::join!(retention, clear);
+        retention.unwrap();
+        clear.unwrap();
+
+        assert_eq!(detailed_rows(&db).await, 0);
+        let (total_queries, total_blocked): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(queries), 0), COALESCE(SUM(blocked), 0) FROM stats_hourly",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(total_queries, 12, "no row may be lost or double counted");
+        assert_eq!(total_blocked, 1);
+        assert_eq!(hour_totals(&db, old_hour).await, (5, 0, 0));
+        assert_eq!(hour_totals(&db, recent_hour).await, (7, 1, 0));
+        assert_eq!(
+            hour_top_domains(&db, old_hour).await,
+            vec![("old.example".to_string(), 5, 0)]
+        );
+        assert_eq!(
+            hour_top_domains(&db, recent_hour).await,
+            vec![("recent.example".to_string(), 7, 1)]
+        );
+    }
+
+    /// B5 minor: a clear that is resumed in sub-threshold runs still vacuums on
+    /// the run that completes it, even when that run deleted fewer than the
+    /// normal 1,000-row threshold.
+    #[tokio::test]
+    async fn test_keep_aggregates_clear_retry_vacuums_on_completion() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-clear-retry-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        let padding = "x".repeat(200);
+        let h0 = hour_of(1_600_000_000_000);
+        let h1 = h0 + HOUR_MS;
+        let mut entries = Vec::new();
+        for i in 0..900i64 {
+            let mut e = entry(h0 + i, "retry-vacuum.example", "allowed");
+            e.rule = Some(format!("{padding}-a{i}"));
+            entries.push(e);
+        }
+        for i in 0..900i64 {
+            let mut e = entry(h1 + i, "retry-vacuum.example", "allowed");
+            e.rule = Some(format!("{padding}-b{i}"));
+            entries.push(e);
+        }
+        db.insert_batch(&entries).await.unwrap();
+        db.vacuum().await.unwrap();
+        let before = db.db_size_bytes().await.unwrap();
+
+        // Fail the second hour's only chunk, so the first run deletes 900
+        // rows (< the 1,000 threshold) and the retry deletes the rest.
+        sqlx::query("CREATE TABLE clear_fail_counter (n INTEGER NOT NULL)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO clear_fail_counter (n) VALUES (0)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            r"
+            CREATE TRIGGER fail_clear_second_hour
+            BEFORE INSERT ON stats_hourly
+            BEGIN
+                UPDATE clear_fail_counter SET n = n + 1;
+                SELECT CASE
+                    WHEN (SELECT n FROM clear_fail_counter) > 1
+                    THEN RAISE(ABORT, 'injected clear failure')
+                END;
+            END
+            ",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(db.delete_query_logs_keep_aggregates().await.is_err());
+        assert_eq!(detailed_rows(&db).await, 900);
+        sqlx::query("DROP TRIGGER fail_clear_second_hour")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        // The completing run deletes 900 rows: below the threshold, but the
+        // detailed log is now empty, so the clear must vacuum anyway.
+        assert_eq!(db.delete_query_logs_keep_aggregates().await.unwrap(), 900);
+        let freelist: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(freelist, 0, "the completing retry must vacuum");
+        let after = db.db_size_bytes().await.unwrap();
+        assert!(
+            after < before,
+            "the vacuumed database must shrink (before={before}, after={after})"
+        );
+        assert_eq!(
+            hour_totals(&db, h0).await.0 + hour_totals(&db, h1).await.0,
+            1_800
+        );
 
         db.pool().close().await;
         let _ = std::fs::remove_dir_all(&temp_dir);

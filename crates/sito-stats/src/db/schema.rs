@@ -113,6 +113,7 @@ impl StatsDb {
             db_path,
             salt: Arc::new(salt),
             rollup_client_names: Arc::new(AtomicBool::new(options.rollup_client_names)),
+            maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
             cache: Arc::new(StatsCache::default()),
         }
     }

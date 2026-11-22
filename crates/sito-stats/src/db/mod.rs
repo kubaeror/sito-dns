@@ -70,6 +70,9 @@ const LEGACY_ROLLUP_HASH_PREFIX: &str = "b3:";
 /// retention sweep and the bounded `keep_aggregates` clear.
 const RETENTION_ROWS_PER_CHUNK: i64 = 5_000;
 
+/// Length of one rollup bucket in milliseconds.
+const HOUR_MS: i64 = 3_600_000;
+
 /// Per-install salt file name under the stats data directory.
 const SALT_FILE_NAME: &str = "stats-salt";
 
@@ -154,6 +157,48 @@ struct RetentionChunk {
     hour: i64,
     lower: (i64, i64),
     upper: (i64, i64),
+}
+
+/// Floors a millisecond timestamp to its hour bucket and returns the
+/// `[start, end)` bounds.
+///
+/// A plain `ts.div_euclid(HOUR_MS) * HOUR_MS` is less than `i64::MIN` for
+/// `ts == i64::MIN`, which panics in debug builds and wraps into a bogus
+/// positive bucket in release builds. The `i128` intermediate makes the floor
+/// exact for every input. The unrepresentable start below `i64::MIN` is
+/// clamped to `i64::MIN`, and the end above `i64::MAX` is clamped to
+/// `i64::MAX`, so the representable part of the extreme buckets is still
+/// processed exactly once (only malformed timestamps can reach them).
+fn hour_bounds(ts: i64) -> (i64, i64) {
+    let start = i128::from(ts).div_euclid(i128::from(HOUR_MS)) * i128::from(HOUR_MS);
+    let end = start + i128::from(HOUR_MS);
+    (
+        i64::try_from(start).unwrap_or(i64::MIN),
+        i64::try_from(end).unwrap_or(i64::MAX),
+    )
+}
+
+/// Stored top lists for one `stats_hourly` row:
+/// `(top_domains, top_clients, top_upstreams)`.
+type StoredTops = (Option<String>, Option<String>, Option<String>);
+
+/// Where a rollup/delete chunk takes its baseline top lists from.
+enum ChunkRollupBase {
+    /// Normal retention: merge the chunk's cumulative temp counts into this
+    /// pre-sweep snapshot. Each chunk replaces the previous chunk's top lists,
+    /// so writing every chunk is crash-safe without double counting.
+    Snapshot(StoredTops),
+    /// Bounded keep-aggregates clear: re-read the current `stats_hourly` row
+    /// inside the chunk transaction and merge only this chunk's counts into it.
+    /// That preserves updates made by a concurrent rollup writer between
+    /// chunks (per-chunk deltas cannot replace those contributions).
+    CurrentRow {
+        /// Whether a missing row may be inserted. `false` when the row existed
+        /// at hour start but was deleted in the meantime: the clear only
+        /// deletes detailed rows then, and does not resurrect a rollup that
+        /// rollup retention removed.
+        allow_insert: bool,
+    },
 }
 
 /// Bounded per-hour rollup payloads extracted from rows about to be pruned.
@@ -387,6 +432,13 @@ pub struct StatsDb {
     /// and one-time rollup backfill. Shared across clones so a hot config
     /// apply changes the policy for every handle without a restart.
     rollup_client_names: Arc<AtomicBool>,
+    /// Serializes rollup-writing maintenance (retention sweeps and the
+    /// keep-aggregates clear) inside this process. Both paths read existing
+    /// rollup state and then replace top lists; without this lock a live API
+    /// clear could race the retention scheduler and overwrite each other's
+    /// contributions. The CLI path holds the service lease, so no cross-process
+    /// clear can run while the server (and its scheduler) is up.
+    maintenance_lock: Arc<tokio::sync::Mutex<()>>,
     cache: Arc<StatsCache>,
 }
 
@@ -434,7 +486,7 @@ fn filtered_query(base: &str, filter: &QueryLogFilter) -> sqlx::QueryBuilder<Sql
 
 /// Existing `stats_hourly` top lists for the hours being rolled up again:
 /// `hour -> (top_domains, top_clients, top_upstreams)`.
-type ExistingRollups = HashMap<i64, (Option<String>, Option<String>, Option<String>)>;
+type ExistingRollups = HashMap<i64, StoredTops>;
 
 /// Loads the already-stored top lists for the hours being rolled up. Queries
 /// are chunked so a very long retention period cannot exceed SQLite's bound

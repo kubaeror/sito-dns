@@ -530,10 +530,12 @@ WP-2.12 closes P2-55..P2-63 plus the P1-19/P1-23/P1-24 residuals. Error
 semantics exclude NXDOMAIN, mapped IPv6 is anonymized and deduplicated as
 IPv4, the live-tail clone is subscriber-gated, the dashboard cache is 30 s,
 `ignore_stats` covers every per-query metric family, and metric series are
-pruned/capped. The forward-only anonymization (P2-59), keep-aggregates
-whole-range clear (P2-61), 1M-row soak, `stats_watermark` role and per-verdict
-histogram contention (P2-62) are documented residuals in the retention/metrics
-module docs and `docs/configuration-reference.md`.
+pruned/capped. The forward-only anonymization (P2-59), the 1M-row soak,
+`stats_watermark` role and per-verdict histogram contention (P2-62) are
+documented residuals in the retention/metrics module docs and
+`docs/configuration-reference.md`. The P2-61 keep-aggregates whole-range clear
+was subsequently fixed by the 2.0 final chunked clear (row below is historical
+except for its resolution note).
 
 | Finding / acceptance | Named test / check | Focused command |
 |---|---|---|
@@ -543,7 +545,7 @@ module docs and `docs/configuration-reference.md`.
 | P2-58: IPv4-mapped IPv6 anonymizes as IPv4 `/24` and canonicalizes to one rollup identifier | `test_anonymize_ipv4_mapped_ipv6`, `test_rollup_hash_canonicalizes_ipv4_mapped_client` | `cargo test -p sito-stats anonymize_ipv4_mapped`; `cargo test -p sito-stats rollup_hash_canonicalizes` |
 | P2-59: anonymization remains forward-only; existing query-log rows are not rewritten (documented residual) | `test_writer_anonymize_ip_toggle`, `test_rollup_pii_hashes_client_ip_and_omits_names_by_default`; see `crates/sito-stats/src/anonymize.rs` and `docs/configuration-reference.md` | `cargo test -p sito-stats writer_anonymize_ip_toggle`; `cargo test -p sito-stats rollup_pii` |
 | P2-60: the live-tail broadcast clones only when a subscriber exists; the writer still receives the moved entry | `test_live_tail_clone_only_with_subscribers` | `cargo test -p sito-stats live_tail_clone` |
-| P2-61: normal retention is hour-bounded with per-hour temp tables; the `keep_aggregates` whole-range clear and its memory/lock cost are documented residuals | `test_retention_handles_multiple_hours_across_days`, `test_retention_concurrent_insert_does_not_drop_batches`, `test_delete_query_logs_keep_aggregates_preserves_rollups` | `cargo test -p sito-stats multiple_hours`; `cargo test -p sito-stats retention_concurrent_insert`; `cargo test -p sito-stats keep_aggregates` |
+| P2-61 (resolved in the 2.0 final pass): normal retention is hour-bounded with per-hour temp tables; the `keep_aggregates` clear is now equally bounded (5,000-row `(ts, id)` chunks, per-chunk commit, delta top-list merge, shared retention/clear lock, resumable) instead of a whole-range transaction | `test_retention_handles_multiple_hours_across_days`, `test_retention_concurrent_insert_does_not_drop_batches`, `test_keep_aggregates_clear_chunks_multiple_hours_and_preserves_rollups`, `test_keep_aggregates_clear_resumes_after_mid_run_failure`, `test_keep_aggregates_clear_resume_preserves_top_lists`, `test_keep_aggregates_clear_and_retention_serialize` | `cargo test -p sito-stats multiple_hours`; `cargo test -p sito-stats retention_concurrent_insert`; `cargo test -p sito-stats keep_aggregates_clear` |
 | P2-62: per-verdict/per-upstream histogram mutex is documented as bounded; the hot `allowed` path has a single-threaded benchmark and the concurrency test is the contention-losslessness evidence | `test_histogram_concurrent_updates_are_not_lost`; `metrics_bench::observe_query_duration` | `cargo test -p sito-stats histogram_concurrent`; `cargo bench -p sito-stats --bench metrics_bench -- observe_query_duration` |
 | P2-63: cache size is republished after flush/invalidate/apply, bogus series are pruned/capped, and the filter-rule gauge follows status updates | `test_cache_management_updates_size_gauge`, `test_dnssec_policy_change_flushes_response_cache`, `test_remove_upstream_health_prunes_dnssec_bogus_series`, `test_dnssec_bogus_cardinality_is_capped`, `test_filter_status_updates_rule_gauge`, `filter_status_metrics_includes_rule_count` | `cargo test -p sito-api cache_management`; `cargo test -p sito-api dnssec_policy_change_flushes`; `cargo test -p sito-stats dnssec_bogus`; `cargo test -p sito-stats remove_upstream_health_prunes`; `cargo test -p sito-stats filter_status_updates`; `cargo test -p sito filter_status_metrics_includes` |
 
