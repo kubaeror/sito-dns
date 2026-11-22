@@ -135,6 +135,13 @@ impl MasterCoordinator {
             tokio::select! {
                 // Outgoing messages queued for this slave
                 Some(msg) = rx.recv() => {
+                    if !self.is_serving() {
+                        debug!(
+                            instance = %session.state.slave_instance,
+                            "Master stopped serving; dropping queued HA push"
+                        );
+                        break;
+                    }
                     session.account_drained(wire_size(&msg));
                     if send_ha_message(&mut ws_stream, &msg, "master", "configuration push").await.is_err() {
                         break;
@@ -143,6 +150,9 @@ impl MasterCoordinator {
 
                 // Periodic ping + liveness watchdog
                 _ = ping_interval.tick() => {
+                    if !self.is_serving() {
+                        break;
+                    }
                     match session.heartbeat() {
                         HeartbeatAction::Superseded => {
                             debug!(

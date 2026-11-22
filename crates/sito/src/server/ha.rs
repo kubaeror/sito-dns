@@ -15,8 +15,6 @@ pub(super) struct HaRuntime {
     pub(super) resync_receiver: Option<tokio::sync::mpsc::Receiver<()>>,
     /// ADR-0010 write gate shared with the API middleware.
     pub(super) write_gate: Arc<sito_api::state::HaWriteGate>,
-    /// Per-slave worker shutdown so a promotion can stop the slave role.
-    pub(super) slave_shutdown: Option<tokio::sync::watch::Sender<bool>>,
     /// Promotion runtime state (enabled only).
     pub(super) promotion: Option<Arc<PromotionRuntimeState>>,
     /// Coordinator created by an in-memory slave→master promotion, shared with
@@ -183,7 +181,8 @@ pub(super) fn init_ha(
         // promotion-enabled master gets its own shutdown switch so fencing can
         // stop accepting new slaves; the global shutdown is forwarded to it.
         let mut configured_master_shutdown = None;
-        let _master_server_handle = if ha_config.replication_port > 0 {
+        let mut configured_master_handle = None;
+        let master_server_handle = if ha_config.replication_port > 0 {
             let listener_shutdown = if promotion_enabled {
                 let (tx, rx) = watch::channel(false);
                 let mut global = shutdown_rx.clone();
@@ -213,6 +212,11 @@ pub(super) fn init_ha(
         } else {
             None
         };
+        if promotion_enabled {
+            configured_master_handle = master_server_handle;
+        } else {
+            let _master_server_handle = master_server_handle;
+        }
 
         let promotion = promotion_enabled.then(|| {
             Arc::new(PromotionRuntimeState {
@@ -227,6 +231,7 @@ pub(super) fn init_ha(
                 tracker: None,
                 slave_shutdown: Mutex::new(None),
                 master_shutdown: Mutex::new(configured_master_shutdown),
+                master_handle: Mutex::new(configured_master_handle),
                 live_config: Mutex::new(None),
                 slave_handle: Mutex::new(None),
                 master_slot: Arc::clone(&promoted_master),
@@ -275,6 +280,7 @@ pub(super) fn init_ha(
                 tracker: Some(tracker.clone()),
                 slave_shutdown: Mutex::new(None),
                 master_shutdown: Mutex::new(None),
+                master_handle: Mutex::new(None),
                 live_config: Mutex::new(None),
                 slave_handle: Mutex::new(None),
                 master_slot: Arc::clone(&promoted_master),
@@ -298,7 +304,6 @@ pub(super) fn init_ha(
         resync_sender,
         resync_receiver,
         write_gate,
-        slave_shutdown: None,
         promotion,
         promoted_master,
     })

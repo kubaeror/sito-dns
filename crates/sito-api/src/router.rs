@@ -581,6 +581,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_promoted_effective_master_is_healthy() {
+        let temp_dir = crate::test_support::temp_dir("sito_health_promoted_master");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let key = std::sync::Arc::new(sito_ha::Ed25519SigningKey::generate().unwrap());
+        let coordinator = sito_ha::MasterCoordinator::new(
+            "promoted".to_string(),
+            1,
+            key,
+            sito_stats::MetricsRegistry::new("2.0.0", "test"),
+        );
+        coordinator.mark_replication_ready();
+        ctx.promoted_master_coordinator
+            .lock()
+            .unwrap()
+            .replace(coordinator);
+        ctx.ha_write_gate.mark_effective_master();
+        ctx.ha_write_gate.allow();
+
+        let (status, _) = health_body(ctx).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_health_not_ready_while_promotion_gate_is_blocked() {
         let temp_dir = crate::test_support::temp_dir("sito_health_promotion_gate");
         let ctx = crate::test_support::mock_context(&temp_dir).await;

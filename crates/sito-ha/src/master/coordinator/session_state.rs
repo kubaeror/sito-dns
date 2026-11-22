@@ -79,6 +79,12 @@ impl<'a> SessionMachine<'a> {
         peer_addr: SocketAddr,
         hello: HelloFields,
     ) -> Result<Self, String> {
+        if !coordinator.is_serving() {
+            return Err(
+                "fenced: the master is not serving replication; new slave sessions are refused"
+                    .to_string(),
+            );
+        }
         let HelloFields {
             instance: slave_instance,
             have_version,
@@ -275,6 +281,16 @@ impl<'a> SessionMachine<'a> {
             self.coordinator
                 .metrics
                 .set_ha_config_version(slave_instance, 0.0);
+        }
+
+        // A node that is read-only/quiescing/fenced must not replicate, even if
+        // it accepted the TCP/WebSocket handshake before the gate closed.
+        if !self.coordinator.is_serving() {
+            info!(
+                instance = %slave_instance,
+                "Master is not serving replication; refusing to enqueue a push"
+            );
+            return rx;
         }
 
         // Hello-only reconciliation mode accepts the connection and records

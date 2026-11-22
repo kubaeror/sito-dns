@@ -36,6 +36,7 @@ pub(super) struct PromotionRuntimeState {
     pub(super) tracker: Option<SlaveStatusTracker>,
     pub(super) slave_shutdown: Mutex<Option<watch::Sender<bool>>>,
     pub(super) master_shutdown: Mutex<Option<watch::Sender<bool>>>,
+    pub(super) master_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(super) live_config: Mutex<Option<Arc<ArcSwap<Config>>>>,
     pub(super) slave_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(super) master_slot: Arc<Mutex<Option<MasterCoordinator>>>,
@@ -61,11 +62,17 @@ impl PromotionRuntimeState {
     }
 
     fn signing_key(&self) -> Option<Arc<Ed25519SigningKey>> {
-        self.signing_key.lock().ok()?.clone()
+        self.signing_key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn coordinator(&self) -> Option<MasterCoordinator> {
-        self.coordinator.lock().ok()?.clone()
+        self.coordinator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -296,12 +303,18 @@ async fn stop_slave_worker(state: &PromotionRuntimeState) {
 fn candidate_eligibility(
     tracker: &SlaveStatusTracker,
     state_path: &std::path::Path,
+    cluster_id: Option<&str>,
+    node_id: Option<&str>,
     identity_mismatch: bool,
 ) -> Eligibility {
     let watermark = tracker.get_watermark();
     let applied_term = watermark.as_ref().map_or(0, |watermark| watermark.term);
     let applied_version = watermark.as_ref().map_or(0, |watermark| watermark.version);
-    let loaded = HaStateStore::new(state_path.to_path_buf()).load();
+    let mut store = HaStateStore::new(state_path.to_path_buf());
+    if let (Some(cluster_id), Some(node_id)) = (cluster_id, node_id) {
+        store = store.with_identity(cluster_id, node_id);
+    }
+    let loaded = store.load();
     let foreign_or_stale_state = match loaded {
         Ok(LoadedState::Missing) => false,
         Ok(loaded @ LoadedState::Present { .. }) => {
@@ -451,7 +464,13 @@ impl PromotionHost for RuntimePromotionHost {
         let Some(tracker) = self.state.tracker.as_ref() else {
             return Eligibility::default();
         };
-        candidate_eligibility(tracker, &self.state.state_path(), self.key().is_err())
+        candidate_eligibility(
+            tracker,
+            &self.state.state_path(),
+            self.state.ha_config.promotion.cluster_id.as_deref(),
+            self.state.ha_config.promotion.node_id.as_deref(),
+            self.key().is_err(),
+        )
     }
 
     fn master_alive(&self) -> bool {
@@ -462,6 +481,12 @@ impl PromotionHost for RuntimePromotionHost {
     }
 
     fn set_writable(&self, writable: bool, reason: Option<String>) {
+        if let Some(coordinator) = self.state.coordinator() {
+            coordinator.set_serving(writable);
+            if !writable {
+                coordinator.close_all_sessions();
+            }
+        }
         if writable {
             self.state.write_gate.allow();
         } else if reason
@@ -485,8 +510,12 @@ impl PromotionHost for RuntimePromotionHost {
                 return Ok(());
             }
             if let Some(coordinator) = self.state.coordinator() {
-                if let Ok(mut slot) = self.state.master_slot.lock() {
-                    *slot = Some(coordinator);
+                match self.state.master_slot.lock() {
+                    Ok(mut slot) => *slot = Some(coordinator),
+                    Err(poisoned) => {
+                        poisoned.into_inner().take();
+                        return Err("promotion coordinator slot poisoned".to_string());
+                    }
                 }
                 self.state.write_gate.mark_effective_master();
                 return Ok(());
@@ -513,8 +542,9 @@ impl PromotionHost for RuntimePromotionHost {
                 self.state.ha_config.require_slaves,
                 self.state.ha_config.require_all_slaves,
             );
+            coordinator.set_serving(false);
             let (master_shutdown_tx, master_shutdown_rx) = watch::channel(false);
-            let _handle = sito_ha::spawn_master_server(
+            let handle = sito_ha::spawn_master_server(
                 self.state.ha_config.clone(),
                 coordinator.clone(),
                 master_shutdown_rx,
@@ -522,14 +552,24 @@ impl PromotionHost for RuntimePromotionHost {
             if let Ok(mut slot) = self.state.master_shutdown.lock() {
                 *slot = Some(master_shutdown_tx);
             }
+            if let Ok(mut slot) = self.state.master_handle.lock() {
+                *slot = Some(handle);
+            }
             *self
                 .state
                 .coordinator
                 .lock()
                 .map_err(|_| "promotion coordinator lock poisoned".to_string())? =
                 Some(coordinator.clone());
-            if let Ok(mut slot) = self.state.master_slot.lock() {
-                *slot = Some(coordinator);
+            match self.state.master_slot.lock() {
+                Ok(mut slot) => *slot = Some(coordinator),
+                Err(poisoned) => {
+                    // A poisoned slot cannot be trusted to receive normal
+                    // publishes; keep the node read-only rather than report a
+                    // writable-but-not-replicating master.
+                    poisoned.into_inner().take();
+                    return Err("promotion coordinator slot poisoned".to_string());
+                }
             }
             self.state.write_gate.mark_effective_master();
             info!("Promoted node switched to the master replication role");
@@ -539,7 +579,9 @@ impl PromotionHost for RuntimePromotionHost {
 
     fn begin_hello_only(&self) -> sito_ha::promotion::BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
-            self.coordinator()?.begin_hello_only();
+            let coordinator = self.coordinator()?;
+            coordinator.set_serving(false);
+            coordinator.begin_hello_only();
             Ok(())
         })
     }
@@ -570,9 +612,14 @@ impl PromotionHost for RuntimePromotionHost {
             if let Ok(LoadedState::Present { bookkeeping, .. }) = store.load() {
                 coordinator.set_promotion_bookkeeping(bookkeeping);
             }
-            coordinator
+            // The first push is the one publish allowed while the API gate is
+            // still closed. It is enabled only for the duration of this call.
+            coordinator.set_serving(true);
+            let result = coordinator
                 .publish_promoted_bundle(prepared.bundle)
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string());
+            coordinator.set_serving(false);
+            result
         })
     }
 
@@ -592,6 +639,12 @@ impl PromotionHost for RuntimePromotionHost {
     }
 
     fn stop_publishing(&self) {
+        // Synchronous serving flag first: an in-flight Hello/handshake must not
+        // enqueue a push after this returns, even before the listener joins.
+        if let Some(coordinator) = self.state.coordinator() {
+            coordinator.set_serving(false);
+            coordinator.close_all_sessions();
+        }
         if let Some(tx) = self
             .state
             .master_shutdown
@@ -601,8 +654,16 @@ impl PromotionHost for RuntimePromotionHost {
         {
             let _ = tx.send(true);
         }
-        if let Some(coordinator) = self.state.coordinator() {
-            coordinator.close_all_sessions();
+        if let Some(handle) = self
+            .state
+            .master_handle
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        {
+            tokio::spawn(async move {
+                let _ = handle.await;
+            });
         }
     }
 
@@ -647,6 +708,7 @@ mod tests {
             tracker: None,
             slave_shutdown: Mutex::new(None),
             master_shutdown: Mutex::new(None),
+            master_handle: Mutex::new(None),
             live_config: Mutex::new(None),
             slave_handle: Mutex::new(None),
             master_slot: Arc::new(Mutex::new(None)),
@@ -657,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn role_switch_waits_for_the_slave_worker_to_exit() {
-        let state = test_state("handoff_wait");
+        let mut state = test_state("handoff_wait");
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
         let handle = tokio::spawn(async move {
@@ -666,8 +728,20 @@ mod tests {
         });
         *state.slave_handle.lock().unwrap() = Some(handle);
 
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        {
+            let state = Arc::get_mut(&mut state).expect("unique test state");
+            state.signing_key.lock().unwrap().replace(key.clone());
+            state.ha_config.master_pubkey = Some(key.public_key_hex());
+            state.ha_config.replication_port = 0;
+        }
+        let host = RuntimePromotionHost {
+            state: Arc::clone(&state),
+        };
         let started = std::time::Instant::now();
-        stop_slave_worker(&state).await;
+        host.switch_role(EffectiveRole::Master)
+            .await
+            .expect("role switch");
         assert!(
             stopped.load(Ordering::SeqCst),
             "the handoff must wait for the worker join, not just send shutdown"
@@ -698,14 +772,16 @@ mod tests {
         let path = state.state_path();
 
         write_legacy_state(&path, 2, 9);
-        let eligibility = candidate_eligibility(&tracker, &path, false);
+        let eligibility =
+            candidate_eligibility(&tracker, &path, Some("home-dns"), Some("node-b"), false);
         assert!(
             eligibility.foreign_or_stale_state,
             "a legacy state ahead of the watermark must block candidacy"
         );
 
         write_legacy_state(&path, 1, 5);
-        let eligibility = candidate_eligibility(&tracker, &path, false);
+        let eligibility =
+            candidate_eligibility(&tracker, &path, Some("home-dns"), Some("node-b"), false);
         assert!(!eligibility.foreign_or_stale_state);
         assert!(
             eligibility.restart_required,
@@ -851,6 +927,7 @@ mod integration_tests {
             tracker: Some(tracker),
             slave_shutdown: Mutex::new(None),
             master_shutdown: Mutex::new(None),
+            master_handle: Mutex::new(None),
             live_config: Mutex::new(Some(Arc::new(ArcSwap::from_pointee(config.clone())))),
             slave_handle: Mutex::new(None),
             master_slot: master_slot.clone(),

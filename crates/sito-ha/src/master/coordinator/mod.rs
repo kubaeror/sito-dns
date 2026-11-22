@@ -276,6 +276,10 @@ pub struct MasterCoordinator {
     /// write carries the published baseline so a normal configuration publish
     /// cannot silently drop it.
     promotion_bookkeeping: Arc<Mutex<Option<crate::promotion::state::PromotionBookkeeping>>>,
+    /// True while the master listener may queue/push configuration bundles.
+    /// Cleared synchronously at the first fence/read-only transition, before
+    /// the listener shutdown is signalled.
+    serving: Arc<AtomicBool>,
     /// True while the master listener is in hello-only reconciliation mode:
     /// accept TLS/WebSocket and Hello, answer ping/pong, but send no
     /// `ConfigPush` and do not install the active bundle.

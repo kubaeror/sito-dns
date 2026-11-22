@@ -3294,3 +3294,49 @@ fn hello_only_blocks_normal_publishes_before_reconciliation() {
     coordinator.end_hello_only();
     assert_eq!(coordinator.update_bundle(test_bundle(3)).unwrap(), 3);
 }
+
+#[test]
+fn read_only_or_fenced_master_never_queues_a_push_for_an_inflight_hello() {
+    let coordinator = test_coordinator();
+    coordinator.update_bundle(test_bundle(2)).unwrap();
+    let hello = HelloFields {
+        instance: "inflight".to_string(),
+        have_version: 0,
+        have_term: 0,
+        capabilities: vec![],
+        token: None,
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: None,
+    };
+    let session = SessionMachine::admit(&coordinator, "127.0.0.1:1000".parse().unwrap(), hello)
+        .expect("serving master admits the handshake");
+
+    // The handshake was admitted, but the node becomes read-only/fenced before
+    // registration. It must not enqueue the already-active push.
+    coordinator.close_all_sessions();
+    assert!(!coordinator.is_serving());
+    let mut rx = session.register();
+    assert!(
+        rx.try_recv().is_err(),
+        "a fenced master must not push to an in-flight Hello"
+    );
+    coordinator.broadcast(&HaMessage::Ping { ts: 1 });
+    assert!(rx.try_recv().is_err());
+
+    // A new Hello after the fence is rejected outright.
+    let hello = HelloFields {
+        instance: "after-fence".to_string(),
+        have_version: 0,
+        have_term: 0,
+        capabilities: vec![],
+        token: None,
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: None,
+    };
+    let error = SessionMachine::admit(&coordinator, "127.0.0.1:1001".parse().unwrap(), hello)
+        .err()
+        .expect("fenced listener refuses new slave sessions");
+    assert!(error.contains("fenced"), "{error}");
+}

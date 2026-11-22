@@ -45,8 +45,24 @@ impl MasterCoordinator {
             require_slaves: Arc::new(AtomicBool::new(false)),
             require_all_slaves: Arc::new(AtomicBool::new(false)),
             promotion_bookkeeping: Arc::new(Mutex::new(None)),
+            serving: Arc::new(AtomicBool::new(true)),
             hello_only: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Sets whether the listener may serve configuration pushes.
+    ///
+    /// This is the synchronous replication half of the promotion write gate:
+    /// it is cleared before a fence/read-only transition and never inferred
+    /// from the API gate afterwards.
+    pub fn set_serving(&self, serving: bool) {
+        self.serving.store(serving, Ordering::SeqCst);
+    }
+
+    /// Whether the listener may queue/push configuration bundles.
+    #[must_use]
+    pub fn is_serving(&self) -> bool {
+        self.serving.load(Ordering::SeqCst)
     }
 
     /// Installs (or clears) the ADR-0010 promotion bookkeeping persisted with

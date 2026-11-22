@@ -47,9 +47,11 @@ pub type PromotedMasterCoordinator = Arc<Mutex<Option<MasterCoordinatorHandle>>>
 /// Runtime write gate for ADR-0010 automatic promotion.
 ///
 /// While blocked, every mutating API request returns `409 Conflict` with a
-/// stable `ha_promotion_fenced` type/detail. The gate is independent of the
-/// configured role: an enabled master is blocked from startup until it holds
-/// the lease and has published, and a fenced node stays blocked across restarts.
+/// stable `urn:sito:ha:promotion_read_only` type for witness/quiesce reasons or
+/// `urn:sito:ha:promotion_fenced` for a durable fence, plus the specific reason
+/// in `detail`. The gate is independent of the configured role: an enabled
+/// master is blocked from startup until it holds the lease and has published,
+/// and a fenced node stays blocked across restarts.
 #[derive(Debug, Default)]
 pub struct HaWriteGate {
     blocked: AtomicBool,
@@ -184,8 +186,8 @@ impl ServerContext {
         self.master_coordinator.clone().or_else(|| {
             self.promoted_master_coordinator
                 .lock()
-                .ok()
-                .and_then(|slot| slot.clone())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         })
     }
 
@@ -477,34 +479,30 @@ impl ServerContext {
         // listener (`replication_port = 0`) still has a meaningful state: the
         // coordinator carries the "replication disabled" explanation and must
         // be surfaced instead of being discarded as a generic ready.
+        let effective_master = self.ha_write_gate.is_effective_master();
         if !ha_readiness_required(config) {
             if config.ha.is_some()
-                && config.server.role == "master"
+                && (config.server.role == "master" || effective_master)
                 && let Some(coordinator) = self.active_master_coordinator()
             {
                 return coordinator.readiness();
             }
             return HaReadiness::ready();
         }
-        match config.server.role.as_str() {
-            "master" => self.active_master_coordinator().map_or_else(
+        if config.server.role == "master" || effective_master {
+            return self.active_master_coordinator().map_or_else(
                 || {
                     HaReadiness::not_ready(
                         "master coordinator is not initialized; replication cannot run",
                     )
                 },
                 |coordinator| coordinator.readiness(),
-            ),
-            "slave" => self.slave_tracker.as_ref().map_or_else(
-                || {
-                    HaReadiness::not_ready(
-                        "slave tracker is not initialized; replication cannot run",
-                    )
-                },
-                sito_ha::SlaveStatusTracker::readiness,
-            ),
-            _ => HaReadiness::ready(),
+            );
         }
+        self.slave_tracker.as_ref().map_or_else(
+            || HaReadiness::not_ready("slave tracker is not initialized; replication cannot run"),
+            sito_ha::SlaveStatusTracker::readiness,
+        )
     }
 
     /// Without HA support there is no coordinator that could be unready.

@@ -91,7 +91,12 @@ pub async fn get_ha_status(
     State(ctx): State<ServerContext>,
 ) -> Result<Json<HaStatusResponse>, ProblemDetails> {
     let cfg = ctx.config.load();
-    let role = cfg.server.role.clone();
+    let configured_role = cfg.server.role.clone();
+    let role = if ctx.ha_write_gate.is_effective_master() {
+        "master".to_string()
+    } else {
+        configured_role
+    };
     let instance_name = cfg.server.instance_name.clone();
     let readiness = ctx.ha_readiness(&cfg);
 
@@ -209,7 +214,13 @@ pub async fn trigger_ha_resync(
     _admin: RequireAdmin,
     State(ctx): State<ServerContext>,
 ) -> Result<Json<HaResyncResponse>, ProblemDetails> {
-    let role = ctx.config.load().server.role.clone();
+    let configured_role = ctx.config.load().server.role.clone();
+    let effective_master = ctx.ha_write_gate.is_effective_master();
+    let role = if effective_master {
+        "master".to_string()
+    } else {
+        configured_role
+    };
     if let Some((reason, fenced)) = ctx.ha_write_gate.blocked()
         && (fenced || role == "master" || ctx.ha_write_gate.is_effective_master())
     {
@@ -432,7 +443,7 @@ mod tests {
         let mut config = (*ctx.config.load_full()).clone();
         config.server.role = "master".to_string();
         config.ha = Some(toml::from_str("replication_port = 8953").unwrap());
-        ctx.config.store(Arc::new(config));
+        ctx.config.store(std::sync::Arc::new(config));
 
         // Publish/replication paths read the effective coordinator, including a
         // promoted slave's shared slot.
@@ -460,7 +471,7 @@ mod tests {
         let mut config = (*ctx.config.load_full()).clone();
         config.server.role = "master".to_string();
         config.ha = Some(toml::from_str("replication_port = 8953").unwrap());
-        ctx.config.store(Arc::new(config));
+        ctx.config.store(std::sync::Arc::new(config));
         ctx.promoted_master_coordinator
             .lock()
             .unwrap()
@@ -478,6 +489,56 @@ mod tests {
         assert_eq!(error.status, StatusCode::CONFLICT.as_u16());
         assert_eq!(error.error_type, "urn:sito:ha:promotion_read_only");
         assert_eq!(error.detail, "ha_promotion_witness_unavailable");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[tokio::test]
+    async fn promoted_effective_master_reports_master_and_resyncs_from_the_live_coordinator() {
+        use crate::auth::AuthUser;
+        use crate::auth::Role;
+
+        let dir = crate::test_support::temp_dir("sito_ha_promoted_status");
+        let ctx = crate::test_support::mock_context(&dir).await;
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+        coordinator.mark_replication_ready();
+        let mut config = (*ctx.config.load_full()).clone();
+        config.server.role = "slave".to_string();
+        config.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+        ctx.config.store(std::sync::Arc::new(config));
+        ctx.promoted_master_coordinator
+            .lock()
+            .unwrap()
+            .replace(coordinator.clone());
+        ctx.ha_write_gate.mark_effective_master();
+        ctx.ha_write_gate.allow();
+
+        let admin = RequireAdmin(AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+            owner: None,
+        });
+        let status = get_ha_status(admin, State(ctx.clone()))
+            .await
+            .expect("status")
+            .0;
+        assert_eq!(status.role, "master");
+        assert_eq!(status.version, 2);
+        assert!(status.ready);
+
+        let admin = RequireAdmin(AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+            owner: None,
+        });
+        let resync = trigger_ha_resync(admin, State(ctx))
+            .await
+            .expect("promoted resync")
+            .0;
+        assert_eq!(resync.role, "master");
+        assert_eq!(resync.version, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1669,10 +1669,6 @@ token_file = "{}"
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let runtime = init_ha(&config, &config_path, &metrics, &shutdown_rx)
         .expect("fenced master starts read-only");
-    runtime.start_master_promotion(
-        Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())),
-        &shutdown_rx,
-    );
 
     let addr = std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), port);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1684,18 +1680,25 @@ token_file = "{}"
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    if listener_was_up {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if tokio::net::TcpStream::connect(addr).await.is_err() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "a fenced configured master kept accepting new slave connections"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        listener_was_up,
+        "precondition: the configured master listener must start before fencing"
+    );
+
+    runtime.start_master_promotion(
+        Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())),
+        &shutdown_rx,
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if tokio::net::TcpStream::connect(addr).await.is_err() {
+            break;
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a fenced configured master kept accepting new slave connections"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
     let _ = shutdown_tx.send(true);

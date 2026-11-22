@@ -226,7 +226,6 @@ pub(super) fn spawn_slave_worker_after_listeners(
     // promotion the worker keeps the global shutdown receiver.
     let slave_shutdown_rx = if let Some(promotion) = ha_runtime.promotion.as_ref() {
         let (tx, rx) = watch::channel(false);
-        ha_runtime.slave_shutdown = Some(tx.clone());
         if let Ok(mut slot) = promotion.slave_shutdown.lock() {
             *slot = Some(tx.clone());
         }

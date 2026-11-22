@@ -177,6 +177,13 @@ impl MasterCoordinator {
         version: u64,
         push_msg: &HaMessage,
     ) {
+        if !self.is_serving() {
+            warn!(
+                version,
+                "Refusing to install an active bundle while the master is not serving"
+            );
+            return;
+        }
         if self.is_hello_only() {
             warn!(
                 version,
@@ -295,8 +302,9 @@ impl MasterCoordinator {
             .and_then(|push| crate::bundle::push_payload_hash(push).ok())
     }
 
-    /// Drops every tracked replication session (fence path).
+    /// Stops serving and drops every tracked replication session (fence path).
     pub fn close_all_sessions(&self) {
+        self.set_serving(false);
         let mut slaves = sito_core::sync::lock_or_recover(&self.slaves);
         slaves.clear();
         self.metrics.set_ha_slaves_connected(0);
@@ -316,6 +324,13 @@ impl MasterCoordinator {
     }
 
     pub(super) fn update_bundle_inner(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
+        if !self.is_serving() {
+            return Err(HaError::Validation {
+                field: "ha_promotion".to_string(),
+                reason: "configuration publishes are disabled while the master is not serving"
+                    .to_string(),
+            });
+        }
         if self.is_hello_only() {
             return Err(HaError::Validation {
                 field: "ha_promotion".to_string(),
@@ -423,6 +438,13 @@ impl MasterCoordinator {
         &self,
         bundle: ConfigBundle,
     ) -> Result<(u64, BroadcastOutcome), HaError> {
+        if !self.is_serving() {
+            return Err(HaError::Validation {
+                field: "ha_promotion".to_string(),
+                reason: "configuration publishes are disabled while the master is not serving"
+                    .to_string(),
+            });
+        }
         if self.is_hello_only() {
             return Err(HaError::Validation {
                 field: "ha_promotion".to_string(),
@@ -524,6 +546,13 @@ impl MasterCoordinator {
     /// `connected` only: it must not disappear from the publish outcome (that
     /// would turn "all channels closed" into a misleading `NoSlaves`).
     pub(super) fn broadcast_with_counts(&self, msg: &HaMessage) -> BroadcastOutcome {
+        if !self.is_serving() {
+            return BroadcastOutcome {
+                connected: sito_core::sync::lock_or_recover(&self.slaves).len(),
+                queued: 0,
+                coalesced: 0,
+            };
+        }
         if self.is_hello_only() {
             // The reconcile window is silent: no ConfigPush may reach a peer
             // before the ahead/fork/hash checks complete.

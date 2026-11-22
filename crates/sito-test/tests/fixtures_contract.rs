@@ -281,6 +281,7 @@ async fn fake_master_heartbeat_is_driven_by_the_manual_clock() {
             token: None,
             role: Some("slave".to_string()),
             protocol_version: Some(sito_ha::PROTOCOL_VERSION),
+            have_bundle_hash: None,
         }
         .to_json()
         .expect("hello json")
