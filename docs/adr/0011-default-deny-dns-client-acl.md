@@ -164,7 +164,8 @@ Similarly, MAC addresses do not participate in admission:
 
 An explicit MAC in `clients.entries[].ids` remains a trusted *policy* identity
 (per D10), but it does not create an allow rule. Only static IP and CIDR values
-do.
+do, and only when `clients.acl.allow_entry_ids = true`; with the default
+`false`, even those are identity/policy only.
 
 ## Decision
 
@@ -535,9 +536,11 @@ sito_dns_acl_dropped_total{family="ipv4"|"ipv6"}
   with host bits masked (for example `192.168.1.0/24`, never
   `192.168.1.77/24`). Values come only from operator configuration (allow,
   deny and, when opted in, entry IP/CIDR ids), never from a client-supplied
-  value. At most 1024 prefixes per list exist by validation; the exporter
-  additionally collapses labels beyond 256 distinct series into
-  `prefix="__other__"` to bound scrape size.
+  value. The 1024-entry validation cap applies to `allow` and `deny`
+  separately; entry-derived prefixes (only when opted in) are not covered by
+  that cap. The exporter collapses labels beyond 256 distinct series into
+  `prefix="__other__"`, so scrape size stays bounded regardless of the number
+  of configured entry ids.
 - `sito_dns_acl_dropped_total` increments only for `deny_response = "drop"`, so
   a silent policy still has a counter.
 - Denied queries with a synthesized response also increment
@@ -562,12 +565,13 @@ network.**
 
 ### Form fields (UI names, not config keys)
 
-- `client_acl_default_deny` — checkbox. Checked by default on **every**
-  bootstrapping run, even when the base template explicitly says
-  `default_policy = "allow"`. In that case the step shows a prominent warning
-  ("this template currently admits every client") and the operator must
-  actively uncheck deny to keep the template's allow policy. A template
-  cannot make a fresh wizard install silently skip default deny.
+- `client_acl_default_deny` — checkbox. Checked by default on **every
+  fresh-install wizard run**, even when the base template explicitly says
+  `default_policy = "allow"` (see the fresh-install marker below). Existing
+  template allow prefixes are prefilled and preserved; the step warns that the
+  template currently admits every client, and the operator must actively
+  uncheck deny to keep the template's allow policy. A template cannot make a
+  genuinely fresh wizard install silently skip default deny.
 - `client_acl_selected` — one checkbox or token per interface candidate. Only
   loopback is selected by default. Every non-loopback candidate starts
   unchecked, regardless of family or RFC 1918/ULA status.
@@ -593,10 +597,14 @@ the existing `WizardCompleteForm::build_config` → `Config::validate` →
 atomic persist path. It does not append raw TOML and does not add a second
 writer. `allow_entry_ids` is written explicitly and is `false` unless the
 operator checks `client_acl_allow_entry_ids`; a base template value of `true`
-does not carry through silently. The server re-runs `getifaddrs(3)` on POST and
-accepts only candidate ids it is currently offering (plus the manual
-textarea); a submitted interface/prefix string is never written without
-re-validation against the live interface list.
+does not carry through silently. Existing `[clients.acl]` allow/deny prefixes
+from the template are prefilled in the form (and kept selected in addition to
+the detected candidates), so accepting default deny does not silently drop a
+routed/NAT allow network the template already declared. The server re-runs
+`getifaddrs(3)` on POST and accepts only candidate ids it is currently
+offering (plus the manual textarea and the prefilled template prefixes); a
+submitted interface/prefix string is never written without re-validation
+against the live interface list or the base ACL it came from.
 
 ### Interface discovery
 
@@ -617,7 +625,7 @@ No candidate is preselected except loopback. On a multi-homed host the operator
 sees the WAN, VPN, Docker bridge and management interfaces and must choose the
 LAN(s) that actually contain DNS clients. Selecting a `public` or
 `bridge_or_tunnel` candidate requires an additional inline confirmation and
-shows the forwarder/NAT warning from the limitation section below. A Docker
+shows the forwarder/NAT warning from the topology-limitation section above. A Docker
 bridge is usually the wrong choice: admitting it admits the host-side
 forwarder, not the containers' downstream clients.
 
@@ -655,26 +663,63 @@ therefore cannot seed an allow network.
   config is explicitly warned as an open resolver and is never produced by
   default.
 
-The previous draft rejected loopback-only. That was wrong: it removed the
-safest option and pushed operators toward allow-all. Loopback-only is now an
-explicit, supported choice. Detection failure simply leaves the candidate list
-with only loopback; it does not fall back to allow and does not force
-allow-all.
+Loopback-only is an explicit, supported choice. Detection failure simply
+leaves the candidate list with only loopback; it does not fall back to allow
+and does not force allow-all.
 
-### When the wizard must/must not touch the ACL
+### Fresh-install vs recovery marker
 
-- `bootstrapping == true` (first-admin setup, including a fresh template): the
-  ACL step is **always rendered and applied**, even when the template already
-  contains `clients.default_policy` or `[clients.acl]`. Existing allow lists
-  are shown, deny is checked by default, and the operator must confirm or
-  change the choice. This closes the bypass where a fresh template with an
-  explicit `default_policy = "allow"` skipped the step.
-- `bootstrapping == false` (post-setup admin recovery via setup token or
-  re-auth): the ACL section is not applied; an existing ACL is untouched.
-- A template that pre-creates an admin account is a provisioned install, not a
-  wizard-completed install. It must set its intended ACL explicitly; the
-  installation guide will say so and the startup warning will report an
-  effective allow policy on a wildcard bind.
+The implementation must **not** use the wizard's `bootstrapping` flag as the
+fresh-install test. In `wizard.rs`, `bootstrapping = is_first_run ||
+setup_token_required`; an existing install with no usable Admin
+(`setup_token_required = true`, `is_first_run = false`) is a recovery run, not
+a fresh install. Using `bootstrapping` here would preselect deny on recovery
+and can rewrite an existing `[clients.acl]`, cutting clients off.
+
+The ACL step is gated by this explicit predicate:
+
+```text
+fresh_install_acl = is_first_run && !is_setup_complete()
+setup_recovery    = setup_token_required && !is_first_run
+```
+
+`is_first_run` is itself the durable marker: the auth manager derives it from
+persisted user state, and it is false once a usable Admin exists or the
+bootstrap default admin is no longer active. No new config-file marker is
+required for D7b.
+
+Concretely for D7b:
+
+- `is_first_run()` is the persisted fresh-install signal: setup has not been
+  completed and the bootstrap default admin is still active. `!is_setup_complete()`
+  is redundant with the current implementation but must be asserted explicitly
+  so a future change to `is_first_run` cannot silently widen the gate.
+- `setup_recovery` is the setup-token / re-auth path for an existing install
+  whose Admin is unavailable. **It must not render or apply the ACL step.** The
+  existing `[clients] default_policy` and `[clients.acl]` are left byte-for-byte
+  untouched (except for unrelated settings the operator changes through the
+  same wizard).
+- `!bootstrapping` is still a `403` and is not an ACL path.
+- A template that pre-creates an Admin is a provisioned install: `is_first_run`
+  is false, so the wizard is not the install path and must set its intended ACL
+  explicitly. The installation guide will say so and the startup warning will
+  report an effective allow policy on a wildcard bind.
+- A first-run template with existing ACL keys still gets the step
+  (`is_first_run` true). Its allow/deny prefixes and `default_policy` are
+  prefilled; deny is preselected for the fresh-install policy but the operator
+  can keep the template's allow policy explicitly. No prefix is discarded by
+  accepting the default.
+- If D7b needs to distinguish "ACL configured once" after setup completes, it
+  must add a persisted `acl_configured`/`bootstrap_completed` marker and test
+  its save/restore/HA behavior. It must not infer that state from the mere
+  presence of `default_policy`, because presence was the original bypass and
+  is also present in recovered configs.
+
+This rule is testable without a live HTTP wizard: unit-test the predicate and
+the form-building function with `is_first_run`/`setup_token_required` values
+and a base `Config`. The HTTP test for recovery must set up
+`setup_token_required = true, is_first_run = false` with an existing ACL and
+assert the step is absent and the persisted ACL unchanged.
 
 ### After setup
 
@@ -765,8 +810,12 @@ itself; the startup exposure warning will say that DNS is open.
 - A master rollback that publishes an older valid bundle is subject to the
   existing monotonic version/term rules. The ACL is not exempt: an old bundle
   cannot lower the slave's watermark.
-- A newly promoted slave already has the last applied shared ACL. Promotion
-  does not re-evaluate or reset it.
+- A slave that has applied the current bundle already has the shared ACL;
+  promotion does not re-evaluate or reset it. An unprovisioned fresh slave is
+  not `Synced` and cannot be promoted as an ACL-serving node: it has no
+  applied ACL, and promotion requires a prior full sync (or an explicit
+  operator-set ACL that the promotion flow validates). The ADR does not
+  invent an ACL at promotion time.
 
 ## HA
 
@@ -829,8 +878,9 @@ itself; the startup exposure warning will say that DNS is open.
 
 ### Positive
 
-- A fresh install is not an open resolver after the wizard, without requiring
-  the operator to write firewall rules first.
+- A fresh install is not an open resolver after the wizard unless the operator
+  explicitly completes the two-step allow-all confirmation, without requiring
+  firewall rules first.
 - Upgrades do not cut off a single existing client: the default remains allow
   until an operator opts in.
 - For the same observed source address and applied bundle, admission is
@@ -883,7 +933,12 @@ itself; the startup exposure warning will say that DNS is open.
 - `dns.bind` remains `["0.0.0.0", "::"]`. The ACL is not a substitute for a
   host firewall, and the installation guide keeps recommending both.
 - Query-log retention, PII hashing and stats are untouched. Denied queries are
-  intentionally absent from the query log; ACL counters are aggregate only.
+  intentionally absent from the query log and, because the ACL runs before
+  identity resolution, from `unidentified_clients` too. Operators must use the
+  `sito_dns_acl_*` counters and the rate-limited ACL log lines to discover
+  denied clients; configuration-reference §9/§13 and the installation/HA docs
+  must say this explicitly so an empty discovery list is not mistaken for "no
+  denied traffic".
 - The admin UI/API is never ACL-filtered, so an ACL mistake cannot lock out
   the operator's management path.
 
@@ -912,7 +967,7 @@ shown in parentheses.
 | Allow IPv4 `/24`, query from inside and outside | Inside admitted (`reason=explicit_allow`), outside denied under deny default (`test_acl_allow_deny_ipv4`) |
 | Allow IPv6 `/64` plus `::1/128`, query from both and from another prefix | IPv6 family counters and outcomes correct; no cross-family match (`test_acl_allow_deny_ipv6`) |
 | Nested allow prefixes `/16` and `/24` | Query in `/24` is allowed; metric reports `/24` (longest prefix) (`test_acl_longest_prefix_reported`) |
-| Broad `deny` plus more specific `allow` and an exact entry id inside the deny | All addresses in deny are denied; specific allow does not override; entry does not re-admit (`test_acl_deny_is_authoritative`) |
+| Broad `deny` plus more specific `allow`, with `allow_entry_ids = true` and an exact entry id inside the deny | All addresses in deny are denied; specific allow does not override; even an opted-in entry does not re-admit (`test_acl_deny_is_authoritative`) |
 | Two overlapping deny prefixes | Most specific reported; action deny (`test_acl_longest_deny_reported`) |
 | IPv4-mapped IPv6 source `::ffff:192.0.2.10` with an IPv4 `/24` allow | Matches the IPv4 rule and increments the IPv4 family label (`test_acl_mapped_ipv6_uses_ipv4_rules`) |
 | `0.0.0.0/0` without `::/0` | IPv4 admitted, IPv6 falls to default deny; counters show the asymmetry (`test_acl_zero_prefix_is_family_scoped`) |
@@ -943,6 +998,8 @@ shown in parentheses.
 | Denied DoH peer sends `X-Forwarded-For: <allowed address>` | Still denied; DNS DoH never consults the header (`test_acl_doh_ignores_x_forwarded_for`) |
 | Denied DoH3 peer sends `X-Forwarded-For: <allowed address>` | Still denied; DoH3 never consults the header (`test_acl_doh3_ignores_x_forwarded_for`) |
 | Allowed DoH peer sends `X-Forwarded-For: <denied address>` | Still admitted; header cannot revoke either (`test_acl_doh_ignores_xff_for_allow`) |
+| DoH peer is a configured `web.trusted_proxies` address and sends an allowed `X-Forwarded-For` | Still decided by the raw peer; the admin trusted-proxy setting is not a DNS ACL input (`test_acl_doh_trusted_proxy_still_ignores_xff`) |
+| DoH3 peer is a configured `web.trusted_proxies` address and sends an allowed `X-Forwarded-For` | Still decided by the raw peer (`test_acl_doh3_trusted_proxy_still_ignores_xff`) |
 | `deny_response = "drop"` on UDP/TCP/DoT/DoQ | No DNS response; connection/rate limits still apply (`test_acl_drop_suppresses_response`) |
 | `deny_response = "drop"` on DoH and DoH3 | HTTP 204, not 403 (`test_acl_drop_doh_is_204`) |
 | Denied multi-question / BADVERS-shaped query | REFUSED from ACL, not FORMERR/BADVERS (`test_acl_precedes_wire_error_paths`) |
@@ -967,9 +1024,13 @@ shown in parentheses.
 | Fresh wizard, allow-all checkbox + exact `ALLOW ALL` text | Writes `0.0.0.0/0` and `::/0` plus a visible warning (`test_wizard_allow_all_is_explicit`) |
 | Wizard POST selects a candidate id not offered by the current interface list | Returns 400 and writes nothing; submitted prefixes are re-validated (`test_wizard_rejects_forged_interface_candidate`) |
 | Fresh template with `allow_entry_ids = true` | Wizard writes `false` unless `client_acl_allow_entry_ids` is checked; warning shown (`test_wizard_entry_ids_opt_in_is_explicit`) |
-| Fresh template with explicit `default_policy = "allow"` and first-run admin state | ACL step is still rendered, deny is preselected, the template's allow is noted with a warning, and the operator must actively keep allow (`test_wizard_fresh_template_explicit_allow_still_shows_acl`) |
-| Fresh template that pre-creates an admin | Wizard not applicable; startup warning reports effective allow on wildcard bind (`test_fresh_provisioned_template_warns_open_resolver`) |
-| Wizard recovery on an existing install | Existing ACL and default policy untouched (`test_wizard_recovery_does_not_change_acl`) |
+| Fresh template with explicit `default_policy = "allow"` and first-run admin state | ACL step is still rendered, deny is preselected, the template's allow prefixes are prefilled/preserved, the template's allow is noted with a warning, and the operator must actively keep allow (`test_wizard_fresh_template_explicit_allow_still_shows_acl`) |
+| Fresh template with existing `[clients.acl] allow` prefixes | Prefixes are prefilled/selected; accepting default deny keeps them, so a routed/NAT allow network is not silently dropped (`test_wizard_fresh_template_prefills_existing_allow`) |
+| Fresh template that pre-creates an admin | `is_first_run = false`; wizard not applicable; startup warning reports effective allow on wildcard bind (`test_fresh_provisioned_template_warns_open_resolver`) |
+| Fresh-install predicate | `is_first_run = true`, `setup_token_required = true`, `is_setup_complete = false` -> ACL step applied (`test_wizard_fresh_install_predicate`) |
+| Setup-token recovery on an existing install (`setup_token_required = true`, `is_first_run = false`, existing ACL) | ACL step is not rendered/applied; existing `default_policy` and ACL remain unchanged (`test_wizard_setup_token_recovery_preserves_existing_acl`) |
+| Re-auth recovery on an existing install | Same as setup-token recovery; ACL untouched (`test_wizard_reauth_recovery_preserves_existing_acl`) |
+| Wizard completion without a reachable bootstrap/recovery path | Still 403; no ACL path (`test_wizard_forbidden_after_setup_even_for_admin`) |
 | Wizard unchecked deny | Writes/keeps `default_policy = "allow"` and does not create a locking ACL (`test_wizard_can_keep_default_allow`) |
 | Wizard raw peer behind an untrusted `X-Forwarded-For` | Header cannot add a candidate; only the raw peer can be suggested, and it is not selected (`test_wizard_acl_peer_ignores_xff`) |
 | `--no-setup`/minimal fresh config | Default allow, no ACL keys required; startup warning remains (`test_headless_fresh_install_stays_allow`) |
@@ -1009,7 +1070,7 @@ shown in parentheses.
 | Full `cargo test --workspace --all-features` | No existing client/policy/HA/cache/filter test changes outcome |
 | Existing config corpus and `SCHEMA_FIXTURE` | No map drift; all existing configs load |
 | Markdown/config-reference checks | `check_markdown_links.py`, `check_config_reference.py`, `check_migration_guide.py` pass |
-| Docs mention forwarder/NAT/reverse-proxy/multi-site limitations | `docs/installation.md`, `docs/runbook-ha.md` and configuration reference §9/§13 contain the warnings (`test_acl_docs_cover_forwarder_and_ha_limits`) |
+| Docs mention forwarder/NAT/reverse-proxy/multi-site limitations and use ACL metrics/logs for denied-client discovery | `docs/installation.md`, `docs/runbook-ha.md` and configuration reference §9/§13 contain the warnings (`test_acl_docs_cover_forwarder_and_ha_limits`) |
 
 ## Implementation checklist for D7b
 
@@ -1077,12 +1138,18 @@ missing map entry, an unknown-key rejection, or a `check-config` regression.
      `client_acl_manual`, `client_acl_loopback_only_ack`,
      `client_acl_public_ack`, `client_acl_allow_entry_ids`,
      `client_acl_allow_all` + exact `client_acl_allow_all_confirm`;
-   - apply the ACL step whenever `bootstrapping == true`, even when the base
-     template has explicit ACL keys; skip it only for recovery
-     (`bootstrapping == false`);
+   - **do not use `bootstrapping` as the fresh-install marker.** Compute
+     `fresh_install_acl = is_first_run && !is_setup_complete()` and
+     `setup_recovery = setup_token_required && !is_first_run`; apply the ACL
+     step only for `fresh_install_acl` and never for `setup_recovery`;
+   - on a first-run template with existing ACL keys, prefill and preserve the
+     allow/deny prefixes and `default_policy`; do not discard them when the
+     operator accepts deny;
    - raw-peer suggestion only; do not use `X-Forwarded-For`/
      `web.trusted_proxies` for the ACL candidate;
-   - no raw TOML append; use `build_config` and the existing persist path.
+   - no raw TOML append; use `build_config` and the existing persist path;
+   - add predicate tests plus setup-token and re-auth recovery tests with an
+     existing ACL, as listed in the test plan.
 9. **Migration** — `crates/sito-core/src/config_migrate.rs`:
    - materialize `clients.default_policy = "allow"` exactly once and report it;
    - leave it unchanged under `--adopt-safe-defaults` and add the warning;
@@ -1106,9 +1173,12 @@ missing map entry, an unknown-key rejection, or a `check-config` regression.
     lockout/downgrade, topology and HA limitations), `docs/config-v2.md`
     (fixture/safe-defaults), `docs/2.0-migration.md` (behavior-preserving ACL
     and downgrade), `docs/installation.md`, `docs/runbook-ha.md` (fresh slave,
-    mixed versions, multi-site) and `README.md` (wizard behavior), and
-    `docs/2.0-claim-matrix.md` (deferred → delivered/release-gated). Add the
-    keys to `docs/policy-matrix.md` so admission is documented before policy.
+    mixed versions, multi-site, ACL metrics/logs as the discovery surface) and
+    `README.md` (wizard behavior), and `docs/2.0-claim-matrix.md`
+    (deferred → delivered/release-gated). Add the keys to
+    `docs/policy-matrix.md` so admission is documented before policy, and
+    document that denied clients are absent from the query log and
+    `unidentified_clients` by design.
     Keep the historical banner in `docs/first-time-setup.md` and point it at
     the current wizard/ACL sections instead of rewriting it as current.
 12. **Verification** — `git diff --check`,
