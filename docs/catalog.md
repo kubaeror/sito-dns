@@ -86,6 +86,22 @@ The dialog also links to the [HostlistsRegistry](https://github.com/AdguardTeam/
 corrupt, the catalog button and dialog are omitted and the custom-URL
 **+ Add Blocklist** flow remains available as the fallback.
 
+## Parental controls and the catalog
+
+The catalog has **no dedicated parental/family filter** and no `parental` flag
+on its entries. Parental control in 2.0 is a per-client-group policy that reads
+the bundled `adult`/`gambling` runtime lists; it is off by default and the
+setup wizard does not enable it.
+
+Catalog entries are manual, global selections only. The nearest entry is
+`hagezi_gambling_blocklist` (HaGeZi's Gambling Blocklist, category `other`,
+"Blocks gambling content"), which an operator can add with **+ Add from
+catalog**. Adding it creates a normal `[[filtering.lists]]` subscription for
+every filtering-enabled group; it is never enabled by `parental = true` and it
+does not replace `parental_categories`. See the
+[parental controls guide](parental-controls.md) for the group configuration,
+the bundled category limits, `[integrations.lists]` and audit steps.
+
 ## Blocked services by group (web UI)
 
 Operators can manage per-group blocked services on the **Clients** page. The

@@ -213,6 +213,9 @@
   <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 16px;">
     Minimal built-in fallback for parental controls and service blocking, verified against the bundled manifest at startup. This is not a maintained external dataset and covers common providers only; subscribe to a full blocklist above or configure <code>[integrations.lists]</code> for broader coverage.
   </p>
+  <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 16px;">
+    Parental control is configured per client group (<code>parental = true</code> plus <code>parental_categories</code>); it is not enabled globally, and the setup wizard leaves it off. The catalog has no dedicated parental filter, so catalog entries are manual selections. See the <a href="https://github.com/kubaeror/sito-dns/blob/main/docs/parental-controls.md" target="_blank" rel="noopener">parental controls guide</a>.
+  </p>
   <div class="table-container">
     <table>
       <thead>
