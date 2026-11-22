@@ -2695,6 +2695,84 @@ async fn test_clients_page_hides_unidentified_for_viewer() {
 }
 
 #[tokio::test]
+async fn test_clients_page_renders_blocked_services_picker() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_clients_group_services_page_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let mut clients = sito_clients::ClientsConfig::default();
+    clients.groups.insert(
+        "kids".to_string(),
+        clients_group_with_services(vec![
+            sito_clients::BlockedServiceConfig {
+                service: "tiktok".to_string(),
+                schedule: Some(sito_clients::Schedule::parse("0 8 * * *").unwrap()),
+            },
+            sito_clients::BlockedServiceConfig {
+                service: "ads".to_string(),
+                schedule: Some(sito_clients::Schedule::parse("0 9 * * *").unwrap()),
+            },
+        ]),
+    );
+    seed_clients_config(&ctx, &clients);
+
+    let headers = operator_form_headers(&ctx).await;
+    let resp = clients_page(
+        State(ctx.clone()),
+        headers,
+        Query(ClientsPageQuery::default()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+
+    assert!(body.contains("Blocked services by group"), "{body}");
+    assert!(body.contains("kids"), "{body}");
+    assert!(body.contains("tiktok"), "{body}");
+    assert!(body.contains("schedule: 0 8 * * *"), "{body}");
+    assert!(
+        body.contains("action=\"/ui/clients/group-services\""),
+        "the picker form must be wired to the handler: {body}"
+    );
+    assert!(body.contains("name=\"csrf_token\" value=\""), "{body}");
+    assert!(
+        body.contains("name=\"group\" :value=\"groupName\""),
+        "{body}"
+    );
+    assert!(body.contains("name=\"selected\""), "{body}");
+    assert_eq!(
+        body.matches("action=\"/ui/clients/group-services\"")
+            .count(),
+        1,
+        "the picker form must be rendered exactly once: {body}"
+    );
+    assert!(
+        body.contains("2 selected"),
+        "the group summary count must render: {body}"
+    );
+
+    // Groups sort default-first, so kids is the second group. Its selection is
+    // carried to the one shared modal as data, not duplicated checkboxes.
+    assert!(body.contains("data-group=\"kids\""), "{body}");
+    assert!(body.contains("data-group-index=\"2\""), "{body}");
+    assert!(body.contains("data-selected=\"tiktok ads\""), "{body}");
+    assert!(
+        body.contains("id=\"group-services-service-tiktok\""),
+        "the catalog checkbox is rendered once: {body}"
+    );
+    assert!(body.contains("Other configured services"), "{body}");
+    assert!(
+        body.contains("value=\"ads\"") && body.contains("Not in the embedded catalog"),
+        "bundled-only services must be shown as removable configured entries: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
 async fn test_clients_page_empty_unidentified_state() {
     let temp_dir = std::env::temp_dir().join(format!(
         "sito_ui_clients_discovered_empty_{}",
@@ -4845,6 +4923,64 @@ fn test_clients_service_views_corrupt_catalog_degrades() {
 }
 
 #[test]
+fn test_clients_service_views_marks_configured_bundled_only_services_unlisted() {
+    let mut clients = sito_clients::ClientsConfig::default();
+    clients.groups.insert(
+        "kids".to_string(),
+        clients_group_with_services(vec![
+            sito_clients::BlockedServiceConfig {
+                service: "ads".to_string(),
+                schedule: Some(sito_clients::Schedule::parse("0 8 * * *").unwrap()),
+            },
+            sito_clients::BlockedServiceConfig {
+                service: "tiktok".to_string(),
+                schedule: None,
+            },
+        ]),
+    );
+
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let registry =
+        sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
+    assert!(catalog.service_by_id("ads").is_none());
+    let views = clients_service_views_from(&clients, Ok(catalog), Some(&registry));
+
+    let kids = views
+        .groups
+        .iter()
+        .find(|group| group.name == "kids")
+        .expect("kids group must render");
+    assert_eq!(
+        kids.blocked_services
+            .iter()
+            .map(|blocked| blocked.service.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ads", "tiktok"]
+    );
+    assert_eq!(
+        kids.unlisted_services
+            .iter()
+            .map(|blocked| blocked.service.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ads"],
+        "configured services missing from the catalog must be surfaced for editing"
+    );
+    assert_eq!(
+        kids.unlisted_services[0].schedule.as_deref(),
+        Some("0 8 * * *")
+    );
+    assert_eq!(
+        views
+            .groups
+            .iter()
+            .find(|group| group.is_default)
+            .expect("default group")
+            .unlisted_services,
+        Vec::new()
+    );
+}
+
+#[test]
 fn test_parse_group_services_form_reads_only_group_and_selected() {
     let pairs = vec![
         ("csrf_token".to_string(), "ignored".to_string()),
@@ -5078,6 +5214,88 @@ async fn test_clients_group_services_handler_preserves_schedules() {
     assert!(
         kids.blocked_services[2].schedule.is_none(),
         "a newly selected service must not inherit a schedule"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_clients_group_services_handler_preserves_bundled_only_services() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_group_services_bundled_only_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let registry =
+        sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
+    assert!(
+        catalog.service_by_id("ads").is_none(),
+        "fixture assumes 'ads' is bundled-only"
+    );
+    assert!(registry.contains_service("ads"));
+
+    let mut clients = sito_clients::ClientsConfig::default();
+    clients.groups.insert(
+        "kids".to_string(),
+        clients_group_with_services(vec![sito_clients::BlockedServiceConfig {
+            service: "ads".to_string(),
+            schedule: Some(sito_clients::Schedule::parse("0 8 * * *").unwrap()),
+        }]),
+    );
+    seed_clients_config(&ctx, &clients);
+    let headers = operator_form_headers(&ctx).await;
+
+    // Editing the group and adding a catalog service must keep the
+    // bundled-only entry and its schedule.
+    let resp = clients_group_services_handler(
+        State(ctx.clone()),
+        headers.clone(),
+        Form(vec![
+            ("group".to_string(), "kids".to_string()),
+            ("selected".to_string(), "ads".to_string()),
+            ("selected".to_string(), "tiktok".to_string()),
+        ]),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let after = load_clients_config(&ctx);
+    let kids = after.groups.get("kids").expect("kids group must remain");
+    assert_eq!(
+        blocked_service_ids(kids),
+        vec!["ads", "tiktok"],
+        "a bundled-only service must survive a catalog edit"
+    );
+    assert_eq!(
+        kids.blocked_services[0]
+            .schedule
+            .as_ref()
+            .map(sito_clients::Schedule::as_str),
+        Some("0 8 * * *"),
+        "the bundled-only service keeps its schedule"
+    );
+
+    // Explicitly deselecting the bundled-only service removes it.
+    let resp = clients_group_services_handler(
+        State(ctx.clone()),
+        headers,
+        Form(vec![
+            ("group".to_string(), "kids".to_string()),
+            ("selected".to_string(), "tiktok".to_string()),
+        ]),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let after = load_clients_config(&ctx);
+    let kids = after.groups.get("kids").expect("kids group must remain");
+    assert_eq!(
+        blocked_service_ids(kids),
+        vec!["tiktok"],
+        "omitting the bundled-only id must remove it intentionally"
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -5391,18 +5609,16 @@ async fn test_clients_group_services_handler_rejects_oversized_selection() {
     seed_clients_config(&ctx, &clients);
     let headers = operator_form_headers(&ctx).await;
 
-    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
-    let selected: Vec<String> = (0..=catalog.services.len())
+    let selected: Vec<String> = (0..=MAX_GROUP_SERVICES_SELECTION)
         .map(|index| format!("service_{index}"))
         .collect();
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
     let registry =
         sito_clients::ServiceRegistry::try_bundled().expect("bundled registry must be valid");
     assert_eq!(
         group_blocked_services(&[], &selected, &catalog, &registry),
-        Err(GroupServicesError::TooMany(
-            MAX_GROUP_SERVICES_SELECTION.min(catalog.services.len())
-        )),
-        "the cap is checked before catalog membership"
+        Err(GroupServicesError::TooMany(MAX_GROUP_SERVICES_SELECTION)),
+        "the absolute selection cap is checked before catalog membership"
     );
 
     let mut pairs = vec![("group".to_string(), "kids".to_string())];

@@ -586,6 +586,7 @@ mod tests {
                     service: "tiktok".to_string(),
                     schedule: Some("0 8 * * *".to_string()),
                 }],
+                unlisted_services: Vec::new(),
             }],
             catalog_service_groups: vec![CatalogServiceGroupViewItem {
                 id: "social_network".to_string(),
@@ -676,6 +677,342 @@ mod tests {
             reauth_token: "",
         };
         assert!(wiz_tmpl.render().unwrap().contains("Welcome to sito DNS"));
+    }
+
+    fn clients_template_with_services(
+        group_services: Vec<ClientGroupServicesViewItem>,
+        catalog_service_groups: Vec<CatalogServiceGroupViewItem>,
+    ) -> ClientsTemplate<'static> {
+        let catalog_service_count = catalog_service_groups
+            .iter()
+            .map(|group| group.services.len())
+            .sum();
+        ClientsTemplate {
+            csrf_token: "group-services-csrf",
+            is_authenticated: true,
+            username: "admin",
+            user_role: "admin",
+            active_tab: "clients",
+            version: "1.2.1",
+            clients: vec![ClientViewItem {
+                name: "Work PC".to_string(),
+                ids: vec!["192.168.1.100".to_string()],
+                group: "default".to_string(),
+            }],
+            discovered: Vec::new(),
+            discovered_total: 0,
+            can_view_discovered: false,
+            discovered_page: 1,
+            discovered_pages: 1,
+            max_entries: sito_clients::MAX_UNIDENTIFIED_CLIENTS,
+            retention_hours: sito_clients::UNIDENTIFIED_CLIENT_TTL_HOURS,
+            group_services,
+            catalog_service_groups,
+            catalog_service_count,
+        }
+    }
+
+    fn blocked_service(service: &str, schedule: Option<&str>) -> BlockedServiceViewItem {
+        BlockedServiceViewItem {
+            service: service.to_string(),
+            schedule: schedule.map(str::to_string),
+        }
+    }
+
+    fn group_services(
+        name: &str,
+        is_default: bool,
+        blocked_services: Vec<BlockedServiceViewItem>,
+        unlisted_services: Vec<BlockedServiceViewItem>,
+    ) -> ClientGroupServicesViewItem {
+        ClientGroupServicesViewItem {
+            name: name.to_string(),
+            is_default,
+            blocked_services,
+            unlisted_services,
+        }
+    }
+
+    fn catalog_service(
+        id: &str,
+        name: &str,
+        group: &str,
+        rule_count: usize,
+        available: bool,
+    ) -> CatalogServiceViewItem {
+        CatalogServiceViewItem {
+            id: id.to_string(),
+            name: name.to_string(),
+            group: group.to_string(),
+            rule_count,
+            available,
+        }
+    }
+
+    fn clients_service_checkbox<'a>(html: &'a str, service_id: &str) -> &'a str {
+        let marker = format!("id=\"group-services-service-{service_id}\"");
+        let start = html
+            .find(&marker)
+            .unwrap_or_else(|| panic!("checkbox for {service_id} must render"));
+        let end = html[start..]
+            .find('>')
+            .unwrap_or_else(|| panic!("checkbox for {service_id} must close"))
+            + start;
+        &html[start..=end]
+    }
+
+    /// Collects every `id="..."` value from rendered HTML and asserts they are
+    /// unique. Duplicate ids indicate the picker catalog was rendered more
+    /// than once.
+    fn assert_unique_element_ids(html: &str) {
+        let mut ids = std::collections::HashSet::new();
+        let mut rest = html;
+        while let Some(start) = rest.find(" id=\"") {
+            let after = &rest[start + 5..];
+            let end = after.find('"').expect("unterminated id attribute");
+            let id = &after[..end];
+            assert!(ids.insert(id), "duplicate HTML id rendered: {id}");
+            rest = &after[end..];
+        }
+    }
+
+    #[test]
+    fn test_clients_blocked_services_picker_renders_groups_and_modal() {
+        let groups = vec![
+            group_services("default", true, Vec::new(), Vec::new()),
+            group_services(
+                "kids",
+                false,
+                vec![
+                    blocked_service("tiktok", Some("0 8 * * *")),
+                    blocked_service("netflix", None),
+                    blocked_service("ads", Some("0 9 * * *")),
+                ],
+                vec![blocked_service("ads", Some("0 9 * * *"))],
+            ),
+        ];
+        let catalog = vec![
+            CatalogServiceGroupViewItem {
+                id: "social_network".to_string(),
+                services: vec![
+                    catalog_service("tiktok", "TikTok", "social_network", 3, true),
+                    catalog_service(
+                        "zero_rule_candidate",
+                        "Zero rule candidate",
+                        "social_network",
+                        0,
+                        false,
+                    ),
+                ],
+            },
+            CatalogServiceGroupViewItem {
+                id: "streaming".to_string(),
+                services: vec![catalog_service("netflix", "Netflix", "streaming", 2, true)],
+            },
+        ];
+        let html = clients_template_with_services(groups, catalog)
+            .render()
+            .expect("render clients blocked-services picker");
+
+        // The existing client management UI is preserved.
+        assert!(html.contains("Identified Clients & Device Policies"));
+        assert!(html.contains("+ Add Client"));
+        assert!(html.contains("action=\"/ui/clients/add\""));
+        assert!(html.contains("Work PC"));
+
+        assert!(html.contains("Blocked services by group"));
+        assert!(html.contains("3 services in catalog"));
+        assert!(html.contains(">default<") || html.contains("default</span>"));
+        assert!(html.contains("kids"));
+        assert!(html.contains("tiktok"));
+        assert!(html.contains("schedule: 0 8 * * *"));
+        assert!(html.contains("netflix"));
+        assert!(html.contains("ads"));
+        assert!(html.contains("3 selected"));
+        assert!(
+            html.contains("No blocked services"),
+            "a group with no services must show an empty state"
+        );
+        assert!(html.contains("aria-label=\"Edit blocked services for group kids\""));
+        assert!(html.contains("Edit services"));
+
+        // One shared modal, populated from the clicked group's data.
+        assert_eq!(
+            html.matches("action=\"/ui/clients/group-services\"")
+                .count(),
+            1,
+            "the picker form must be rendered once, not once per group"
+        );
+        assert!(html.contains("id=\"group-services-search\""));
+        assert!(!html.contains("id=\"group-services-search-2\""));
+        assert!(html.contains("<span class=\"mono\" x-text=\"groupName\"></span>"));
+        assert!(html.contains("name=\"group\" :value=\"groupName\""));
+        assert!(html.contains("name=\"csrf_token\" value=\"group-services-csrf\""));
+        assert!(html.contains("name=\"selected\""));
+        assert!(html.contains("value=\"tiktok\""));
+        assert!(html.contains(":disabled=\"groupIndex !== 2\""));
+        assert!(html.contains("x-model=\"query\""));
+        assert!(html.contains("x-text=\"count\""));
+        assert!(html.contains("Save services"));
+        assert!(html.contains(">Cancel<"));
+        assert_unique_element_ids(&html);
+
+        // Per-group selection state is carried safely in data attributes; the
+        // click handler checks the matching boxes case-insensitively.
+        assert!(html.contains("data-group=\"kids\""));
+        assert!(html.contains("data-group-index=\"2\""));
+        assert!(html.contains("data-selected=\"tiktok netflix ads\""));
+        assert!(html.contains("input.checked = selected.has(input.value.toLowerCase())"));
+
+        // The picker is searchable by name, id and group.
+        assert!(html.contains("data-service-search=\"tiktok tiktok social_network\""));
+        assert!(
+            html.to_lowercase()
+                .contains("data-service-search=\"netflix netflix streaming\"")
+        );
+        assert!(html.contains("dataset.serviceSearch"));
+
+        // Catalog checkboxes are neutral in the shared markup; configured
+        // services are applied when a group opens.
+        let tiktok = clients_service_checkbox(&html, "tiktok");
+        assert!(!tiktok.contains("checked"));
+
+        // Unavailable rows are disabled and explain why.
+        let unavailable = clients_service_checkbox(&html, "zero_rule_candidate");
+        assert!(unavailable.contains("disabled aria-disabled=\"true\""));
+        assert!(!unavailable.contains("checked"));
+        assert!(
+            html.contains("Unavailable: this build has no usable blocking rules for this service.")
+        );
+
+        // Configured services missing from the catalog get an explicit,
+        // removable section instead of disappearing on save.
+        assert!(html.contains("Other configured services"));
+        assert!(html.contains(
+            "These services are configured for this group but are not in the embedded catalog."
+        ));
+        assert!(html.contains("value=\"ads\""));
+        assert!(
+            html.contains(
+                "Not in the embedded catalog. Checked keeps this group's existing entry."
+            )
+        );
+    }
+
+    #[test]
+    fn test_clients_blocked_services_shared_modal_renders_once() {
+        let groups = vec![
+            group_services("default", true, Vec::new(), Vec::new()),
+            group_services(
+                "kids",
+                false,
+                vec![blocked_service("tiktok", None)],
+                Vec::new(),
+            ),
+            group_services(
+                "guests",
+                false,
+                vec![blocked_service("netflix", None)],
+                Vec::new(),
+            ),
+        ];
+        let catalog = vec![CatalogServiceGroupViewItem {
+            id: "social_network".to_string(),
+            services: vec![
+                catalog_service("tiktok", "TikTok", "social_network", 2, true),
+                catalog_service("netflix", "Netflix", "social_network", 2, true),
+            ],
+        }];
+        let html = clients_template_with_services(groups, catalog)
+            .render()
+            .expect("render clients picker with multiple groups");
+
+        assert_eq!(
+            html.matches("action=\"/ui/clients/group-services\"")
+                .count(),
+            1,
+            "one shared form must serve every group"
+        );
+        assert_eq!(
+            html.matches("id=\"group-services-search\"").count(),
+            1,
+            "the search input must not be duplicated per group"
+        );
+        assert_eq!(
+            html.matches("id=\"group-services-service-tiktok\"").count(),
+            1,
+            "catalog rows must render once"
+        );
+        assert!(html.contains("data-selected=\"tiktok\""));
+        assert!(html.contains("data-selected=\"netflix\""));
+        assert_unique_element_ids(&html);
+    }
+
+    #[test]
+    fn test_clients_blocked_services_without_catalog_degrades() {
+        let groups = vec![group_services(
+            "kids",
+            false,
+            vec![blocked_service("tiktok", None)],
+            Vec::new(),
+        )];
+        let html = clients_template_with_services(groups, Vec::new())
+            .render()
+            .expect("render clients page with an empty catalog");
+
+        assert!(html.contains("Blocked services by group"));
+        assert!(html.contains("kids"));
+        assert!(html.contains("tiktok"));
+        assert!(html.contains("1 selected"));
+        assert!(html.contains(
+            "The embedded service catalog is unavailable, so blocked services cannot be edited here."
+        ));
+        assert!(html.contains("Catalog unavailable"));
+        assert!(
+            !html.contains("action=\"/ui/clients/group-services\""),
+            "the picker form must be omitted when the catalog is empty"
+        );
+        assert!(
+            !html.contains("Edit services"),
+            "edit buttons must be omitted when the catalog is empty"
+        );
+        assert!(
+            !html.contains("id=\"group-services-title\""),
+            "no picker modal"
+        );
+        assert!(
+            html.contains("+ Add Client") && html.contains("action=\"/ui/clients/add\""),
+            "the existing client UI must keep working"
+        );
+    }
+
+    #[test]
+    fn test_clients_blocked_services_metadata_is_html_escaped() {
+        let groups = vec![group_services(
+            "kids",
+            false,
+            vec![blocked_service("tiktok", None)],
+            Vec::new(),
+        )];
+        let catalog = vec![CatalogServiceGroupViewItem {
+            id: "social_network".to_string(),
+            services: vec![catalog_service(
+                "tiktok",
+                "<script>alert('name')</script>",
+                "social_network",
+                2,
+                true,
+            )],
+        }];
+        let html = clients_template_with_services(groups, catalog)
+            .render()
+            .expect("render clients picker with hostile metadata");
+
+        assert!(
+            !html.contains("<script>alert('name')</script>"),
+            "catalog names must not be injected as raw HTML"
+        );
+        assert!(html.contains("&#60;script&#62;alert"));
     }
 
     fn filtering_template_with_catalog(

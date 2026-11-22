@@ -75,6 +75,11 @@ pub struct ClientGroupServicesViewItem {
     pub is_default: bool,
     /// Configured entries in configuration order, deduplicated by service id.
     pub blocked_services: Vec<BlockedServiceViewItem>,
+    /// Configured entries whose ids are absent from the embedded catalog
+    /// (bundled-only or legacy ids). The picker shows these as an editable
+    /// "Other configured services" section so saving cannot drop them
+    /// silently.
+    pub unlisted_services: Vec<BlockedServiceViewItem>,
 }
 
 /// One catalog service offered by the blocked-service picker.
