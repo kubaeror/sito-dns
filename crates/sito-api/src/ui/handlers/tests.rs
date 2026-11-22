@@ -1787,6 +1787,7 @@ fn session_to_user(session: &crate::auth::session::Session) -> crate::auth::Auth
         username: session.username.clone(),
         role: session.role,
         token_id: None,
+        owner: None,
     }
 }
 

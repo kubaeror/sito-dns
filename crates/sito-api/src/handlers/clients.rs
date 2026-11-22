@@ -894,6 +894,7 @@ mod tests {
             username: "operator".to_string(),
             role: Role::Operator,
             token_id: None,
+            owner: None,
         })
     }
 
@@ -904,6 +905,7 @@ mod tests {
             username: "admin".to_string(),
             role: Role::Admin,
             token_id: None,
+            owner: None,
         })
     }
 

@@ -149,6 +149,50 @@ fn test_clients_trust_arp_is_an_optional_v2_field() {
 }
 
 #[test]
+fn test_auth_api_rate_limit_is_a_hot_applied_v2_field() {
+    // The key is registered in the v1→v2 map, so the real loader accepts it.
+    let ctx = Config::from_toml_str(&format!(
+        "{TEST_BASE}[auth]\napi_rate_limit_per_minute = 10\n"
+    ))
+    .expect("auth.api_rate_limit_per_minute = 10 must pass the real v2 loader");
+    let auth = ctx.get_auth_config();
+    assert_eq!(auth.api_rate_limit_per_minute, 10);
+
+    // Absent means the documented default and the key is not fabricated in
+    // the raw section.
+    let default = Config::from_toml_str(TEST_BASE).expect("omitting the key stays valid");
+    assert_eq!(default.get_auth_config().api_rate_limit_per_minute, 600);
+    assert!(
+        default
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.get("api_rate_limit_per_minute"))
+            .is_none(),
+        "the default must not be written into the raw [auth] table"
+    );
+
+    // 0 is the documented opt-out and survives validation plus serialization.
+    let disabled = Config::from_toml_str(&format!(
+        "{TEST_BASE}[auth]\napi_rate_limit_per_minute = 0\n"
+    ))
+    .expect("0 disables the per-account limit");
+    assert_eq!(disabled.get_auth_config().api_rate_limit_per_minute, 0);
+    let document = toml::to_string_pretty(&disabled).expect("serialize config");
+    assert!(document.contains("api_rate_limit_per_minute = 0"));
+    Config::from_toml_str(&document).expect("the serialized opt-out re-parses");
+
+    // The documented upper bound is enforced by the real loader.
+    let too_high = Config::from_toml_str(&format!(
+        "{TEST_BASE}[auth]\napi_rate_limit_per_minute = 1000001\n"
+    ))
+    .expect_err("the real loader must reject values above the cap");
+    assert!(
+        too_high.to_string().contains("api_rate_limit_per_minute"),
+        "the loader error must name the field: {too_high}"
+    );
+}
+
+#[test]
 fn test_duplicate_dns_bind_addresses_are_rejected() {
     expect_cross_section(
         &format!("{TEST_BASE}[dns]\nbind = [\"127.0.0.1\", \"127.0.0.1\"]\n"),

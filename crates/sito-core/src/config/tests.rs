@@ -346,6 +346,40 @@ fn test_default_api_token_ttl_is_bounded() {
 }
 
 #[test]
+fn test_api_rate_limit_defaults_parses_and_is_bounded() {
+    let auth = AuthConfig::default();
+    assert_eq!(
+        auth.api_rate_limit_per_minute, 600,
+        "the per-account API rate limit must default to 600 requests/minute"
+    );
+
+    let cfg = Config::from_toml_str("config_version = 2\n[auth]\napi_rate_limit_per_minute = 10\n")
+        .expect("a bounded auth.api_rate_limit_per_minute must parse");
+    let parsed: AuthConfig = cfg.auth.unwrap().try_into().unwrap();
+    assert_eq!(parsed.api_rate_limit_per_minute, 10);
+    parsed.validate().expect("10 requests/minute is valid");
+
+    let disabled =
+        Config::from_toml_str("config_version = 2\n[auth]\napi_rate_limit_per_minute = 0\n")
+            .expect("0 disables the limit");
+    let parsed: AuthConfig = disabled.auth.unwrap().try_into().unwrap();
+    assert_eq!(parsed.api_rate_limit_per_minute, 0);
+    parsed.validate().expect("0 is an explicit opt-out");
+
+    let too_high = Config::from_toml_str(&format!(
+        "config_version = 2\n[auth]\napi_rate_limit_per_minute = {}\n",
+        MAX_API_RATE_LIMIT_PER_MINUTE + 1
+    ))
+    .expect_err("values above the documented cap must be rejected");
+    assert!(
+        too_high
+            .to_string()
+            .contains("auth.api_rate_limit_per_minute"),
+        "the error must name the field: {too_high}"
+    );
+}
+
+#[test]
 fn test_default_config_doq_port_disabled_and_conflict_free() {
     let cfg = Config::default();
     assert_eq!(cfg.dns.dot_port, 853);
@@ -1053,6 +1087,7 @@ session_ttl_hours = 24
 login_rate_limit = 5
 session_persist = true
 token_default_ttl_days = 90
+api_rate_limit_per_minute = 600
 
 [stats]
 retention_days = 90

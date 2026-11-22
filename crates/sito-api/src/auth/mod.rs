@@ -4,6 +4,7 @@ pub mod client_ip;
 pub mod lockout;
 pub mod manager;
 pub mod password;
+pub(crate) mod rate_limit;
 pub mod rbac;
 pub mod secret_store;
 pub mod session;

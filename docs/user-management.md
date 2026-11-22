@@ -337,6 +337,15 @@ account. Tokens created with a bearer credential inherit the owner of the
 authenticating token. Tokens written by older releases have no owner; they are
 legacy/ownerless and remain Admin-managed.
 
+Every authenticated `/api/v2` request is also charged to an account-wide rate
+limit (`auth.api_rate_limit_per_minute`, default **600** requests per minute,
+`0` disables it). A browser session and all API tokens owned by the same account
+share one bucket; a legacy ownerless token is limited on its own. Exceeding the
+limit returns `429 Too Many Requests` with an RFC 7807 `ProblemDetails` body and
+a `Retry-After` header (seconds until the fixed one-minute window resets).
+Per-IP login/TOTP limits and the per-endpoint stats/query-log limits remain in
+place, and the stricter limit wins. Failed authentication is not charged.
+
 A single account may hold at most **16 tokens**
 (`MAX_API_TOKENS_PER_OWNER`). The limit is enforced when tokens are created:
 creating a 17th token evicts that account's oldest token; another account's
@@ -507,6 +516,10 @@ on the next start (see section 1).
   are rejected before lockout bookkeeping or password hashing. Lockout keys are
   BLAKE3 digests (the raw username is never retained), and username spraying
   cannot evict an account whose lockout is still active.
+* Authenticated API traffic has an additional account-wide ceiling
+  (`auth.api_rate_limit_per_minute`, default 600 per minute). Unauthenticated
+  requests such as `/auth/login` and `/auth/totp/verify` are not charged by it;
+  they keep their per-IP limits.
 * Expired tokens are rejected immediately and removed from memory; their
   on-disk snapshot is rewritten by the background pruner within 60 seconds.
 * WebSocket authentication uses only an `Authorization: Bearer` header or the
