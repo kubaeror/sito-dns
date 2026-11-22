@@ -219,6 +219,11 @@ impl Config {
             }
         }
 
+        // ADR-0011 source ACL. Validate it from the raw table so an error
+        // names the exact `[clients.acl]` key, and so check-config, startup,
+        // API writes and HA apply all reject the same document.
+        Self::validate_clients_acl_section(table)?;
+
         let Some(entries) = table.get("entries") else {
             return Ok(());
         };
@@ -356,6 +361,74 @@ impl Config {
                     format!("clients.entries[{index}].upstreams"),
                     format!(
                         "client '{name}' sets use_global_upstreams = false but has no per-client upstream targets"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the ADR-0011 `[clients] default_policy` / `[clients.acl]`
+    /// keys from the raw TOML table.
+    fn validate_clients_acl_section(table: &toml::Table) -> Result<(), ConfigError> {
+        if let Some(policy) = table.get("default_policy") {
+            let policy = policy.as_str().ok_or_else(|| {
+                ConfigError::validation(
+                    "clients.default_policy",
+                    "clients.default_policy must be the string \"allow\" or \"deny\"",
+                )
+            })?;
+            if policy != "allow" && policy != "deny" {
+                return Err(ConfigError::validation(
+                    "clients.default_policy",
+                    format!(
+                        "invalid value '{policy}': clients.default_policy must be exactly \"allow\" or \"deny\""
+                    ),
+                ));
+            }
+        }
+
+        let Some(acl) = table.get("acl") else {
+            return Ok(());
+        };
+        let acl = acl.as_table().ok_or_else(|| {
+            ConfigError::validation("clients.acl", "[clients.acl] must be a table")
+        })?;
+
+        let allow = parse_acl_list(acl, "clients.acl.allow")?;
+        let deny = parse_acl_list(acl, "clients.acl.deny")?;
+        for denied in &deny {
+            if allow.iter().any(|allowed| allowed == denied) {
+                return Err(ConfigError::validation(
+                    "clients.acl.deny",
+                    format!(
+                        "prefix '{}/{}' appears in both clients.acl.allow and clients.acl.deny; choose one action",
+                        denied.0, denied.1
+                    ),
+                ));
+            }
+        }
+
+        if let Some(allow_entry_ids) = acl.get("allow_entry_ids")
+            && !allow_entry_ids.is_bool()
+        {
+            return Err(ConfigError::validation(
+                "clients.acl.allow_entry_ids",
+                "clients.acl.allow_entry_ids must be a boolean",
+            ));
+        }
+        if let Some(response) = acl.get("deny_response") {
+            let response = response.as_str().ok_or_else(|| {
+                ConfigError::validation(
+                    "clients.acl.deny_response",
+                    "clients.acl.deny_response must be the string \"refused\" or \"drop\"",
+                )
+            })?;
+            if response != "refused" && response != "drop" {
+                return Err(ConfigError::validation(
+                    "clients.acl.deny_response",
+                    format!(
+                        "invalid value '{response}': clients.acl.deny_response must be exactly \"refused\" or \"drop\""
                     ),
                 ));
             }
@@ -690,9 +763,6 @@ impl Config {
     /// false.
     #[must_use]
     pub fn dns_exposure_warning(&self) -> Option<String> {
-        // sito has no DNS client allow-list: a wildcard bind accepts recursion
-        // from every source. Rate limiting attenuates abuse, it does not
-        // authorize clients.
         if !self.dns_listeners_exposed() {
             return None;
         }
@@ -703,9 +773,34 @@ impl Config {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
+        // ADR-0011: under an effective deny policy the wildcard listener is
+        // not an open resolver. Name the ACL as the active control instead of
+        // reporting an unqualified exposure. The admin UI warning is separate
+        // and unaffected.
+        if self.clients_default_policy_is_deny() {
+            return Some(format!(
+                "DNS listeners bind to {binds}; [clients] default_policy = \"deny\" is the active DNS client admission control, so only configured allow/entry networks may query. Verify the allow list before relying on it: a missing or loopback-only allow list denies every LAN client, and rate limiting is still not an access control. Keep the host firewall as defense in depth"
+            ));
+        }
+        // No effective deny policy: a wildcard bind accepts recursion from
+        // every source. Rate limiting attenuates abuse, it does not authorize
+        // clients.
         Some(format!(
-            "DNS listeners bind to {binds} and accept queries from any source; sito has no DNS client allow-list and rate limiting is not an access control. Restrict the DNS ports to your LAN with a host firewall or set dns.bind to specific LAN addresses"
+            "DNS listeners bind to {binds} and clients.default_policy is \"allow\", so any source not matched by an explicit [clients.acl] deny rule is admitted; rate limiting is not an access control. Restrict the DNS ports to your LAN with a host firewall, set dns.bind to specific LAN addresses, or configure [clients.acl] with default_policy = \"deny\""
         ))
+    }
+
+    /// True when the raw `[clients]` table selects `default_policy = "deny"`.
+    ///
+    /// Used only for exposure wording; full enum validation happens in
+    /// [`Self::validate_clients_acl_section`].
+    fn clients_default_policy_is_deny(&self) -> bool {
+        self.clients
+            .as_ref()
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.get("default_policy"))
+            .and_then(toml::Value::as_str)
+            == Some("deny")
     }
 
     /// True when the configuration explicitly declares that the admin scheme
@@ -950,6 +1045,67 @@ fn validate_hostname(host: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Maximum number of prefixes in each `[clients.acl] allow`/`deny` list
+/// (ADR-0011). Mirrors `sito_clients::MAX_ACL_PREFIXES`.
+const MAX_ACL_PREFIXES: usize = 1024;
+
+/// Parses and validates one `[clients.acl] allow`/`deny` list, returning
+/// canonical `(network, prefix)` pairs for duplicate/conflict checks.
+fn parse_acl_list(acl: &toml::Table, field: &str) -> Result<Vec<(IpAddr, u8)>, ConfigError> {
+    let Some(value) = acl.get(field.rsplit('.').next().unwrap_or(field)) else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        ConfigError::validation(field, format!("{field} must be an array of strings"))
+    })?;
+    if values.len() > MAX_ACL_PREFIXES {
+        return Err(ConfigError::validation(
+            field,
+            format!(
+                "{field} contains {} entries; at most {MAX_ACL_PREFIXES} prefixes are allowed",
+                values.len()
+            ),
+        ));
+    }
+
+    let mut parsed = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let value = value.as_str().ok_or_else(|| {
+            ConfigError::validation(
+                format!("{field}[{index}]"),
+                format!("{field} must be an array of IPv4/IPv6 addresses or CIDR strings"),
+            )
+        })?;
+        let network = if let Ok(ip) = value.trim().parse::<IpAddr>() {
+            let prefix = match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            crate::net::IpNetwork::new(ip, prefix)
+        } else {
+            crate::net::IpNetwork::parse(value.trim())
+        }
+        .map_err(|e| {
+            ConfigError::validation(
+                format!("{field}[{index}]"),
+                format!("invalid value '{value}': {e}"),
+            )
+        })?;
+        let canonical = (network.network_address(), network.prefix());
+        if parsed.contains(&canonical) {
+            return Err(ConfigError::validation(
+                format!("{field}[{index}]"),
+                format!(
+                    "duplicate canonical prefix '{}/{}'",
+                    canonical.0, canonical.1
+                ),
+            ));
+        }
+        parsed.push(canonical);
+    }
+    Ok(parsed)
 }
 
 /// Validates one `zone:algorithm:base64` trust-anchor entry. An operator typo

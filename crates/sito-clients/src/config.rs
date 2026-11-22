@@ -7,9 +7,97 @@ use crate::safe_search::YouTubeSafeSearchMode;
 use crate::schedule::Schedule;
 use crate::timezone::ClientTimeZone;
 
+/// What happens to a DNS query whose source matches no explicit ACL rule
+/// (ADR-0011). Kept as a typed enum so an invalid value is rejected at load
+/// time instead of silently defaulting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AclDefaultPolicy {
+    /// Admit the query (compatibility default; upgrades stay allow).
+    #[default]
+    Allow,
+    /// Refuse the query (fresh-install wizard policy).
+    Deny,
+}
+
+impl AclDefaultPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// What a denied client receives (ADR-0011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AclDenyResponse {
+    /// Send a normal DNS REFUSED (RCODE 5) response.
+    #[default]
+    Refused,
+    /// Send no DNS response at all; DoH/DoH3 return HTTP 204.
+    Drop,
+}
+
+impl AclDenyResponse {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::Drop => "drop",
+        }
+    }
+}
+
+/// Source-address admission rules for the DNS listeners (ADR-0011).
+///
+/// This is shared configuration: it is part of the HA bundle and its decision
+/// depends only on the observed peer address, never on DoH path/SNI, MAC, ARP,
+/// RouterOS leases, headers or groups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAclConfig {
+    /// IPv4/IPv6 addresses or CIDR blocks whose sources may use the listeners.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// IPv4/IPv6 addresses or CIDR blocks that are always denied. Deny wins
+    /// over every allow rule regardless of prefix length.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Treat static IP/CIDR values in `clients.entries[].ids` as allow rules.
+    /// Off by default: an entry is identity/policy, not admission.
+    #[serde(default)]
+    pub allow_entry_ids: bool,
+    /// Response for a denied source.
+    #[serde(default)]
+    pub deny_response: AclDenyResponse,
+}
+
+impl ClientAclConfig {
+    /// True when no ACL key differs from its typed default. Used only for
+    /// pretty-printing typed configuration; the raw `Config` value is what the
+    /// API persists.
+    #[must_use]
+    pub fn is_inert(&self) -> bool {
+        self.allow.is_empty()
+            && self.deny.is_empty()
+            && !self.allow_entry_ids
+            && self.deny_response == AclDenyResponse::Refused
+    }
+}
+
 /// Clients configuration section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ClientsConfig {
+    /// What happens when no explicit rule matches (ADR-0011). Defaults to
+    /// `"allow"` so upgrades and hand-written configs are unchanged.
+    #[serde(default)]
+    pub default_policy: AclDefaultPolicy,
+    /// Source-address admission rules for the DNS listeners.
+    #[serde(default, skip_serializing_if = "ClientAclConfig::is_inert")]
+    pub acl: ClientAclConfig,
     /// Timezone used to evaluate group and blocked-service cron schedules
     /// (default: `"local"`, the host's system timezone).
     ///

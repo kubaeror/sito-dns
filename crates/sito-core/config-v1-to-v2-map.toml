@@ -501,6 +501,26 @@ path = "clients.trust_arp"
 status = "kept"
 
 [[field]]
+path = "clients.default_policy"
+status = "kept"
+
+[[field]]
+path = "clients.acl.allow"
+status = "kept"
+
+[[field]]
+path = "clients.acl.deny"
+status = "kept"
+
+[[field]]
+path = "clients.acl.allow_entry_ids"
+status = "kept"
+
+[[field]]
+path = "clients.acl.deny_response"
+status = "kept"
+
+[[field]]
 path = "clients.entries[].name"
 status = "kept"
 

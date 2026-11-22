@@ -1136,6 +1136,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// ADR-0011: DoH3 admission/identity is the observed QUIC peer address.
+    /// `X-Forwarded-For` is a plain HTTP header and must never replace it.
+    #[tokio::test]
+    async fn test_doh3_ignores_x_forwarded_for_for_client_ip() {
+        let temp_dir = std::env::temp_dir().join(format!("sito_doh3_xff_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"h3".to_vec()])
+                .unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let seen: Arc<std::sync::Mutex<Option<ClientContext>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let seen_handler = Arc::clone(&seen);
+        let handler = Arc::new(move |query: Message, client: ClientContext| {
+            let seen = Arc::clone(&seen_handler);
+            async move {
+                *seen.lock().unwrap() = Some(client);
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                Some(resp)
+            }
+        });
+
+        let listener_handle = start_doh3_listener(
+            Doh3Config::new(actual_addr, Some(TlsAcceptorManager::new(server_config))),
+            handler,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in crate::tls::load_certificates(&cert_file).unwrap() {
+            root_store.add(cert).unwrap();
+        }
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_client_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap();
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint
+            .set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_client_crypto)));
+
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .unwrap();
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let mut query = Message::new(8010, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("xff.doh3.example.").unwrap(),
+            RecordType::A,
+        ));
+        let wire = encode_message(&query).unwrap();
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://localhost/dns-query")
+            .header(http::header::CONTENT_TYPE, "application/dns-message")
+            .header("X-Forwarded-For", "203.0.113.250")
+            .header("Forwarded", "for=203.0.113.250")
+            .body(())
+            .unwrap();
+        let mut stream = send_request.send_request(req).await.unwrap();
+        stream.send_data(wire.into()).await.unwrap();
+        stream.finish().await.unwrap();
+        let resp = stream.recv_response().await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        let observed = seen.lock().unwrap().clone().expect("handler must run");
+        assert_eq!(
+            observed.ip,
+            std::net::Ipv4Addr::LOCALHOST,
+            "DoH3 must use the raw QUIC peer, never X-Forwarded-For"
+        );
+        assert_eq!(observed.proto, "doh3");
+
+        drop(send_request);
+        driver_task.abort();
+        let _ = shutdown_tx.send(true);
+        let _ = listener_handle.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     /// P1-14: DoH3 responses over the 65,535-byte DNS framing limit must be
     /// truncated (TC=1) rather than sent as an oversized body.
     #[tokio::test]

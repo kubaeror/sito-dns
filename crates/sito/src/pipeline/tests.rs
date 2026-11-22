@@ -1916,6 +1916,24 @@ async fn with_test_metrics(pipeline: DnsPipeline) -> (DnsPipeline, sito_stats::M
     (pipeline, metrics)
 }
 
+/// Like [`with_test_metrics`], but also exposes the live query-log stream so
+/// a test can prove a denied query creates no entry.
+async fn with_test_metrics_and_log(
+    pipeline: DnsPipeline,
+) -> (
+    DnsPipeline,
+    sito_stats::MetricsRegistry,
+    tokio::sync::broadcast::Receiver<sito_stats::QueryLogEntry>,
+) {
+    let stats_db = sito_stats::StatsDb::in_memory().await.unwrap();
+    let writer = sito_stats::QueryLogWriter::spawn(stats_db, 100);
+    let sender = writer.sender();
+    let receiver = sender.subscribe();
+    let metrics = sito_stats::MetricsRegistry::new("test", "test");
+    let pipeline = pipeline.with_stats(sender, metrics.clone());
+    (pipeline, metrics, receiver)
+}
+
 /// D-12: a failing upstream is labelled by its configured name, lowers that
 /// server's health gauge immediately, and recovers to 1 after a success.
 /// No failure may ever be recorded under the legacy `upstream="all"` label.
@@ -4607,4 +4625,339 @@ async fn test_pipeline_uses_snapshot_generation_for_dnssec_cache_insert() {
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0011 DNS client ACL enforcement (D7b1 tests B/C/D).
+// ---------------------------------------------------------------------------
+
+fn acl_clients(
+    default_policy: sito_clients::AclDefaultPolicy,
+    allow: &[&str],
+    deny: &[&str],
+) -> sito_clients::ClientsConfig {
+    sito_clients::ClientsConfig {
+        default_policy,
+        acl: sito_clients::ClientAclConfig {
+            allow: allow.iter().map(|value| (*value).to_string()).collect(),
+            deny: deny.iter().map(|value| (*value).to_string()).collect(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::assert_is_empty)]
+async fn test_acl_refused_udp_has_no_pipeline_side_effects() {
+    use sito_clients::AclDefaultPolicy;
+
+    let clients = acl_clients(AclDefaultPolicy::Allow, &[], &["203.0.113.0/24"]);
+    let (pipeline, calls, temp_dir) = policy_pipeline(&[], clients).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+
+    let mut query = rewrite_query("refused.example.", RecordType::A);
+    query.metadata.recursion_desired = true;
+    let mut edns = Edns::new();
+    edns.set_max_payload(4096);
+    query.set_edns(edns);
+    let question = query.queries[0].clone();
+
+    let response = pipeline
+        .handle(query, ClientContext::new("203.0.113.5".parse().unwrap()))
+        .await
+        .expect("refused mode returns a response");
+
+    assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+    assert_eq!(response.metadata.id, 42);
+    assert_eq!(response.metadata.op_code, OpCode::Query);
+    assert!(response.metadata.recursion_available);
+    assert!(response.metadata.recursion_desired);
+    assert_eq!(response.queries, vec![question]);
+    assert!(response.answers.is_empty());
+    assert!(response.authorities.is_empty());
+    assert!(response.additionals.is_empty());
+    let response_edns = response.edns.as_ref().expect("EDNS query gets an OPT");
+    assert_eq!(response_edns.version(), 0);
+    assert_eq!(
+        response_edns.max_payload(),
+        pipeline.runtime().snapshot().config.dns.edns_udp_size
+    );
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "denied queries must not reach upstream"
+    );
+    let rendered = metrics.render_prometheus();
+    assert!(
+        rendered.contains(
+            r#"sito_dns_acl_decisions_total{action="deny",reason="explicit_deny",family="ipv4"} 1"#
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            r#"sito_dns_acl_matched_prefix_total{action="deny",prefix="203.0.113.0/24",family="ipv4"} 1"#
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(r#"sito_queries_total{proto="udp",qtype="1",verdict="refused"} 1"#),
+        "{rendered}"
+    );
+    // The exposition emits a zero default series, so assert the counter never
+    // advanced: identity resolution did not run for the denied query.
+    assert!(
+        rendered.contains(r#"sito_clients_identified_total{method="ip"} 0"#),
+        "identity must not be resolved for denied traffic: {rendered}"
+    );
+
+    let _ = tokio::fs::remove_dir_all(temp_dir).await;
+}
+
+#[tokio::test]
+async fn test_acl_allow_keeps_existing_behavior() {
+    use sito_clients::AclDefaultPolicy;
+
+    let (pipeline, calls, temp_dir) =
+        policy_pipeline(&[], acl_clients(AclDefaultPolicy::Allow, &[], &[])).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+
+    let response = pipeline
+        .handle(
+            rewrite_query("allowed.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .expect("default allow returns the upstream answer");
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let rendered = metrics.render_prometheus();
+    assert!(
+        rendered.contains(
+            r#"sito_dns_acl_decisions_total{action="allow",reason="default_policy",family="ipv4"} 1"#
+        ),
+        "{rendered}"
+    );
+
+    let _ = tokio::fs::remove_dir_all(temp_dir).await;
+}
+
+#[tokio::test]
+async fn test_acl_entry_ids_opt_in_admits_end_to_end() {
+    use sito_clients::AclDefaultPolicy;
+
+    let mut clients = acl_clients(AclDefaultPolicy::Deny, &[], &[]);
+    clients.acl.allow_entry_ids = true;
+    clients.entries = vec![policy_entry("laptop", "127.0.0.1", "default")];
+    let (pipeline, calls, temp_dir) = policy_pipeline(&[], clients).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+
+    let response = pipeline
+        .handle(
+            rewrite_query("entry.example.", RecordType::A),
+            ClientContext::new("127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .expect("opted-in entry admits");
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(metrics.render_prometheus().contains(
+        r#"sito_dns_acl_decisions_total{action="allow",reason="client_entry",family="ipv4"} 1"#
+    ));
+
+    let _ = tokio::fs::remove_dir_all(temp_dir).await;
+}
+
+#[tokio::test]
+async fn test_acl_denied_query_writes_no_query_log_or_discovery() {
+    use sito_clients::AclDefaultPolicy;
+
+    let (pipeline, calls, temp_dir) =
+        policy_pipeline(&[], acl_clients(AclDefaultPolicy::Deny, &[], &[])).await;
+    let (pipeline, _metrics, mut log_rx) = with_test_metrics_and_log(pipeline).await;
+
+    let response = pipeline
+        .handle(
+            rewrite_query("denied.example.", RecordType::A),
+            ClientContext::new("198.51.100.9".parse().unwrap()),
+        )
+        .await
+        .expect("refused mode still answers");
+    assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        pipeline
+            .runtime()
+            .snapshot()
+            .clients
+            .unidentified_clients()
+            .is_empty(),
+        "a denied client must not enter discovery"
+    );
+    let received = tokio::time::timeout(std::time::Duration::from_millis(100), log_rx.recv()).await;
+    assert!(
+        received.is_err(),
+        "a denied query must not create a query-log entry: {received:?}"
+    );
+
+    let _ = tokio::fs::remove_dir_all(temp_dir).await;
+}
+
+#[tokio::test]
+async fn test_acl_drop_suppresses_response_and_counts_drop() {
+    use sito_clients::AclDefaultPolicy;
+
+    let mut clients = acl_clients(AclDefaultPolicy::Deny, &[], &[]);
+    clients.acl.deny_response = sito_clients::AclDenyResponse::Drop;
+    let (pipeline, calls, temp_dir) = policy_pipeline(&[], clients).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+
+    let response = pipeline
+        .handle(
+            rewrite_query("drop.example.", RecordType::A),
+            ClientContext::new("203.0.113.9".parse().unwrap()),
+        )
+        .await;
+    assert!(response.is_none(), "drop sends no DNS frame/datagram");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let rendered = metrics.render_prometheus();
+    assert!(rendered.contains(r#"sito_dns_acl_dropped_total{family="ipv4"} 1"#));
+    assert!(
+        !rendered.contains(r#"sito_queries_total{proto="udp",qtype="1",verdict="refused"}"#),
+        "drop mode does not emit a refused query series: {rendered}"
+    );
+
+    let _ = tokio::fs::remove_dir_all(temp_dir).await;
+}
+
+#[tokio::test]
+async fn test_acl_precedes_wire_error_paths() {
+    use hickory_proto::op::Query;
+    use sito_clients::AclDefaultPolicy;
+
+    let (pipeline, calls, temp_dir) =
+        policy_pipeline(&[], acl_clients(AclDefaultPolicy::Deny, &[], &[])).await;
+    let client = ClientContext::new("198.51.100.10".parse().unwrap());
+
+    let mut multi = rewrite_query("multi.example.", RecordType::A);
+    multi.queries.push(Query::query(
+        Name::from_str("second.example.").unwrap(),
+        RecordType::AAAA,
+    ));
+    let response = pipeline.handle(multi, client.clone()).await.unwrap();
+    assert_eq!(
+        response.metadata.response_code,
+        ResponseCode::Refused,
+        "a denied multi-question probe is REFUSED, not FORMERR"
+    );
+
+    let mut badvers = rewrite_query("badvers.example.", RecordType::A);
+    let mut edns = Edns::new();
+    edns.set_version(1);
+    badvers.set_edns(edns);
+    let response = pipeline.handle(badvers, client).await.unwrap();
+    assert_eq!(
+        response.metadata.response_code,
+        ResponseCode::Refused,
+        "a denied BADVERS-shaped probe is REFUSED, not BADVERS"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let _ = tokio::fs::remove_dir_all(temp_dir).await;
+}
+
+#[tokio::test]
+async fn test_acl_doh_path_sni_and_secret_are_not_credentials() {
+    use sito_clients::AclDefaultPolicy;
+    use std::collections::HashMap;
+
+    let mut clients = acl_clients(AclDefaultPolicy::Deny, &[], &[]);
+    clients.acl.allow_entry_ids = true;
+    clients.entries = vec![policy_entry("tablet", "aa:bb:cc:dd:ee:ff", "default")];
+    clients.client_id_secrets = HashMap::from([("tablet".to_string(), "s3cret-label".to_string())]);
+    let (pipeline, calls, temp_dir) = policy_pipeline(&[], clients).await;
+
+    let mut client = ClientContext::with_id("198.51.100.11".parse().unwrap(), "s3cret-label");
+    client.sni = Some("s3cret-label.dns.example".to_string());
+    client.proto = "doh".to_string();
+    let response = pipeline
+        .handle(rewrite_query("doh.example.", RecordType::A), client)
+        .await
+        .unwrap();
+    assert_eq!(
+        response.metadata.response_code,
+        ResponseCode::Refused,
+        "a secret/path/SNI label must not bypass the source ACL"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let _ = tokio::fs::remove_dir_all(temp_dir).await;
+}
+
+#[tokio::test]
+async fn test_acl_mapped_ipv6_uses_ipv4_rules_end_to_end() {
+    use sito_clients::AclDefaultPolicy;
+
+    let (pipeline, calls, temp_dir) = policy_pipeline(
+        &[],
+        acl_clients(AclDefaultPolicy::Deny, &["127.0.0.0/8"], &[]),
+    )
+    .await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+
+    let response = pipeline
+        .handle(
+            rewrite_query("mapped.example.", RecordType::A),
+            ClientContext::new("::ffff:127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .expect("mapped IPv4 matches the IPv4 allow rule");
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(metrics.render_prometheus().contains(
+        r#"sito_dns_acl_decisions_total{action="allow",reason="explicit_allow",family="ipv4"} 1"#
+    ));
+
+    let _ = tokio::fs::remove_dir_all(temp_dir).await;
+}
+
+#[tokio::test]
+async fn test_acl_denied_traffic_ignores_ignore_stats() {
+    use sito_clients::AclDefaultPolicy;
+
+    let mut clients = acl_clients(AclDefaultPolicy::Deny, &[], &[]);
+    let mut entry = policy_entry("ignored", "198.51.100.12", "default");
+    entry.ignore_stats = true;
+    entry.ignore_query_log = true;
+    clients.entries = vec![entry];
+    let (pipeline, calls, temp_dir) = policy_pipeline(&[], clients).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+
+    let response = pipeline
+        .handle(
+            rewrite_query("ignore-stats.example.", RecordType::A),
+            ClientContext::new("198.51.100.12".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let rendered = metrics.render_prometheus();
+    assert!(
+        rendered.contains(
+            r#"sito_dns_acl_decisions_total{action="deny",reason="default_policy",family="ipv4"} 1"#
+        ),
+        "ACL telemetry is not suppressible by identity flags: {rendered}"
+    );
+    assert!(
+        rendered.contains(r#"sito_queries_total{proto="udp",qtype="1",verdict="refused"} 1"#),
+        "the refused query series is emitted before identity is known: {rendered}"
+    );
+
+    let _ = tokio::fs::remove_dir_all(temp_dir).await;
 }

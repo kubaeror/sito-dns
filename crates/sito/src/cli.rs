@@ -2205,6 +2205,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn test_check_config_accepts_and_rejects_dns_client_acl() {
+        let dir = temp_config_dir("check_config_acl");
+        let path = dir.join("config.toml");
+
+        // Positive: every ACL key through the real `sito check-config` path.
+        std::fs::write(
+            &path,
+            "config_version = 2\n\
+             [upstream]\n\
+             servers = [\"1.1.1.1\"]\n\
+             [clients]\n\
+             default_policy = \"deny\"\n\
+             [clients.acl]\n\
+             allow = [\"127.0.0.1/32\", \"::1/128\", \"192.168.1.0/24\"]\n\
+             deny = [\"192.168.1.128/25\"]\n\
+             allow_entry_ids = false\n\
+             deny_response = \"refused\"\n",
+        )
+        .unwrap();
+        run_check_config(&path).expect("valid ACL must pass check-config");
+
+        // Negative: duplicate canonical prefix names the exact key/value.
+        std::fs::write(
+            &path,
+            "config_version = 2\n\
+             [upstream]\n\
+             servers = [\"1.1.1.1\"]\n\
+             [clients.acl]\n\
+             allow = [\"192.168.1.7/24\", \"192.168.1.0/24\"]\n",
+        )
+        .unwrap();
+        let err = run_check_config(&path).expect_err("duplicate prefix must fail");
+        assert!(
+            err.to_string().contains("clients.acl.allow")
+                && err.to_string().contains("192.168.1.0/24"),
+            "got: {err}"
+        );
+
+        // Negative: invalid enum names the key.
+        std::fs::write(
+            &path,
+            "config_version = 2\n\
+             [upstream]\n\
+             servers = [\"1.1.1.1\"]\n\
+             [clients]\n\
+             default_policy = \"deny-all\"\n",
+        )
+        .unwrap();
+        let err = run_check_config(&path).expect_err("invalid enum must fail");
+        assert!(
+            err.to_string().contains("clients.default_policy")
+                && err.to_string().contains("deny-all"),
+            "got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(feature = "ha")]
     fn ha_promotion_document(promotion: &str) -> String {
         format!(

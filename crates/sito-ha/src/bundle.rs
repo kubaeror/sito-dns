@@ -1308,6 +1308,65 @@ ids = ["10.0.0.5"]
     }
 
     #[test]
+    fn test_ha_sanitizer_preserves_acl_and_strips_only_client_secrets() {
+        let master_toml = r#"
+config_version = 2
+
+[server]
+role = "master"
+instance_name = "master-prod"
+
+[clients]
+default_policy = "deny"
+
+[clients.acl]
+allow = ["192.168.1.0/24", "::1/128"]
+deny = ["192.168.1.128/25"]
+allow_entry_ids = false
+deny_response = "drop"
+
+[clients.client_id_secrets]
+tablet = "client_shared_secret_9876"
+"#;
+        let sanitized = sanitize_config_for_bundle(master_toml).unwrap();
+        for expected in [
+            "default_policy = \"deny\"",
+            "192.168.1.0/24",
+            "::1/128",
+            "192.168.1.128/25",
+            "allow_entry_ids = false",
+            "deny_response = \"drop\"",
+        ] {
+            assert!(
+                sanitized.contains(expected),
+                "shared ACL value {expected} must survive sanitization: {sanitized}"
+            );
+        }
+        assert!(!sanitized.contains("client_id_secrets"));
+        assert!(!sanitized.contains("client_shared_secret_9876"));
+
+        let parsed = sito_core::config::Config::from_toml_str(&sanitized)
+            .expect("sanitized ACL document must load as v2");
+        let clients = parsed
+            .clients
+            .as_ref()
+            .and_then(toml::Value::as_table)
+            .expect("clients table");
+        assert_eq!(
+            clients.get("default_policy").and_then(toml::Value::as_str),
+            Some("deny")
+        );
+        let acl = clients
+            .get("acl")
+            .and_then(toml::Value::as_table)
+            .expect("acl table");
+        assert_eq!(
+            acl.get("deny_response").and_then(toml::Value::as_str),
+            Some("drop")
+        );
+    }
+
+    #[test]
     fn sanitized_configs_equal_ignores_formatting_but_detects_value_changes() {
         let a = "config_version = 2\n[server]\nrole = \"slave\"\n";
         let b =

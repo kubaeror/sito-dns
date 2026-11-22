@@ -931,6 +931,203 @@ fn test_upstream_hostname_target_requires_bootstrap() {
 /// WP-2.7: `UpstreamConfig::validate` itself rejects bad targets so direct
 /// callers (API DTO handling, restore) cannot bypass the configuration path.
 #[test]
+fn test_acl_config_real_loader() {
+    let document = format!(
+        "{TEST_BASE}\
+         [clients]\n\
+         default_policy = \"deny\"\n\
+         [clients.acl]\n\
+         allow = [\"192.168.1.7/24\", \"2001:db8::/64\"]\n\
+         deny = [\"192.168.1.128/25\"]\n\
+         allow_entry_ids = true\n\
+         deny_response = \"drop\"\n"
+    );
+    let config = Config::from_toml_str(&document).expect("ACL fixture is valid v2");
+    let clients = config
+        .clients
+        .as_ref()
+        .and_then(toml::Value::as_table)
+        .expect("clients section");
+    assert_eq!(
+        clients.get("default_policy").and_then(toml::Value::as_str),
+        Some("deny")
+    );
+    let acl = clients
+        .get("acl")
+        .and_then(toml::Value::as_table)
+        .expect("acl table");
+    let allow: Vec<&str> = acl
+        .get("allow")
+        .and_then(toml::Value::as_array)
+        .expect("allow array")
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .collect();
+    assert_eq!(allow, vec!["192.168.1.7/24", "2001:db8::/64"]);
+    assert_eq!(
+        acl.get("allow_entry_ids").and_then(toml::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        acl.get("deny_response").and_then(toml::Value::as_str),
+        Some("drop")
+    );
+
+    // The raw document is what the API/HA sanitizer carries; the loader must
+    // retain every key.
+    let rendered = toml::to_string_pretty(&config).expect("serialize");
+    for expected in [
+        "default_policy = \"deny\"",
+        "\"192.168.1.7/24\"",
+        "\"2001:db8::/64\"",
+        "\"192.168.1.128/25\"",
+        "allow_entry_ids = true",
+        "deny_response = \"drop\"",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected} in {rendered}"
+        );
+    }
+}
+
+#[test]
+fn test_acl_defaults_are_compatibility_first_through_loader() {
+    for document in [
+        TEST_BASE.to_string(),
+        format!("{TEST_BASE}[clients]\n"),
+        format!("{TEST_BASE}[clients]\nentries = []\n"),
+    ] {
+        let config = Config::from_toml_str(&document).expect("omitted ACL is valid");
+        let clients = config.clients.as_ref().and_then(toml::Value::as_table);
+        // Omitted keys use their typed defaults; the loader must not write
+        // them and must not treat the document as ACL-configured.
+        assert!(
+            clients.is_none_or(|table| !table.contains_key("default_policy")),
+            "the loader must not materialize default_policy"
+        );
+        assert!(
+            clients.is_none_or(|table| !table.contains_key("acl")),
+            "the loader must not materialize [clients.acl]"
+        );
+    }
+}
+
+#[test]
+fn test_acl_config_rejections() {
+    for (document, expected_key, expected_value) in [
+        (
+            "[clients]\ndefault_policy = \"block\"\n".to_string(),
+            "clients.default_policy",
+            "block",
+        ),
+        (
+            "[clients]\ndefault_policy = true\n".to_string(),
+            "clients.default_policy",
+            "allow",
+        ),
+        (
+            "[clients.acl]\ndeny_response = \"silent\"\n".to_string(),
+            "clients.acl.deny_response",
+            "silent",
+        ),
+        (
+            "[clients.acl]\nallow_entry_ids = \"yes\"\n".to_string(),
+            "clients.acl.allow_entry_ids",
+            "boolean",
+        ),
+        (
+            "[clients.acl]\nallow = [\"192.0.2.0/33\"]\n".to_string(),
+            "clients.acl.allow[0]",
+            "192.0.2.0/33",
+        ),
+        (
+            "[clients.acl]\nallow = [\"2001:db8::/129\"]\n".to_string(),
+            "clients.acl.allow[0]",
+            "2001:db8::/129",
+        ),
+        (
+            "[clients.acl]\nallow = [\"192.168.1.7/24\", \"192.168.1.0/24\"]\n".to_string(),
+            "clients.acl.allow[1]",
+            "192.168.1.0/24",
+        ),
+        (
+            "[clients.acl]\nallow = [\"192.0.2.0/24\"]\ndeny = [\"192.0.2.0/24\"]\n".to_string(),
+            "clients.acl.deny",
+            "192.0.2.0/24",
+        ),
+    ] {
+        let toml = format!("{TEST_BASE}{document}");
+        let err = Config::from_toml_str(&toml).expect_err("must be rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains(expected_key),
+            "error must name {expected_key}: {text}"
+        );
+        assert!(
+            text.contains(expected_value),
+            "error must name {expected_value}: {text}"
+        );
+    }
+
+    let too_many: Vec<String> = (0..=1024)
+        .map(|i| format!("\"198.51.{}.{}/32\"", 100 + i / 256, i % 256))
+        .collect();
+    let document = format!(
+        "{TEST_BASE}[clients.acl]\nallow = [{}]\n",
+        too_many.join(", ")
+    );
+    let err = Config::from_toml_str(&document).expect_err("cap is enforced");
+    assert!(err.to_string().contains("clients.acl.allow"), "{err}");
+    assert!(err.to_string().contains("1024"), "{err}");
+}
+
+#[test]
+fn test_acl_config_save_does_not_materialize_default_policy() {
+    // The API persists the raw `Config`; a save that did not explicitly build
+    // the ACL must not add `default_policy` merely because the typed default
+    // is allow.
+    let document = format!("{TEST_BASE}[clients]\nentries = []\n");
+    let config = Config::from_toml_str(&document).expect("valid");
+    let rendered = toml::to_string_pretty(&config).expect("serialize");
+    assert!(
+        !rendered.contains("default_policy"),
+        "an ordinary save must not materialize the key: {rendered}"
+    );
+    assert!(
+        !rendered.contains("[clients.acl]"),
+        "an ordinary save must not materialize [clients.acl]: {rendered}"
+    );
+
+    // Explicit values are preserved byte-for-byte at the value level.
+    let explicit = format!(
+        "{TEST_BASE}[clients]\ndefault_policy = \"deny\"\n[clients.acl]\nallow = [\"192.0.2.0/24\"]\n"
+    );
+    let config = Config::from_toml_str(&explicit).expect("valid");
+    let rendered = toml::to_string_pretty(&config).expect("serialize");
+    assert!(rendered.contains("default_policy = \"deny\""));
+    assert!(rendered.contains("\"192.0.2.0/24\""));
+}
+
+#[test]
+fn test_acl_deny_effective_exposure_warning_names_acl() {
+    let mut config = Config::default();
+    config.dns.bind = vec!["0.0.0.0".parse().unwrap(), "::".parse().unwrap()];
+    let allow = config.dns_exposure_warning().expect("wildcard bind warns");
+    assert!(allow.contains("any source not matched"), "{allow}");
+
+    config.clients = Some(toml::from_str("default_policy = \"deny\"\n").unwrap());
+    let deny = config
+        .dns_exposure_warning()
+        .expect("wildcard bind still warns");
+    assert!(
+        deny.contains("active DNS client admission control"),
+        "{deny}"
+    );
+    assert!(!deny.contains("accept queries from any source"), "{deny}");
+}
+
+#[test]
 fn test_upstream_config_validate_checks_targets_directly() {
     let mut config = UpstreamConfig {
         servers: vec!["udp://1.1.1.1/dns-query".to_string()],
@@ -1225,6 +1422,13 @@ rollup_client_names = false
 timezone = "UTC"
 trust_routeros_lease_names = false
 trust_arp = true
+default_policy = "deny"
+
+[clients.acl]
+allow = ["192.168.1.0/24", "::1/128"]
+deny = ["192.168.1.128/25"]
+allow_entry_ids = true
+deny_response = "drop"
 
 [[clients.entries]]
 name = "phone"

@@ -19,6 +19,7 @@ use std::sync::{Arc, RwLock};
 use sito_core::client::{ClientContext, ClientId, IdentitySource};
 use sito_core::net::IpNetwork;
 
+use crate::acl::AclIndex;
 use crate::config::{ClientEntryConfig, ClientsConfig};
 use crate::mac::{MacResolver, normalize_mac_id};
 use crate::policy::EffectivePolicy;
@@ -83,6 +84,8 @@ struct ClientIndex {
 pub struct ClientRegistry {
     config: ClientsConfig,
     index: Arc<ClientIndex>,
+    /// Compiled source ACL (ADR-0011), independent of identity resolution.
+    acl: Arc<AclIndex>,
     mac_resolver: MacResolver,
     timezone: ClientTimeZone,
     routeros_leases: Arc<RwLock<Vec<RouterOsLease>>>,
@@ -124,6 +127,19 @@ impl ClientRegistry {
         unidentified_clients: Arc<RwLock<HashMap<IpAddr, UnidentifiedClient>>>,
     ) -> Self {
         let index = Arc::new(build_client_index(&config));
+        // The ACL is compiled once per registry snapshot. A hand-built
+        // registry with an invalid ACL fails closed instead of silently
+        // admitting; every server path validates configuration before here.
+        let acl = Arc::new(AclIndex::compile(&config).unwrap_or_else(|error| {
+            tracing::error!(
+                %error,
+                "Invalid [clients.acl] configuration; DNS client ACL fails closed"
+            );
+            AclIndex::deny_all()
+        }));
+        for warning in acl.warnings() {
+            tracing::warn!(warning = %warning, "DNS client ACL");
+        }
         let mac_resolver = MacResolver::new();
         // ARP resolution is only needed when an entry declares a MAC identity
         // or the operator opted into `clients.trust_arp`; otherwise the query
@@ -135,6 +151,7 @@ impl ClientRegistry {
         Self {
             config,
             index,
+            acl,
             mac_resolver,
             timezone,
             routeros_leases,
@@ -158,6 +175,16 @@ impl ClientRegistry {
     #[must_use]
     pub fn unidentified_store(&self) -> Arc<RwLock<HashMap<IpAddr, UnidentifiedClient>>> {
         Arc::clone(&self.unidentified_clients)
+    }
+
+    /// The compiled DNS client source ACL for this registry snapshot.
+    ///
+    /// This is intentionally independent of [`ClientRegistry::resolve`]: the
+    /// admission decision must not touch ARP, RouterOS leases, schedules or
+    /// the discovered-client store.
+    #[must_use]
+    pub fn acl(&self) -> &AclIndex {
+        &self.acl
     }
 
     /// Access the internal MacResolver (e.g. to inject mock ARP entries in tests).

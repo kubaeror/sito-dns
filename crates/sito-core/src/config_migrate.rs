@@ -247,6 +247,31 @@ pub(crate) fn migrate(
         report.defaults_materialized.push("web.bind".to_string());
     }
 
+    // ADR-0011: make the preserved allow-all admission behavior explicit in
+    // the migrated document exactly once. Migration never writes deny, an
+    // allow rule or `allow_entry_ids = true`; v1 has no ACL information from
+    // which reachable clients could be inferred. `--adopt-safe-defaults` also
+    // leaves this at "allow": flipping it would cut off existing clients.
+    if get_path(&table, "clients.default_policy").is_none() {
+        insert_path(
+            &mut table,
+            "clients.default_policy",
+            toml::Value::String("allow".to_string()),
+        );
+        report
+            .defaults_materialized
+            .push("clients.default_policy".to_string());
+        if options.adopt_safe_defaults {
+            report.warnings.push(
+                "clients.default_policy stays \"allow\": the DNS client ACL is not part of \
+                 --adopt-safe-defaults because v1 cannot describe reachable clients. Use the \
+                 first-boot wizard or deliberately set clients.default_policy = \"deny\" with \
+                 explicit [clients.acl] allow rules before relying on default deny"
+                    .to_string(),
+            );
+        }
+    }
+
     let document =
         toml::to_string_pretty(&table).map_err(|e| ConfigError::Migration(e.to_string()))?;
 

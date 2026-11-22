@@ -964,6 +964,127 @@ fn test_migration_materializes_the_v1_web_bind_default() {
 }
 
 #[test]
+fn test_migration_materializes_clients_default_policy_allow() {
+    // ADR-0011: a v1 upgrade must preserve allow behavior and make it
+    // explicit exactly once; migration never invents deny or allow rules.
+    for v1 in [
+        "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+        "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\n",
+        "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\n[[clients.entries]]\nname = \"phone\"\nids = [\"192.168.1.20\"]\n",
+    ] {
+        let outcome = Config::migrate_v1_to_v2(v1, &MigrationOptions::default()).expect("migrate");
+        let parsed = Config::from_toml_str(&outcome.document).expect("valid v2");
+        let clients = parsed
+            .clients
+            .as_ref()
+            .and_then(toml::Value::as_table)
+            .expect("clients table");
+        assert_eq!(
+            clients.get("default_policy").and_then(toml::Value::as_str),
+            Some("allow"),
+            "migration must materialize the compatibility default"
+        );
+        assert!(
+            clients.get("acl").is_none(),
+            "migration must not invent [clients.acl]: {clients:?}"
+        );
+        assert!(
+            outcome
+                .report
+                .defaults_materialized
+                .iter()
+                .any(|field| field == "clients.default_policy"),
+            "materialization must be reported: {:?}",
+            outcome.report.defaults_materialized
+        );
+        assert!(
+            !outcome
+                .report
+                .safe_defaults_applied
+                .iter()
+                .any(|field| field == "clients.default_policy"),
+            "the ACL is never a safe-default rewrite"
+        );
+    }
+}
+
+#[test]
+fn test_migration_adopt_safe_defaults_keeps_acl_allow_with_warning() {
+    let v1 = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\n[[clients.entries]]\nname = \"phone\"\nids = [\"192.168.1.20\"]\n";
+    let outcome = Config::migrate_v1_to_v2(
+        v1,
+        &MigrationOptions {
+            adopt_safe_defaults: true,
+            ..MigrationOptions::default()
+        },
+    )
+    .expect("migrate");
+    let parsed = Config::from_toml_str(&outcome.document).expect("valid v2");
+    let clients = parsed
+        .clients
+        .as_ref()
+        .and_then(toml::Value::as_table)
+        .expect("clients table");
+    assert_eq!(
+        clients.get("default_policy").and_then(toml::Value::as_str),
+        Some("allow"),
+        "--adopt-safe-defaults must not flip admission"
+    );
+    assert!(
+        !outcome
+            .report
+            .safe_defaults_applied
+            .iter()
+            .any(|field| field == "clients.default_policy"),
+        "the ACL is intentionally not in the safe-default table"
+    );
+    assert!(
+        outcome
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("clients.default_policy")
+                && warning.contains("not part of")),
+        "the operator must be told to opt in deliberately: {:?}",
+        outcome.report.warnings
+    );
+}
+
+#[test]
+fn test_migration_does_not_overwrite_an_existing_acl_policy() {
+    // A repeated/other migration input that already carries the key must be
+    // left byte-for-byte semantically unchanged.
+    let v1 = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]\n[clients]\ndefault_policy = \"deny\"\n[clients.acl]\nallow = [\"192.168.1.0/24\"]\nallow_entry_ids = true\n";
+    let outcome = Config::migrate_v1_to_v2(v1, &MigrationOptions::default()).expect("migrate");
+    let parsed = Config::from_toml_str(&outcome.document).expect("valid v2");
+    let clients = parsed
+        .clients
+        .as_ref()
+        .and_then(toml::Value::as_table)
+        .expect("clients table");
+    assert_eq!(
+        clients.get("default_policy").and_then(toml::Value::as_str),
+        Some("deny")
+    );
+    let acl = clients
+        .get("acl")
+        .and_then(toml::Value::as_table)
+        .expect("acl table");
+    assert_eq!(
+        acl.get("allow_entry_ids").and_then(toml::Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        !outcome
+            .report
+            .defaults_materialized
+            .iter()
+            .any(|field| field == "clients.default_policy"),
+        "an existing policy is never re-materialized"
+    );
+}
+
+#[test]
 fn test_migration_ignore_unknown_keys_handles_table_arrays_and_nested_sni_fields() {
     let v1 = r#"
 config_version = 1

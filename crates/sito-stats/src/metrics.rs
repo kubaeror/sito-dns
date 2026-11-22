@@ -84,6 +84,8 @@ impl HistogramState {
 type Counter = Arc<AtomicU64>;
 /// Map of interned-label counters.
 type CounterMap<K> = RwLock<HashMap<K, Counter>>;
+/// Rendered (label, label, label, count) tuple for three-label families.
+type ThreeLabelCount = (Arc<str>, Arc<str>, Arc<str>, u64);
 /// Map of interned-label histograms; only the first observation for a label
 /// allocates and takes the outer write lock.
 type HistogramMap = RwLock<HashMap<u32, Arc<Mutex<HistogramState>>>>;
@@ -100,6 +102,12 @@ struct InternerState {
 const MAX_INTERNER_LABELS: usize = 4_096;
 /// Label value used once [`MAX_INTERNER_LABELS`] is reached.
 const INTERNER_OVERFLOW_LABEL: &str = "__other__";
+
+/// Maximum distinct `prefix` label values on
+/// `sito_dns_acl_matched_prefix_total`. Prefixes come from operator
+/// configuration, but opted-in client entry ids are not covered by the 1024
+/// explicit-list cap, so the exporter collapses beyond this many.
+const MAX_ACL_PREFIX_LABELS: usize = 256;
 
 /// Maximum distinct upstream labels in `sito_dnssec_bogus_total`.
 ///
@@ -219,12 +227,25 @@ fn bounded_qtype(qtype: u16) -> u16 {
 /// only assigned (and a `String` only allocated) when a label value is seen for
 /// the first time. This keeps the DNS hot path free of per-query `format!` /
 /// `to_string()` calls.
-#[derive(Default)]
 struct LabelInterner {
+    cap: usize,
     state: RwLock<InternerState>,
 }
 
+impl Default for LabelInterner {
+    fn default() -> Self {
+        Self::new(MAX_INTERNER_LABELS)
+    }
+}
+
 impl LabelInterner {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            state: RwLock::new(InternerState::default()),
+        }
+    }
+
     fn intern(&self, value: &str) -> u32 {
         if let Ok(state) = self.state.read()
             && let Some(&id) = state.ids.get(value)
@@ -238,7 +259,7 @@ impl LabelInterner {
         }
         // Collapse new values into a single overflow label once the cap is
         // reached; existing (known) labels keep their ids.
-        let value = if state.labels.len() >= MAX_INTERNER_LABELS {
+        let value = if state.labels.len() >= self.cap {
             INTERNER_OVERFLOW_LABEL
         } else {
             value
@@ -344,6 +365,15 @@ pub struct MetricsRegistry {
     cache_stale_served: Arc<AtomicU64>,
     dnssec_bogus: Arc<Mutex<BTreeMap<String, u64>>>,
     clients_identified: Arc<CounterMap<u32>>,
+    /// (action id, reason id, family id) -> count (ADR-0011).
+    acl_decisions: Arc<CounterMap<(u32, u32, u32)>>,
+    /// (action id, prefix id, family id) -> count (ADR-0011). The prefix
+    /// interner is dedicated and capped so entry-derived ids stay bounded.
+    acl_matched_prefix: Arc<CounterMap<(u32, u32, u32)>>,
+    acl_prefix_labels: Arc<LabelInterner>,
+    /// Denied-and-dropped queries by family (ADR-0011).
+    acl_dropped_ipv4: Arc<AtomicU64>,
+    acl_dropped_ipv6: Arc<AtomicU64>,
     doh_bypass_blocked: Arc<AtomicU64>,
     /// proto id -> count
     transport_queries_total: Arc<CounterMap<u32>>,
@@ -425,6 +455,11 @@ impl MetricsRegistry {
             cache_stale_served: Arc::new(AtomicU64::new(0)),
             dnssec_bogus: Arc::new(Mutex::new(BTreeMap::new())),
             clients_identified: Arc::new(RwLock::new(HashMap::new())),
+            acl_decisions: Arc::new(RwLock::new(HashMap::new())),
+            acl_matched_prefix: Arc::new(RwLock::new(HashMap::new())),
+            acl_prefix_labels: Arc::new(LabelInterner::new(MAX_ACL_PREFIX_LABELS)),
+            acl_dropped_ipv4: Arc::new(AtomicU64::new(0)),
+            acl_dropped_ipv6: Arc::new(AtomicU64::new(0)),
             doh_bypass_blocked: Arc::new(AtomicU64::new(0)),
             transport_queries_total: Arc::new(RwLock::new(HashMap::new())),
             ha_slaves_connected: Arc::new(AtomicI64::new(0)),
@@ -603,6 +638,46 @@ impl MetricsRegistry {
     pub fn inc_clients_identified(&self, method: &str) {
         let method_id = self.labels.intern(method);
         increment_counter(&self.clients_identified, method_id);
+    }
+
+    /// Records one DNS client ACL decision (ADR-0011).
+    ///
+    /// `action` is `allow`/`deny`, `reason` is one of the four bounded reason
+    /// labels and `family` is `ipv4`/`ipv6`. No client address or query name
+    /// is ever a label.
+    pub fn inc_acl_decision(&self, action: &str, reason: &str, family: &str) {
+        increment_counter(
+            &self.acl_decisions,
+            (
+                self.labels.intern(action),
+                self.labels.intern(reason),
+                self.labels.intern(family),
+            ),
+        );
+    }
+
+    /// Records the most specific configured prefix that matched. The value
+    /// must already be canonical (`network/prefix` with host bits masked) and
+    /// comes only from operator configuration.
+    pub fn inc_acl_matched_prefix(&self, action: &str, prefix: &str, family: &str) {
+        increment_counter(
+            &self.acl_matched_prefix,
+            (
+                self.labels.intern(action),
+                self.acl_prefix_labels.intern(prefix),
+                self.labels.intern(family),
+            ),
+        );
+    }
+
+    /// Records a denied query that was silently dropped (`deny_response =
+    /// "drop"`). Synthesized REFUSED responses use
+    /// `sito_queries_total{verdict="refused"}` instead.
+    pub fn inc_acl_dropped(&self, family: &str) {
+        match family {
+            "ipv6" => self.acl_dropped_ipv6.fetch_add(1, Ordering::Relaxed),
+            _ => self.acl_dropped_ipv4.fetch_add(1, Ordering::Relaxed),
+        };
     }
 
     pub fn inc_doh_bypass_blocked(&self) {
@@ -868,6 +943,7 @@ impl MetricsRegistry {
     pub fn render_prometheus(&self) -> String {
         let mut out = String::new();
         self.render_query_family(&mut out);
+        self.render_acl_family(&mut out);
         self.render_upstream_family(&mut out);
         self.render_cache_family(&mut out);
         self.render_filter_family(&mut out);
@@ -1003,6 +1079,105 @@ impl MetricsRegistry {
                 }
             }
         }
+    }
+
+    /// DNS client ACL counters (ADR-0011).
+    fn render_acl_family(&self, out: &mut String) {
+        // 1c. sito_dns_acl_decisions_total
+        out.push_str("# HELP sito_dns_acl_decisions_total DNS client ACL admission decisions\n");
+        out.push_str("# TYPE sito_dns_acl_decisions_total counter\n");
+        {
+            let map = sito_core::sync::read_or_recover(&self.acl_decisions);
+            if map.is_empty() {
+                out.push_str(
+                    "sito_dns_acl_decisions_total{action=\"allow\",reason=\"default_policy\",family=\"ipv4\"} 0\n",
+                );
+            } else {
+                let mut entries: Vec<ThreeLabelCount> = map
+                    .iter()
+                    .map(|(&(action, reason, family), count)| {
+                        (
+                            self.labels.label(action),
+                            self.labels.label(reason),
+                            self.labels.label(family),
+                            count.load(Ordering::Relaxed),
+                        )
+                    })
+                    .collect();
+                entries.sort_by(|a, b| {
+                    a.0.as_ref()
+                        .cmp(b.0.as_ref())
+                        .then_with(|| a.1.as_ref().cmp(b.1.as_ref()))
+                        .then_with(|| a.2.as_ref().cmp(b.2.as_ref()))
+                });
+                for (action, reason, family, count) in entries {
+                    let _ = writeln!(
+                        out,
+                        "sito_dns_acl_decisions_total{{action=\"{}\",reason=\"{}\",family=\"{}\"}} {count}",
+                        escape_label_value(&action),
+                        escape_label_value(&reason),
+                        escape_label_value(&family)
+                    );
+                }
+            }
+        }
+
+        // 1d. sito_dns_acl_matched_prefix_total
+        out.push_str(
+            "# HELP sito_dns_acl_matched_prefix_total DNS client ACL decisions by canonical matched prefix\n",
+        );
+        out.push_str("# TYPE sito_dns_acl_matched_prefix_total counter\n");
+        {
+            let map = sito_core::sync::read_or_recover(&self.acl_matched_prefix);
+            if map.is_empty() {
+                out.push_str(
+                    "sito_dns_acl_matched_prefix_total{action=\"allow\",prefix=\"0.0.0.0/0\",family=\"ipv4\"} 0\n",
+                );
+            } else {
+                let mut entries: Vec<ThreeLabelCount> = map
+                    .iter()
+                    .map(|(&(action, prefix, family), count)| {
+                        (
+                            self.labels.label(action),
+                            self.acl_prefix_labels.label(prefix),
+                            self.labels.label(family),
+                            count.load(Ordering::Relaxed),
+                        )
+                    })
+                    .collect();
+                entries.sort_by(|a, b| {
+                    a.0.as_ref()
+                        .cmp(b.0.as_ref())
+                        .then_with(|| a.1.as_ref().cmp(b.1.as_ref()))
+                        .then_with(|| a.2.as_ref().cmp(b.2.as_ref()))
+                });
+                for (action, prefix, family, count) in entries {
+                    let _ = writeln!(
+                        out,
+                        "sito_dns_acl_matched_prefix_total{{action=\"{}\",prefix=\"{}\",family=\"{}\"}} {count}",
+                        escape_label_value(&action),
+                        escape_label_value(&prefix),
+                        escape_label_value(&family)
+                    );
+                }
+            }
+        }
+
+        // 1e. sito_dns_acl_dropped_total
+        out.push_str(
+            "# HELP sito_dns_acl_dropped_total DNS queries denied and silently dropped by the client ACL\n",
+        );
+        out.push_str("# TYPE sito_dns_acl_dropped_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_dns_acl_dropped_total{{family=\"ipv4\"}} {}",
+            self.acl_dropped_ipv4.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "sito_dns_acl_dropped_total{{family=\"ipv6\"}} {}",
+            self.acl_dropped_ipv6.load(Ordering::Relaxed)
+        );
     }
 
     /// Upstream latency, error, and health families.
@@ -1898,6 +2073,16 @@ sito_query_duration_seconds_bucket{verdict="blocked",le="5"} 1
 sito_query_duration_seconds_bucket{verdict="blocked",le="+Inf"} 1
 sito_query_duration_seconds_sum{verdict="blocked"} 0.35
 sito_query_duration_seconds_count{verdict="blocked"} 1
+# HELP sito_dns_acl_decisions_total DNS client ACL admission decisions
+# TYPE sito_dns_acl_decisions_total counter
+sito_dns_acl_decisions_total{action="allow",reason="default_policy",family="ipv4"} 0
+# HELP sito_dns_acl_matched_prefix_total DNS client ACL decisions by canonical matched prefix
+# TYPE sito_dns_acl_matched_prefix_total counter
+sito_dns_acl_matched_prefix_total{action="allow",prefix="0.0.0.0/0",family="ipv4"} 0
+# HELP sito_dns_acl_dropped_total DNS queries denied and silently dropped by the client ACL
+# TYPE sito_dns_acl_dropped_total counter
+sito_dns_acl_dropped_total{family="ipv4"} 0
+sito_dns_acl_dropped_total{family="ipv6"} 0
 # HELP sito_upstream_rtt_seconds Upstream round-trip time in seconds
 # TYPE sito_upstream_rtt_seconds histogram
 sito_upstream_rtt_seconds_bucket{upstream="tls://dns.quad9.net",le="0.00025"} 0
@@ -2532,6 +2717,57 @@ mod allocation_tests {
             reg.render_prometheus()
                 .contains(r#"sito_filter_rules{list="total"} 42"#),
             "a partial status must not reset the rule gauge to zero"
+        );
+    }
+
+    #[test]
+    fn test_acl_metrics_are_bounded_and_private() {
+        let reg = MetricsRegistry::new("2.0.0", "test");
+        reg.inc_acl_decision("allow", "explicit_allow", "ipv4");
+        reg.inc_acl_decision("deny", "explicit_deny", "ipv4");
+        reg.inc_acl_decision("deny", "default_policy", "ipv6");
+        reg.inc_acl_matched_prefix("allow", "192.168.1.0/24", "ipv4");
+        reg.inc_acl_matched_prefix("deny", "192.168.1.128/25", "ipv4");
+        reg.inc_acl_dropped("ipv4");
+        reg.inc_acl_dropped("ipv6");
+
+        let text = reg.render_prometheus();
+        assert!(text.contains(
+            r#"sito_dns_acl_decisions_total{action="deny",reason="explicit_deny",family="ipv4"} 1"#
+        ));
+        assert!(text.contains(
+            r#"sito_dns_acl_decisions_total{action="deny",reason="default_policy",family="ipv6"} 1"#
+        ));
+        assert!(text.contains(
+            r#"sito_dns_acl_matched_prefix_total{action="allow",prefix="192.168.1.0/24",family="ipv4"} 1"#
+        ));
+        assert!(text.contains(r#"sito_dns_acl_dropped_total{family="ipv4"} 1"#));
+        assert!(text.contains(r#"sito_dns_acl_dropped_total{family="ipv6"} 1"#));
+        // No client address or query name is ever a label.
+        assert!(!text.contains("198.51.100."), "no client IP labels: {text}");
+        assert!(!text.contains("example.com"), "no qname labels: {text}");
+
+        // Entry-derived prefixes beyond the exporter cap collapse, so scrape
+        // size is bounded regardless of the number of configured entry ids.
+        for octet in 0..300u16 {
+            let prefix = format!("10.{}.{}.0/24", octet / 256, octet % 256);
+            reg.inc_acl_matched_prefix("allow", &prefix, "ipv4");
+        }
+        let text = reg.render_prometheus();
+        assert!(
+            text.contains(r#"sito_dns_acl_matched_prefix_total{action="allow",prefix="__other__",family="ipv4"}"#),
+            "overflow prefixes must collapse into __other__: {text}"
+        );
+        let distinct: std::collections::HashSet<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("sito_dns_acl_matched_prefix_total{"))
+            .filter_map(|line| line.split("prefix=\"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert!(
+            distinct.len() <= 257,
+            "matched-prefix series must stay bounded: {}",
+            distinct.len()
         );
     }
 }

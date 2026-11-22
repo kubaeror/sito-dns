@@ -57,8 +57,11 @@ pub struct DnsPipeline {
     /// Per-client upstream managers keyed by `servers.join(",")`; swappable so
     /// client upstream changes hot-reload.
     scoped_upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamManager>>>>,
+    /// Bounded/sampled logging for denied DNS client ACL decisions.
+    acl_log: acl::AclLogSampler,
 }
 
+mod acl;
 mod cache;
 mod context;
 mod dnssec;
