@@ -202,6 +202,9 @@ pub enum CatalogError {
         /// URL found in the catalog.
         url: String,
     },
+    /// The catalog license does not match the pinned upstream license.
+    #[error("catalog source license '{0}' does not match the pinned license")]
+    UnexpectedLicense(String),
 }
 
 fn require_non_empty(
@@ -277,7 +280,10 @@ impl Catalog {
                 url: self.source.services.clone(),
             });
         }
-        require_non_empty("catalog source", "", "license", &self.source.license)
+        if self.source.license != CATALOG_LICENSE {
+            return Err(CatalogError::UnexpectedLicense(self.source.license.clone()));
+        }
+        Ok(())
     }
 
     fn validate_categories(&self) -> Result<(), CatalogError> {
@@ -487,8 +493,9 @@ impl Catalog {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_category() -> CatalogCategory {
         CatalogCategory {
@@ -547,6 +554,35 @@ mod tests {
         assert_ne!(catalog.services.len(), 0);
         assert_ne!(catalog.categories.len(), 0);
         assert_ne!(catalog.service_groups.len(), 0);
+    }
+
+    #[test]
+    fn committed_catalog_has_pinned_shape() {
+        let catalog = Catalog::embedded().expect("embedded catalog must be valid");
+        assert_eq!(catalog.filters.len(), 66);
+        assert_eq!(catalog.services.len(), 142);
+        assert_eq!(catalog.categories.len(), 4);
+        assert_eq!(catalog.service_groups.len(), 12);
+        assert_eq!(catalog.source.license, CATALOG_LICENSE);
+
+        let counts: Vec<(&str, usize)> = catalog
+            .categories()
+            .map(|category| {
+                (
+                    category.id.as_str(),
+                    catalog.filter_count_in_category(&category.id),
+                )
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                ("general", 15),
+                ("other", 16),
+                ("regional", 18),
+                ("security", 17),
+            ]
+        );
     }
 
     #[test]
@@ -723,23 +759,96 @@ mod tests {
     }
 
     #[test]
-    fn generator_check_passes_against_committed_catalog() {
+    fn unexpected_catalog_license_is_rejected() {
+        let mut catalog = sample_catalog();
+        catalog.source.license = "MIT".to_string();
+        let error = catalog.validate().expect_err("license must fail");
+        assert!(matches!(error, CatalogError::UnexpectedLicense(_)));
+    }
+
+    fn run_catalog_check(out: &Path) -> std::process::Output {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let script = root.join("scripts/generate-catalog.py");
         let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
-        let output = match Command::new(&python).arg(&script).arg("--check").output() {
-            Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("skipping catalog check: {python} not found");
-                return;
-            }
-            Err(error) => panic!("failed to run {python}: {error}"),
-        };
+        Command::new(&python)
+            .arg(&script)
+            .arg("--check")
+            .arg("--out")
+            .arg(out)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to run {python} for the required catalog check: {error}")
+            })
+    }
+
+    fn temp_catalog(tag: &str, contents: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be after the Unix epoch")
+            .as_nanos();
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "sito-catalog-{}-{tag}-{unique}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("write temporary catalog");
+        path
+    }
+
+    #[test]
+    fn generator_check_passes_against_committed_catalog() {
+        let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/catalog/catalog.json");
+        let output = run_catalog_check(&out);
         assert!(
             output.status.success(),
             "generate-catalog.py --check failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn generator_check_rejects_content_and_line_ending_tampering() {
+        let mut removed: serde_json::Value =
+            serde_json::from_str(CATALOG_JSON).expect("catalog JSON must parse");
+        let filters = removed["filters"]
+            .as_array_mut()
+            .expect("filters must be an array");
+        let removed_filter = filters.remove(0);
+        assert_eq!(
+            removed_filter["id"].as_str(),
+            Some("adguard_dns_filter"),
+            "regression test expects to remove the first known filter"
+        );
+        let removed_json =
+            serde_json::to_string_pretty(&removed).expect("serialize removed-filter catalog");
+
+        let mut changed: serde_json::Value =
+            serde_json::from_str(CATALOG_JSON).expect("catalog JSON must parse");
+        changed["filters"][0]["name"] = serde_json::Value::String("Tampered filter".to_string());
+        changed["filters"][0]["version"] = serde_json::Value::String("9.9.9".to_string());
+        let changed_json =
+            serde_json::to_string_pretty(&changed).expect("serialize changed-metadata catalog");
+
+        let crlf = CATALOG_JSON.replace('\n', "\r\n");
+
+        for (tag, contents) in [
+            ("removed", removed_json),
+            ("changed", changed_json),
+            ("crlf", crlf),
+        ] {
+            let path = temp_catalog(tag, &contents);
+            let output = run_catalog_check(&path);
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                !output.status.success(),
+                "tampered catalog ({tag}) must fail the check"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("SHA-256"),
+                "expected pinned-digest failure for {tag}, got: {stderr}"
+            );
+        }
     }
 }

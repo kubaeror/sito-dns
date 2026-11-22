@@ -21,20 +21,27 @@ Usage::
     python3 scripts/generate-catalog.py                     # fetch and write
     python3 scripts/generate-catalog.py --filters-file F \\
         --services-file S                                   # write from files
-    python3 scripts/generate-catalog.py --check             # offline drift check
+    python3 scripts/generate-catalog.py --check             # offline tamper check
 
 ``--check`` never touches the network. Without ``--filters-file`` and
-``--services-file`` it validates the committed catalog and compares it with
-the canonical bytes the generator would emit for that data, so hand edits,
-unknown fields, unsorted entries and formatting drift are rejected. When both
-local index files are supplied it re-generates the catalog from them and
-compares that output with the committed file, giving a full offline
-reproducibility check.
+``--services-file`` it is an offline tamper/canonicalization guard: the
+committed catalog's raw bytes must match the pinned ``CATALOG_SHA256`` digest,
+and its structure must match the canonical bytes the generator would emit for
+that data. Removed or changed filters/services, changed names/URLs/
+descriptions/versions, unknown fields, unsorted entries, CRLF line endings and
+any other formatting change all fail.
+
+When both local index files are supplied it re-generates the catalog from them
+and compares that output with the committed file. Use this (or a normal
+generation run against the live indexes) for the release-time upstream drift
+check. After an intentional catalog change, regenerate and update
+``CATALOG_SHA256`` to the digest printed by the generator.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import urllib.error
@@ -50,6 +57,13 @@ SERVICES_URL = "https://adguardteam.github.io/HostlistsRegistry/assets/services.
 
 CATALOG_VERSION = 1
 CATALOG_LICENSE = "GPL-3.0-only"
+
+# SHA-256 of the exact committed catalog bytes. The no-input ``--check`` path
+# compares the file against this pin, so any content or formatting edit fails
+# even when the result still parses and canonicalises cleanly. Update this
+# value whenever the catalog is intentionally regenerated; the generator
+# prints the new digest.
+CATALOG_SHA256 = "957d814e1e0c64c486014d1a164f6535cdaf7b5ab600333e86a49d0d4998adde"
 
 # AdGuard HostlistsRegistry filter group ids -> stable sito category ids.
 FILTER_GROUP_CATEGORIES = {
@@ -413,12 +427,12 @@ def validate_output(catalog: Any) -> None:
     for index, raw in enumerate(raw_filters):
         context = f"catalog.filters[{index}]"
         entry = _require_object(raw, context)
-        _check_exact_fields(entry, FILTER_FIELDS, context)
         forbidden = FORBIDDEN_FILTER_FIELDS.intersection(entry)
         if forbidden:
             raise CatalogError(
                 f"{context} contains filter-body field(s): {', '.join(sorted(forbidden))}"
             )
+        _check_exact_fields(entry, FILTER_FIELDS, context)
 
         filter_id = _require_str(entry, "id", context)
         if filter_id in filter_ids:
@@ -568,6 +582,10 @@ def render(catalog: dict[str, Any]) -> str:
     return json.dumps(catalog, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
 
 
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def _describe_drift(expected: str, actual: str) -> str:
     expected_lines = expected.splitlines()
     actual_lines = actual.splitlines()
@@ -601,18 +619,26 @@ def run_generate(args: argparse.Namespace) -> int:
     )
     catalog = build_catalog(filters_doc, services_doc)
     rendered = render(catalog)
+    rendered_bytes = rendered.encode("utf-8")
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    if out.exists() and out.read_text(encoding="utf-8") == rendered:
+    if out.exists() and out.read_bytes() == rendered_bytes:
         print(f"catalog unchanged: {out}")
-        return 0
-    with out.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write(rendered)
-    print(
-        f"wrote {len(catalog['filters'])} filters and "
-        f"{len(catalog['services'])} services to {out}"
-    )
+    else:
+        out.write_bytes(rendered_bytes)
+        print(
+            f"wrote {len(catalog['filters'])} filters and "
+            f"{len(catalog['services'])} services to {out}"
+        )
+
+    digest = _sha256(rendered_bytes)
+    if digest != CATALOG_SHA256:
+        print(
+            "note: catalog SHA-256 changed; update CATALOG_SHA256 in "
+            f"scripts/generate-catalog.py to {digest}",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -625,7 +651,25 @@ def run_check(args: argparse.Namespace) -> int:
     out = Path(args.out)
     if not out.exists():
         raise CatalogError(f"committed catalog does not exist: {out}")
-    committed = out.read_text(encoding="utf-8")
+    committed_bytes = out.read_bytes()
+    digest = _sha256(committed_bytes)
+    if digest != CATALOG_SHA256:
+        print(
+            f"catalog tamper detected: {out} SHA-256 {digest} "
+            f"does not match pinned {CATALOG_SHA256}",
+            file=sys.stderr,
+        )
+        print(
+            "If this change is intentional, run "
+            "`python3 scripts/generate-catalog.py` and update CATALOG_SHA256 "
+            "to the digest it prints.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        committed = committed_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CatalogError(f"{out} is not valid UTF-8: {exc}") from exc
 
     if args.filters_file:
         generated = render(

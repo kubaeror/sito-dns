@@ -28,7 +28,10 @@ and in the catalog's own `source` block.
 
 ## Generation and update policy
 
-The catalog is **release-bound**, not fetched at runtime:
+The catalog is **release-bound**, not fetched at runtime.
+
+Release-time regeneration (network) refreshes the catalog and prints its
+SHA-256:
 
 ```bash
 python3 scripts/generate-catalog.py
@@ -36,18 +39,29 @@ python3 scripts/generate-catalog.py --check
 ```
 
 The generator fetches the two indexes and writes the deterministic
-`crates/sito-clients/src/catalog/catalog.json`. Regenerate it at release/build
-time when refreshing the catalog, review the diff, and commit the JSON with the
-code that consumes it. `--check` runs offline: it validates the committed file
-and verifies that it matches the canonical bytes the generator would emit for
-that data, failing on hand edits, unknown fields, unsorted entries or formatting
-drift. Supplying both `--filters-file` and `--services-file` also lets
-`--check` regenerate from pinned local copies without network access.
+`crates/sito-clients/src/catalog/catalog.json`. When intentionally refreshing
+the catalog, review the diff, update `CATALOG_SHA256` in the generator to the
+digest it prints, and commit the JSON, the pin and the consuming code together.
+
+The default `--check` is the **offline tamper/canonicalization guard**. It
+never touches the network and requires:
+
+1. the committed file's raw bytes to match the pinned `CATALOG_SHA256` — this
+   catches removed or changed filters/services, names, URLs, descriptions,
+   versions, line endings (including CRLF) and any other byte-level edit;
+2. the file to validate structurally and equal the canonical bytes the
+   generator would emit for that data — this catches unknown fields, unsorted
+   entries and formatting drift.
+
+Upstream drift is a separate release-time check: rerun the generator against
+the live indexes and review the diff, or pass both `--filters-file` and
+`--services-file` to `--check` to regenerate from locally pinned index copies
+without network access.
 
 `catalog_version` in the JSON (currently `1`) guards schema compatibility. The
 Rust loader `Catalog::embedded()` rejects unknown versions, unknown fields,
-duplicate ids, empty names/URLs/rules and references to undeclared categories
-or service groups.
+duplicate ids, empty names/URLs/rules, unexpected source URLs/license and
+references to undeclared categories or service groups.
 
 ## Runtime behaviour
 
