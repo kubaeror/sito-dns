@@ -287,14 +287,15 @@ token_file = "/etc/sito/witness.token"  # 0600, one shared cluster token
 | `witness.url` | string | none | Required; `https://`; host present; no userinfo | Witness base URL. |
 | `witness.ca` | string (path) | none | Required; absolute; readable at startup | CA bundle used to verify the witness certificate. |
 | `witness.server_name` | string | URL host | Non-empty if set; must match the certificate SAN | TLS server name. |
-| `witness.fingerprint` | string | none | `blake3:<64 hex>` if set; matched in addition to CA | Optional certificate pin. |
+| `witness.fingerprint` | string | none | `blake3:<64 hex>` if set; matched in addition to CA. Preimage is the DER-encoded witness server certificate | Optional certificate pin. |
 | `witness.token_file` | string (path) | none | Required; absolute; mode `0600` at startup | File containing the shared bearer token. |
 
 When `enabled = false`, the promotion field bounds are **not** validated, so an
 existing config with `ha.ping_interval_secs = 30` and no promotion keys loads
 unchanged. `candidate`, `require_manual_confirmation` and the witness fields
-are inert (a `candidate = true` on a master logs a warning, not an error);
-`backend` is still validated. The derived heartbeat default is
+are inert (a `candidate = true` on a master logs a warning, not an error).
+`backend` is the exception: its value is validated even when disabled so a typo
+or unsupported backend is caught immediately. The derived heartbeat default is
 `max(45, 3 × ping)`, so enabling on such a cluster yields `90` without
 hand-editing. An explicit `heartbeat_timeout_secs = 45` with `ping = 30` is
 rejected with an error naming the key; there is no upper bound, so
@@ -399,6 +400,11 @@ Record shape:
 }
 ```
 
+All hash values (`bundle_hash`, `have_bundle_hash`, `published_hash`, and the
+witness fingerprint pin) are normalized to 64 lowercase hexadecimal characters.
+The `blake3:` prefix is accepted on input and stripped before storage or
+comparison, so `blake3:<hex>` and bare `<hex>` are equivalent.
+
 `holder` is `node_id` plus a random per-process boot UUID. The durable
 `node_id` identifies the node; the boot UUID distinguishes process
 incarnations. A restart is a new holder and cannot renew the previous process's
@@ -415,6 +421,42 @@ fork and is ineligible. A master with no active bundle uses `version = 0` and
 `bundle_hash = "none"`; its first publish is version 1. `"none"` is invalid for
 version > 0.
 
+**Publish baseline vs pending promotion version.** The witness record's
+`(version, bundle_hash)` is always the last **published** baseline. A promotion
+writes a local `ha_state.toml` at `baseline_version + 1` before publishing; that
+is a **pending** version and must never be sent to the witness or used as an
+acquisition baseline. The state file carries:
+
+- `publication_state`: `pending` | `publishing` | `published`;
+- `published_version` / `published_hash`: the last bundle this node knows was
+  published (the prior baseline while pending);
+- the pending bundle's own `version` / hash (the active state bundle).
+
+Rules:
+
+- During quiesce and reconciliation the node renews the witness with
+  `(published_version, published_hash)`, never the pending version. The witness
+  record therefore remains at the last actually published version.
+- The first publish uses
+  `publish_version = max(baseline_version + 1, pending_version)`; a pending
+  version may be reused only if no reachable slave reports a different
+  same-version hash (see reconciliation).
+- After the first publish succeeds, the node atomically updates
+  `publication_state = "published"`, `published_version = publish_version`,
+  `published_hash = publish_hash`, then renews the witness with the new
+  version/hash. Only then does the witness hold `publish_version`.
+- A crash **before** the state write leaves no pending state; the record is the
+  baseline.
+- A crash after the state write but **before** publish leaves
+  `publication_state = "pending"`; the record is still the baseline, and the
+  node may reuse `publish_version`.
+- A crash during publish leaves `"publishing"`; reconciliation treats a slave
+  at `publish_version` with the pending hash as proof the publish succeeded, a
+  different hash as a fork, and no slave at it as safe to reuse.
+- A crash after publish but before the `"published"` state update is the same
+  `"publishing"` case: reconciliation decides, and the node never skips a
+  version or lets the witness reserve an unpublished one.
+
 ### Witness HTTP API
 
 All `/v1/*` endpoints require `Authorization: Bearer <token>` and
@@ -430,8 +472,8 @@ path, query or fragment; the client appends `/v1/...`.
 | `GET /healthz` | `200`/`503`, no auth, no detail | Process and state-dir writable. |
 | `GET /v1/info` | `{lease_protocol_version: 1, cluster_id, now_unix_ms}` | Compatibility and clock hint. |
 | `GET /v1/lease` | `200` record or `204` | Current record, including an expired one. |
-| `POST /v1/lease/acquire` | `{holder, node_id, expected_term, expected_revision, term, version, bundle_hash, ttl_secs}` | `holder` must be `node_id/<uuid>`. Succeeds iff the record is absent with `expected_* = null`, or the record matches `(expected_term, expected_revision)` and is expired. Requires `term == current.term + 1` (or `term == 1` when absent); `version > current.version` (bounded by `current.version + 1_000_000`, the existing peer-lead limit), or `version == current.version` with the same `bundle_hash`; and a valid BLAKE3 hash, or `"none"` exactly when `version == 0`. On success: new holder, term, `revision + 1`, expiry = witness now + TTL. |
-| `POST /v1/lease/renew` | `{holder, term, expected_revision, version, bundle_hash, ttl_secs}` | Succeeds iff the record is held by `holder` at `term` with `expected_revision` and is not expired. Requires the same version/hash rule as acquire. On success: same term, `revision + 1`, new expiry. |
+| `POST /v1/lease/acquire` | `{holder, node_id, expected_term, expected_revision, term, version, bundle_hash, ttl_secs}` | `holder` must be `node_id/<uuid>`. Succeeds iff the record is absent with `expected_* = null`, or the record matches `(expected_term, expected_revision)` and is expired. Requires `term == current.term + 1` (or `term == 1` when absent); `version > current.version` (bounded by `current.version + 1_000_000`, the existing peer-lead limit), or `version == current.version` with the same `bundle_hash`; and a valid BLAKE3 hash, or `"none"` exactly when `version == 0`; and `5 <= ttl_secs <= 300`. On success: new holder, term, `revision + 1`, expiry = witness now + TTL. |
+| `POST /v1/lease/renew` | `{holder, term, expected_revision, version, bundle_hash, ttl_secs}` | Succeeds iff the record is held by `holder` at `term` with `expected_revision` and is not expired. Requires the same version/hash and `ttl_secs` bounds as acquire. On success: same term, `revision + 1`, new expiry. |
 
 There is no release endpoint in 2.0. A graceful master shutdown leaves the
 lease until expiry; a candidate waits. This avoids a stale process resuming
@@ -452,18 +494,35 @@ not required.
 - **`enabled = true`, `role = "master"`:**
   1. If `data_dir/ha_fence.json` exists and is not reconciled, start read-only
      with `ha_fenced_until_reconciled`; do not acquire.
-  2. Otherwise read `GET /v1/lease` and compare the local state with the
-     record: `state_term > record.term` is `master_term_ahead` (the witness is
-     behind the state; manual witness reconciliation is required);
-     `state_version < record.version` is `master_state_behind`; an equal
-     version with a different `bundle_hash` is `master_state_forked`. In any
-     of these cases start read-only and do not acquire; the operator must
-     restore, resync or reconcile the correct bundle. If local state is equal
-     (same hash) or newer (a publish the witness has not recorded yet) at a
-     term not above `record.term`, call `POST /v1/lease/acquire`.
-  3. On success, write the promoted state (`promotion_origin = "restart"`),
-     then quiesce, reconcile and publish (see below). Only after the first
-     successful publish is the API writable.
+  2. Otherwise read `GET /v1/lease` and establish the local published
+     baseline **before** comparing it:
+     1. `state_term > record.term` → `master_term_ahead` (the witness is
+        behind the state; manual witness reconciliation is required).
+     2. If `publication_state` is `pending` or `publishing` and the state
+        bundle's `(version, hash)` equals the witness record, the publish
+        succeeded: mark it published (`published_version/hash` = the bundle)
+        and continue.
+     3. A state written by an older binary without
+        `publication_state`/`published_*` is **unknown**: infer published only
+        when the state bundle's `(version, hash)` equals the witness record;
+        otherwise start read-only and reconcile.
+     4. Compare the established `state.published_version`/`published_hash` with
+        the record: below `record.version` is `master_state_behind`; equal with
+        a different hash is `master_state_forked`. The pending bundle version
+        is **not** used for these comparisons.
+     5. If the published state is equal (same hash) or newer (a publish the
+        witness has not recorded yet) at a term not above `record.term`, call
+        `POST /v1/lease/acquire` with `version = state.published_version` and
+        `bundle_hash = state.published_hash`.
+     In any other case do not acquire; the operator must restore, resync or
+     reconcile the correct bundle.
+  3. On success, write the promoted state
+     (`promotion_origin = "restart"`, `publication_state = "pending"` or the
+     preserved `"publishing"` when reusing that state's pending version,
+     `published_version`/`published_hash` from the acquire baseline), then
+     quiesce, reconcile and publish at
+     `publish_version = max(baseline_version + 1, pending_version)` (see
+     below). Only after the first successful publish is the API writable.
   4. On witness/TLS/auth failure, start read-only, serve DNS from the last
      snapshot, reject mutations, report not-ready with the specific reason, and
      retry with backoff.
@@ -484,73 +543,132 @@ A candidate runs this only after all eligibility gates pass.
      to renewal.
    - Held by another live holder: stay `waiting`; retry after
      `renew_interval_secs` with jitter. Never steal a live lease.
-   - Absent and `state_term > 0`: refuse (`lease_record_missing`); losing the
-     record could reset the term, so recovery is manual.
-   - Absent and `state_term == 0`, or expired, or term-reset rules allow:
+   - Absent and `max(applied_term, state_term) > 0`: refuse
+     (`lease_record_missing`) **before any acquire**. A normal slave has
+     `state_term = 0` but a non-zero watermark term; losing the witness record
+     must not reset the cluster to term 1. Recovery is manual (restore the
+     witness state or perform an explicit reinitialization).
+   - If the record exists and `max(applied_term, state_term) > current.term`:
+     abort `candidate_term_ahead` **before any acquire**. The witness cannot
+     reject a term above its record when the record is absent, so this check is
+     client-side and mandatory. A term above the witness requires manual
+     witness reconciliation, never a silent jump.
+   - Absent with `max(applied_term, state_term) == 0`, or expired, or
+     term-reset rules allow:
      compute:
      - `next_term = current.term + 1` (or `1` if absent)
-     - `baseline_version = max(current.version, applied_version, state_version)`
-     - `baseline_hash` = the BLAKE3 signed-payload hash of the content at that
-       baseline (watermark, state, or the active bundle)
-     - if `baseline_version == current.version` and
-       `baseline_hash != current.bundle_hash`: abort `candidate_forked`; the
-       same version with different content is a fork
-     - if `baseline_version < current.version`: abort `candidate_behind`
+     - If `publication_state` is `pending` or `publishing` and the state
+       bundle's `(version, hash)` equals the witness record, infer that the
+       publish succeeded: use the bundle as `state.published_version`/
+       `published_hash` for this computation (mark it published after
+       re-acquisition).
+     - `node_published_version = max(applied_version,
+       state.published_version)` — the pending state bundle version is **not**
+       part of this max unless the publishing inference above matched
+     - `node_published_hash` = the hash at that version (the applied watermark
+       hash, or `state.published_hash`)
+     - if `node_published_version < current.version`: abort
+       `candidate_behind`; the node lacks the witness's last published content
+       and must not adopt a version/hash it does not have
+     - if `node_published_version == current.version` and
+       `node_published_hash != current.bundle_hash`: abort `candidate_forked`;
+       the same version with different content is a fork
+     - if `node_published_version > current.version`: the node has newer
+       published content (a publish the witness has not recorded yet); this is
+       allowed, and the witness acquire accepts the higher version
+     - `baseline_version = node_published_version`;
+       `baseline_hash = node_published_hash`
+     - `pending_version` = the local state bundle version when
+       `publication_state` is `pending` or `publishing`; otherwise `0`
+     - `publish_version = max(baseline_version + 1, pending_version)`
 
      Then call `POST /v1/lease/acquire` with the observed
      `(expected_term, expected_revision)` (both `null` if absent), `term =
-     next_term`, `version = baseline_version`, `bundle_hash = baseline_hash`,
-     and `ttl_secs = lease_ttl_secs`.
-   - If the local `applied_term` or `state_term` is greater than
-     `current.term`, the witness will reject `term != current.term + 1`. The
-     candidate aborts with `candidate_term_ahead`; a term above the witness
-     requires manual witness reconciliation, never a silent jump.
+     next_term`, `version = baseline_version` (**the published baseline, never
+     the pending version, and never a witness version the node does not have**),
+     `bundle_hash = baseline_hash`, and `ttl_secs = lease_ttl_secs`.
 3. On a 409, another node won or the record changed. Re-read; do not retry the
    same term/revision. Back off with jitter. The loser stays read-only.
 4. On success, the candidate holds term `T`.
-5. Write the promoted state to `ha_state.toml` atomically: the bundle baseline
-   (`term = T`, `version = baseline_version + 1`), the candidate's last applied
-   content, and audit fields (`promotion_origin = "automatic"`,
-   `lease_holder`, `cluster_id`, `promoted_at_unix_ms`). If this write fails, do
-   not publish; stop renewing and fence.
-   - A crash **before** the state write leaves no promoted state. The lease
+5. Write the promoted state to `ha_state.toml` atomically:
+   the bundle (`term = T`, `version = publish_version`),
+   `publication_state = "pending"` (or preserve a prior `"publishing"` when
+   re-acquiring that state and reusing the same `publish_version`),
+   `published_version = baseline_version`,
+   `published_hash = baseline_hash`,
+   the pending bundle hash, the candidate's last applied content, and audit
+   fields (`promotion_origin = "automatic"`, `lease_holder`, `cluster_id`,
+   `promoted_at_unix_ms`). The pending version is local only; the witness
+   record still holds `baseline_version`/`baseline_hash`. If this write fails,
+   do not publish; stop renewing and fence.
+   - A crash **before** the state write leaves no pending state. The lease
      expires; a restarted candidate is a new holder. It re-reads the record
-     (term `T`, version `baseline`), still satisfies the version gate, and may
-     re-acquire at the next term; it never publishes at `T`.
-   - A crash **after** the state write leaves a promotion-in-progress marker
-     (`term = T`, `version = baseline + 1`). On restart the node only acts as
-     master after re-acquiring the lease; otherwise it stays read-only and
-     reports `promotion_interrupted`. It publishes at `baseline + 2` or higher,
-     never reusing a version.
+     (term `T`, published version `baseline`), still satisfies the version
+     gate, and may re-acquire at the next term; it never publishes at `T`.
+   - A crash **after** the state write but **before** publish leaves
+     `publication_state = "pending"`. The record is still the baseline. On
+     restart the node is a new holder: it waits for expiry, re-acquires at the
+     next term against the published baseline, and may **reuse
+     `publish_version`**; it does not skip to `baseline + 2`.
+   - A crash **during** publish leaves `publication_state = "publishing"`
+     (set immediately before the first push). On restart, after re-acquiring,
+     reconciliation (step 7) decides: a reachable slave at `publish_version`
+     with the pending hash means the publish succeeded; a different hash is a
+     fork; no slave at it means the version is safe to reuse.
 6. **Pre-publish quiesce:** wait `lease_ttl_secs` (not separately configurable
    in 2.0) without accepting writes or publishing. Continue renewing the witness
-   lease during this wait. This is longer than the old holder's maximum
-   self-fence deadline under the stated model, so any old holder has stopped
-   publishing before the new master's first publish.
-7. **Version and content reconciliation:** start the replication listener (so
-   slaves can connect via the stable endpoint) and wait up to
-   `reconcile_window_secs` for hellos. Collect
+   with `(baseline_version, baseline_hash)` — the **published baseline**, never
+   the pending version. This is longer than the old holder's maximum self-fence
+   deadline under the stated model, so any old holder has stopped publishing
+   before the new master's first publish.
+7. **Hello-only reconciliation:** start the replication listener in a
+   hello-only mode that accepts TLS/WebSocket, reads `Hello` and answers
+   ping/pong, but **does not install an active push and does not send any
+   `ConfigPush`** while the window is open. This is required because the normal
+   master session enqueues the active bundle on every Hello
+   (`session_state.rs`); without the gate, a forked baseline slave could apply
+   `publish_version` before the checks below. Wait up to
+   `reconcile_window_secs` for hellos and collect
    `have_term`/`have_version`/`have_bundle_hash`.
+   - For each reachable slave, compare against **both** the witness record
+     `(current.version, current.bundle_hash)` and the publish baseline
+     `(baseline_version, baseline_hash)`. A same-version hash mismatch at either
+     published baseline aborts (`cluster_forked`). This catches a slave forked
+     at the witness's older version even when the baseline was raised by the
+     node's own published state. A `0`/`"none"` baseline is not a published
+     bundle and is not hash-compared; a slave at version 0 simply applies the
+     first publish.
    - If any reachable slave reports `have_term > T` or `have_version >
-     baseline_version`, abort (`candidate_behind`): do not publish, stay
-     read-only, let the lease expire, and require manual reconciliation. Never
-     publish a version above content you do not have.
-   - If a reachable slave reports `have_version == baseline_version` and a
-     `have_bundle_hash` different from `baseline_hash`, abort
-     (`cluster_forked`): the cluster already has different content at the
-     baseline, and publishing `baseline + 1` would silently overwrite it.
-   - If a reachable slave at the baseline omits `have_bundle_hash` (an old v2
-     peer), abort (`candidate_hash_unknown`) rather than risk overwriting a
-     fork. Promotion-enabled clusters must run a peer build that reports it.
-   - If no slave is ahead, forked or unknown, publish the first bundle at
-     `(T, baseline_version + 1)` and then renew the witness record with the new
-     published version and its signed-payload hash. The baseline hash is used
-     only for the reconciliation comparison; it is not the new bundle's hash.
+     publish_version`, abort (`candidate_behind`). A slave at
+     `publish_version` is allowed only when `publication_state = "publishing"`
+     and its hash equals the pending hash (proof the prior publish succeeded);
+     any other `publish_version` report is an in-flight/forked bundle and
+     aborts. A reachable slave with `have_version > baseline_version` that is
+     not that allowed `publish_version` case is an unknown in-flight version;
+     abort (`candidate_behind`) rather than overwrite it.
+   - If a reachable slave at a compared published baseline or at
+     `publish_version` omits `have_bundle_hash` (an old v2 peer), abort
+     (`candidate_hash_unknown`) rather than risk overwriting a fork.
+     Promotion-enabled clusters must run a peer build that reports it.
+   - If no slave is ahead, forked or unknown, atomically set
+     `publication_state = "publishing"` (keeping `published_version`/`hash`)
+     **before** the first push; if that write fails, do not publish. Publish the
+     first bundle at `(T, publish_version)`, then atomically set
+     `publication_state = "published"`, `published_version = publish_version`,
+     `published_hash = publish_hash` in `ha_state.toml`; only then renew the
+     witness with `(publish_version, publish_hash)`. The witness never holds an
+     unpublished version. If the `"published"` state write fails, do not renew
+     the witness; stay read-only. On restart, reconciliation can prove the
+     publish from a slave at `publish_version`/pending hash (or the witness
+     record can, if a later renewal succeeded before the failure).
    - A slave that reports ahead **after** the window is latched/diverged; the
      master keeps publishing to healthy slaves but never overwrites the ahead
      slave. The operator resolves the fork manually.
-8. After the first successful publish, the node is writable and renews every
-   `renew_interval_secs`.
+   - If reconciliation aborts, disconnect the hello-only listener, do not
+     install an active push, stay read-only, and let the lease expire.
+8. After the first successful publish and the `"published"` state update, the
+   node is writable and renews every `renew_interval_secs` with the published
+   version/hash.
 
 **Role persistence.** Automatic promotion changes the **effective role** in
 memory; it does not rewrite `server.role` in `config.toml`. Acquiring stops the
@@ -565,11 +683,14 @@ persisting the new role (edit `config.toml`, set `candidate = false`, restart)
 for auditability.
 
 **Master restart with promotion enabled.** A master has `ha_state.toml` rather
-than a watermark. It uses `state_term`/`state_version` and the state bundle
-hash as its baseline: `next_term = current.term + 1`, first published version
-`max(current.version, state_version) + 1`. A state term above the witness
-record is refused as `master_term_ahead`; a state version below the witness
-record or an equal version with a different bundle hash is refused as
+than a watermark. It uses `state_term`, `state.published_version` and
+`state.published_hash` as its baseline: `next_term = current.term + 1`;
+after confirming `state.published_version` is not below `current.version`,
+`baseline_version = state.published_version` and
+`publish_version = max(baseline_version + 1, pending_version)`. A pending state
+bundle version is not a published baseline. A state term above the witness
+record is refused as `master_term_ahead`; a published version below the witness
+record or an equal published version with a different hash is refused as
 `master_state_behind`/`master_state_forked`. The master must not overwrite
 newer or forked content, and must not silently lower a term. Because a restart
 is a new holder and
@@ -589,17 +710,25 @@ bump on every restart, should leave promotion disabled or tune
 ### Renewal, conflicts and self-fencing
 
 - Renewal is `POST /v1/lease/renew` with the observed `(term, revision)`:
-  the holder re-asserts its identity, updates `version` and expiry, and leaves
-  the term unchanged. The witness increments `revision`.
+  the holder re-asserts its identity, updates `version`/`bundle_hash` and
+  expiry, and leaves the term unchanged. The witness increments `revision`.
+  Renewal compares against the node's **published baseline**
+  (`published_version`, `published_hash`), never the pending version.
 - **A 409 is not automatically "lease lost".** Re-read the record:
-  - still this holder at the same term and not expired, with a witness
-    `version` not above our published version: adopt the new revision (for
-    example a lost renewal ACK) and continue;
+  - still this holder at the same term and not expired, with the witness
+    `(version, bundle_hash)` exactly equal to our published baseline: adopt the
+    new revision (for example a lost renewal ACK) and continue;
+  - still this holder at the same term, not expired, with the witness version
+    **below** our published baseline: adopt the revision and retry with our
+    higher published version/hash (the witness accepts a non-decreasing
+    version);
+  - still this holder at the same term, not expired, but the witness version is
+    **above** our published baseline, or the version is equal and the
+    `bundle_hash` differs: fence with `lease_version_regression` (the journal
+    names version vs hash); never renew or publish below or beside the witness
+    baseline;
   - still this holder but expired: fence (the self-fence deadline should have
     fired first);
-  - still this holder but the witness `version` is above ours: fence with
-    `lease_version_regression`; never renew or publish below the witness
-    baseline;
   - foreign holder or higher term: fence immediately;
   - absent: fence and report `lease_record_missing`.
 - **Network/TLS/5xx errors** are retried with backoff until the self-fence
@@ -641,14 +770,21 @@ bump on every restart, should leave promotion disabled or tune
 }
 ```
 
-- The marker is written **before** the node stops accepting writes. If the
-  write fails, the process still becomes read-only and logs a critical error;
-  the absence of a marker is treated as an operator-repair condition on the next
-  start (the node may not re-acquire until the data dir is repaired).
-- On startup, an unreconciled marker makes the node read-only regardless of
-  role or lease availability (`ha_fenced_until_reconciled`). It does not
-  acquire the lease and does not become a candidate.
-- `sito ha clear-fence --confirm` removes the marker after the operator has
+- The marker is written **before** the node stops accepting writes. The fence
+  transition first writes `ha_fence.pending` atomically, then
+  `ha_fence.json`. If the final marker write fails but `pending` succeeded, the
+  node is still durably fenced on restart. If **both** writes fail, the process
+  becomes read-only, logs a critical error and exits non-zero; no durable fence
+  distinction exists. Startup then runs a data-dir writable/parse integrity
+  check: an unhealthy dir refuses; if the dir is later repaired with no marker,
+  the node may acquire a **new** term only after the witness confirms no newer
+  holder. The witness term remains the safety backstop, and this is the one
+  residual where the no-reacquire policy cannot be recorded.
+- On startup, either an unreconciled `ha_fence.json` or `ha_fence.pending`
+  makes the node read-only regardless of role or lease availability
+  (`ha_fenced_until_reconciled`). It does not acquire the lease and does not
+  become a candidate.
+- `sito ha clear-fence --confirm` removes both markers after the operator has
   verified the current master/term. It is a local CLI action; it does not grant
   a lease.
 - A marker from a different `cluster_id`/`node_id` is a data-dir mix-up: refuse
@@ -672,8 +808,9 @@ A candidate is eligible only if:
 - it is not degraded, diverged, or fork-latched;
 - it has no pending restart-required configuration mismatch;
 - it has no stale **foreign** `ha_state.toml` ahead of the watermark. A state
-  file written by this node's own in-progress automatic promotion is allowed
-  and participates as `state_term`/`state_version`; a foreign or unmarked stale
+  file written by this node's own in-progress automatic promotion is allowed:
+  its `published_version` participates in the baseline, while its pending
+  version only participates in `publish_version`. A foreign or unmarked stale
   state must be reconciled first;
 - it can reach the witness, pass TLS/auth, and match `cluster_id`.
 
@@ -743,10 +880,13 @@ Automatic promotion does not reinterpret or bypass them:
 - **Term is the fencing token.** A promotion sets `term` from the witness CAS
   (`term + 1`), never from a peer message. A stale holder's lower term is
   rejected by every slave even when its local version is higher.
-- **Both term and version rise.** The first published version is
-  `max(witness.version, applied_version, state_version) + 1`, strictly above the
-  witness record and the candidate's applied/attempted state. A term bump alone
-  is not accepted.
+- **Both term and version rise.** `node_published_version =
+  max(applied_version, state.published_version)`; it must be at least the
+  witness record's version with the same hash at equality, or the candidate
+  aborts. The first publish version is
+  `max(node_published_version + 1, pending_version)`, strictly above the
+  candidate's published baseline. The pending state version is never a witness
+  baseline. A term bump alone is not accepted.
 - **Watermarks are the rollback guard.** A promoted bundle below a slave's
   watermark is rejected. A candidate behind the witness record refuses. A
   reachable slave ahead of the baseline aborts the promotion; a late ahead
@@ -770,10 +910,18 @@ The manual runbook (§2) remains the operator escape hatch:
    quiesces, reconciles and publishes. Do **not** hand-edit a term above the
    witness; the witness will reject it (`candidate_term_ahead`/`term_mismatch`)
    and the correct action is manual witness reconciliation.
-2. The manual version choice must be
-   `max(witness.version, local applied/state version, highest reported peer
-   version) + 1`. If a peer is ahead and unreachable, the operator must resolve
-   the fork before promoting; never lower a peer's watermark.
+2. The manual local baseline is
+   `max(applied_version, state.published_version)`, and the publish version is
+   `max(baseline + 1, pending_version)`. A pending state version is not a
+   baseline. Refuse to promote if the local baseline is below the witness
+   record's version or matches it with a different hash. Any reachable peer
+   ahead of the local baseline, or at the same version with a different hash, is
+   a rejection condition to resolve first; a peer version is not a content
+   source the node can publish. If a peer is ahead and unreachable, the
+   operator must resolve the fork before promoting; never lower a peer's
+   watermark. The master-startup formula omits `applied_version` because a
+   master has no watermark and reconciles peers; both formulas use the same
+   local published-baseline rule.
 3. If the witness record is behind the cluster after a restore or an earlier
    operator bypass, stop the witness, back up `state_dir`, and use the offline
    `sito ha lease-admin set --state-dir <dir> --term <T> --version <V>
@@ -824,6 +972,8 @@ The manual runbook (§2) remains the operator escape hatch:
     "term": 8,
     "version": 128,
     "bundle_hash": "blake3:9f2c...64-hex",
+    "publication_state": "published",
+    "published_version": 128,
     "lease_revision": 13,
     "lease_expires_in_secs": 22,
     "witness_reachable": true,
@@ -850,8 +1000,10 @@ The manual runbook (§2) remains the operator escape hatch:
   `lease_version_regression`,
   `fenced`, `fenced_until_reconciled`, `v1_state`, `promotion_interrupted`,
   `endpoint_is_ip_literal`.
-- `bundle_hash` is the active bundle's signed-payload hash, used for
-  same-version reconciliation and the offline witness recovery tool.
+- `version`/`bundle_hash` describe the **active** bundle (which may be pending
+  during a promotion); `publication_state`/`published_version` show whether
+  that active bundle is pending, publishing or published. The published baseline
+  is used for reconciliation and the offline witness recovery tool.
 - `witness_reachable` is a last-probe boolean, not a safety input.
 - The existing top-level `ready`/`readiness_reason` remain authoritative for
   health. Witness-unavailable and fencing conditions make the node not-ready;
@@ -898,10 +1050,13 @@ requires it at the baseline during reconciliation and aborts
 carries `term` and `version`, and slaves already enforce term monotonicity plus
 version continuity.
 
-The optional audit fields in `ha_state.toml` are additive and ignored by readers
-that do not know them. The mandatory promotion state (the bundle's `term` and
-`version`) already exists in the v2 shape. `ha_fence.json` and
-`ha_promote.confirm` are new node-local files owned by this feature.
+The promotion bookkeeping in `ha_state.toml` (`publication_state`,
+`published_version`, `published_hash`, and the optional audit fields) is
+node-local and additive; older readers ignore it, and a downgrade that rewrites
+the file loses the marker but keeps the v2 bundle's `term`/`version`. The
+mandatory promotion state (the bundle's `term` and `version`) already exists in
+the v2 shape. `ha_fence.json`, `ha_fence.pending` and `ha_promote.confirm` are new
+node-local files owned by this feature.
 
 ## Safety argument
 
@@ -938,20 +1093,27 @@ additional `lease_ttl_secs` (quiesce) after acquisition before its first
 publish. Under the stated model (the witness clock does not jump forward by more
 than the TTL, and `CLOCK_BOOTTIME` advances through pauses), the old holder has
 stopped publishing before the new first publish. During that window the old
-holder may still publish `T` to slaves that have not seen `T+1`; this is a
-handover artifact, not a second current-term publisher. The new holder is silent
-during the window, and reconciliation prevents overwriting content it lacks.
-This bounds the pre-publish window the heartbeat-only design leaves fully open;
-the residual unbounded-pause case is listed below.
+holder may have already published (or may still publish) `T` bundles to slaves
+that have not seen `T+1`; those bundles are a handover artifact, not a second
+current-term publisher. The new holder is silent during the window: the
+listener is hello-only and sends no `ConfigPush` until reconciliation
+completes, and reconciliation prevents overwriting content it lacks, including
+a slave that accepted an old baseline before the window closed. This bounds the
+pre-publish window the heartbeat-only design leaves fully open; the residual
+unbounded-pause case is listed below.
 
-**I4 — No content rollback.** The first publish version is one above
-`max(witness.version, applied_version, state_version)`. A reachable slave ahead
-of that baseline, or at the same version with a different signed-payload hash,
-aborts the promotion before publishing; a late ahead slave is latched and never
-overwritten. The master never raises its version above content it does not have
-merely to beat a slave. Therefore a slave's applied version can increase, but
-its newer content is not replaced by older content; divergence is surfaced, not
-silently merged.
+**I4 — No content rollback.** `node_published_version = max(applied_version,
+state.published_version)`. It must be at least the witness record's version,
+and equal versions must have the same hash; otherwise the candidate aborts
+(`candidate_behind`/`candidate_forked`). `publish_version =
+max(node_published_version + 1, pending_version)`. A reachable slave ahead of
+`publish_version`, at a same version with a different signed-payload hash at
+either the witness record or the local published baseline, or unexpectedly at
+`publish_version`, aborts the promotion before publishing; a late ahead slave
+is latched and never overwritten. The master never raises its version
+above content it does not have merely to beat a slave. Therefore a slave's
+applied version can increase, but its newer content is not replaced by older
+content; divergence is surfaced, not silently merged.
 
 **I5 — The holder stops before the witness can grant its term elsewhere.** The
 self-fence deadline is `TTL - max(2, renew_interval)`, earlier than witness
@@ -1017,7 +1179,8 @@ rather than extending a lease.
   bounds the ordinary case; eliminating the residual requires external fencing
   (STONITH, power-off, or a storage layer that rejects non-holder writes).
 - **Witness data loss or corruption.** `lease.json` is the term history. A lost
-  record with a client `state_term > 0` refuses `lease_record_missing`; the
+  record with a client `max(applied_term, state_term) > 0` refuses
+  `lease_record_missing`; the
   witness itself refuses to start if `initialized` exists but the record is
   missing. Recovery is a restore or an explicit manual cluster
   reinitialization, never a silent term reset.
@@ -1080,7 +1243,9 @@ possible; do not weaken the CAS/expiry semantics to make tests fast.
 | Renew with a stale revision / foreign holder / wrong term | 409 with the current record; no state change |
 | Renew after expiry | 409; must acquire term + 1 |
 | Acquire with `term != current + 1`, `version < current.version`, a version jump above the 1,000,000 peer-lead bound, or equal version with a different `bundle_hash` | 409; no state change |
+| Acquire/renew with `ttl_secs` outside 5..=300 | 400; no state change |
 | Two concurrent acquires on the same expired record | Exactly one 200; the other 409 |
+| Hash normalization | `bundle_hash`/`have_bundle_hash` accept `blake3:<hex>` and bare lowercase hex equivalently; malformed hashes are rejected |
 | TLS: wrong CA, wrong SAN, wrong pin | Client handshake fails; no fallback |
 | Auth: missing/wrong bearer token | 401; no state change |
 | Cluster mismatch | 403; no state change |
@@ -1097,24 +1262,37 @@ possible; do not weaken the CAS/expiry semantics to make tests fast.
 |---|---|
 | Master startup, witness up | Acquires, quiesces, reconciles, publishes, becomes writable; mutations accepted |
 | Master startup, witness down/unreadable/bad token/bad TLS | Process runs read-only; DNS serves; mutations 409; `/health` false; retries; does not exit |
-| Candidate promotion | Waits heartbeat timeout; acquires `T+1`; quiesces; reconciles; publishes at baseline + 1; slaves apply |
+| Candidate promotion | Waits heartbeat timeout; acquires `T+1`; quiesces; reconciles; publishes at `publish_version`; slaves apply |
 | Two-candidate race | Exactly one acquires; loser stays read-only; no two terms |
 | Pre-publish window | Old master publishes at `T` just before fencing; candidate acquires `T+1`, quiesces, sees the slave's higher version, aborts (`candidate_behind`) and does not overwrite |
+| Witness record across quiesce | With acquire baseline `V`, after the pending state is written at `V+1`, the witness record stays at `V/Vhash` through quiesce and reconciliation; only the post-publish renew moves it to `V+1` |
+| Crash after pending state, before publish | Record is `V`; restart re-acquires `V`, may reuse `V+1`; a different candidate at `V` is not `candidate_behind`; no skip to `V+2` |
+| Crash during publish / after publish before `"published"` | State `publishing`; a reachable slave at `V+1` with the pending hash proves success; different hash aborts; no hash/slave allows safe reuse; record never holds an unpublished version |
+| Crash after `"published"` state | Baseline is `V+1`; next publish is `V+2`; no version reuse |
+| `"published"` state write fails | No witness renew; stay read-only; restart infers success from a slave at `V+1`/pending hash or the witness record, then marks published |
+| Pending/publishing state + witness record matches the state bundle | Restart (master or candidate) infers the publish succeeded, establishes baseline `V+1`, and publishes `V+2`; no `candidate_behind` deadlock |
 | Same-version fork at baseline | A reachable slave reports the baseline version with a different `have_bundle_hash`; the promotion aborts (`cluster_forked`) and publishes nothing |
-| Missing reconciliation hash | A reachable baseline slave omits `have_bundle_hash`; the promotion aborts (`candidate_hash_unknown`) and publishes nothing |
-| Master restart with state behind/forked/term-ahead | `state_version < witness.version` → `master_state_behind`; equal version + different hash → `master_state_forked`; `state_term > witness.term` → `master_term_ahead`; all read-only, no acquire |
+| Same-version fork at witness's older version | Baseline raised to `V+1` by published state, witness record at `V`; a reachable slave at `V` with a different hash aborts (`cluster_forked`); no `V+2` publish |
+| Unknown in-flight version | Reachable slave at `V+1` while baseline is `V` and the allowed publish is `V+2`; abort (`candidate_behind`), no overwrite |
+| Node behind the witness record | Node's published baseline `V`, witness record `V+1`; abort `candidate_behind`; do not adopt `V+1` as a baseline or publish its own `V+2` |
+| Node at witness version, different hash | Node's published baseline `V`, witness `V` with a different hash; abort `candidate_forked` |
+| Missing reconciliation hash | A reachable compared-baseline slave or a `publish_version` slave omits `have_bundle_hash`; the promotion aborts (`candidate_hash_unknown`) and publishes nothing |
+| Hello-only reconciliation | A connected forked slave receives **no `ConfigPush`** during the reconcile window; abort or success happens before any push; after success exactly one first push |
+| Master restart with state behind/forked/term-ahead | `state.published_version < witness.version` → `master_state_behind`; equal published version + different hash → `master_state_forked`; `state_term > witness.term` → `master_term_ahead`; all read-only, no acquire |
 | Reachable slave ahead after first publish | Slave latches/diverges; master does not bump above it; manual reconciliation |
 | Lease expiry / renewal failure | Fences at `TTL - margin`; 409 mutations; DNS read-only; metrics/audit; `ha_promotion_fenced` |
-| Renewal 409 with our holder/term/revision-advanced | Re-reads, adopts revision, continues (lost ACK) |
+| Renewal 409 with our holder/term/revision-advanced, same version/hash | Re-reads, adopts revision, continues (lost ACK) |
+| Renewal 409 with same holder/term/version but different hash | Fences with `lease_version_regression`; does not adopt/retry until the deadline |
 | Renewal unreachable before deadline | Retries; fences only after the deadline |
-| Restart after fence | Durable `ha_fence.json` makes it read-only; no acquisition; `ha_fenced_until_reconciled` |
-| `sito ha clear-fence --confirm` | Removes the marker; the node may acquire on the next attempt |
+| Restart after fence | Durable `ha_fence.json` (or `ha_fence.pending`) makes it read-only; no acquisition; `ha_fenced_until_reconciled` |
+| Fence marker write failure | Final-marker failure with `pending` present still blocks restart; both fail → process exits non-zero; startup runs a data-dir integrity check and never resumes the fenced term (safety rests on the witness term) |
+| `sito ha clear-fence --confirm` | Removes both markers; the node may acquire on the next attempt |
 | `require_manual_confirmation = true` | Waits for `sito ha confirm-promotion` before acquire; a stale/wrong-node/wrong-cluster confirmation is ignored; confirm while master alive/lease held is refused; confirm + lease succeeds |
 | Manual promotion with promotion enabled | Starts as master, acquires `T+1`, quiesces/reconciles, publishes; a hand-edited higher term is refused |
 | Stable endpoint | `master_url` IP literal logs `ha_promotion_endpoint_is_ip_literal`; VIP/DNS works; no endpoint move leaves slaves unable to replicate but no split brain |
 | `require_slaves` / `require_all_slaves` | Promoted master applies the policy; two-node + `require_all_slaves` is not-ready until a slave connects while DNS serves |
 | v1 rejection | v1 watermark/state/peer refuses startup/negotiation; no term raised |
-| Lease record loss | Client with `state_term > 0` refuses `lease_record_missing`; no term reset |
+| Lease record loss | Client with `max(applied_term, state_term) > 0` refuses `lease_record_missing` before any acquire; a normal slave with `applied_term > 0`/`state_term = 0` and a lost witness state dir does **not** fall through to term 1 |
 | Identity mismatch | Candidate without the trusted signing key/master certificate refuses (`candidate_identity_mismatch`) |
 | No-HA feature build | `[ha.promotion]` rejected with the HA-feature error |
 
@@ -1181,9 +1359,12 @@ possible; do not weaken the CAS/expiry semantics to make tests fast.
 
 - Remove `[ha.promotion]` before running a binary that predates the keys; a v2
   parser that does not know them rejects the document as unknown configuration.
-- `ha_state.toml` remains valid v2 state. Optional audit fields are ignored by
-  older readers; if an older master rewrites the file, the audit metadata is
-  lost but `term`/`version`/bundle survive. Keep a backup.
+- `ha_state.toml` remains valid v2 state. The promotion bookkeeping
+  (`publication_state`, `published_version`, `published_hash`) and audit fields
+  are ignored by older readers; if an older master rewrites the file, they are
+  lost but `term`/`version`/bundle survive. On re-upgrade, a state without
+  `publication_state` must be treated as **unknown** and reconciled with the
+  witness/slaves; never assume its bundle version was published. Keep a backup.
 - `ha_fence.json` is new; older binaries ignore it, so a downgrade can lose the
   "do not re-acquire" protection. Clear/reconcile fences before downgrading or
   keep the node stopped until the cluster is reconciled. Remove a stale
@@ -1265,7 +1446,11 @@ C3b implements the feature.
   limit, timeouts and the `/healthz`, `/v1/info`, `/v1/lease`,
   `/v1/lease/acquire`, `/v1/lease/renew` endpoints.
 - Implement the single-writer CAS state machine with term/revision/expiry and
-  version monotonicity.
+  version monotonicity. Enforce the `ttl_secs` 5..=300 bound server-side and
+  normalize `bundle_hash` input to 64 lowercase hex (accept and strip a
+  `blake3:` prefix). The record must never receive a client's pending version:
+  the client-side rule is authoritative, and the witness stores exactly the
+  baseline it is sent.
 - Implement atomic persistence (`lease.json`, `initialized`, `lease.lock`,
   temp+fsync+rename, dir fsync), restart reload, corrupt/missing-with-sentinel
   refusal, cluster mismatch refusal, and `0700`/`0600` permissions.
@@ -1285,18 +1470,45 @@ C3b implements the feature.
   retry; status/reason; no witness fallback.
 - Candidate state machine: heartbeat wait, optional manual confirmation,
   acquire, `T+1`, state write, quiesce, reconciliation, first publish, renew.
+- Implement the publish-baseline/pending-state model in `ha_state.toml`:
+  `publication_state` (`pending|publishing|published`),
+  `published_version`/`published_hash`, and the pending bundle version/hash.
+  Acquisition and renewal use only the published baseline. Quiesce renews with
+  the published baseline; the pending version is never sent to the witness.
+  Reuse a pending/publishing version after a crash; skip to `+1` only after the
+  state is `published`. Infer a successful publish when a `publishing` state's
+  pending bundle `(version, hash)` equals the witness record, then mark it
+  published.
+- Implement lease-record-loss refusal on
+  `max(applied_term, state_term) > 0` **before** any acquire, and the
+  client-side `candidate_term_ahead` check before acquire (the witness cannot
+  reject an absent record).
+- Enforce `node_published_version = max(applied_version,
+  state.published_version)` as the only content baseline: it must be at least
+  `witness.version`, with the same hash at equality. Never adopt a witness
+  version/hash the node has not applied, and never include the pending state
+  version in the baseline.
 - Extend `HaMessage::Hello` with the optional `have_bundle_hash` field
   (`#[serde(default)]`); slaves populate it from the watermark; masters use it
   during reconciliation. Keep normal v2 replication compatible with peers that
   omit it.
-- Implement the pre-publish quiesce (`lease_ttl_secs`) and
-  `reconcile_window_secs` with slave hello collection; abort on an ahead
-  reachable slave, a same-version different-hash slave, or a missing hash;
-  latch a late ahead slave; never bump above it.
-- Renewal conflict/unreachable handling exactly as specified; self-fence
-  deadline with `CLOCK_BOOTTIME`; wall-step detection.
-- Durable `ha_fence.json` write/read, startup refusal, and
-  `sito ha clear-fence --confirm`.
+- Implement a **hello-only listener mode** for quiesce/reconciliation: accept
+  TLS/WebSocket, read `Hello`, answer ping/pong, and send **no `ConfigPush`**
+  until reconciliation completes. Only then install the active bundle and allow
+  normal push-on-hello.
+- Implement reconciliation against both the witness record
+  `(version, bundle_hash)` and the publish baseline `(version, hash)` plus the
+  pending version in `publishing` state; abort on an ahead reachable slave, any
+  same-version different-hash slave at either baseline, an unknown in-flight
+  version above the baseline that is not the allowed pending publish, an
+  unexpected `publish_version` report, or a missing hash; latch a late ahead
+  slave; never bump above it.
+- Renewal conflict/unreachable handling exactly as specified (including the
+  409 same-version different-hash fence with `lease_version_regression`);
+  self-fence deadline with `CLOCK_BOOTTIME`; wall-step detection.
+- Durable `ha_fence.json`/`ha_fence.pending` write/read, startup refusal on
+  either marker, corrupt-data-dir exit when both fail, and
+  `sito ha clear-fence --confirm` (removes both).
 - Effective-role switching without rewriting `config.toml`; restart behavior.
 - Local `sito ha confirm-promotion --confirm` and `ha_promote.confirm` file
   (one-shot, `0600`, consumed atomically, age-limited).
