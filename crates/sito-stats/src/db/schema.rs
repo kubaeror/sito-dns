@@ -164,8 +164,32 @@ impl StatsDb {
     /// binary's embedded migrator rejects `_sqlx_migrations` rows whose version
     /// it does not know (`VersionMissing`). Running idempotent DDL instead
     /// keeps the database openable by 1.9.3 while new code gets the table.
-    pub(super) async fn ensure_additive_schema(&self) -> Result<(), StatsError> {
+    ///
+    /// The version marker is re-read under the `BEGIN IMMEDIATE` write lock
+    /// before any DDL. A newer binary may have migrated the database after the
+    /// caller's pre-flight check, so this guard is what actually prevents an
+    /// older binary from overwriting a newer marker. Every caller must go
+    /// through this method (it is deliberately private) rather than writing
+    /// the marker itself.
+    async fn ensure_additive_schema(&self) -> Result<(), StatsError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        let found = Self::read_stored_schema_version_conn(&mut tx).await?;
+        if found > SCHEMA_VERSION {
+            tx.rollback().await?;
+            return Err(StatsError::SchemaTooNew {
+                found,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if found == SCHEMA_VERSION {
+            // Another current binary won the race between the pre-flight
+            // check and this transaction. Its commit already included the
+            // additive objects, so leave the database untouched.
+            tx.rollback().await?;
+            return Ok(());
+        }
+
         sqlx::query(
             r"
             CREATE TABLE IF NOT EXISTS stats_meta (
@@ -182,10 +206,13 @@ impl StatsDb {
             .execute(&mut *tx)
             .await?;
         // Commit the marker with the additive objects: a crash cannot leave a
-        // database that claims to be current without the runtime schema.
+        // database that claims to be current without the runtime schema. The
+        // `WHERE` clause is defense in depth: only an older/legacy value may
+        // be advanced, never an equal or newer marker.
         sqlx::query(
             "INSERT INTO stats_meta (key, value) VALUES ('schema_version', ?) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value \
+             WHERE CAST(stats_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
         )
         .bind(SCHEMA_VERSION.to_string())
         .execute(&mut *tx)
@@ -244,13 +271,25 @@ impl StatsDb {
     }
 
     async fn read_stored_schema_version(pool: &Pool<Sqlite>) -> Result<i64, StatsError> {
+        let mut conn = pool.acquire().await?;
+        Self::read_stored_schema_version_conn(&mut conn).await
+    }
+
+    /// Reads and validates the stored marker through an existing connection.
+    ///
+    /// Running this inside the additive `BEGIN IMMEDIATE` transaction is what
+    /// makes the newer-version guard race-free: no other writer can commit
+    /// between this read and the conditional marker write.
+    async fn read_stored_schema_version_conn(
+        conn: &mut SqliteConnection,
+    ) -> Result<i64, StatsError> {
         // Do not create `stats_meta` here: a version check must not run DDL,
         // both so refusal is side-effect free and so a read-only connection
         // can perform the check.
         let has_meta: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'stats_meta'",
         )
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
         if has_meta == 0 {
             return Ok(LEGACY_SCHEMA_VERSION);
@@ -258,7 +297,7 @@ impl StatsDb {
 
         let value: Option<String> =
             sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'schema_version'")
-                .fetch_optional(pool)
+                .fetch_optional(&mut *conn)
                 .await?;
         let Some(raw) = value else {
             return Ok(LEGACY_SCHEMA_VERSION);
@@ -526,5 +565,88 @@ fn parse_schema_version(raw: &str) -> Result<i64, StatsError> {
         _ => Err(StatsError::InvalidSchemaVersion {
             value: raw.to_string(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod schema_version_tests {
+    use super::*;
+
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sito-stats-{prefix}-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Regression: a newer binary can commit a newer marker between the
+    /// pre-flight check in `run_migrations_with_mode` and the additive
+    /// transaction. The in-transaction guard must refuse it and must not
+    /// rewrite the marker to the older supported version.
+    #[tokio::test]
+    async fn test_additive_pass_refuses_newer_marker_written_after_preflight() {
+        let dir = temp_dir("schema-race-guard");
+        let db_path = dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        let newer = SCHEMA_VERSION + 1;
+        sqlx::query("UPDATE stats_meta SET value = ? WHERE key = 'schema_version'")
+            .bind(newer.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        // Bypass the pre-flight check exactly as a lost race would.
+        let err = db.ensure_additive_schema().await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StatsError::SchemaTooNew { found, supported }
+                    if found == newer && supported == SCHEMA_VERSION
+            ),
+            "expected SchemaTooNew from the in-transaction guard, got {err}"
+        );
+
+        let stored: String =
+            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'schema_version'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            newer.to_string(),
+            "a newer marker must never be overwritten"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The guarded additive pass still advances a legacy/older marker to the
+    /// supported version (the conditional upsert must not block real
+    /// upgrades).
+    #[tokio::test]
+    async fn test_additive_pass_advances_legacy_marker() {
+        let dir = temp_dir("schema-legacy-advance");
+        let db_path = dir.join("stats.db");
+        let db = StatsDb::open(&db_path).await.unwrap();
+
+        sqlx::query("UPDATE stats_meta SET value = ? WHERE key = 'schema_version'")
+            .bind(LEGACY_SCHEMA_VERSION.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        db.ensure_additive_schema().await.unwrap();
+
+        let stored: String =
+            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'schema_version'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored, SCHEMA_VERSION.to_string());
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
