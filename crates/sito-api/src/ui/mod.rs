@@ -481,18 +481,32 @@ mod tests {
             version: "1.2.1",
             lists: &[],
             custom_rules: "||ad.com^",
-            bundled_lists: vec![crate::ui::templates::BundledListView {
-                id: "adult".to_string(),
-                kind: "domains".to_string(),
-                version: "2026.09.2".to_string(),
-                source: "https://example.com/adult.txt".to_string(),
-                license: "CC0-1.0".to_string(),
-                entries: 40,
-                state: "built-in (minimal)".to_string(),
-                last_refresh: "—".to_string(),
-                last_attempt: "2023-11-14 22:13 UTC".to_string(),
-                last_error: Some("fetch failed".to_string()),
-            }],
+            bundled_lists: vec![
+                crate::ui::templates::BundledListView {
+                    id: "adult".to_string(),
+                    kind: "domains".to_string(),
+                    version: "2026.09.2".to_string(),
+                    source: "https://example.com/adult.txt".to_string(),
+                    license: "CC0-1.0".to_string(),
+                    entries: 40,
+                    state: "built-in (minimal)".to_string(),
+                    last_refresh: "—".to_string(),
+                    last_attempt: "2023-11-14 22:13 UTC".to_string(),
+                    last_error: Some("fetch failed".to_string()),
+                },
+                crate::ui::templates::BundledListView {
+                    id: "services".to_string(),
+                    kind: "services".to_string(),
+                    version: "2026.09.2".to_string(),
+                    source: "https://example.com/services.json".to_string(),
+                    license: "CC0-1.0".to_string(),
+                    entries: 146,
+                    state: "built-in (minimal)".to_string(),
+                    last_refresh: "—".to_string(),
+                    last_attempt: "—".to_string(),
+                    last_error: None,
+                },
+            ],
             catalog_categories: vec![crate::ui::templates::CatalogCategoryView {
                 id: "general".to_string(),
                 name: "General".to_string(),
@@ -524,6 +538,10 @@ mod tests {
         );
         assert!(filtering_html.contains("adult"));
         assert!(filtering_html.contains("CC0-1.0"));
+        assert!(
+            filtering_html.contains("plus GPL-3.0-only catalog entries"),
+            "the merged services row must not imply its catalog-only entries are CC0-1.0"
+        );
         assert!(filtering_html.contains("Last attempt: 2023-11-14 22:13 UTC"));
         assert!(filtering_html.contains("Last error: fetch failed"));
         assert!(filtering_html.contains("+ Add from catalog"));
@@ -1252,10 +1270,14 @@ mod tests {
         assert!(html.contains("catalog has no dedicated parental filter"));
         assert!(html.contains("no separate refresh button"));
 
-        // The simulator evaluates only the global policy.
+        // The simulator evaluates only the global policy; group membership,
+        // group custom rules, parental categories and services are outside it.
         assert!(html.contains("In-process simulator"));
         assert!(html.contains("global filter lists and custom rules"));
-        assert!(html.contains("not part of this check"));
+        assert!(html.contains("Client-group custom rules"));
+        assert!(
+            html.contains("parental categories and blocked services are not part of this check")
+        );
     }
 
     #[test]

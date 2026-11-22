@@ -20,7 +20,7 @@ The upstream indexes are:
 - <https://adguardteam.github.io/HostlistsRegistry/assets/filters.json>
 - <https://adguardteam.github.io/HostlistsRegistry/assets/services.json>
 
-AdguardTeam/HostlistsRegistry is licensed under GPL-3.0 and sito is
+AdguardTeam/HostlistsRegistry is licensed under GPL-3.0-only and sito is
 GPL-3.0-only, so embedding the metadata is license-compatible. Attribution and
 the upstream URLs are recorded in `THIRD_PARTY_NOTICES` at the repository root
 and in the catalog's own `source` block.
