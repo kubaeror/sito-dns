@@ -253,6 +253,8 @@ pub(crate) fn catalog_page_views(
                 .then_with(|| a.id.cmp(&b.id))
         });
         for filter in filters {
+            let stored_name = catalog_list_name(filter);
+            let name_sanitized = stored_name != filter.name;
             filter_views.push(crate::ui::templates::CatalogFilterView {
                 id: filter.id.clone(),
                 name: filter.name.clone(),
@@ -262,6 +264,8 @@ pub(crate) fn catalog_page_views(
                 homepage: filter.homepage.clone(),
                 source_url: catalog_filter_url(filter).to_string(),
                 version: filter.version.clone(),
+                stored_name,
+                name_sanitized,
                 deprecated: filter.deprecated,
                 already_added: catalog_list_is_present(filter, &existing_names, &existing_urls),
             });

@@ -264,6 +264,8 @@ mod tests {
                 homepage: "https://example.com".to_string(),
                 source_url: "https://example.com/filter.txt".to_string(),
                 version: "1.0.0".to_string(),
+                stored_name: "AdGuard DNS filter".to_string(),
+                name_sanitized: false,
                 deprecated: false,
                 already_added: false,
             }],
@@ -280,6 +282,18 @@ mod tests {
         assert!(filtering_html.contains("CC0-1.0"));
         assert!(filtering_html.contains("Last attempt: 2023-11-14 22:13 UTC"));
         assert!(filtering_html.contains("Last error: fetch failed"));
+        assert!(filtering_html.contains("+ Add from catalog"));
+        assert!(filtering_html.contains("Choose blocklists"));
+        assert!(filtering_html.contains("action=\"/ui/filtering/add-catalog\""));
+        assert!(filtering_html.contains("name=\"selected\""));
+        assert!(filtering_html.contains("value=\"adguard_dns_filter\""));
+        assert!(filtering_html.contains("AdGuard DNS filter"));
+        assert!(filtering_html.contains("Ads and trackers"));
+        assert!(
+            filtering_html.contains("+ Add Blocklist")
+                && filtering_html.contains("action=\"/ui/filtering/add\""),
+            "the custom-URL modal must remain available"
+        );
 
         let rewrites_tmpl = RewritesTemplate {
             csrf_token: "",
@@ -399,6 +413,212 @@ mod tests {
             reauth_token: "",
         };
         assert!(wiz_tmpl.render().unwrap().contains("Welcome to sito DNS"));
+    }
+
+    fn filtering_template_with_catalog(
+        categories: Vec<crate::ui::templates::CatalogCategoryView>,
+        filters: Vec<crate::ui::templates::CatalogFilterView>,
+    ) -> FilteringTemplate<'static> {
+        let catalog_filter_count = filters.len();
+        FilteringTemplate {
+            csrf_token: "catalog-csrf",
+            is_authenticated: true,
+            username: "admin",
+            user_role: "admin",
+            active_tab: "filtering",
+            version: "1.2.1",
+            lists: &[],
+            custom_rules: "",
+            bundled_lists: Vec::new(),
+            catalog_categories: categories,
+            catalog_filters: filters,
+            catalog_filter_count,
+        }
+    }
+
+    fn catalog_category(
+        id: &str,
+        name: &str,
+        filter_count: usize,
+    ) -> crate::ui::templates::CatalogCategoryView {
+        crate::ui::templates::CatalogCategoryView {
+            id: id.to_string(),
+            name: name.to_string(),
+            display_number: 1,
+            filter_count,
+        }
+    }
+
+    fn catalog_filter(
+        id: &str,
+        name: &str,
+        stored_name: &str,
+        name_sanitized: bool,
+        deprecated: bool,
+        already_added: bool,
+    ) -> crate::ui::templates::CatalogFilterView {
+        crate::ui::templates::CatalogFilterView {
+            id: id.to_string(),
+            name: name.to_string(),
+            category: "general".to_string(),
+            category_name: "General".to_string(),
+            description: format!("{name} description"),
+            homepage: format!("https://example.com/{id}"),
+            source_url: format!("https://example.com/{id}.txt"),
+            version: "2026.1".to_string(),
+            stored_name: stored_name.to_string(),
+            name_sanitized,
+            deprecated,
+            already_added,
+        }
+    }
+
+    fn checkbox_tag<'a>(html: &'a str, id: &str) -> &'a str {
+        let marker = format!("id=\"catalog-filter-{id}\"");
+        let start = html
+            .find(&marker)
+            .unwrap_or_else(|| panic!("checkbox for {id} must render"));
+        let end = html[start..]
+            .find('>')
+            .unwrap_or_else(|| panic!("checkbox for {id} must close"))
+            + start;
+        &html[start..=end]
+    }
+
+    #[test]
+    fn test_filtering_catalog_modal_renders_selection_controls() {
+        let categories = vec![
+            catalog_category("general", "General", 3),
+            catalog_category("security", "Security", 1),
+        ];
+        let filters = vec![
+            catalog_filter(
+                "adguard_dns_filter",
+                "AdGuard DNS filter",
+                "AdGuard DNS filter",
+                false,
+                false,
+                false,
+            ),
+            catalog_filter(
+                "already_added_filter",
+                "Already added filter",
+                "Already added filter",
+                false,
+                false,
+                true,
+            ),
+            catalog_filter(
+                "deprecated_filter",
+                "Deprecated filter",
+                "Deprecated filter",
+                false,
+                true,
+                false,
+            ),
+            catalog_filter(
+                "hagezi_windows_office_tracker_blocklist",
+                "HaGeZi Windows/Office Tracker Blocklist",
+                "HaGeZi Windows-Office Tracker Blocklist",
+                true,
+                false,
+                false,
+            ),
+        ];
+        let html = filtering_template_with_catalog(categories, filters)
+            .render()
+            .expect("render filtering catalog modal");
+
+        assert!(html.contains("+ Add from catalog"));
+        assert!(html.contains("Choose blocklists"));
+        assert!(html.contains("action=\"/ui/filtering/add-catalog\""));
+        assert!(
+            html.contains("name=\"csrf_token\" value=\"catalog-csrf\""),
+            "the catalog form must carry the CSRF token"
+        );
+        assert!(html.contains("id=\"catalog-search\""));
+        assert!(html.contains("x-model=\"catalogSearch\""));
+        assert!(html.contains("General"));
+        assert!(html.contains("Security"));
+        assert!(html.contains(">3<"), "category count must render");
+        assert!(html.contains("AdGuard DNS filter description"));
+        assert!(html.contains("Version <span class=\"mono\">2026.1</span>"));
+        assert!(html.contains("href=\"https://example.com/adguard_dns_filter\""));
+        assert!(
+            html.contains("https://github.com/AdguardTeam/HostlistsRegistry")
+                && html.contains("GPL-3.0-only"),
+            "the modal must show its source and license"
+        );
+        assert!(html.contains("Add custom URL"));
+
+        // Checkboxes submit only catalog ids.
+        assert!(html.contains("name=\"selected\""));
+        assert!(html.contains("value=\"adguard_dns_filter\""));
+        assert!(
+            !checkbox_tag(&html, "adguard_dns_filter").contains("aria-disabled"),
+            "an available filter must stay selectable"
+        );
+
+        let already_added = checkbox_tag(&html, "already_added_filter");
+        assert!(already_added.contains("disabled aria-disabled=\"true\""));
+        assert!(html.contains(">Added<"));
+
+        let deprecated = checkbox_tag(&html, "deprecated_filter");
+        assert!(deprecated.contains("disabled aria-disabled=\"true\""));
+        assert!(html.contains(">Deprecated<"));
+
+        // Sanitized upstream names show the effective stored name.
+        assert!(html.contains(
+            "Saved as <span class=\"mono\">HaGeZi Windows-Office Tracker Blocklist</span>"
+        ));
+        assert!(html.contains("Renamed on save"));
+
+        // The client-side cap and add-selected state are wired.
+        assert!(html.contains("catalogMax: 20"));
+        assert!(html.contains("catalogSelected.length >= catalogMax"));
+        assert!(html.contains(":disabled=\"catalogSelected.length === 0\""));
+        assert!(html.contains("Add selected ("));
+    }
+
+    #[test]
+    fn test_filtering_catalog_empty_degrades_without_broken_modal() {
+        let html = filtering_template_with_catalog(Vec::new(), Vec::new())
+            .render()
+            .expect("render filtering page without a catalog");
+
+        assert!(!html.contains("+ Add from catalog"));
+        assert!(!html.contains("Choose blocklists"));
+        assert!(!html.contains("action=\"/ui/filtering/add-catalog\""));
+        assert!(
+            html.contains("+ Add Blocklist") && html.contains("action=\"/ui/filtering/add\""),
+            "the custom-URL fallback must remain when the catalog is unavailable"
+        );
+    }
+
+    #[test]
+    fn test_filtering_catalog_metadata_is_html_escaped() {
+        let filters = vec![catalog_filter(
+            "hostile_filter",
+            "<script>alert('name')</script>",
+            "<script>alert('name')</script>",
+            false,
+            false,
+            false,
+        )];
+        let html = filtering_template_with_catalog(
+            vec![catalog_category("general", "<b>General</b>", 1)],
+            filters,
+        )
+        .render()
+        .expect("render filtering catalog with hostile metadata");
+
+        assert!(
+            !html.contains("<script>alert('name')</script>"),
+            "catalog metadata must not be injected as raw HTML"
+        );
+        assert!(!html.contains("<b>General</b>"));
+        assert!(html.contains("&#60;script&#62;"));
+        assert!(html.contains("&#60;b&#62;General&#60;/b&#62;"));
     }
 
     #[test]

@@ -2,8 +2,8 @@
 
 `sito-clients` embeds a catalog of filter and blocked-service metadata derived
 from the [AdGuard HostlistsRegistry](https://github.com/AdguardTeam/HostlistsRegistry).
-The catalog lets the UI and API (follow-up work) offer AdGuard-style filter and
-service selection without making a network request to discover what is
+The catalog lets the UI and API offer AdGuard-style filter selection (and,
+later, service selection) without making a network request to discover what is
 available.
 
 The catalog is **metadata only**:
@@ -63,13 +63,35 @@ Rust loader `Catalog::embedded()` rejects unknown versions, unknown fields,
 duplicate ids, empty names/URLs/rules, unexpected source URLs/license and
 references to undeclared categories or service groups.
 
+## Choose from catalog (web UI)
+
+Operators can open **+ Add from catalog** on the Filtering page to choose
+from the embedded metadata. The dialog:
+
+- searches by filter name or description and groups entries by category with
+  per-category counts;
+- shows each filter's name, description, version, homepage and source link;
+- disables entries that are already configured with an **Added** badge, and
+  disables deprecated entries with a **Deprecated** badge;
+- submits only repeated `selected` catalog ids to
+  `POST /ui/filtering/add-catalog`; names and URLs always come from the
+  embedded catalog, never from the browser;
+- labels the effective stored name when an upstream name has to be sanitized
+  for routing (for example a name containing `/` becomes `-`), so the operator
+  knows what will appear in the list table;
+- caps one selection at 20 filters, enforced in both the UI and the handler.
+
+The dialog also links to the [HostlistsRegistry](https://github.com/AdguardTeam/HostlistsRegistry)
+(GPL-3.0-only) and this document. If the embedded catalog is missing or
+corrupt, the catalog button and dialog are omitted and the custom-URL
+**+ Add Blocklist** flow remains available as the fallback.
+
 ## Runtime behaviour
 
 Filter-list bodies are **not** embedded. The catalog only records their
-metadata and URLs; when an operator selects a filter, the runtime selection
-work (follow-up F2c) downloads the list body through the existing
-subscription/list machinery. Fetching the catalog itself at runtime is not part
-of 2.0.
+metadata and URLs; when an operator selects a filter, the runtime downloads the
+list body through the existing subscription/list machinery. Fetching the
+catalog itself at runtime is not part of 2.0.
 
 ## Category mapping
 
