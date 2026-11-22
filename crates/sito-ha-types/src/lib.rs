@@ -7,6 +7,7 @@
 pub mod bundle;
 pub mod config;
 pub mod error;
+pub mod hash;
 pub mod protocol;
 pub mod readiness;
 pub mod status;
@@ -14,6 +15,9 @@ pub mod status;
 pub use bundle::{AppliedWatermark, ConfigBundle, FilterListMetadata};
 pub use config::HaConfig;
 pub use error::HaError;
+pub use hash::{
+    BundleHashError, normalize_blake3_hash, normalize_bundle_hash, normalize_optional_hash,
+};
 pub use protocol::{AckConflict, HaMessage, PROTOCOL_VERSION, UpstreamReport};
 pub use readiness::{HaReadiness, HaReadinessState};
 pub use status::{PublishOutcome, ResyncOutcome, SlaveState, SlaveStatsSummary, SlaveSummary};

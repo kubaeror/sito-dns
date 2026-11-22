@@ -118,6 +118,14 @@ NESTED_BY_SECTION: dict[int, list[tuple[str, str, str]]] = {
         ),
     ],
     10: [("entries.", "RewriteEntryConfig", "crates/sito-rewrites/src/config.rs")],
+    13: [
+        ("promotion.", "PromotionConfig", "crates/sito-ha-types/src/config.rs"),
+        (
+            "promotion.witness.",
+            "WitnessClientConfig",
+            "crates/sito-ha-types/src/config.rs",
+        ),
+    ],
     15: [("categories.", "ListSourceConfig", "crates/sito-clients/src/runtime_lists.rs")],
 }
 
@@ -125,6 +133,7 @@ NESTED_BY_SECTION: dict[int, list[tuple[str, str, str]]] = {
 # their own in that sub-table.
 NESTED_SKIP = {
     (9, "ClientGroupConfig"): {"blocked_services"},
+    (13, "PromotionConfig"): {"witness"},
     (15, "ListCategoriesConfig"): {"categories"},
 }
 

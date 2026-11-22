@@ -3342,6 +3342,7 @@ version = "2.0.0-rc.2"
 dependencies = [
  "base64 0.23.1",
  "hex",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror",

@@ -22,6 +22,397 @@ fn default_ping_interval_secs() -> u64 {
     15
 }
 
+fn default_promotion_backend() -> String {
+    "witness".to_string()
+}
+
+fn default_lease_ttl_secs() -> u64 {
+    30
+}
+
+fn default_renew_interval_secs() -> u64 {
+    10
+}
+
+fn default_reconcile_window_secs() -> u64 {
+    10
+}
+
+/// Witness endpoint parsed from `ha.promotion.witness.url`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessUrl {
+    /// Host without IPv6 brackets, exactly as it appears in the URL authority.
+    pub host: String,
+    /// Explicit port or the ADR default `8954`.
+    pub port: u16,
+}
+
+/// Parses a `https://host[:port]` witness base URL.
+///
+/// ADR-0010 requires TLS, a host and no userinfo, path, query or fragment. The
+/// default witness port is `8954`. IPv6 literals must be bracketed, as in
+/// `https://[2001:db8::2]:8954`.
+pub fn parse_witness_url(input: &str) -> Result<WitnessUrl, HaError> {
+    let invalid = |reason: &str| HaError::Validation {
+        field: "ha.promotion.witness.url".to_string(),
+        reason: reason.to_string(),
+    };
+
+    let trimmed = input.trim();
+    let Some((scheme, authority)) = trimmed.split_once("://") else {
+        return Err(invalid(
+            "must be an absolute https:// URL with a host, for example https://witness.lan:8954",
+        ));
+    };
+    if !scheme.eq_ignore_ascii_case("https") {
+        return Err(invalid(
+            "must use https://; plaintext http:// is not supported for the witness",
+        ));
+    }
+    if authority.is_empty() {
+        return Err(invalid("must include a host"));
+    }
+    if authority.contains('@') {
+        return Err(invalid("must not contain userinfo"));
+    }
+    if authority.contains('/') || authority.contains('?') || authority.contains('#') {
+        return Err(invalid(
+            "must not contain a path, query or fragment; the client appends /v1/...",
+        ));
+    }
+
+    let (host, port_text, bracketed) = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, after)) = rest.split_once(']') else {
+            return Err(invalid("has an unterminated IPv6 host literal"));
+        };
+        let port_text = if after.is_empty() {
+            None
+        } else if let Some(port) = after.strip_prefix(':') {
+            Some(port)
+        } else {
+            return Err(invalid("has an unexpected suffix after the IPv6 host"));
+        };
+        (host, port_text, true)
+    } else if authority.matches(':').count() > 1 {
+        return Err(invalid(
+            "must bracket IPv6 host literals, for example https://[2001:db8::2]:8954",
+        ));
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if port.bytes().all(|byte| byte.is_ascii_digit()) && !host.is_empty() {
+            (host, Some(port), false)
+        } else {
+            (authority, None, false)
+        }
+    } else {
+        (authority, None, false)
+    };
+
+    if host.is_empty() {
+        return Err(invalid("must include a host"));
+    }
+    if !bracketed && host.contains(':') {
+        return Err(invalid("has an invalid port or an unbracketed host"));
+    }
+    if host.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(invalid("host must not contain whitespace"));
+    }
+
+    let port = match port_text {
+        None => 8954,
+        Some(text) => {
+            let port = text
+                .parse::<u16>()
+                .map_err(|_| invalid("has an invalid port"))?;
+            if port == 0 {
+                return Err(invalid("port must be greater than zero"));
+            }
+            port
+        }
+    };
+
+    Ok(WitnessUrl {
+        host: host.to_string(),
+        port,
+    })
+}
+
+fn validate_identifier(field: &'static str, value: &str) -> Result<(), HaError> {
+    let valid_len = (1..=64).contains(&value.len());
+    let valid_chars = value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if valid_len && valid_chars {
+        Ok(())
+    } else {
+        Err(HaError::Validation {
+            field: field.to_string(),
+            reason: format!("{field} must be 1-64 characters from [A-Za-z0-9._-]"),
+        })
+    }
+}
+
+/// Witness client configuration `[ha.promotion.witness]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WitnessClientConfig {
+    /// Base URL of the witness, for example `https://witness.lan:8954`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+
+    /// CA bundle used to verify the witness certificate (absolute path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<PathBuf>,
+
+    /// TLS server name; defaults to the URL host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+
+    /// Optional BLAKE3 pin of the DER witness certificate, in addition to CA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+
+    /// File containing the shared bearer token (absolute path, mode 0600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<PathBuf>,
+}
+
+impl WitnessClientConfig {
+    /// Returns the configured fingerprint in canonical lowercase hex form.
+    ///
+    /// Both `blake3:<hex>` and bare `<hex>` are accepted, matching the ADR's
+    /// hash normalization rule.
+    pub fn normalized_fingerprint(&self) -> Result<Option<String>, HaError> {
+        self.fingerprint
+            .as_deref()
+            .map(|value| {
+                crate::hash::normalize_blake3_hash(value).map_err(|error| HaError::Validation {
+                    field: "ha.promotion.witness.fingerprint".to_string(),
+                    reason: format!("must be blake3:<64 hex> (the DER certificate pin): {error}"),
+                })
+            })
+            .transpose()
+    }
+}
+
+/// Automatic promotion configuration `[ha.promotion]`.
+///
+/// The feature is opt-in and inert unless [`Self::enabled`] is true. Bounds are
+/// only validated when enabled; `backend` is validated always so a typo cannot
+/// be ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromotionConfig {
+    /// Master gate. When false, every other field is inert.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// This node may try to acquire the lease. Exactly one slave per cluster.
+    #[serde(default)]
+    pub candidate: bool,
+
+    /// Stable cluster identifier shared with the witness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_id: Option<String>,
+
+    /// Stable per-node identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+
+    /// Lease backend. Only `"witness"` is supported in 2.0.
+    #[serde(default = "default_promotion_backend")]
+    pub backend: String,
+
+    /// Witness-side lease lifetime in seconds.
+    #[serde(default = "default_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+
+    /// Lease renewal period in seconds.
+    #[serde(default = "default_renew_interval_secs")]
+    pub renew_interval_secs: u64,
+
+    /// Candidate wait after master loss. Omitted means
+    /// `max(45, 3 * ha.ping_interval_secs)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_timeout_secs: Option<u64>,
+
+    /// Require a local operator confirmation before acquiring the lease.
+    #[serde(default)]
+    pub require_manual_confirmation: bool,
+
+    /// Window for slaves to report their applied term/version/after quiesce.
+    #[serde(default = "default_reconcile_window_secs")]
+    pub reconcile_window_secs: u64,
+
+    /// Witness TLS/auth settings.
+    #[serde(default)]
+    pub witness: WitnessClientConfig,
+}
+
+impl Default for PromotionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            candidate: false,
+            cluster_id: None,
+            node_id: None,
+            backend: default_promotion_backend(),
+            lease_ttl_secs: default_lease_ttl_secs(),
+            renew_interval_secs: default_renew_interval_secs(),
+            heartbeat_timeout_secs: None,
+            require_manual_confirmation: false,
+            reconcile_window_secs: default_reconcile_window_secs(),
+            witness: WitnessClientConfig::default(),
+        }
+    }
+}
+
+impl PromotionConfig {
+    /// Effective candidate wait: the explicit value or `max(45, 3 * ping)`.
+    #[must_use]
+    pub fn effective_heartbeat_timeout_secs(&self, ping_interval_secs: u64) -> u64 {
+        self.heartbeat_timeout_secs
+            .unwrap_or_else(|| ping_interval_secs.saturating_mul(3).max(45))
+    }
+
+    /// Validates the promotion section for the configured node role.
+    ///
+    /// Only [`Self::backend`] is checked when `enabled = false`, so an existing
+    /// HA configuration loads unchanged and a disabled `candidate = true` on a
+    /// master remains inert (the operator-facing warning is emitted by the
+    /// runtime, not here).
+    pub fn validate(&self, role: &str, ping_interval_secs: u64) -> Result<(), HaError> {
+        if self.backend != "witness" {
+            return Err(HaError::Validation {
+                field: "ha.promotion.backend".to_string(),
+                reason: format!(
+                    "unsupported_lease_backend: '{}' is not supported; only \"witness\" is available in 2.0",
+                    self.backend
+                ),
+            });
+        }
+
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if self.candidate && role != "slave" {
+            return Err(HaError::Validation {
+                field: "ha.promotion.candidate".to_string(),
+                reason: "candidate = true requires server.role = \"slave\" when ha.promotion.enabled = true"
+                    .to_string(),
+            });
+        }
+
+        let cluster_id = self
+            .cluster_id
+            .as_deref()
+            .ok_or_else(|| HaError::Validation {
+                field: "ha.promotion.cluster_id".to_string(),
+                reason: "cluster_id is required when ha.promotion.enabled = true".to_string(),
+            })?;
+        validate_identifier("ha.promotion.cluster_id", cluster_id)?;
+
+        let node_id = self.node_id.as_deref().ok_or_else(|| HaError::Validation {
+            field: "ha.promotion.node_id".to_string(),
+            reason: "node_id is required when ha.promotion.enabled = true".to_string(),
+        })?;
+        validate_identifier("ha.promotion.node_id", node_id)?;
+
+        if !(5..=300).contains(&self.lease_ttl_secs) {
+            return Err(HaError::Validation {
+                field: "ha.promotion.lease_ttl_secs".to_string(),
+                reason: "lease_ttl_secs must be between 5 and 300".to_string(),
+            });
+        }
+        if self.renew_interval_secs == 0 || self.renew_interval_secs > self.lease_ttl_secs / 3 {
+            return Err(HaError::Validation {
+                field: "ha.promotion.renew_interval_secs".to_string(),
+                reason: format!(
+                    "renew_interval_secs must be between 1 and lease_ttl_secs / 3 ({})",
+                    self.lease_ttl_secs / 3
+                ),
+            });
+        }
+        if self.lease_ttl_secs < self.renew_interval_secs.saturating_mul(3) {
+            return Err(HaError::Validation {
+                field: "ha.promotion.lease_ttl_secs".to_string(),
+                reason: "lease_ttl_secs must be at least 3 * renew_interval_secs".to_string(),
+            });
+        }
+        if self.heartbeat_timeout_secs.is_some_and(|heartbeat| {
+            heartbeat == 0 || heartbeat < ping_interval_secs.saturating_mul(3)
+        }) {
+            return Err(HaError::Validation {
+                field: "ha.promotion.heartbeat_timeout_secs".to_string(),
+                reason: format!(
+                    "heartbeat_timeout_secs must be at least 1 and at least 3 * ha.ping_interval_secs ({})",
+                    ping_interval_secs.saturating_mul(3)
+                ),
+            });
+        }
+        if !(1..=60).contains(&self.reconcile_window_secs) {
+            return Err(HaError::Validation {
+                field: "ha.promotion.reconcile_window_secs".to_string(),
+                reason: "reconcile_window_secs must be between 1 and 60".to_string(),
+            });
+        }
+
+        let url = self
+            .witness
+            .url
+            .as_deref()
+            .ok_or_else(|| HaError::Validation {
+                field: "ha.promotion.witness.url".to_string(),
+                reason: "witness.url is required when ha.promotion.enabled = true".to_string(),
+            })?;
+        parse_witness_url(url)?;
+
+        let ca = self
+            .witness
+            .ca
+            .as_ref()
+            .ok_or_else(|| HaError::Validation {
+                field: "ha.promotion.witness.ca".to_string(),
+                reason: "witness.ca is required when ha.promotion.enabled = true".to_string(),
+            })?;
+        if !ca.is_absolute() {
+            return Err(HaError::Validation {
+                field: "ha.promotion.witness.ca".to_string(),
+                reason: "witness.ca must be an absolute path".to_string(),
+            });
+        }
+
+        let token_file = self
+            .witness
+            .token_file
+            .as_ref()
+            .ok_or_else(|| HaError::Validation {
+                field: "ha.promotion.witness.token_file".to_string(),
+                reason: "witness.token_file is required when ha.promotion.enabled = true"
+                    .to_string(),
+            })?;
+        if !token_file.is_absolute() {
+            return Err(HaError::Validation {
+                field: "ha.promotion.witness.token_file".to_string(),
+                reason: "witness.token_file must be an absolute path".to_string(),
+            });
+        }
+
+        if let Some(server_name) = self.witness.server_name.as_deref() {
+            rustls_pki_types::ServerName::try_from(server_name.to_string()).map_err(|error| {
+                HaError::Validation {
+                    field: "ha.promotion.witness.server_name".to_string(),
+                    reason: format!(
+                        "witness.server_name '{server_name}' is not a valid TLS server name: {error}"
+                    ),
+                }
+            })?;
+        }
+
+        self.witness.normalized_fingerprint()?;
+
+        Ok(())
+    }
+}
+
 /// High Availability clustering configuration section `[ha]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HaConfig {
@@ -99,6 +490,10 @@ pub struct HaConfig {
     /// Interval in seconds for WebSocket heartbeat pings (default: 15s).
     #[serde(default = "default_ping_interval_secs")]
     pub ping_interval_secs: u64,
+
+    /// Opt-in automatic promotion with a lease witness (default: disabled).
+    #[serde(default)]
+    pub promotion: PromotionConfig,
 }
 
 impl Default for HaConfig {
@@ -120,6 +515,7 @@ impl Default for HaConfig {
             require_all_slaves: false,
             stats_interval_secs: default_stats_interval_secs(),
             ping_interval_secs: default_ping_interval_secs(),
+            promotion: PromotionConfig::default(),
         }
     }
 }
@@ -248,6 +644,8 @@ impl HaConfig {
                 }
             }
         }
+
+        self.promotion.validate(role, self.ping_interval_secs)?;
 
         Ok(())
     }
@@ -401,5 +799,328 @@ pinned_slave_fingerprints = ["blake3:11223344"]
             ..Default::default()
         };
         assert!(disabled_cfg.validate("master").is_ok());
+    }
+
+    fn valid_promotion() -> PromotionConfig {
+        PromotionConfig {
+            enabled: true,
+            candidate: true,
+            cluster_id: Some("home-dns".to_string()),
+            node_id: Some("sito-node-a".to_string()),
+            witness: WitnessClientConfig {
+                url: Some("https://witness.lan:8954".to_string()),
+                ca: Some(PathBuf::from("/etc/sito/certs/witness-ca.crt")),
+                server_name: None,
+                fingerprint: None,
+                token_file: Some(PathBuf::from("/etc/sito/witness.token")),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn promotion_defaults_are_opt_in_and_inert() {
+        let cfg = HaConfig::default();
+        let promotion = &cfg.promotion;
+        assert!(!promotion.enabled);
+        assert!(!promotion.candidate);
+        assert_eq!(promotion.cluster_id, None);
+        assert_eq!(promotion.node_id, None);
+        assert_eq!(promotion.backend, "witness");
+        assert_eq!(promotion.lease_ttl_secs, 30);
+        assert_eq!(promotion.renew_interval_secs, 10);
+        assert_eq!(promotion.heartbeat_timeout_secs, None);
+        assert!(!promotion.require_manual_confirmation);
+        assert_eq!(promotion.reconcile_window_secs, 10);
+        assert_eq!(promotion.witness.url, None);
+        assert_eq!(promotion.witness.ca, None);
+        assert_eq!(promotion.witness.server_name, None);
+        assert_eq!(promotion.witness.fingerprint, None);
+        assert_eq!(promotion.witness.token_file, None);
+
+        // A disabled section is inert: no bounds are validated.
+        let disabled = HaConfig {
+            replication_port: 0,
+            ping_interval_secs: 30,
+            ..Default::default()
+        };
+        assert!(disabled.validate("master").is_ok());
+    }
+
+    #[test]
+    fn promotion_accepts_the_full_adr_document() {
+        let cfg = valid_promotion();
+        cfg.validate("slave", 15).expect("full promotion config");
+
+        let toml_value: toml::Value = toml::from_str(
+            r#"
+enabled = true
+candidate = true
+cluster_id = "home-dns"
+node_id = "sito-node-a"
+backend = "witness"
+lease_ttl_secs = 30
+renew_interval_secs = 10
+heartbeat_timeout_secs = 90
+require_manual_confirmation = false
+reconcile_window_secs = 10
+
+[witness]
+url = "https://witness.lan:8954"
+ca = "/etc/sito/certs/witness-ca.crt"
+server_name = "witness.lan"
+fingerprint = "blake3:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+token_file = "/etc/sito/witness.token"
+"#,
+        )
+        .unwrap();
+        let parsed = PromotionConfig::deserialize(toml_value).unwrap();
+        assert_eq!(
+            parsed.witness.normalized_fingerprint().unwrap().as_deref(),
+            Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+        );
+        parsed.validate("slave", 15).unwrap();
+    }
+
+    #[test]
+    fn heartbeat_default_derives_from_ping_only_when_enabled() {
+        let mut cfg = valid_promotion();
+        assert_eq!(cfg.effective_heartbeat_timeout_secs(15), 45);
+        assert_eq!(cfg.effective_heartbeat_timeout_secs(30), 90);
+
+        // An explicit 45 is valid with ping 15 and rejected with ping 30.
+        cfg.heartbeat_timeout_secs = Some(45);
+        cfg.validate("slave", 15).unwrap();
+        let err = cfg.validate("slave", 30).unwrap_err();
+        assert!(err.to_string().contains("heartbeat_timeout_secs"), "{err}");
+
+        // Large ping values have no unsatisfiable upper bound.
+        let large = PromotionConfig {
+            heartbeat_timeout_secs: Some(10_000),
+            ..valid_promotion()
+        };
+        large.validate("slave", 1201).unwrap();
+    }
+
+    #[test]
+    fn enabled_promotion_requires_every_adr_field() {
+        type Mutation = fn(&mut PromotionConfig);
+        let cases: [(&str, Mutation); 5] = [
+            ("cluster_id", |cfg: &mut PromotionConfig| {
+                cfg.cluster_id = None;
+            }),
+            ("node_id", |cfg: &mut PromotionConfig| {
+                cfg.node_id = None;
+            }),
+            ("witness.url", |cfg: &mut PromotionConfig| {
+                cfg.witness.url = None;
+            }),
+            ("witness.ca", |cfg: &mut PromotionConfig| {
+                cfg.witness.ca = None;
+            }),
+            ("witness.token_file", |cfg: &mut PromotionConfig| {
+                cfg.witness.token_file = None;
+            }),
+        ];
+        for (field, mutate) in cases {
+            let mut cfg = valid_promotion();
+            mutate(&mut cfg);
+            let err = cfg.validate("slave", 15).unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "missing {field} must name the key, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_is_validated_even_when_disabled() {
+        let mut cfg = PromotionConfig {
+            backend: "etcd".to_string(),
+            ..Default::default()
+        };
+        let err = cfg.validate("master", 15).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported_lease_backend"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("backend"), "{err}");
+
+        cfg.backend = "witness".to_string();
+        cfg.validate("master", 15).unwrap();
+    }
+
+    #[test]
+    fn witness_url_requires_https_host_and_no_userinfo_or_path() {
+        for url in [
+            "http://witness.lan:8954",
+            "https://user:pass@witness.lan:8954",
+            "https://witness.lan:8954/v1",
+            "https://witness.lan:8954/",
+            "https://witness.lan?x=1",
+            "https://witness.lan#frag",
+            "https://",
+            "https://:8954",
+            "https://witness.lan:not-a-port",
+        ] {
+            let mut cfg = valid_promotion();
+            cfg.witness.url = Some(url.to_string());
+            let err = cfg.validate("slave", 15).unwrap_err();
+            assert!(err.to_string().contains("witness.url"), "{url}: {err}");
+        }
+
+        parse_witness_url("https://witness.lan").unwrap();
+        let endpoint = parse_witness_url("https://[2001:db8::2]:9954").unwrap();
+        assert_eq!(endpoint.host, "2001:db8::2");
+        assert_eq!(endpoint.port, 9954);
+        assert_eq!(parse_witness_url("https://witness.lan").unwrap().port, 8954);
+    }
+
+    #[test]
+    fn witness_paths_must_be_absolute_and_fingerprints_valid() {
+        let mut relative_ca = valid_promotion();
+        relative_ca.witness.ca = Some(PathBuf::from("certs/witness-ca.crt"));
+        assert!(
+            relative_ca
+                .validate("slave", 15)
+                .unwrap_err()
+                .to_string()
+                .contains("witness.ca")
+        );
+
+        let mut relative_token = valid_promotion();
+        relative_token.witness.token_file = Some(PathBuf::from("witness.token"));
+        assert!(
+            relative_token
+                .validate("slave", 15)
+                .unwrap_err()
+                .to_string()
+                .contains("witness.token_file")
+        );
+
+        for server_name in ["  ", "bad name", "host:8954", "a/b"] {
+            let mut invalid_name = valid_promotion();
+            invalid_name.witness.server_name = Some(server_name.to_string());
+            assert!(
+                invalid_name
+                    .validate("slave", 15)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("server_name"),
+                "{server_name:?} must be rejected"
+            );
+        }
+
+        for fingerprint in ["blake3:abc", "1234", "blake3:zz"] {
+            let mut cfg = valid_promotion();
+            cfg.witness.fingerprint = Some(fingerprint.to_string());
+            let err = cfg.validate("slave", 15).unwrap_err();
+            assert!(
+                err.to_string().contains("fingerprint"),
+                "{fingerprint}: {err}"
+            );
+        }
+
+        // Bare lowercase and prefixed uppercase are both accepted.
+        let mut cfg = valid_promotion();
+        cfg.witness.fingerprint = Some(format!("BLAKE3:{}", "AB".repeat(32)));
+        assert_eq!(
+            cfg.validate("slave", 15)
+                .and_then(|()| cfg.witness.normalized_fingerprint())
+                .unwrap()
+                .as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+    }
+
+    #[test]
+    fn candidate_requires_slave_role_only_when_enabled() {
+        let mut cfg = valid_promotion();
+        let err = cfg.validate("master", 15).unwrap_err();
+        assert!(err.to_string().contains("candidate"), "{err}");
+
+        cfg.enabled = false;
+        cfg.validate("master", 15).unwrap();
+    }
+
+    #[test]
+    fn intervals_are_bounded_and_consistent() {
+        let mut ttl = valid_promotion();
+        ttl.lease_ttl_secs = 4;
+        assert!(
+            ttl.validate("slave", 15)
+                .unwrap_err()
+                .to_string()
+                .contains("lease_ttl_secs")
+        );
+        ttl.lease_ttl_secs = 301;
+        assert!(
+            ttl.validate("slave", 15)
+                .unwrap_err()
+                .to_string()
+                .contains("lease_ttl_secs")
+        );
+
+        let mut renew = valid_promotion();
+        renew.renew_interval_secs = 0;
+        assert!(
+            renew
+                .validate("slave", 15)
+                .unwrap_err()
+                .to_string()
+                .contains("renew_interval_secs")
+        );
+        renew.renew_interval_secs = 11;
+        assert!(
+            renew
+                .validate("slave", 15)
+                .unwrap_err()
+                .to_string()
+                .contains("renew_interval_secs")
+        );
+
+        let mut reconcile = valid_promotion();
+        reconcile.reconcile_window_secs = 0;
+        assert!(
+            reconcile
+                .validate("slave", 15)
+                .unwrap_err()
+                .to_string()
+                .contains("reconcile_window_secs")
+        );
+        reconcile.reconcile_window_secs = 61;
+        assert!(
+            reconcile
+                .validate("slave", 15)
+                .unwrap_err()
+                .to_string()
+                .contains("reconcile_window_secs")
+        );
+    }
+
+    #[test]
+    fn identifiers_are_bounded_and_restricted() {
+        let mut cfg = valid_promotion();
+        cfg.cluster_id = Some(String::new());
+        assert!(
+            cfg.validate("slave", 15)
+                .unwrap_err()
+                .to_string()
+                .contains("cluster_id")
+        );
+        cfg.cluster_id = Some("x".repeat(65));
+        assert!(
+            cfg.validate("slave", 15)
+                .unwrap_err()
+                .to_string()
+                .contains("cluster_id")
+        );
+        cfg.cluster_id = Some("bad cluster".to_string());
+        assert!(
+            cfg.validate("slave", 15)
+                .unwrap_err()
+                .to_string()
+                .contains("cluster_id")
+        );
     }
 }

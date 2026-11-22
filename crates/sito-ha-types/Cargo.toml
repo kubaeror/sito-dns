@@ -9,6 +9,7 @@ description = "Portable configuration, status and wire types for sito high avail
 [dependencies]
 base64.workspace = true
 hex.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

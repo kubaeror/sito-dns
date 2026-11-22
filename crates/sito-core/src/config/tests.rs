@@ -133,6 +133,77 @@ fn test_ha_slave_readiness_requirements_load_from_config() {
 }
 
 #[test]
+fn test_ha_promotion_keys_load_through_the_v2_loader() {
+    // The full ADR-0010 table must be accepted by the real v2 loader (map +
+    // serde), not only by the typed `HaConfig` struct.
+    let toml_str = format!(
+        "{TEST_BASE}[ha]\n\
+         replication_port = 8953\n\
+         ping_interval_secs = 30\n\
+         \n\
+         [ha.promotion]\n\
+         enabled = true\n\
+         candidate = true\n\
+         cluster_id = \"home-dns\"\n\
+         node_id = \"sito-node-a\"\n\
+         backend = \"witness\"\n\
+         lease_ttl_secs = 30\n\
+         renew_interval_secs = 10\n\
+         heartbeat_timeout_secs = 90\n\
+         require_manual_confirmation = false\n\
+         reconcile_window_secs = 10\n\
+         \n\
+         [ha.promotion.witness]\n\
+         url = \"https://witness.lan:8954\"\n\
+         ca = \"/etc/sito/certs/witness-ca.crt\"\n\
+         server_name = \"witness.lan\"\n\
+         fingerprint = \"blake3:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
+         token_file = \"/etc/sito/witness.token\"\n"
+    );
+    let config = Config::from_toml_str(&toml_str).expect("promotion table must load");
+    let ha = config.ha.expect("[ha] section");
+    let promotion = ha.get("promotion").expect("promotion table");
+    assert_eq!(
+        promotion.get("enabled").and_then(toml::Value::as_bool),
+        Some(true)
+    );
+    let witness = promotion.get("witness").expect("witness table");
+    assert_eq!(
+        witness.get("url").and_then(toml::Value::as_str),
+        Some("https://witness.lan:8954")
+    );
+
+    // Disabled promotion with a large ping and no heartbeat key still loads:
+    // bounds are only validated by the typed promotion validator.
+    let disabled = Config::from_toml_str(&format!(
+        "{TEST_BASE}[ha]\nreplication_port = 8953\nping_interval_secs = 30\n[ha.promotion]\nenabled = false\n"
+    ))
+    .expect("a disabled promotion section must stay inert");
+    let promotion = disabled
+        .ha
+        .expect("[ha]")
+        .get("promotion")
+        .cloned()
+        .expect("promotion table");
+    assert_eq!(
+        promotion.get("enabled").and_then(toml::Value::as_bool),
+        Some(false)
+    );
+
+    // Unknown nested promotion keys are rejected by the v2 unknown-key policy.
+    let err = Config::from_toml_str(&format!(
+        "{TEST_BASE}[ha]\nreplication_port = 8953\n[ha.promotion]\nenabled = false\nbogus = 1\n"
+    ))
+    .unwrap_err();
+    assert!(err.to_string().contains("bogus"), "got: {err}");
+    let err = Config::from_toml_str(&format!(
+        "{TEST_BASE}[ha]\nreplication_port = 8953\n[ha.promotion.witness]\nbogus = 1\n"
+    ))
+    .unwrap_err();
+    assert!(err.to_string().contains("bogus"), "got: {err}");
+}
+
+#[test]
 fn test_reject_invalid_config() {
     // Bad config version: v1 must be rejected with the migration hint.
     let bad_ver = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]";
@@ -1212,6 +1283,25 @@ require_slaves = true
 require_all_slaves = true
 stats_interval_secs = 30
 ping_interval_secs = 15
+
+[ha.promotion]
+enabled = false
+candidate = false
+cluster_id = "home-dns"
+node_id = "sito-node-a"
+backend = "witness"
+lease_ttl_secs = 30
+renew_interval_secs = 10
+heartbeat_timeout_secs = 90
+require_manual_confirmation = false
+reconcile_window_secs = 10
+
+[ha.promotion.witness]
+url = "https://witness.lan:8954"
+ca = "/etc/sito/certs/witness-ca.crt"
+server_name = "witness.lan"
+fingerprint = "blake3:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+token_file = "/etc/sito/witness.token"
 
 [integrations.mikrotik]
 enabled = false

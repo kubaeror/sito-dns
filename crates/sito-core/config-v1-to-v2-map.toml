@@ -682,6 +682,66 @@ status = "kept"
 path = "ha.ping_interval_secs"
 status = "kept"
 
+[[field]]
+path = "ha.promotion.enabled"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.candidate"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.cluster_id"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.node_id"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.backend"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.lease_ttl_secs"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.renew_interval_secs"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.heartbeat_timeout_secs"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.require_manual_confirmation"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.reconcile_window_secs"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.witness.url"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.witness.ca"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.witness.server_name"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.witness.fingerprint"
+status = "kept"
+
+[[field]]
+path = "ha.promotion.witness.token_file"
+status = "kept"
+
 # ---------------------------------------------------------------------------
 # [integrations]
 # ---------------------------------------------------------------------------

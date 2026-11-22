@@ -25,6 +25,20 @@ use super::SlaveAppHandles;
 use super::apply::apply_config_push;
 use super::stats::build_stats_report;
 
+/// The applied bundle hash to advertise in `Hello`, if it is known and valid.
+///
+/// ADR-0010 adds this field additively: absent means unknown (old peer or a
+/// watermark written by an older binary). A malformed/stale watermark value is
+/// omitted rather than sent, because a malformed present value would be
+/// rejected by the master's strict wire parser.
+fn hello_bundle_hash(tracker: &SlaveStatusTracker) -> Option<String> {
+    let watermark = tracker.get_watermark()?;
+    if watermark.version == 0 {
+        return None;
+    }
+    sito_ha_types::hash::normalize_blake3_hash(&watermark.payload_hash).ok()
+}
+
 /// Delay before reconnecting after a clean master close.
 ///
 /// A clean close usually means a master restart/rollout, so reconnect promptly
@@ -333,6 +347,7 @@ where
         token: ha_config.slave_token.clone(),
         role: Some("slave".to_string()),
         protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: hello_bundle_hash(tracker),
     };
     send_ha_message(&mut ws_stream, &hello, "slave", "Hello").await?;
 
@@ -405,6 +420,7 @@ where
                     token: ha_config.slave_token.clone(),
                     role: Some("slave".to_string()),
                     protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+                    have_bundle_hash: hello_bundle_hash(tracker),
                 };
                 send_ha_message(&mut ws_stream, &hello, "slave", "resync Hello").await?;
             }
@@ -751,4 +767,31 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hello_hash_comes_from_a_valid_applied_watermark_only() {
+        let tracker = SlaveStatusTracker::new("slave-1".to_string(), 0, None);
+        assert_eq!(hello_bundle_hash(&tracker), None, "no watermark is unknown");
+
+        tracker
+            .persist_watermark(0, 1, "none")
+            .expect("version-zero watermark");
+        assert_eq!(hello_bundle_hash(&tracker), None, "version 0 has no bundle");
+
+        let hash = "ab".repeat(32);
+        tracker
+            .persist_watermark(3, 1, &hash)
+            .expect("applied watermark");
+        assert_eq!(hello_bundle_hash(&tracker), Some(hash));
+
+        // A malformed legacy watermark is omitted rather than sent as a
+        // present-but-invalid hash, which the master would reject.
+        tracker.persist_watermark(4, 1, "not-a-hash").unwrap();
+        assert_eq!(hello_bundle_hash(&tracker), None);
+    }
 }

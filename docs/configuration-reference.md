@@ -653,6 +653,7 @@ replication_port = 8953
 | `require_slaves` | boolean | `false` | (Master only) Make HA readiness not-ready until at least one connected slave is synced to the current configuration version. Ignored by the slave role. |
 | `require_all_slaves` | boolean | `false` | (Master only) Make HA readiness not-ready until every connected slave is synced to the current configuration version. Zero connected slaves is also not ready. Implies `require_slaves`. |
 | `stats_interval_secs` | integer | `30` | Interval between slave-to-master statistics reports. |
+| `promotion` | table | — | Opt-in automatic promotion with a lease witness ([ADR-0010](adr/0010-ha-automatic-promotion.md)). The default `enabled = false` keeps every promotion field inert. |
 
 `require_slaves` and `require_all_slaves` are opt-in: both default to `false`,
 so an upgraded master keeps the previous behavior and stays ready (given a
@@ -667,6 +668,64 @@ example `HA requires at least one synced slave (0/2 connected)` or
 readiness; the slave role ignores them and does not change its own readiness.
 With `replication_port = 0` no slave can connect, so setting either requirement
 keeps readiness not-ready (the listener itself remains intentionally disabled).
+
+#### `[ha.promotion]` — automatic promotion with a lease witness
+
+Automatic promotion is **opt-in and default `false`**. The witness is a separate
+`sito ha lease-server` process on a third host (not either HA node); the client
+uses TLS with CA verification, an optional BLAKE3 pin of the DER server
+certificate, and a shared bearer token from a `0600` file. There is no
+plaintext or unauthenticated fallback. When `enabled = false` no witness client,
+promotion thread, readiness gate or new file is created, and every other key in
+this table is inert except `backend`, whose value is always validated. All
+promotion keys are startup/restart-only and are not hot-reloaded.
+
+```toml
+[ha.promotion]
+enabled = false
+candidate = false
+cluster_id = "home-dns"
+node_id = "sito-node-a"
+backend = "witness"
+lease_ttl_secs = 30
+renew_interval_secs = 10
+# heartbeat_timeout_secs = 45      # default: max(45, 3 * ha.ping_interval_secs)
+require_manual_confirmation = false
+reconcile_window_secs = 10
+
+[ha.promotion.witness]
+url = "https://witness.lan:8954"
+ca = "/etc/sito/certs/witness-ca.crt"
+# server_name = "witness.lan"       # default: the URL host
+# fingerprint = "blake3:<64 hex>"   # optional DER certificate pin, in addition to CA
+token_file = "/etc/sito/witness.token"  # 0600, one shared cluster token
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `promotion.enabled` | boolean | `false` | Master gate for automatic promotion. When false, bounds are not validated and the feature is inert. |
+| `promotion.candidate` | boolean | `false` | Exactly one slave in the cluster may try to acquire the lease. Requires `server.role = "slave"` when enabled; when disabled it is inert (the operator-facing warning for a `true` value on a master is C3b2b runtime behavior, not config validation). |
+| `promotion.cluster_id` | string | `None` | Stable cluster identifier, 1–64 characters from `[A-Za-z0-9._-]`; must match the witness. Required when enabled. |
+| `promotion.node_id` | string | `None` | Stable per-node identifier, 1–64 characters from `[A-Za-z0-9._-]`; unique per node. Required when enabled. |
+| `promotion.backend` | string | `"witness"` | Lease backend. Only `"witness"` is supported in 2.0; any other value is rejected as `unsupported_lease_backend` even when disabled. |
+| `promotion.lease_ttl_secs` | integer | `30` | Witness-side lease lifetime, 5–300 seconds and at least `3 * renew_interval_secs`. |
+| `promotion.renew_interval_secs` | integer | `10` | Lease renewal period, 1–`lease_ttl_secs / 3` seconds. |
+| `promotion.heartbeat_timeout_secs` | integer | — | Candidate wait before inspecting or acquiring the lease. Omitted derives `max(45, 3 * ha.ping_interval_secs)`; an explicit value must be at least `3 * ha.ping_interval_secs` and at least 1. There is no upper bound. |
+| `promotion.require_manual_confirmation` | boolean | `false` | Require a local operator confirmation before acquisition. It never bypasses the lease. |
+| `promotion.reconcile_window_secs` | integer | `10` | Window after quiesce for slaves to report their applied term/version, 1–60 seconds. |
+| `promotion.witness` | table | — | Witness TLS and bearer-auth settings. |
+| `promotion.witness.url` | string | `None` | Witness base URL: `https://host[:port]`, no userinfo, path, query or fragment. The default port is `8954`. Required when enabled. |
+| `promotion.witness.ca` | string | `None` | Absolute path to the CA bundle that verifies the witness certificate. Required when enabled. |
+| `promotion.witness.server_name` | string | `None` | TLS server name; defaults to the URL host and must match the certificate SAN. |
+| `promotion.witness.fingerprint` | string | `None` | Optional BLAKE3 pin of the DER witness server certificate, matched in addition to the CA. `blake3:<64 hex>` and bare 64 hex are equivalent. |
+| `promotion.witness.token_file` | string | `None` | Absolute path to the shared bearer token file, mode `0600`. Required when enabled. |
+
+`check-config` validates structure, types, ranges and required keys without
+contacting the witness. A valid config with an unreachable witness does not
+exit; the node stays read-only with a specific reason and retries. See
+[ADR-0010](adr/0010-ha-automatic-promotion.md) for the witness API, lease
+semantics and failure model. The client transport foundation is documented in
+[`ha-promotion-client.md`](ha-promotion-client.md).
 
 HA protocol **v2** is required on every node. A `Hello` without
 `protocol_version`, a v1 `ConfigPush`, or a v1 `ha_state.toml`/

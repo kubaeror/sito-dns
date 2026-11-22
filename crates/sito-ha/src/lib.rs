@@ -11,6 +11,7 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod master;
+pub mod promotion;
 pub mod protocol;
 pub mod readiness;
 pub mod session;
@@ -35,6 +36,7 @@ pub use error::HaError;
 pub use master::{
     MasterCoordinator, PublishOutcome, ResyncOutcome, SlaveSummary, spawn_master_server,
 };
+pub use promotion::{WITNESS_REQUEST_TIMEOUT, WitnessClient, WitnessClientError};
 pub use protocol::{AckConflict, HaMessage, PROTOCOL_VERSION, UpstreamReport};
 pub use readiness::{HaReadiness, HaReadinessState};
 pub use slave::{

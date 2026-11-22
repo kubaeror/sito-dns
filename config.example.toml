@@ -187,6 +187,26 @@ anonymize_querylog = false
 # allow_unpinned_tls = false         # accept any server cert (testing only)
 # require_slaves = false             # master readiness needs >= 1 synced slave
 # require_all_slaves = false         # master readiness needs every slave synced
+#
+# Opt-in automatic promotion with a lease witness (ADR-0010). Default false:
+# the section is inert and no witness connection/thread/file is created.
+# [ha.promotion]
+# enabled = false
+# candidate = false                  # exactly one slave; requires role = "slave"
+# cluster_id = "home-dns"            # must match the witness
+# node_id = "sito-node-a"            # unique and stable per node
+# backend = "witness"                # only supported backend in 2.0
+# lease_ttl_secs = 30                # 5..300, >= 3 * renew_interval_secs
+# renew_interval_secs = 10           # 1..(lease_ttl_secs / 3)
+# heartbeat_timeout_secs = 45        # default max(45, 3 * ping_interval_secs)
+# require_manual_confirmation = false
+# reconcile_window_secs = 10         # 1..60
+# [ha.promotion.witness]
+# url = "https://witness.lan:8954"   # https only, no userinfo/path/query/fragment
+# ca = "/etc/sito/certs/witness-ca.crt"
+# server_name = "witness.lan"        # default: the URL host
+# fingerprint = "blake3:<64 hex>"    # optional DER pin, in addition to CA
+# token_file = "/etc/sito/witness.token"  # 0600, shared cluster token
 
 # Curated parental/service list updates (bundled data is the fallback).
 # [integrations.lists]
