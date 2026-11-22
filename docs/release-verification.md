@@ -85,6 +85,7 @@ tag-push row leaves the release as a draft and blocks publication.
 | 5 | Docs truth | `docs.yml` → `meta` (`python3 scripts/check_test_matrix.py`) | run URL and command output | config reference, migration IDs, links and P0/P1 test-matrix names resolve; no stale 2.0 claim | rc.3, rc.4, final (docs owner) |
 | 6 | Installer E2E | `ci.yml` → `contrib` → `bash contrib/tests/test-installer.sh` | green `contrib` job log | fresh install, live upgrade, backup order and failed-health rollback pass | rc.4, final if S5 changed (ops owner) |
 | 7 | 1.9.5 → 2.0 migration and rollback | `bash scripts/test-migration-1.9.5.sh` | transcript ending `PASS: 1.9.5 data-dir migration and rollback acceptance` | v1.9.5 data dir migrates, v2 answers, users/TOTP/stats DB stay intact, rollback answers | rc.4, final if S2/S5 changed (ops owner) |
+| 7b | Archived installer E2E (E2) | `SITO_ARCHIVE_E2E=1 bash scripts/test-installer-archive-1.9.5.sh` (manual/weekly `archive-installer-e2e.yml`) | transcript ending `PASS: real archived 1.9.5 installer upgrade, migration and rollback` | the real v1.9.5 archive installs with its packaged installer, checksum/signature verification passes, the current installer runs `db migrate` with a 0600 backup, health/DNS/users/stats rows survive, and both the operator rollback and the failed-health pairing rollback restore 1.9.5 with v1 config | rc.4, final if S2/S5 changed (ops owner) |
 | 8 | Docker upgrade E2E | `bash scripts/test-docker-upgrade.sh` | transcript ending `docker upgrade E2E OK (...)` | 1.9.5 container upgrades to the candidate with healthy DNS + healthcheck, then the rollback serves again | rc.4, final if S2/S5 changed (ops owner) |
 | 9 | Per-architecture image scan (E4) | `release.yml` → `docker-build-push` → `Scan the published image for vulnerabilities` | run URL, digest, one `Scanning ...` and one `No HIGH/CRITICAL unfixed vulnerabilities on ...` line per platform | all three platforms are scanned from the published digest and no fixed HIGH/CRITICAL finding remains | rc.4 image, final (security reviewer) |
 | 10 | Image signature and attestations | `docker-build-push` cosign steps; [verify the published image](#verify-the-published-image) | digest, `cosign verify` output, provenance, SPDX SBOM, tag map | signature identity `release.yml@refs/tags/*`, provenance and SBOM present, tags point at the digest | rc.4 image, final (release manager) |
@@ -332,7 +333,7 @@ ignored, as documented in the workflow.
 
 ## Upgrade, installer and Docker E2E
 
-Three real upgrade paths must be green on the rc.4 candidate, and again on the
+Four real upgrade paths must be green on the rc.4 candidate, and again on the
 final commit if S2 or S5 changed after rc.4. The installer and migration
 scripts are owned by E1/E2; this checklist records their evidence.
 
@@ -382,8 +383,43 @@ scripts are owned by E1/E2; this checklist records their evidence.
    0600 `stats.db.v1.bak`, and the rollback container answered again with the
    v1 data.
 
+4. Real archived installer, not a fabricated 1.9.5 binary. This lane needs
+   network access and is therefore manual/weekly, never default PR CI:
+
+   ```bash
+   SITO_ARCHIVE_E2E=1 \
+   SITO_NEW_BIN="$PWD/target/debug/sito" \
+   SITO_ARCHIVE_KEEP_TMP=1 \
+     bash scripts/test-installer-archive-1.9.5.sh
+   ```
+
+   Without `SITO_ARCHIVE_E2E=1` the script exits before any download. It pins
+   `SITO_ARCHIVE_TAG=v1.9.5`, downloads the published archive and
+   `SHA256SUMS`, always verifies the SHA-256, and verifies the cosign keyless
+   signature by default (the archived installer installs a checksum-verified
+   cosign when needed). `SITO_ARCHIVE_ALLOW_UNSIGNED=1` is the only skip; it
+   prints `SKIP` and still verifies SHA-256. The script installs the real
+   archive with its own packaged `install.sh` into a temp prefix behind a fake
+   systemctl wrapper, seeds a v1 data directory through the real 1.9.5 server,
+   migrates the config with the current binary (`config migrate --from v1 --to
+   v2 --backup`, the documented precondition), then runs the current installer
+   with the local 2.x binary.
+
+   Expected transcript tail:
+   `PASS: real archived 1.9.5 installer upgrade, migration and rollback`.
+   Record the archived 1.9.5 `--version` line, the SHA-256 `OK` line, the
+   `Cosign keyless signature verified successfully` / `Verified OK` output,
+   the `Migrating stats database` and 0600 `stats.db.v1.bak` lines, the
+   `/api/v2/status` version, the preserved query_log count, and the
+   `Restoring matching v1 configuration` line from the failed-health rollback.
+   The same lane is available as the manual/weekly
+   [`archive-installer-e2e.yml`](../.github/workflows/archive-installer-e2e.yml)
+   workflow. The offline wiring/policy check is
+   `bash scripts/test-installer-archive-e2e.sh` and runs in the `contrib` CI
+   job; it does not download anything.
+
 A failed or missing transcript blocks the release. Record the command, commit
-SHA, date and transcript path for all three runs.
+SHA, date and transcript path for all four runs.
 
 ## Live DNS and health smoke (E8)
 

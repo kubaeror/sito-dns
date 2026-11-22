@@ -1,0 +1,49 @@
+name: Archived installer E2E
+
+# E2 real archived-installer lane. It downloads the published v1.9.5 release
+# assets from GitHub, installs them with the archive's own installer into a
+# temp prefix behind a fake systemctl, then upgrades with the current installer
+# and a locally built 2.x binary. It is intentionally not part of pull-request
+# CI: the default PR suite keeps `bash contrib/tests/test-installer.sh` and the
+# offline static wiring test `scripts/test-installer-archive-e2e.sh`.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archive-installer-e2e
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  archive-installer-e2e:
+    name: archive-installer-e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: 1.99.1
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: archive-installer-e2e
+
+      - name: Build the current 2.x binary
+        run: cargo build --locked -p sito --features embed-ui
+
+      - name: Run the real archived 1.9.5 installer E2E
+        env:
+          SITO_ARCHIVE_E2E: '1'
+          SITO_NEW_BIN: ${{ github.workspace }}/target/debug/sito
+          SITO_ARCHIVE_KEEP_TMP: '1'
+        run: bash scripts/test-installer-archive-1.9.5.sh

@@ -428,6 +428,8 @@ jobs:
           shellcheck -S warning \
             contrib/install.sh \
             contrib/tests/test-installer.sh \
+            scripts/test-installer-archive-1.9.5.sh \
+            scripts/test-installer-archive-e2e.sh \
             scripts/verify-release-gate.sh \
             scripts/test-verify-release-gate.sh \
             scripts/test-release-workflow.sh \
@@ -443,6 +445,8 @@ jobs:
           python3 contrib/tests/test_adguard_to_sito.py
       - name: Test the installer end to end
         run: bash contrib/tests/test-installer.sh
+      - name: Test the archived-installer E2E wiring
+        run: bash scripts/test-installer-archive-e2e.sh
       - name: Test compose and systemd defaults
         run: |
           bash scripts/test-compose-defaults.sh
