@@ -67,6 +67,38 @@ expect_job_absent() {
     fi
 }
 
+# Prints one `- name:` step body so a policy check cannot be satisfied by a
+# different step in the same job. Steps in this workflow are indented six
+# spaces and the body runs until the next step starts.
+step_section() {
+    local step="$1" file="$2"
+    awk -v header="      - name: ${step}" '
+        $0 == header { in_step = 1; next }
+        in_step && /^      - name: / { exit }
+        in_step { print }
+    ' "${file}"
+}
+
+expect_step_match() {
+    local file="$1" step="$2" pattern="$3" message="$4"
+    if ! step_section "${step}" "${file}" | grep -E -- "${pattern}" >/dev/null; then
+        echo "not ok - ${message}" >&2
+        failures=$((failures + 1))
+    else
+        echo "ok - ${message}"
+    fi
+}
+
+expect_step_absent() {
+    local file="$1" step="$2" pattern="$3" message="$4"
+    if step_section "${step}" "${file}" | grep -E -- "${pattern}" >/dev/null; then
+        echo "not ok - ${message}" >&2
+        failures=$((failures + 1))
+    else
+        echo "ok - ${message}"
+    fi
+}
+
 expect_match "${RELEASE}" '^  release-gate:' "release workflow has a release-gate job"
 expect_job_match "${RELEASE}" "release-gate" 'scripts/verify-release-gate\.sh' "release-gate job invokes the gate script"
 expect_job_match "${RELEASE}" "release-gate" 'checks: read' "release-gate job can read check runs"
@@ -105,6 +137,25 @@ expect_job_match "${RELEASE}" "docker-build-push" 'provenance: true' "image prov
 expect_job_match "${RELEASE}" "docker-build-push" 'sbom: true' "image SBOM attestation is retained"
 expect_job_match "${RELEASE}" "docker-build-push" 'id-token: write' "image signing can use GitHub OIDC"
 expect_job_absent "${RELEASE}" "docker-build-push" 'continue-on-error' "image scanning/signing cannot continue on error"
+
+# The vulnerability gate must cover every platform the image index promises.
+SCAN_STEP="Scan the published image for vulnerabilities"
+expect_step_match "${RELEASE}" "${SCAN_STEP}" 'linux/amd64' "image scan covers linux/amd64"
+expect_step_match "${RELEASE}" "${SCAN_STEP}" 'linux/arm64' "image scan covers linux/arm64"
+expect_step_match "${RELEASE}" "${SCAN_STEP}" 'linux/arm/v7' "image scan covers linux/arm/v7"
+expect_step_match "${RELEASE}" "${SCAN_STEP}" 'platforms=\(linux/amd64 linux/arm64 linux/arm/v7\)' "image scan lists the three promised platforms in one set"
+expect_step_match "${RELEASE}" "${SCAN_STEP}" 'for platform in "\$\{platforms\[@\]\}"; do' "image scan loops over every platform"
+expect_step_match "${RELEASE}" "${SCAN_STEP}" '--platform "\$\{platform\}"' "image scan passes the loop platform to Trivy"
+# A hardcoded single platform would silently restore the amd64-only gate.
+expect_step_absent "${RELEASE}" "${SCAN_STEP}" '--platform linux/amd64' "image scan does not hardcode linux/amd64 as the only platform"
+expect_step_match "${RELEASE}" "${SCAN_STEP}" 'severity HIGH,CRITICAL' "per-platform scan keeps the HIGH/CRITICAL gate"
+expect_step_match "${RELEASE}" "${SCAN_STEP}" 'ignore-unfixed' "per-platform scan still ignores unfixed findings"
+expect_step_match "${RELEASE}" "${SCAN_STEP}" 'exit-code 1' "per-platform scan fails the release"
+expect_step_match "${RELEASE}" "${SCAN_STEP}" '\$\{HOME\}/\.docker:/root/\.docker:ro' "per-platform scan keeps the read-only Docker config mount"
+expect_step_match "${RELEASE}" "${SCAN_STEP}" '"\$\{IMAGE\}@\$\{DIGEST\}"' "per-platform scan pulls the pushed digest"
+expect_step_absent "${RELEASE}" "${SCAN_STEP}" ':latest' "per-platform scan never scans a mutable latest tag"
+expect_step_absent "${RELEASE}" "${SCAN_STEP}" 'continue-on-error' "per-platform scan cannot continue on error"
+expect_step_absent "${RELEASE}" "${SCAN_STEP}" 'deferred' "per-platform scan is no longer deferred"
 
 expect_match "${CI}" 'branches: \[main, release/1\.9\.x\]' "CI runs on the release branch"
 expect_match "${SECURITY}" 'branches: \[main, release/1\.9\.x\]' "security runs on the release branch"

@@ -474,19 +474,24 @@ jobs:
           # `docker/login-action` stored the GHCR credential in the runner's
           # Docker config. Mount it read-only so Trivy can pull the digest.
           #
-          # Only the linux/amd64 variant is scanned. The arm64/armv7 variants
-          # share the same distroless runtime base and are executed by the
-          # artifact E2E, but per-platform vulnerability scanning is deferred
-          # to WP-3.1 so the release lane stays within its budget.
-          docker run --rm \
-            -v "${HOME}/.docker:/root/.docker:ro" \
-            "${TRIVY_IMAGE}" image \
-            --platform linux/amd64 \
-            --severity HIGH,CRITICAL \
-            --ignore-unfixed \
-            --exit-code 1 \
-            --no-progress \
-            "${IMAGE}@${DIGEST}"
+          # Every platform the release promises is scanned from the same
+          # pushed digest, so a HIGH/CRITICAL vulnerability that only affects
+          # arm64 or armv7 cannot slip past the gate. `set -e` stops at the
+          # first failing platform, which fails the release job.
+          platforms=(linux/amd64 linux/arm64 linux/arm/v7)
+          for platform in "${platforms[@]}"; do
+            echo "Scanning ${IMAGE}@${DIGEST} for ${platform}"
+            docker run --rm \
+              -v "${HOME}/.docker:/root/.docker:ro" \
+              "${TRIVY_IMAGE}" image \
+              --platform "${platform}" \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 1 \
+              --no-progress \
+              "${IMAGE}@${DIGEST}"
+            echo "No HIGH/CRITICAL unfixed vulnerabilities on ${platform}"
+          done
 
       - name: Sign and verify the image digest (cosign keyless)
         env:
