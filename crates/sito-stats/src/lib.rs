@@ -2364,7 +2364,7 @@ mod tests {
         assert!(!cleanup_payload.contains("10.7.7.10"));
         assert!(cleanup_payload.contains("blake3:"));
 
-        // Same guard on the keep-aggregates whole-range clear path.
+        // Same guard on the chunked keep-aggregates clear path.
         let recent = chrono::Utc::now().timestamp_millis();
         let mut recent_entry = retention_entry(recent, "race-clear.example", "allowed", None);
         recent_entry.client_ip = "10.7.7.11".into();

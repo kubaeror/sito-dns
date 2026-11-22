@@ -64,10 +64,14 @@ const ROLLUP_HASH_PREFIX: &str = "blake3:";
 /// `b3::1` is still hashed rather than mistaken for a stored digest.
 const LEGACY_ROLLUP_HASH_PREFIX: &str = "b3:";
 
-/// Maximum number of detailed query-log rows processed in one retention
+/// Maximum number of detailed query-log rows processed in one rollup/delete
 /// transaction. A single busy hour is sub-chunked by `id` to keep the writer
-/// lock short even when millions of rows share one hour.
+/// lock short even when millions of rows share one hour. Shared by the normal
+/// retention sweep and the bounded `keep_aggregates` clear.
 const RETENTION_ROWS_PER_CHUNK: i64 = 5_000;
+
+/// Length of one rollup bucket in milliseconds.
+const HOUR_MS: i64 = 3_600_000;
 
 /// Per-install salt file name under the stats data directory.
 const SALT_FILE_NAME: &str = "stats-salt";
@@ -153,6 +157,60 @@ struct RetentionChunk {
     hour: i64,
     lower: (i64, i64),
     upper: (i64, i64),
+}
+
+/// Floors a millisecond timestamp to its hour bucket and returns the
+/// `[start, end)` bounds.
+///
+/// A plain `ts.div_euclid(HOUR_MS) * HOUR_MS` is less than `i64::MIN` for
+/// `ts == i64::MIN`, which panics in debug builds and wraps into a bogus
+/// positive bucket in release builds. The `i128` intermediate makes the floor
+/// exact for every input. The unrepresentable start below `i64::MIN` is
+/// clamped to `i64::MIN`, and the end above `i64::MAX` is clamped to
+/// `i64::MAX`, so the representable part of the extreme buckets is still
+/// processed exactly once (only malformed timestamps can reach them).
+fn hour_bounds(ts: i64) -> (i64, i64) {
+    let start = i128::from(ts).div_euclid(i128::from(HOUR_MS)) * i128::from(HOUR_MS);
+    let end = start + i128::from(HOUR_MS);
+    (
+        i64::try_from(start).unwrap_or(i64::MIN),
+        i64::try_from(end).unwrap_or(i64::MAX),
+    )
+}
+
+/// Stored top lists for one `stats_hourly` row:
+/// `(top_domains, top_clients, top_upstreams)`.
+type StoredTops = (Option<String>, Option<String>, Option<String>);
+
+/// Where a rollup/delete chunk takes its baseline top lists from.
+enum ChunkRollupBase<'a> {
+    /// Normal retention: merge the chunk's cumulative temp counts into this
+    /// pre-sweep snapshot. Each chunk replaces the previous chunk's top lists,
+    /// so writing every chunk is crash-safe without double counting.
+    Snapshot(&'a StoredTops),
+    /// Bounded keep-aggregates clear: merge the run's cumulative temp counts
+    /// into the pre-clear snapshot, plus any external updates observed since
+    /// the previous chunk. `state` carries those per-hour values across chunks.
+    CurrentRow(&'a mut ClearRollupState),
+}
+
+/// Per-hour merge state for the bounded keep-aggregates clear.
+struct ClearRollupState {
+    /// Top lists stored for the hour before this run (or before the retry).
+    existing: StoredTops,
+    /// Positive-only top-list deltas made by another writer between chunks.
+    /// Under the maintenance lock this is normally empty, but preserving it
+    /// keeps an external (for example operator/retention) update from being
+    /// replaced by our pre-run snapshot.
+    external: HourRollup,
+    /// Exactly the top lists written by the previous chunk of this run, used
+    /// to derive `external` deltas.
+    last_written: Option<StoredTops>,
+    /// Whether a missing row may be inserted. `false` when the row existed at
+    /// hour start but was deleted in the meantime: the clear only deletes
+    /// detailed rows then, and does not resurrect a rollup that rollup
+    /// retention removed.
+    allow_insert: bool,
 }
 
 /// Bounded per-hour rollup payloads extracted from rows about to be pruned.
@@ -386,6 +444,13 @@ pub struct StatsDb {
     /// and one-time rollup backfill. Shared across clones so a hot config
     /// apply changes the policy for every handle without a restart.
     rollup_client_names: Arc<AtomicBool>,
+    /// Serializes rollup-writing maintenance (retention sweeps and the
+    /// keep-aggregates clear) inside this process. Both paths read existing
+    /// rollup state and then replace top lists; without this lock a live API
+    /// clear could race the retention scheduler and overwrite each other's
+    /// contributions. The CLI path holds the service lease, so no cross-process
+    /// clear can run while the server (and its scheduler) is up.
+    maintenance_lock: Arc<tokio::sync::Mutex<()>>,
     cache: Arc<StatsCache>,
 }
 
@@ -433,146 +498,7 @@ fn filtered_query(base: &str, filter: &QueryLogFilter) -> sqlx::QueryBuilder<Sql
 
 /// Existing `stats_hourly` top lists for the hours being rolled up again:
 /// `hour -> (top_domains, top_clients, top_upstreams)`.
-type ExistingRollups = HashMap<i64, (Option<String>, Option<String>, Option<String>)>;
-
-/// Extracts bounded per-hour top lists for the rows in `[start, end)` and
-/// `[id_start, id_end]` inside the retention transaction.
-async fn collect_hour_rollups(
-    conn: &mut SqliteConnection,
-    start: i64,
-    end: i64,
-    id_start: i64,
-    id_end: i64,
-    rollups: &mut HashMap<i64, HourRollup>,
-) -> Result<(), StatsError> {
-    let limit = i64::try_from(ROLLUP_TOP_N).unwrap_or(100);
-
-    // Domains: union of the top-N by total and by blocked count, so both
-    // `top_domains` and `top_blocked_domains` stay representative after the
-    // per-hour lists are merged.
-    let domain_rows = sqlx::query(
-        r"
-        SELECT hour, qname, total, blocked FROM (
-            SELECT
-                (ts / 3600000) * 3600000 AS hour,
-                qname,
-                COUNT(*) AS total,
-                SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) AS blocked,
-                ROW_NUMBER() OVER (
-                    PARTITION BY (ts / 3600000) * 3600000
-                    ORDER BY COUNT(*) DESC, qname ASC
-                ) AS rn_total,
-                ROW_NUMBER() OVER (
-                    PARTITION BY (ts / 3600000) * 3600000
-                    ORDER BY SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) DESC, qname ASC
-                ) AS rn_blocked
-            FROM query_log
-            WHERE ts >= ? AND ts < ? AND id >= ? AND id <= ?
-            GROUP BY (ts / 3600000) * 3600000, qname
-        )
-        WHERE rn_total <= ? OR rn_blocked <= ?
-        ",
-    )
-    .bind(start)
-    .bind(end)
-    .bind(id_start)
-    .bind(id_end)
-    .bind(limit)
-    .bind(limit)
-    .fetch_all(&mut *conn)
-    .await?;
-
-    for row in domain_rows {
-        let hour: i64 = row.get("hour");
-        rollups.entry(hour).or_default().domains.push((
-            row.get::<String, _>("qname"),
-            row.get::<Option<i64>, _>("total").unwrap_or(0),
-            row.get::<Option<i64>, _>("blocked").unwrap_or(0),
-        ));
-    }
-
-    // Clients: top-N by total with a deterministic name per IP.
-    let client_rows = sqlx::query(
-        r"
-        SELECT hour, client_ip, client_name, total, blocked, last_seen FROM (
-            SELECT
-                (ts / 3600000) * 3600000 AS hour,
-                client_ip,
-                MAX(client_name) AS client_name,
-                COUNT(*) AS total,
-                SUM(CASE WHEN verdict = 'blocked' THEN 1 ELSE 0 END) AS blocked,
-                MAX(ts) AS last_seen,
-                ROW_NUMBER() OVER (
-                    PARTITION BY (ts / 3600000) * 3600000
-                    ORDER BY COUNT(*) DESC, client_ip ASC
-                ) AS rn
-            FROM query_log
-            WHERE ts >= ? AND ts < ? AND id >= ? AND id <= ?
-            GROUP BY (ts / 3600000) * 3600000, client_ip
-        )
-        WHERE rn <= ?
-        ",
-    )
-    .bind(start)
-    .bind(end)
-    .bind(id_start)
-    .bind(id_end)
-    .bind(limit)
-    .fetch_all(&mut *conn)
-    .await?;
-
-    for row in client_rows {
-        let hour: i64 = row.get("hour");
-        rollups.entry(hour).or_default().clients.push((
-            row.get::<String, _>("client_ip"),
-            row.get::<Option<String>, _>("client_name"),
-            row.get::<Option<i64>, _>("total").unwrap_or(0),
-            row.get::<Option<i64>, _>("blocked").unwrap_or(0),
-            row.get::<Option<i64>, _>("last_seen").unwrap_or(0),
-        ));
-    }
-
-    // Upstreams: top-N by total.
-    let upstream_rows = sqlx::query(
-        r"
-        SELECT hour, upstream, total, errors, elapsed_sum FROM (
-            SELECT
-                (ts / 3600000) * 3600000 AS hour,
-                upstream,
-                COUNT(*) AS total,
-                SUM(CASE WHEN rcode IS NOT NULL AND rcode NOT IN (0, 3) THEN 1 ELSE 0 END) AS errors,
-                SUM(COALESCE(elapsed_us, 0)) AS elapsed_sum,
-                ROW_NUMBER() OVER (
-                    PARTITION BY (ts / 3600000) * 3600000
-                    ORDER BY COUNT(*) DESC, upstream ASC
-                ) AS rn
-            FROM query_log
-            WHERE ts >= ? AND ts < ? AND id >= ? AND id <= ? AND upstream IS NOT NULL
-            GROUP BY (ts / 3600000) * 3600000, upstream
-        )
-        WHERE rn <= ?
-        ",
-    )
-    .bind(start)
-    .bind(end)
-    .bind(id_start)
-    .bind(id_end)
-    .bind(limit)
-    .fetch_all(&mut *conn)
-    .await?;
-
-    for row in upstream_rows {
-        let hour: i64 = row.get("hour");
-        rollups.entry(hour).or_default().upstreams.push((
-            row.get::<String, _>("upstream"),
-            row.get::<Option<i64>, _>("total").unwrap_or(0),
-            row.get::<Option<i64>, _>("errors").unwrap_or(0),
-            row.get::<Option<i64>, _>("elapsed_sum").unwrap_or(0),
-        ));
-    }
-
-    Ok(())
-}
+type ExistingRollups = HashMap<i64, StoredTops>;
 
 /// Loads the already-stored top lists for the hours being rolled up. Queries
 /// are chunked so a very long retention period cannot exceed SQLite's bound

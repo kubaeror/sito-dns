@@ -1469,11 +1469,14 @@ and the three WP commits (`a385e76`, `7d7d6ec`, `dfd7b7e`) on
   retroactive anonymization needs a bounded, crash-resumable rewrite and is
   deferred (documented in `sito-stats/src/anonymize.rs` and the config
   reference).
-- **P2-61 (keep-aggregates clear):** the operator-requested
-  `keep_aggregates=true` clear is deliberately one whole-range transaction and
-  loads all affected hours' top lists in memory; normal retention remains
-  hour-bounded with per-hour temp tables. The whole-range cost is a documented
-  residual.
+- **P2-61 (keep-aggregates clear): resolved in the 2.0 final pass.** The
+  `keep_aggregates=true` clear is now hour-bounded and row-bounded (5,000-row
+  `(ts, id)` chunks, one committed transaction per chunk) with per-chunk delta
+  merges, resumability, a shared retention/clear maintenance lock and no
+  empty-rollup resurrection. The original residual text (one whole-range
+  transaction loading all affected hours' top lists) is historical and
+  superseded by `crates/sito-stats/src/db/retention.rs` and
+  `docs/configuration-reference.md`.
 - **90-day / 1M scale:** a 72-hour multi-day retention test covers the
   hour-chunked algorithm; a 1M-row/90-day soak remains a capacity-testing
   residual (sweep cost is linear in expired rows; each transaction is

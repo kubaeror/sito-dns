@@ -308,9 +308,15 @@ subscriber exists.
 exposition test).
 
 **Residual risk.** Query-log anonymization is forward-only: existing detailed
-rows are not rewritten. The `keep_aggregates` whole-range clear and a 1M-row /
-90-day soak remain capacity residuals. A local root/data-directory attacker can
-read the database; this is local compromise, outside the remote threat model.
+rows are not rewritten. A 1M-row / 90-day soak remains a capacity residual. A
+local root/data-directory attacker can read the database; this is local
+compromise, outside the remote threat model.
+
+> **Update (2.0 final, B5 fix):** the `keep_aggregates` whole-range clear noted
+> in the historical text above is superseded. It is now hour/row-bounded,
+> per-chunk committed, resumable, serialized with retention, and preserves
+> concurrent rollup updates. See `crates/sito-stats/src/db/retention.rs` and
+> `docs/configuration-reference.md`.
 
 ### 3.10 Operations, deployment and release integrity
 
@@ -701,7 +707,7 @@ Initial review run:
 | R-4 | Image scan is linux/amd64 only | Release evidence | Per-arch scanning deferred; the release workflow now runs a live DNS/health smoke on the attested image |
 | R-5 | `dns.bind` defaults to wildcard; no default-deny DNS client ACL | Exposure | Operator firewall/ACL is the documented mitigation |
 | R-6 | HA API mutations on a slave are rejected, but direct config-file edits are not rejected at edit time and there is no automatic promotion | Availability | Documented; shared-field drift is detected after the write |
-| R-7 | Stats query-log anonymization is forward-only; `keep_aggregates` clear and 1M-row/90-day soak remain capacity residuals | Privacy/capacity | Documented; forward-only rewrite is deferred |
+| R-7 | Stats query-log anonymization is forward-only; the 1M-row/90-day soak remains a capacity residual (the `keep_aggregates` clear residual was fixed in the 2.0 final pass; this row is historical) | Privacy/capacity | Documented; forward-only rewrite is deferred |
 | R-8 | `chrono` is unmaintained and reachable in production | Supply chain | Suppression accepted; review by 2027-01-31 |
 | R-9 | `basic-toml` is unmaintained and build-time only | Supply chain | Suppression accepted; review by 2027-01-31 |
 | R-10 | `allow_unpinned_tls` / `allow_insecure_ws` are explicit insecure opt-outs | Operator choice | Documented; a configured pin/CA is always enforced |

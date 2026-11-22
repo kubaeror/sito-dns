@@ -179,12 +179,18 @@ impl StatsDb {
     /// Clears the query log with an explicit rollup client-name policy (the
     /// API passes the live configuration so a hot-reloaded setting applies).
     ///
-    /// `keep_aggregates = true` folds the whole `query_log` range into hourly
-    /// rollups in one transaction before deleting it; that operator-requested
-    /// path is deliberately not hour-bounded and is documented as the
-    /// whole-range memory/lock residual (P2-61). The default
+    /// `keep_aggregates = true` folds the remaining `query_log` rows into
+    /// hourly rollups in bounded per-hour chunks before deleting them, each
+    /// chunk in its own transaction. An interrupted clear leaves the
+    /// already-committed chunks in place and is safely resumable. The default
     /// `keep_aggregates = false` deletes both tables atomically without
     /// aggregating.
+    ///
+    /// This path is also used by the API/UI clear on a running server. The CLI
+    /// takes the service lease and refuses a live server (unless `--force`);
+    /// the API cannot stop the writer, so a row inserted after its hour was
+    /// processed can survive until the next clear/retention. Use the stopped
+    /// CLI path when a complete clear is required.
     ///
     /// `rollup_client_names` is the caller's captured policy, not an override:
     /// a live `false` from [`StatsDb::set_rollup_client_names`] is
@@ -219,9 +225,38 @@ impl StatsDb {
         };
 
         self.invalidate_stats_cache();
-        if total_deleted >= VACUUM_MIN_DELETED_ROWS
-            && let Err(e) = self.vacuum().await
-        {
+
+        // The threshold is per run. A keep-aggregates clear that was interrupted
+        // and resumed in several sub-threshold runs would otherwise never
+        // vacuum, so also vacuum when the detailed log is empty and there are
+        // pages to reclaim. `EXISTS` is an index/table probe, not a count.
+        // Failures here are best-effort like the vacuum itself: the clear
+        // already committed, so a probe error must not turn it into a failure.
+        let mut vacuum_needed = total_deleted >= VACUUM_MIN_DELETED_ROWS;
+        if keep_aggregates && !vacuum_needed {
+            match sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM query_log)")
+                .fetch_one(&self.pool)
+                .await
+            {
+                Ok(0) => {
+                    // A zero-row retry can still need to compact free pages
+                    // left by the earlier partial run.
+                    let freelist: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+                        .fetch_one(&self.pool)
+                        .await
+                        .unwrap_or(0);
+                    vacuum_needed = deleted > 0 || freelist > 0;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "stats clear vacuum probe failed; skipping completion vacuum"
+                    );
+                }
+            }
+        }
+        if vacuum_needed && let Err(e) = self.vacuum().await {
             tracing::warn!(error = %e, "stats clear vacuum failed");
         }
         Ok(deleted)
