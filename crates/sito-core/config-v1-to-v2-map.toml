@@ -489,6 +489,10 @@ path = "clients.trust_routeros_lease_names"
 status = "kept"
 
 [[field]]
+path = "clients.trust_arp"
+status = "kept"
+
+[[field]]
 path = "clients.entries[].name"
 status = "kept"
 

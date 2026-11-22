@@ -125,9 +125,10 @@ impl ClientRegistry {
     ) -> Self {
         let index = Arc::new(build_client_index(&config));
         let mac_resolver = MacResolver::new();
-        // ARP resolution is only needed when an entry declares a MAC identity;
-        // when it is not, the query path must not touch the ARP snapshot at all.
-        if !index.macs.is_empty() {
+        // ARP resolution is only needed when an entry declares a MAC identity
+        // or the operator opted into `clients.trust_arp`; otherwise the query
+        // path must not touch the ARP snapshot at all.
+        if !index.macs.is_empty() || config.trust_arp {
             mac_resolver.start_background_refresh();
         }
         let timezone = config.timezone;
@@ -240,7 +241,23 @@ impl ClientRegistry {
         // 2. Unknown client fallback. Wire-claimed labels are recorded so
         //    display/statistics can show them, but they are never
         //    authenticated policy identity. An ARP MAC that does not belong to
-        //    an operator-configured entry is display-only as well.
+        //    an operator-configured entry is display-only as well unless
+        //    `clients.trust_arp` opts into MAC identity.
+        //
+        //    With `trust_arp`, an ARP-resolved MAC is a trusted
+        //    `IdentitySource::Mac` even when no entry lists it. This is
+        //    MAC-only: no name/group is invented and no other ARP attribute is
+        //    consulted. A trusted identity produced earlier in the chain (for
+        //    example a verified RouterOS lease name) is kept, while untrusted
+        //    wire labels (`TlsSni`/`DohPath`) are replaced by the trusted MAC.
+        if self.config.trust_arp
+            && !ctx.identity_source.is_some_and(IdentitySource::is_trusted)
+            && let Some(mac) = self.mac_resolver.resolve_mac(ctx.ip)
+        {
+            ctx.mac = Some(mac);
+            ctx.identity_source = Some(IdentitySource::Mac);
+        }
+
         if ctx.identity_source.is_none() {
             ctx.identity_source = if ctx.sni.is_some() {
                 Some(IdentitySource::TlsSni)
@@ -254,7 +271,7 @@ impl ClientRegistry {
     }
 
     fn resolve_known_mac(&self, ip: IpAddr, entry: &ClientEntryConfig) -> Option<String> {
-        if !self.index.macs.is_empty()
+        if (!self.index.macs.is_empty() || self.config.trust_arp)
             && let Some(mac) = self.mac_resolver.resolve_mac(ip)
         {
             return Some(mac);
@@ -297,9 +314,10 @@ impl ClientRegistry {
         }
 
         // 3. Local MAC matching. Skipped entirely when no entry declares a MAC
-        //    identity: the ARP snapshot is then never consulted on the query
-        //    path (the background refresher is not even started).
-        if !self.index.macs.is_empty()
+        //    identity and `clients.trust_arp` is off: the ARP snapshot is then
+        //    never consulted on the query path (the background refresher is
+        //    not even started).
+        if (!self.index.macs.is_empty() || self.config.trust_arp)
             && let Some(mac) = self.mac_resolver.resolve_mac(ctx.ip)
         {
             ctx.mac = Some(mac.clone());
@@ -1458,9 +1476,9 @@ schedule_enabled = true
         );
         assert!(!ctx.may_match_client_exception());
 
-        // An ARP MAC that is not listed on any entry is display-only: it does
-        // not become a policy identity (D10: MAC identity is operator
-        // configured; this tree has no `trust_arp` opt-in).
+        // An ARP MAC that is not listed on any entry is display-only by
+        // default: it does not become a policy identity (D10: unlisted ARP
+        // MAC identity requires the `clients.trust_arp` opt-in).
         let arp_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
         let mut arp = HashMap::new();
         arp.insert(arp_ip, "00:11:22:33:44:55".to_string());
@@ -1470,6 +1488,156 @@ schedule_enabled = true
         assert_eq!(mac_ctx.mac.as_deref(), Some("00:11:22:33:44:55"));
         assert_eq!(mac_ctx.identity_source, None);
         assert!(!mac_ctx.may_match_client_exception());
+    }
+
+    #[test]
+    fn test_unlisted_arp_mac_is_display_only_without_trust_arp() {
+        let mut cfg = sample_config();
+        cfg.trust_arp = false;
+        let reg = ClientRegistry::new(cfg);
+
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        let mut arp = HashMap::new();
+        arp.insert(ip, "00:11:22:33:44:55".to_string());
+        reg.mac_resolver().set_mock_arp(arp);
+
+        let mut ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(ctx.mac.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(
+            ctx.identity_source, None,
+            "without trust_arp an unlisted ARP MAC stays display-only"
+        );
+        assert!(!ctx.may_match_client_exception());
+        assert!(!ctx.may_match_secret_rules());
+        assert_eq!(policy.client_name, None);
+        assert_eq!(policy.group_name, "default");
+    }
+
+    #[test]
+    fn test_trust_arp_grants_mac_identity_for_unlisted_mac() {
+        use sito_core::IdentitySource;
+
+        let mut cfg = sample_config();
+        cfg.trust_arp = true;
+        let reg = ClientRegistry::new(cfg);
+
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        let mut arp = HashMap::new();
+        arp.insert(ip, "00:11:22:33:44:55".to_string());
+        reg.mac_resolver().set_mock_arp(arp);
+
+        let mut ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(ctx.mac.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(
+            ctx.identity_source,
+            Some(IdentitySource::Mac),
+            "trust_arp makes an unlisted ARP MAC a trusted identity"
+        );
+        assert!(ctx.may_match_client_exception());
+        assert!(ctx.may_match_secret_rules());
+        assert_eq!(ctx.client_name, None, "a MAC must not invent a client name");
+        assert_eq!(ctx.group, None, "a MAC must not invent a group");
+        assert_eq!(ctx.id, None, "a MAC must not invent a client id");
+        assert_eq!(policy.client_name, None);
+        assert_eq!(policy.group_name, "default");
+        assert!(!policy.trusted);
+
+        let identity = ctx.identity().expect("MAC identity");
+        assert_eq!(identity.source, IdentitySource::Mac);
+        assert_eq!(identity.mac.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(identity.name, None);
+        assert_eq!(identity.group, None);
+    }
+
+    #[test]
+    fn test_trust_arp_is_off_by_default_and_configured_mac_still_works() {
+        use sito_core::IdentitySource;
+
+        // A MAC listed on an entry is a MAC identity regardless of trust_arp.
+        let reg = ClientRegistry::new(sample_config());
+        let ip = "192.168.1.99".parse().unwrap();
+        let mut arp = HashMap::new();
+        arp.insert(ip, "aa:bb:cc:dd:ee:ff".to_string());
+        reg.mac_resolver().set_mock_arp(arp);
+
+        let mut ctx = ClientContext::new(ip);
+        let policy = reg.resolve(&mut ctx, reg.now());
+        assert_eq!(policy.client_name.as_deref(), Some("Jane's Phone"));
+        assert_eq!(ctx.identity_source, Some(IdentitySource::Mac));
+        assert!(ctx.may_match_client_exception());
+    }
+
+    #[test]
+    fn test_trust_arp_never_overrides_stronger_identity() {
+        use sito_core::IdentitySource;
+
+        let mut cfg = sample_config();
+        cfg.trust_arp = true;
+        let reg = ClientRegistry::new(cfg);
+
+        let mut arp = HashMap::new();
+        arp.insert(
+            "192.168.1.20".parse().unwrap(),
+            "02:00:00:00:00:01".to_string(),
+        );
+        arp.insert(
+            "10.0.0.55".parse().unwrap(),
+            "02:00:00:00:00:02".to_string(),
+        );
+        arp.insert(
+            "172.16.0.5".parse().unwrap(),
+            "02:00:00:00:00:03".to_string(),
+        );
+        reg.mac_resolver().set_mock_arp(arp);
+
+        // Exact IP still wins; the MAC is recorded for display and MAC
+        // matchers without changing identity provenance.
+        let mut ip_ctx = ClientContext::new("192.168.1.20".parse().unwrap());
+        let ip_policy = reg.resolve(&mut ip_ctx, reg.now());
+        assert_eq!(ip_ctx.identity_source, Some(IdentitySource::Ip));
+        assert_eq!(ip_policy.client_name.as_deref(), Some("Jane's Phone"));
+        assert_eq!(ip_ctx.mac.as_deref(), Some("02:00:00:00:00:01"));
+
+        // CIDR still wins.
+        let mut cidr_ctx = ClientContext::new("10.0.0.55".parse().unwrap());
+        let cidr_policy = reg.resolve(&mut cidr_ctx, reg.now());
+        assert_eq!(cidr_ctx.identity_source, Some(IdentitySource::Cidr));
+        assert_eq!(cidr_policy.client_name.as_deref(), Some("Office Subnet"));
+        assert_eq!(cidr_ctx.mac.as_deref(), Some("02:00:00:00:00:02"));
+
+        // A configured shared secret still wins.
+        let mut secret_ctx =
+            ClientContext::with_id("172.16.0.5".parse().unwrap(), "jane-secret-a1");
+        reg.resolve(&mut secret_ctx, reg.now());
+        assert_eq!(secret_ctx.identity_source, Some(IdentitySource::Secret));
+        assert_eq!(secret_ctx.client_name.as_deref(), Some("Jane's Phone"));
+        assert_eq!(secret_ctx.mac.as_deref(), Some("02:00:00:00:00:03"));
+
+        // A verified RouterOS lease name is trusted identity too and must not
+        // be downgraded to the ARP MAC.
+        let mut routeros_cfg = sample_config();
+        routeros_cfg.trust_arp = true;
+        routeros_cfg.trust_routeros_lease_names = true;
+        let reg = ClientRegistry::new(routeros_cfg);
+        let lease_ip: IpAddr = "192.168.1.160".parse().unwrap();
+        let mut arp = HashMap::new();
+        arp.insert(lease_ip, "02:00:00:00:00:04".to_string());
+        reg.mac_resolver().set_mock_arp(arp);
+        reg.update_routeros_leases(vec![RouterOsLease {
+            mac: "02:00:00:00:00:04".to_string(),
+            ip: Some(lease_ip),
+            hostname: Some("unmapped-host".to_string()),
+            comment: None,
+            verified: true,
+        }]);
+
+        let mut ctx = ClientContext::new(lease_ip);
+        reg.resolve(&mut ctx, reg.now());
+        assert_eq!(ctx.identity_source, Some(IdentitySource::RouterOs));
+        assert_eq!(ctx.client_name.as_deref(), Some("unmapped-host"));
+        assert_eq!(ctx.mac.as_deref(), Some("02:00:00:00:00:04"));
     }
 
     #[test]

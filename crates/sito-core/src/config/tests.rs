@@ -1062,6 +1062,7 @@ rollup_client_names = false
 [clients]
 timezone = "UTC"
 trust_routeros_lease_names = false
+trust_arp = true
 
 [[clients.entries]]
 name = "phone"

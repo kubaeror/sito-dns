@@ -122,6 +122,33 @@ fn test_unknown_keys_are_rejected_everywhere() {
 }
 
 #[test]
+fn test_clients_trust_arp_is_an_optional_v2_field() {
+    // The key is registered in the v1→v2 map, so the real loader accepts it.
+    let enabled = Config::from_toml_str(&format!("{TEST_BASE}[clients]\ntrust_arp = true\n"))
+        .expect("clients.trust_arp = true must pass the real v2 loader");
+    let clients = enabled.clients.clone().expect("[clients] section");
+    assert_eq!(
+        clients.get("trust_arp").and_then(toml::Value::as_bool),
+        Some(true)
+    );
+
+    // Absent means the documented default (`false`) and the key is not
+    // fabricated in the raw section.
+    let default = Config::from_toml_str(&format!("{TEST_BASE}[clients]\n"))
+        .expect("omitting trust_arp must stay valid");
+    let clients = default.clients.expect("[clients] section");
+    assert!(clients.get("trust_arp").is_none());
+
+    // The opt-in round-trips through the v2 document (config save/HA apply).
+    let document = toml::to_string_pretty(&enabled).expect("serialize config");
+    assert!(
+        document.contains("trust_arp = true"),
+        "trust_arp must survive serialization: {document}"
+    );
+    Config::from_toml_str(&document).expect("the serialized opt-in re-parses");
+}
+
+#[test]
 fn test_duplicate_dns_bind_addresses_are_rejected() {
     expect_cross_section(
         &format!("{TEST_BASE}[dns]\nbind = [\"127.0.0.1\", \"127.0.0.1\"]\n"),

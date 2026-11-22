@@ -53,6 +53,20 @@ pub struct ClientsConfig {
     /// where DHCP leases are managed by the operator.
     #[serde(default)]
     pub trust_routeros_lease_names: bool,
+    /// Trust a MAC address learned from the local ARP table as client
+    /// identity even when no client entry lists that MAC (default `false`).
+    ///
+    /// When enabled, a query's source IP is resolved against the ARP snapshot
+    /// and the MAC is recorded as a trusted `IdentitySource::Mac` identity, so
+    /// `$client` MAC rules and rewrite `exception_clients` can match it. Only
+    /// the MAC is trusted: ARP hostnames and every other ARP attribute are
+    /// ignored, and no client name/group is invented from the MAC alone.
+    ///
+    /// This only identifies hosts on the same L2 segment as the resolver. The
+    /// operator-configured IP/CIDR/secret chain and verified RouterOS leases
+    /// keep their existing precedence over the ARP MAC.
+    #[serde(default)]
+    pub trust_arp: bool,
 }
 
 /// Optional `[integrations]` section: RouterOS DHCP lease sync and curated
@@ -217,5 +231,21 @@ schedule = "0 0 15-21 * * MON-FRI"
             defaults.client_id_secrets
         );
         assert!(!defaults.trust_routeros_lease_names);
+        assert!(!defaults.trust_arp);
+    }
+
+    #[test]
+    fn test_trust_arp_is_opt_in_and_defaults_off() {
+        let defaults: ClientsConfig = toml::from_str("").unwrap();
+        assert!(
+            !defaults.trust_arp,
+            "ARP MAC identity must stay opt-in by default"
+        );
+
+        let cfg: ClientsConfig = toml::from_str("trust_arp = true\n").unwrap();
+        assert!(cfg.trust_arp);
+
+        let explicit_off: ClientsConfig = toml::from_str("trust_arp = false\n").unwrap();
+        assert!(!explicit_off.trust_arp);
     }
 }
