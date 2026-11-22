@@ -177,7 +177,8 @@ pub async fn system_update_check_handler(
     }
     let csrf = get_csrf_token(&ctx, &headers);
 
-    match crate::updater::check_for_update(None).await {
+    let data_dir = ctx.config.load().server.data_dir.clone();
+    match crate::updater::check_for_update(None, &data_dir).await {
         Ok(info) => axum::response::Html(update_check_html(&info, &csrf)).into_response(),
         Err(e) => {
             axum::response::Html(format!(
@@ -212,7 +213,8 @@ pub async fn system_update_apply_handler(
     }
 
     let require_signature = ctx.config.load().server.update_require_signature;
-    match crate::updater::apply_update(None, false, require_signature).await {
+    let data_dir = ctx.config.load().server.data_dir.clone();
+    match crate::updater::apply_update(None, false, require_signature, &data_dir).await {
         Ok(msg) => axum::response::Html(format!(
             r#"<div style="padding: 14px; background: rgba(34, 197, 94, 0.1); border: 1px solid var(--success); border-radius: 6px;">
                 <div style="font-weight: 600; color: var(--success); margin-bottom: 4px;">Update Successful!</div>

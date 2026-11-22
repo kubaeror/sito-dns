@@ -396,10 +396,13 @@ sudo SITO_VERSION=1.9.5 bash contrib/install.sh
 
 Without `--config`, the CLI prefers an existing `/etc/sito/config.toml` and
 otherwise uses `./config.toml`, so the updater commands above work from `/root`
-after the service is stopped. Pass `sito update --config <path>` (or
-`sito --config <path> update`) when the configuration lives somewhere else. If
-neither location exists, `sito update` refuses to run instead of guessing the
-signature policy.
+after the service is stopped. If both files exist, or when the server runs with
+a custom `--config <path>`, pass the same `--config <path>` to `sito update`
+(or `sito --config <path> update`); the updater refuses to guess because the
+server and CLI must lock the same `server.data_dir` update lock. If neither
+location exists, `sito update` refuses to run instead of guessing the signature
+policy. `server.data_dir` must be an absolute path so the shared update lock
+cannot depend on each process's working directory.
 
 When the update crosses the 1.9.x → 2.0 line, also migrate the configuration
 and the statistics database with the service stopped (see
