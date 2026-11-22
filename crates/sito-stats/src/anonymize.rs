@@ -20,7 +20,12 @@ use std::net::IpAddr;
 /// Anonymizes an IP address by masking host bits:
 /// - IPv4: /24 (zeroes out the last octet)
 /// - IPv4-mapped IPv6 (`::ffff:a.b.c.d`): the mapped IPv4 /24
+/// - IPv4-compatible IPv6 (`::a.b.c.d`): the compatible IPv4 /24
 /// - IPv6: /56 (zeroes out the last 72 bits)
+///
+/// `::` (unspecified) and `::1` (loopback) are IPv6 special addresses rather
+/// than IPv4-compatible hosts, so they keep the native IPv6 `/56` mask (both
+/// reduce to `::`); they are not client addresses.
 pub fn anonymize_ip(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(v4) => anonymize_ipv4(v4),
@@ -29,6 +34,12 @@ pub fn anonymize_ip(ip: IpAddr) -> String {
                 // Treating a mapped address as native IPv6 zeroes octets 7..16,
                 // collapsing every mapped client to `::`. Mask the IPv4 host
                 // part instead so mapped and native IPv4 clients share a /24.
+                return anonymize_ipv4(v4);
+            }
+            if let Some(v4) = ipv4_compatible(&v6) {
+                // Deprecated IPv4-compatible spelling (`::a.b.c.d`). It has the
+                // same first-96-bits-zero shape as mapped addresses, so native
+                // IPv6 `/56` masking would collapse every such client to `::`.
                 return anonymize_ipv4(v4);
             }
             let mut octets = v6.octets();
@@ -43,6 +54,23 @@ pub fn anonymize_ip(ip: IpAddr) -> String {
 fn anonymize_ipv4(v4: std::net::Ipv4Addr) -> String {
     let octets = v4.octets();
     format!("{}.{}.{}.0", octets[0], octets[1], octets[2])
+}
+
+/// Returns the embedded IPv4 address for an IPv4-compatible IPv6 address
+/// (`::a.b.c.d`, first 96 bits zero), excluding the `::` and `::1` special
+/// addresses. Mapped addresses are handled separately by
+/// [`std::net::Ipv6Addr::to_ipv4_mapped`].
+fn ipv4_compatible(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let octets = v6.octets();
+    if !octets[..12].iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    if v6.is_unspecified() || v6.is_loopback() {
+        return None;
+    }
+    Some(std::net::Ipv4Addr::new(
+        octets[12], octets[13], octets[14], octets[15],
+    ))
 }
 
 #[cfg(test)]
@@ -90,5 +118,42 @@ mod tests {
             anonymize_ip("192.0.2.99".parse().unwrap()),
             "a mapped address and its native IPv4 form must share a /24"
         );
+    }
+
+    /// IPv4-compatible IPv6 (`::a.b.c.d`, first 96 bits zero) is a second
+    /// spelling of the same client. Treating it as native IPv6 `/56` collapsed
+    /// every compatible client to `::`; it must mask the embedded IPv4 /24.
+    #[test]
+    fn test_anonymize_ipv4_compatible_ipv6() {
+        let first: IpAddr = "::192.0.2.10".parse().unwrap();
+        let second: IpAddr = "::198.51.100.20".parse().unwrap();
+
+        assert_eq!(anonymize_ip(first), "192.0.2.0");
+        assert_eq!(anonymize_ip(second), "198.51.100.0");
+        assert_ne!(
+            anonymize_ip(first),
+            anonymize_ip(second),
+            "distinct compatible clients must not collapse to the same masked address"
+        );
+        assert_ne!(anonymize_ip(first), "::");
+        assert_eq!(
+            anonymize_ip(first),
+            anonymize_ip("192.0.2.99".parse().unwrap()),
+            "a compatible address and its native IPv4 form must share a /24"
+        );
+        assert_eq!(
+            anonymize_ip(first),
+            anonymize_ip("::ffff:192.0.2.99".parse().unwrap()),
+            "compatible and mapped spellings of one client must share a /24"
+        );
+    }
+
+    /// `::` and `::1` are IPv6 special addresses, not IPv4-compatible client
+    /// addresses. They keep the native IPv6 `/56` mask rather than becoming
+    /// `0.0.0.0`.
+    #[test]
+    fn test_anonymize_ipv6_special_addresses() {
+        assert_eq!(anonymize_ip("::".parse().unwrap()), "::");
+        assert_eq!(anonymize_ip("::1".parse().unwrap()), "::");
     }
 }

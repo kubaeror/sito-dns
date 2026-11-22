@@ -577,7 +577,7 @@ anonymize_querylog = false
 | `stats.retention_days` | integer | `90` | Days to keep detailed per-query records before automated pruning and hourly aggregation (must be ≥ 1; alias: `query_log_retention_days`). |
 | `stats.rollup_retention_days` | integer | `365` | Days to keep hourly rollups (aggregate totals, top domains and keyed-hash client identifiers) before deleting them (must be ≥ 1). |
 | `stats.rollup_client_names` | boolean | `false` | Include client display names in hourly rollups. Off by default; raw client IPs are never stored in rollups (keyed BLAKE3 hashes are used). |
-| `privacy.anonymize_querylog` | boolean | `false` | Mask client IPs (/24 for IPv4, /56 for IPv6) before persisting to database and before live-tail broadcast. |
+| `privacy.anonymize_querylog` | boolean | `false` | Mask client IPs (/24 for IPv4, /56 for IPv6) before persisting to database and before live-tail broadcast. IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`) IPv6 spellings use the embedded IPv4 `/24`; the `::` and `::1` special addresses keep the IPv6 `/56` mask. |
 
 `[stats]` and `[privacy]` are typed sections parsed with `deny_unknown_fields`;
 `retention_days` and `rollup_retention_days` must be at least 1, so a zero

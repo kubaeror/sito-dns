@@ -3,7 +3,7 @@
 //! A populated registry is reused for every iteration so the measurement is
 //! the update/render path, not LabelInterner setup.
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use sito_stats::MetricsRegistry;
 use std::hint::black_box;
 
@@ -55,5 +55,47 @@ fn bench_metrics(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_metrics);
+/// Measures same-label contention on the `allowed` histogram.
+///
+/// `metrics_bench::metrics` is single-threaded by design. This group compares
+/// the per-observation cost of one writer with N writers hammering the same
+/// verdict label. Each iteration performs `threads * OBSERVATIONS_PER_THREAD`
+/// observations, so the scoped thread spawn/join is amortized and criterion's
+/// element throughput is directly comparable across thread counts. Compare
+/// `observe_query_duration_1_thread` with `observe_query_duration_N_threads`
+/// before considering sharding the per-label `HistogramState`.
+fn bench_contended_histogram(c: &mut Criterion) {
+    const OBSERVATIONS_PER_THREAD: usize = 1_000;
+    let workers = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .clamp(2, 8);
+    let registry = std::sync::Arc::new(populated_registry());
+
+    let mut group = c.benchmark_group("metrics_contended");
+    for threads in [1usize, workers] {
+        group.throughput(Throughput::Elements(
+            (threads * OBSERVATIONS_PER_THREAD) as u64,
+        ));
+        group.bench_function(format!("observe_query_duration_{threads}_threads"), |b| {
+            b.iter(|| {
+                std::thread::scope(|scope| {
+                    for _ in 0..threads {
+                        let registry = std::sync::Arc::clone(&registry);
+                        scope.spawn(move || {
+                            for _ in 0..OBSERVATIONS_PER_THREAD {
+                                registry.observe_query_duration(
+                                    black_box("allowed"),
+                                    black_box(0.000_3),
+                                );
+                            }
+                        });
+                    }
+                });
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_metrics, bench_contended_histogram);
 criterion_main!(benches);
