@@ -788,7 +788,6 @@ token = "ha-token"
     responses(
         (status = 200, description = "Configuration reloaded", body = ConfigUpdateResponse),
         (status = 400, description = "Invalid configuration on disk", body = ProblemDetails),
-        (status = 409, description = "The reload changes restart-only fields or the configuration generation changed", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 500, description = "Configuration could not be read, applied, or persisted", body = ProblemDetails)

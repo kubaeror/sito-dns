@@ -238,8 +238,8 @@ fn group_to_dto(name: &str, group: &ClientGroupConfig) -> ClientGroupDto {
     path = "/api/v2/clients",
     responses(
         (status = 200, description = "Clients list retrieved", body = Vec<ClientDto>),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
     tag = "Clients",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -263,8 +263,8 @@ pub async fn get_clients(
     params(UnidentifiedClientsQuery),
     responses(
         (status = 200, description = "Discovered but unconfigured clients, newest first", body = UnidentifiedClientsResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
     tag = "Clients",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -306,10 +306,10 @@ pub async fn get_unidentified_clients(
     request_body = ClientDto,
     responses(
         (status = 201, description = "Client created", body = ClientDto),
-        (status = 400, description = "Bad Request"),
-        (status = 409, description = "Client name or shared secret already exists"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 400, description = "Bad Request", body = ProblemDetails),
+        (status = 409, description = "Client name or shared secret already exists", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 500, description = "Configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Clients",
@@ -368,10 +368,10 @@ pub async fn create_client(
     params(("name" = String, Path, description = "Client name"), ClientRevealQuery),
     responses(
         (status = 200, description = "Client details retrieved (shared secret replaced by a marker unless ?reveal=1)", body = ClientDto),
-        (status = 403, description = "Revealing a secret requires the Admin role"),
-        (status = 404, description = "Not Found"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Revealing a secret requires the Admin role", body = ProblemDetails),
+        (status = 404, description = "Not Found", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
     tag = "Clients",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -418,11 +418,11 @@ pub async fn get_client_by_name(
     params(("name" = String, Path, description = "Client name")),
     responses(
         (status = 200, description = "Client updated (partial merge)", body = ClientDto),
-        (status = 400, description = "Invalid configuration"),
-        (status = 404, description = "Not Found"),
-        (status = 409, description = "Renaming onto an existing client name"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 400, description = "Invalid configuration", body = ProblemDetails),
+        (status = 404, description = "Not Found", body = ProblemDetails),
+        (status = 409, description = "Renaming onto an existing client name", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 500, description = "Configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Clients",
@@ -515,11 +515,9 @@ pub async fn update_client(
     params(("name" = String, Path, description = "Client name")),
     responses(
         (status = 200, description = "Client deleted", body = GenericMessageResponse),
-        (status = 400, description = "Invalid configuration"),
-        (status = 404, description = "Not Found"),
-        (status = 409, description = "Configuration generation changed while the write was staged"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Not Found", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 500, description = "Configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Clients",
@@ -552,8 +550,8 @@ pub async fn delete_client(
     path = "/api/v2/clients/groups",
     responses(
         (status = 200, description = "Client groups retrieved", body = Vec<ClientGroupDto>),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
     tag = "Clients",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -591,9 +589,9 @@ pub async fn get_client_groups(
     params(("name" = String, Path, description = "Group name")),
     responses(
         (status = 200, description = "Client group retrieved", body = ClientGroupDto),
-        (status = 404, description = "Not Found"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 404, description = "Not Found", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
     tag = "Clients",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -633,10 +631,9 @@ pub async fn get_client_group_by_name(
     params(("name" = String, Path, description = "Group name")),
     responses(
         (status = 200, description = "Client group updated (partial merge; fields absent keep current values)", body = ClientGroupDto),
-        (status = 400, description = "Invalid configuration"),
-        (status = 409, description = "Configuration generation changed while the write was staged"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 400, description = "Invalid configuration", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 500, description = "Configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Clients",
@@ -706,10 +703,10 @@ pub async fn update_client_group(
     request_body = ClientGroupDto,
     responses(
         (status = 201, description = "Client group added", body = ClientGroupDto),
-        (status = 400, description = "Invalid configuration"),
+        (status = 400, description = "Invalid configuration", body = ProblemDetails),
         (status = 409, description = "Group already exists", body = ProblemDetails),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 500, description = "Configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Clients",
@@ -763,11 +760,11 @@ pub async fn add_client_group(
     params(("name" = String, Path, description = "Group name")),
     responses(
         (status = 200, description = "Client group deleted", body = crate::models::GenericMessageResponse),
-        (status = 400, description = "The default group cannot be deleted"),
-        (status = 404, description = "Group not found"),
-        (status = 409, description = "Group is still referenced by clients, or the configuration generation changed"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 400, description = "The default group cannot be deleted", body = ProblemDetails),
+        (status = 404, description = "Group not found", body = ProblemDetails),
+        (status = 409, description = "Group is still referenced by clients", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 500, description = "Configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Clients",

@@ -62,7 +62,6 @@ pub async fn get_upstream_config(
     responses(
         (status = 200, description = "Updated upstream DNS configuration", body = UpstreamConfigDto),
         (status = 400, description = "Invalid configuration", body = ProblemDetails),
-        (status = 409, description = "The configuration changes restart-only fields or the generation changed", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 500, description = "Upstream configuration could not be applied or persisted", body = ProblemDetails)

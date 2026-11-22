@@ -515,7 +515,7 @@ mod tests {
         let expectations: &[(&str, &str, &[&str])] = &[
             ("/api/v2/config", "put", &["400", "409", "500"]),
             ("/api/v2/config", "get", &["500"]),
-            ("/api/v2/config/reload", "post", &["400", "409", "500"]),
+            ("/api/v2/config/reload", "post", &["400", "500"]),
             ("/api/v2/config/backup", "get", &["500"]),
             (
                 "/api/v2/config/restore/confirm",
@@ -528,11 +528,7 @@ mod tests {
                 "put",
                 &["400", "409", "404", "500"],
             ),
-            (
-                "/api/v2/clients/{name}",
-                "delete",
-                &["400", "409", "404", "500"],
-            ),
+            ("/api/v2/clients/{name}", "delete", &["404", "500"]),
             (
                 "/api/v2/clients/groups/{name}",
                 "delete",
@@ -547,10 +543,10 @@ mod tests {
             (
                 "/api/v2/filtering/lists/{id}",
                 "delete",
-                &["400", "409", "404", "500"],
+                &["409", "404", "500"],
             ),
-            ("/api/v2/filtering/refresh", "post", &["400", "409", "500"]),
-            ("/api/v2/filtering/rules", "put", &["400", "409", "500"]),
+            ("/api/v2/filtering/refresh", "post", &["500"]),
+            ("/api/v2/filtering/rules", "put", &["500"]),
             (
                 "/api/v2/integrations/lists/{category}/refresh",
                 "post",
@@ -561,18 +557,10 @@ mod tests {
             ("/api/v2/stats", "get", &["400", "429", "500"]),
             ("/api/v2/stats/clients", "get", &["400", "429", "500"]),
             ("/api/v2/stats/upstreams", "get", &["400", "429", "500"]),
-            ("/api/v2/rewrites", "post", &["400", "409", "500"]),
-            (
-                "/api/v2/rewrites/{id}",
-                "put",
-                &["400", "409", "404", "500"],
-            ),
-            (
-                "/api/v2/rewrites/{id}",
-                "delete",
-                &["400", "409", "404", "500"],
-            ),
-            ("/api/v2/upstream", "put", &["400", "409", "500"]),
+            ("/api/v2/rewrites", "post", &["400", "500"]),
+            ("/api/v2/rewrites/{id}", "put", &["400", "404", "500"]),
+            ("/api/v2/rewrites/{id}", "delete", &["404", "500"]),
+            ("/api/v2/upstream", "put", &["400", "500"]),
             ("/api/v2/upstream/test", "post", &["400"]),
             ("/api/v2/auth/totp/verify", "post", &["401", "429"]),
             ("/api/v2/auth/totp/setup", "get", &["401", "403", "500"]),
@@ -606,6 +594,34 @@ mod tests {
                 assert!(
                     statuses.contains(*status),
                     "{method} {path} must document {status}, got {statuses:?}"
+                );
+            }
+        }
+
+        // These operations take the config-apply lock before they capture the
+        // runtime generation, so `ApplyError::GenerationConflict` cannot occur.
+        // They also use the locked/full apply variants, which skip the
+        // restart-only gate. Advertising 409 (or apply-validation 400) here
+        // would be inventing a status the handler can never return.
+        let unreachable: &[(&str, &str, &[&str])] = &[
+            ("/api/v2/clients/{name}", "delete", &["400", "409"]),
+            ("/api/v2/clients/groups/{name}", "put", &["409"]),
+            ("/api/v2/filtering/lists/{id}", "delete", &["400"]),
+            ("/api/v2/filtering/refresh", "post", &["400", "409"]),
+            ("/api/v2/filtering/rules", "put", &["400", "409"]),
+            ("/api/v2/rewrites", "post", &["409"]),
+            ("/api/v2/rewrites/{id}", "put", &["409"]),
+            ("/api/v2/rewrites/{id}", "delete", &["400", "409"]),
+            ("/api/v2/upstream", "put", &["409"]),
+            ("/api/v2/config/reload", "post", &["409"]),
+        ];
+        for (path, method, absent) in unreachable {
+            let operation = &document["paths"][*path][*method];
+            let statuses = response_statuses(operation);
+            for status in *absent {
+                assert!(
+                    !statuses.contains(*status),
+                    "{method} {path} must not document unreachable {status}, got {statuses:?}"
                 );
             }
         }

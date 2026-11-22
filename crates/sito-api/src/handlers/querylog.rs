@@ -109,8 +109,8 @@ impl IntoResponse for QueryLogHandlerError {
     params(QueryLogQueryParams),
     responses(
         (status = 200, description = "Query logs retrieved with cursor pagination", body = QueryLogPage),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 429, description = "Rate limited", body = ProblemDetails,
             headers(("Retry-After", description = "Seconds to wait before retrying"))),
         (status = 500, description = "Query log could not be read", body = ProblemDetails)
@@ -163,8 +163,8 @@ pub async fn get_querylog(
     params(ClearQueryLogParams),
     responses(
         (status = 200, description = "Query log cleared successfully", body = GenericMessageResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 500, description = "Query log could not be cleared", body = ProblemDetails)
     ),
     tag = "QueryLog",
@@ -203,8 +203,8 @@ pub async fn delete_querylog(
     params(ClearQueryLogParams),
     responses(
         (status = 200, description = "Query log cleared successfully", body = GenericMessageResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 500, description = "Query log could not be cleared", body = ProblemDetails)
     ),
     tag = "QueryLog",
@@ -230,8 +230,8 @@ pub async fn clear_querylog(
     path = "/api/v2/querylog/stream",
     responses(
         (status = 101, description = "WebSocket upgrade accepted; query log entries stream as JSON text frames"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden (including cross-origin/Origin: null)")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden (including cross-origin/Origin: null)", body = ProblemDetails)
     ),
     tag = "QueryLog",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
