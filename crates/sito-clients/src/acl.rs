@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use sito_core::net::IpNetwork;
 use thiserror::Error;
@@ -83,9 +84,14 @@ impl AclReason {
 }
 
 /// A canonical (host-bits-masked) ACL prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The reporting label is computed once at compile time so the query path
+/// emits ACL metrics/log fields without allocating. Equality/hashing include
+/// the label, which is deterministic for a given network anyway.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AclPrefix {
     network: IpNetwork,
+    label: Arc<str>,
 }
 
 impl AclPrefix {
@@ -94,7 +100,15 @@ impl AclPrefix {
         // canonical network address makes duplicate detection stable.
         let canonical = IpNetwork::new(network.network_address(), network.prefix())
             .expect("a parsed network keeps its valid prefix");
-        Self { network: canonical }
+        let label: Arc<str> = Arc::from(format!(
+            "{}/{}",
+            canonical.network_address(),
+            canonical.prefix()
+        ));
+        Self {
+            network: canonical,
+            label,
+        }
     }
 
     /// Builds a host prefix from a bare address.
@@ -131,13 +145,12 @@ impl AclPrefix {
     }
 
     /// Canonical label, always `network/prefix` with host bits masked.
+    ///
+    /// Precomputed at compile time; safe to pass directly to metric/log
+    /// fields without a per-query allocation.
     #[must_use]
-    pub fn label(&self) -> String {
-        format!(
-            "{}/{}",
-            self.network.network_address(),
-            self.network.prefix()
-        )
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// True when every address in the prefix is loopback.
@@ -357,17 +370,6 @@ impl AclIndex {
         self.entry_allow.len()
     }
 
-    /// True when an explicit or opted-in entry allow is a catch-all
-    /// (`0.0.0.0/0` or `::/0`), i.e. the effective policy still admits every
-    /// source in at least one family.
-    #[must_use]
-    pub fn has_catch_all_allow(&self) -> bool {
-        self.allow
-            .iter()
-            .chain(self.entry_allow.iter())
-            .any(|prefix| prefix.prefix_len() == 0)
-    }
-
     /// Decides admission for the observed peer address.
     ///
     /// IPv4-mapped IPv6 sources are canonicalized to IPv4 so they match the
@@ -531,13 +533,52 @@ fn parse_entry_id(value: &str) -> Result<Option<AclPrefix>, String> {
     Ok(Some(AclPrefix::new(network)))
 }
 
-/// True when every address in `prefix` is also covered by a deny prefix.
+/// Numeric `[start, end]` bounds of a prefix within its address family.
+fn prefix_bounds(prefix: &AclPrefix) -> (u128, u128) {
+    let start: u128 = match prefix.network().network_address() {
+        IpAddr::V4(addr) => u128::from(u32::from(addr)),
+        IpAddr::V6(addr) => u128::from(addr),
+    };
+    let bits: u32 = match prefix.family() {
+        AclFamily::Ipv4 => 32,
+        AclFamily::Ipv6 => 128,
+    };
+    let host_bits = bits - u32::from(prefix.prefix_len());
+    let size = if host_bits == 128 {
+        u128::MAX
+    } else {
+        (1u128 << host_bits) - 1
+    };
+    (start, start | size)
+}
+
+/// True when every address in `prefix` is covered by the **union** of deny
+/// prefixes. This detects adjacent rules (two `/25`s covering a `/24`), not
+/// just one supernet.
 fn is_fully_denied(prefix: &AclPrefix, deny: &[AclPrefix]) -> bool {
-    deny.iter().any(|denied| {
-        denied.family() == prefix.family()
-            && denied.prefix_len() <= prefix.prefix_len()
-            && denied.contains(prefix.network().network_address())
-    })
+    let (allow_start, allow_end) = prefix_bounds(prefix);
+    let mut intervals: Vec<(u128, u128)> = deny
+        .iter()
+        .filter(|denied| denied.family() == prefix.family())
+        .map(prefix_bounds)
+        .filter(|(start, end)| *end >= allow_start && *start <= allow_end)
+        .collect();
+    if intervals.is_empty() {
+        return false;
+    }
+    intervals.sort_unstable_by_key(|(start, _)| *start);
+
+    let mut cursor = allow_start;
+    for (start, end) in intervals {
+        if start > cursor {
+            return false;
+        }
+        if end >= allow_end {
+            return true;
+        }
+        cursor = cursor.max(end.saturating_add(1));
+    }
+    false
 }
 
 #[cfg(test)]
@@ -810,6 +851,38 @@ mod tests {
     }
 
     #[test]
+    fn test_acl_lockout_warning_sees_adjacent_deny_union() {
+        let cfg = config(
+            AclDefaultPolicy::Deny,
+            &["10.1.2.0/24"],
+            &["10.1.2.0/25", "10.1.2.128/25"],
+        );
+        let index = AclIndex::compile(&cfg).unwrap();
+        assert!(
+            index
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("no effective allow network")),
+            "two adjacent /25 denials cover the /24 allow: {:?}",
+            index.warnings()
+        );
+        assert_eq!(index.decide(ip("10.1.2.7")).action, AclAction::Deny);
+
+        // A gap in the union must keep the allow effective and suppress the
+        // lockout warning.
+        let partial = config(AclDefaultPolicy::Deny, &["10.1.2.0/24"], &["10.1.2.0/25"]);
+        let partial = AclIndex::compile(&partial).unwrap();
+        assert!(
+            !partial
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("no effective allow network")),
+            "{:?}",
+            partial.warnings()
+        );
+    }
+
+    #[test]
     fn test_acl_entry_id_trimming_and_malformed_rejection() {
         let mut cfg = config(AclDefaultPolicy::Deny, &[], &[]);
         cfg.acl.allow_entry_ids = true;
@@ -825,24 +898,6 @@ mod tests {
             assert!(err.field.starts_with("clients.entries[0].ids[0]"), "{err}");
             assert!(err.message.contains(malformed), "{err}");
         }
-    }
-
-    #[test]
-    fn test_acl_detects_catch_all_allow() {
-        let cfg = config(AclDefaultPolicy::Deny, &["0.0.0.0/0"], &[]);
-        let index = AclIndex::compile(&cfg).unwrap();
-        assert!(index.has_catch_all_allow());
-
-        let mut entry_all = config(AclDefaultPolicy::Deny, &[], &[]);
-        entry_all.acl.allow_entry_ids = true;
-        entry_all.entries = vec![entry("all", &["::/0"])];
-        assert!(AclIndex::compile(&entry_all).unwrap().has_catch_all_allow());
-
-        assert!(
-            !AclIndex::compile(&config(AclDefaultPolicy::Deny, &["10.0.0.0/8"], &[]))
-                .unwrap()
-                .has_catch_all_allow()
-        );
     }
 
     #[test]

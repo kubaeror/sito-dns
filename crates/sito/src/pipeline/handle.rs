@@ -27,26 +27,24 @@ impl QueryHandler for DnsPipeline {
         // path so denied sources cannot exercise wire-level error handling.
         let acl = runtime_snapshot.clients.acl();
         let decision = acl.decide(client.ip);
+        // Labels are precomputed in `AclPrefix`; both allow and deny series
+        // are emitted without a per-query allocation.
+        let matched_prefix = decision.matched.map(sito_clients::AclPrefix::label);
         if let Some(ref metrics) = self.metrics {
             metrics.inc_acl_decision(
                 decision.action.as_str(),
                 decision.reason.as_str(),
                 decision.family.as_str(),
             );
-        }
-        if decision.is_denied() {
-            // The label is only needed for denied traffic (sampled log and
-            // matched-prefix metric). Allowed queries stay allocation-free.
-            let matched_prefix = decision.matched.map(sito_clients::AclPrefix::label);
-            if let Some(ref metrics) = self.metrics
-                && let Some(ref prefix) = matched_prefix
-            {
+            if let Some(prefix) = matched_prefix {
                 metrics.inc_acl_matched_prefix(
                     decision.action.as_str(),
                     prefix,
                     decision.family.as_str(),
                 );
             }
+        }
+        if decision.is_denied() {
             let deny_response = acl.deny_response();
             if deny_response == sito_clients::AclDenyResponse::Drop
                 && let Some(ref metrics) = self.metrics
@@ -61,7 +59,7 @@ impl QueryHandler for DnsPipeline {
                     proto = %client.proto,
                     action = "deny",
                     reason = decision.reason.as_str(),
-                    matched_prefix = matched_prefix.as_deref().unwrap_or("default"),
+                    matched_prefix = matched_prefix.unwrap_or("default"),
                     "DNS client ACL denied a query"
                 ),
                 acl::AclLogLevel::Debug => debug!(
@@ -69,7 +67,7 @@ impl QueryHandler for DnsPipeline {
                     proto = %client.proto,
                     action = "deny",
                     reason = decision.reason.as_str(),
-                    matched_prefix = matched_prefix.as_deref().unwrap_or("default"),
+                    matched_prefix = matched_prefix.unwrap_or("default"),
                     "DNS client ACL denied a query"
                 ),
             }

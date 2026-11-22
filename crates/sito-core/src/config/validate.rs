@@ -42,7 +42,8 @@ impl Config {
 
     /// Loads and validates a configuration file through the same single
     /// parser every other entry point uses.
-    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
+    #[cfg(test)]
+    pub(crate) fn load(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let document = std::fs::read_to_string(path).map_err(|e| {
             ConfigError::Parse(format!(

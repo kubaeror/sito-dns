@@ -4930,9 +4930,16 @@ async fn test_acl_mapped_ipv6_uses_ipv4_rules_end_to_end() {
         .expect("mapped IPv4 matches the IPv4 allow rule");
     assert_eq!(response.metadata.response_code, ResponseCode::NoError);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(metrics.render_prometheus().contains(
+    let rendered = metrics.render_prometheus();
+    assert!(rendered.contains(
         r#"sito_dns_acl_decisions_total{action="allow",reason="explicit_allow",family="ipv4"} 1"#
     ));
+    assert!(
+        rendered.contains(
+            r#"sito_dns_acl_matched_prefix_total{action="allow",prefix="127.0.0.0/8",family="ipv4"} 1"#
+        ),
+        "the allow matched-prefix series must be emitted: {rendered}"
+    );
 
     let _ = tokio::fs::remove_dir_all(temp_dir).await;
 }
@@ -4974,12 +4981,116 @@ async fn test_acl_denied_traffic_ignores_ignore_stats() {
     let _ = tokio::fs::remove_dir_all(temp_dir).await;
 }
 
+/// Runs one real DoH request through `DnsPipeline` with the given ACL and
+/// `web.trusted_proxies`, returning the DNS rcode and upstream call count.
+async fn acl_doh_request(
+    clients: sito_clients::ClientsConfig,
+    trusted_proxies: Vec<std::net::IpAddr>,
+    x_forwarded_for: &str,
+    qname: &str,
+) -> (ResponseCode, usize, std::path::PathBuf) {
+    let mut config = Config::default();
+    config.dns.dnssec.validate = false;
+    config.filtering.enabled = true;
+    config.filtering.fail_closed = false;
+    config.filtering.lists.clear();
+    let mut web = config.get_web_config();
+    web.trusted_proxies = trusted_proxies;
+    config.set_web_config(web);
+
+    let (pipeline, calls, temp_dir) = policy_pipeline_with_config(config, clients).await;
+    let pipeline = std::sync::Arc::new(pipeline);
+    let handler = {
+        let pipeline = std::sync::Arc::clone(&pipeline);
+        move |query: Message, client: ClientContext| {
+            let pipeline = std::sync::Arc::clone(&pipeline);
+            async move { pipeline.handle(query, client).await }
+        }
+    };
+    let port = sito_test_support::reserve_port_number().unwrap();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = sito_transport::start_doh_listener(
+        sito_transport::DohConfig::new(addr, None),
+        std::sync::Arc::new(handler),
+        shutdown_rx,
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut query = rewrite_query(qname, RecordType::A);
+    query.metadata.id = 9100;
+    let wire = sito_proto::encode_message(&query).unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/dns-query"))
+        .header("Content-Type", "application/dns-message")
+        .header("X-Forwarded-For", x_forwarded_for)
+        .body(wire)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.bytes().await.unwrap();
+    let dns_response = sito_proto::decode_message(&body).unwrap();
+
+    let _ = shutdown_tx.send(true);
+    let _ = handle.await;
+    (
+        dns_response.metadata.response_code,
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        temp_dir,
+    )
+}
+
+#[tokio::test]
+async fn test_acl_doh_trusted_proxy_xff_cannot_override_raw_peer() {
+    use sito_clients::AclDefaultPolicy;
+
+    // Denied raw peer (127.0.0.1), trusted as a proxy, sends an XFF address
+    // that the ACL would allow. The raw peer must still be denied.
+    let denied_clients = acl_clients(AclDefaultPolicy::Deny, &["192.0.2.0/24"], &[]);
+    let (code, calls, temp_dir) = acl_doh_request(
+        denied_clients,
+        vec!["127.0.0.1".parse().unwrap(), "192.0.2.10".parse().unwrap()],
+        "192.0.2.10",
+        "xff-denied-peer.example.",
+    )
+    .await;
+    assert_eq!(
+        code,
+        ResponseCode::Refused,
+        "X-Forwarded-For must not admit a denied raw DoH peer"
+    );
+    assert_eq!(calls, 0);
+    let _ = tokio::fs::remove_dir_all(temp_dir).await;
+
+    // Allowed raw peer (127.0.0.1), trusted as a proxy, sends XFF with a denied
+    // address. The raw peer must remain admitted.
+    let allowed_clients = acl_clients(AclDefaultPolicy::Deny, &["127.0.0.1/32"], &[]);
+    let (code, calls, temp_dir) = acl_doh_request(
+        allowed_clients,
+        vec!["127.0.0.1".parse().unwrap(), "203.0.113.9".parse().unwrap()],
+        "203.0.113.9",
+        "xff-allowed-peer.example.",
+    )
+    .await;
+    assert_eq!(
+        code,
+        ResponseCode::NoError,
+        "a denied X-Forwarded-For value must not revoke an allowed raw peer"
+    );
+    assert_eq!(calls, 1);
+    let _ = tokio::fs::remove_dir_all(temp_dir).await;
+}
+
 #[tokio::test]
 async fn test_acl_identity_hints_never_admit() {
     use sito_clients::AclDefaultPolicy;
 
     let mut clients = acl_clients(AclDefaultPolicy::Deny, &[], &[]);
     clients.trust_arp = true;
+    clients.trust_routeros_lease_names = true;
     clients.acl.allow_entry_ids = true;
     clients.entries = vec![
         policy_entry("mac-only", "aa:bb:cc:dd:ee:ff", "default"),
@@ -5016,7 +5127,7 @@ async fn test_acl_identity_hints_never_admit() {
 }
 
 #[tokio::test]
-async fn test_acl_web_trusted_proxies_do_not_change_dns_admission() {
+async fn test_acl_trusted_proxy_config_is_not_a_dns_input() {
     use sito_clients::AclDefaultPolicy;
 
     let mut config = Config::default();
@@ -5025,7 +5136,9 @@ async fn test_acl_web_trusted_proxies_do_not_change_dns_admission() {
     config.filtering.fail_closed = false;
     config.filtering.lists.clear();
     let mut web = config.get_web_config();
-    web.trusted_proxies = vec!["127.0.0.1".parse().unwrap(), "203.0.113.0".parse().unwrap()];
+    // Both the allowed and denied peers are configured trusted proxies; that
+    // admin-listener setting still must not change DNS admission.
+    web.trusted_proxies = vec!["127.0.0.1".parse().unwrap(), "203.0.113.9".parse().unwrap()];
     config.set_web_config(web);
 
     let clients = acl_clients(AclDefaultPolicy::Deny, &["127.0.0.1/32"], &[]);
@@ -5111,7 +5224,7 @@ async fn test_acl_hot_reload_swaps_policy_atomically() {
     let _ = tokio::fs::remove_dir_all(temp_dir).await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_acl_logs_contain_only_network_metadata() {
     use sito_clients::AclDefaultPolicy;
     use std::fmt::Write as _;
@@ -5119,7 +5232,6 @@ async fn test_acl_logs_contain_only_network_metadata() {
     use tracing::field::{Field, Visit};
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
-    #[derive(Clone, Default)]
     struct CaptureLayer {
         events: Arc<Mutex<Vec<String>>>,
     }
@@ -5139,18 +5251,11 @@ async fn test_acl_logs_contain_only_network_metadata() {
         }
     }
 
-    // A process-wide capture avoids the thread-local dispatch race with other
-    // parallel tests that emit tracing events before this test starts. The
-    // assertions filter to this test's source IP, so unrelated test logs do
-    // not affect them.
-    static GLOBAL_LOGS: std::sync::OnceLock<Arc<Mutex<Vec<String>>>> = std::sync::OnceLock::new();
-    let buffer = GLOBAL_LOGS
-        .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
-        .clone();
+    let buffer = Arc::new(Mutex::new(Vec::new()));
     let capture = CaptureLayer {
         events: Arc::clone(&buffer),
     };
-    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture));
+    let subscriber = tracing_subscriber::registry().with(capture);
 
     let clients = acl_clients(AclDefaultPolicy::Deny, &[], &[]);
     let (pipeline, _calls, temp_dir) = policy_pipeline(&[], clients).await;
@@ -5159,23 +5264,20 @@ async fn test_acl_logs_contain_only_network_metadata() {
     client.sni = Some("s3cret-client-label.dns.example".to_string());
     client.id_authenticated = true;
     client.proto = "doh".to_string();
-    let response = pipeline
-        .handle(
-            rewrite_query("pii-secret-name.example.", RecordType::A),
-            client,
-        )
-        .await
-        .unwrap();
+    let query = rewrite_query("pii-secret-name.example.", RecordType::A);
+
+    // Scoped dispatch: `with_default` is thread-local, and `block_in_place`
+    // keeps the query on this thread for the whole await. No process-global
+    // subscriber is installed.
+    let response = tracing::subscriber::with_default(subscriber, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(pipeline.handle(query, client))
+        })
+    })
+    .unwrap();
     assert_eq!(response.metadata.response_code, ResponseCode::Refused);
 
-    let logs = buffer
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|line| line.contains("198.51.100.31"))
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let logs = buffer.lock().unwrap().join("\n");
     assert!(logs.contains("DNS client ACL denied"), "{logs}");
     assert!(logs.contains("198.51.100.31"), "{logs}");
     assert!(logs.contains("doh"), "{logs}");

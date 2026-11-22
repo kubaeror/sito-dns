@@ -672,7 +672,15 @@ fn build_client_index(config: &ClientsConfig) -> ClientIndex {
                 index.exact_ips.entry(ip).or_insert(entry_idx);
                 continue;
             }
-            if let Ok(network) = IpNetwork::parse(id) {
+            // Keep identity matching consistent with the ADR-0011 admission
+            // index: a CIDR id with whitespace around `/` is the same value
+            // for both, so an opted-in entry cannot admit a client without
+            // identifying it (and dropping its group/trusted/upstream policy).
+            let cidr = id.split_once('/').map_or_else(
+                || id.to_string(),
+                |(address, prefix)| format!("{}/{}", address.trim(), prefix.trim()),
+            );
+            if let Ok(network) = IpNetwork::parse(&cidr) {
                 index.subnets.push((network, entry_idx));
                 continue;
             }
@@ -1665,6 +1673,38 @@ schedule_enabled = true
         assert_eq!(ctx.identity_source, Some(IdentitySource::RouterOs));
         assert_eq!(ctx.client_name.as_deref(), Some("unmapped-host"));
         assert_eq!(ctx.mac.as_deref(), Some("02:00:00:00:00:04"));
+    }
+
+    #[test]
+    fn test_spaced_entry_cidr_admission_and_identity_agree() {
+        let mut config = ClientsConfig::default();
+        config.acl.allow_entry_ids = true;
+        config.entries = vec![ClientEntryConfig {
+            name: "spaced".to_string(),
+            ids: vec![" 192.0.2.55 / 24 ".to_string()],
+            group: "default".to_string(),
+            ignore_query_log: false,
+            ignore_stats: false,
+            use_global_upstreams: true,
+            upstreams: None,
+            trusted: false,
+        }];
+
+        let registry = ClientRegistry::new(config);
+        let ip: IpAddr = "192.0.2.77".parse().unwrap();
+        assert_eq!(
+            registry.acl().decide(ip).action,
+            crate::acl::AclAction::Allow,
+            "the admission index trims around '/'"
+        );
+
+        let mut client = ClientContext::new(ip);
+        registry.resolve(&mut client, registry.now());
+        assert_eq!(
+            client.client_name.as_deref(),
+            Some("spaced"),
+            "identity resolution must trim the same CIDR id"
+        );
     }
 
     #[test]

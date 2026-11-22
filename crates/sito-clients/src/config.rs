@@ -94,9 +94,9 @@ pub struct ClientAclConfig {
 }
 
 impl ClientAclConfig {
-    /// True when no ACL key differs from its typed default. Used only for
-    /// pretty-printing typed configuration; the raw `Config` value is what the
-    /// API persists.
+    /// True when no ACL key differs from its typed default. Used by typed
+    /// serialization (client API, UI, HA apply) to omit an inert table; the
+    /// same defaults are also skipped field-by-field when the table is kept.
     #[must_use]
     pub fn is_inert(&self) -> bool {
         self.allow.is_empty()
