@@ -2294,6 +2294,87 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
+    /// A scrub failure must leave the policy marker uncommitted so the next
+    /// startup (or apply) retries it. Simulate the failure by closing the pool:
+    /// the in-memory policy flips but the transaction cannot start, so the
+    /// on-disk marker and named rows are untouched. Reopening then retries the
+    /// scrub exactly once and commits the marker.
+    #[tokio::test]
+    async fn test_failed_name_scrub_retries_on_next_open() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-stats-name-scrub-retry-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut entry = retention_entry(now - 100 * 86_400_000, "retry.example", "allowed", None);
+        entry.client_ip = "10.7.7.11".into();
+        entry.client_name = Some("retry-named-device".into());
+
+        let db = StatsDb::open_with_rollup_client_names(&db_path, true)
+            .await
+            .unwrap();
+        db.insert_batch(&[entry]).await.unwrap();
+        db.cleanup_detailed_retention(90).await.unwrap();
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(payload.contains("retry-named-device"));
+
+        // Make every statement fail, including `BEGIN IMMEDIATE`.
+        db.pool().close().await;
+        db.set_rollup_client_names(false)
+            .await
+            .expect_err("the scrub must report the closed pool instead of pretending it ran");
+        drop(db);
+
+        // The marker was not committed with a failed scrub, so reopening under
+        // the old policy still sees the names and reports the old marker.
+        let db = StatsDb::open_with_rollup_client_names(&db_path, true)
+            .await
+            .unwrap();
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            payload.contains("retry-named-device"),
+            "a failed scrub must not be recorded as done: {payload}"
+        );
+        let marker: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM stats_meta WHERE key = 'rollup_client_names_policy'",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(marker.as_deref(), Some("true"));
+        drop(db);
+
+        // The next open under the disabled policy retries and scrubs.
+        let db = StatsDb::open_with_rollup_client_names(&db_path, false)
+            .await
+            .unwrap();
+        let payload: String = sqlx::query_scalar("SELECT top_clients FROM stats_hourly LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(!payload.contains("retry-named-device"));
+        assert!(!payload.contains("10.7.7.11"));
+        assert!(payload.contains("blake3:"));
+        let marker: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM stats_meta WHERE key = 'rollup_client_names_policy'",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(marker.as_deref(), Some("false"));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     /// P1-19: a live config apply re-applies the policy without reopening the
     /// database, scrubbing already-written rollup names immediately.
     #[tokio::test]

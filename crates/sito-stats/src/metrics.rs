@@ -23,9 +23,9 @@
 //! families). Sharding by label would add memory/indirection without removing
 //! the per-label serialization that the exposition requires, so the per-label
 //! mutex is kept deliberately. `metrics_bench` records the single-threaded
-//! per-update cost of `observe_query_duration("allowed", ...)`; the actual
-//! contention evidence is `test_histogram_concurrent_updates_are_not_lost`,
-//! which pins losslessness for same-label writers.
+//! per-update cost of `observe_query_duration("allowed", ...)` and a
+//! multi-threaded same-label contended throughput group; the losslessness
+//! guarantee is pinned by `test_histogram_concurrent_updates_are_not_lost`.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;

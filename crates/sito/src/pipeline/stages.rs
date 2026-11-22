@@ -723,6 +723,19 @@ impl DnsPipeline {
                         )
                         .await;
                 }
+                // The foreground insert path republishes the footprint gauge,
+                // but a background prefetch bypasses it. Without this update a
+                // successful refresh (or a strict-Bogus replacement) leaves
+                // `sito_cache_size_bytes` reporting the pre-refresh size until
+                // the next foreground insert/apply. An early resolve error
+                // returns above with the cache unchanged, so the gauge stays
+                // truthful there. A rejected insert leaves `weighted_size`
+                // unchanged, so republishing it is still accurate.
+                if let Some(metrics) = &bg_metrics {
+                    metrics.set_cache_size_bytes(
+                        i64::try_from(bg_cache.weighted_size()).unwrap_or(i64::MAX),
+                    );
+                }
             });
         }
         cached_resp.metadata.id = query_id;

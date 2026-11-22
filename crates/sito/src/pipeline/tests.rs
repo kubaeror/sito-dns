@@ -1945,6 +1945,18 @@ async fn with_test_metrics_and_log(
     (pipeline, metrics, receiver)
 }
 
+/// Reads the `sito_cache_size_bytes` gauge from the rendered exposition.
+fn cache_size_gauge(metrics: &sito_stats::MetricsRegistry) -> i64 {
+    metrics
+        .render_prometheus()
+        .lines()
+        .find_map(|line| line.strip_prefix("sito_cache_size_bytes "))
+        .expect("cache size gauge is rendered")
+        .trim()
+        .parse()
+        .expect("cache size gauge is an integer")
+}
+
 /// D-12: a failing upstream is labelled by its configured name, lowers that
 /// server's health gauge immediately, and recovers to 1 after a success.
 /// No failure may ever be recorded under the legacy `upstream="all"` label.
@@ -3515,6 +3527,149 @@ async fn test_prefetch_clears_ad_when_no_validation_ran() {
 
     let resp = pipeline.handle(do_query(4, &name), client).await.unwrap();
     assert!(!resp.metadata.authentic_data);
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A background prefetch bypasses the foreground `shape_and_insert` stage, so
+/// it must republish `sito_cache_size_bytes` after replacing the entry.
+#[tokio::test]
+async fn test_prefetch_updates_cache_size_gauge() {
+    use std::sync::atomic::Ordering;
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.dnssec.mode = "disabled".to_string();
+    config.dns.dnssec.validate = false;
+    config.dns.cache.prefetch = true;
+    config.dns.cache.min_ttl = 10;
+    config.dns.cache.max_ttl = 10;
+    let (pipeline, calls, temp_dir) = test_pipeline(config).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    let name = Name::from_str("prefetch-gauge.example.").unwrap();
+
+    let seed_query = do_query(30, &name);
+    let mut seed = Message::response(30, OpCode::Query);
+    seed.queries = seed_query.queries.clone();
+    seed.answers.push(Record::from_rdata(
+        name.clone(),
+        10,
+        RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 30))),
+    ));
+    pipeline
+        .cache
+        .insert_with_status(&seed_query, &seed, ValidationStatus::Insecure)
+        .await;
+    // Moka settles weight accounting asynchronously, so seed a deliberately
+    // wrong gauge. The assertion is that the prefetch republishes whatever
+    // `weighted_size()` reports, not a particular byte count.
+    metrics.set_cache_size_bytes(123_456_789);
+    let sentinel = cache_size_gauge(&metrics);
+
+    for id in 30..=31 {
+        let resp = pipeline
+            .handle(do_query(id, &name), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    }
+
+    let mut updated = false;
+    for _ in 0..250 {
+        let expected = i64::try_from(pipeline.cache.weighted_size()).unwrap_or(i64::MAX);
+        if cache_size_gauge(&metrics) == expected && calls.load(Ordering::SeqCst) >= 1 {
+            updated = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        updated,
+        "the prefetch must republish the cache footprint: gauge={} sentinel={} cache={} calls={}",
+        cache_size_gauge(&metrics),
+        sentinel,
+        pipeline.cache.weighted_size(),
+        calls.load(Ordering::SeqCst)
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// A prefetch that fails upstream leaves the cache unchanged, so its footprint
+/// gauge must stay as-is rather than being republished from a stale read. The
+/// background task returns before any insert; the foreground keeps serving the
+/// seeded entry.
+#[tokio::test]
+async fn test_prefetch_error_leaves_cache_size_gauge_truthful() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.dnssec.mode = "disabled".to_string();
+    config.dns.dnssec.validate = false;
+    config.dns.cache.prefetch = true;
+    config.dns.cache.min_ttl = 10;
+    config.dns.cache.max_ttl = 10;
+    let fail = std::sync::Arc::new(AtomicBool::new(false));
+    let (pipeline, _server, calls, temp_dir) =
+        test_pipeline_with_failure_toggle(config, std::sync::Arc::clone(&fail)).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+    let name = Name::from_str("prefetch-gauge-error.example.").unwrap();
+
+    let marker = std::net::Ipv4Addr::new(203, 0, 113, 31);
+    let seed_query = do_query(30, &name);
+    let mut seed = Message::response(30, OpCode::Query);
+    seed.queries = seed_query.queries.clone();
+    seed.answers
+        .push(Record::from_rdata(name.clone(), 10, RData::A(A(marker))));
+    pipeline
+        .cache
+        .insert_with_status(&seed_query, &seed, ValidationStatus::Unchecked)
+        .await;
+    // Model a stale foreground gauge. The background resolve fails before any
+    // insert, so the cache is unchanged and the gauge must stay as-is.
+    metrics.set_cache_size_bytes(123_456_789);
+    fail.store(true, Ordering::SeqCst);
+    for id in 30..=31 {
+        let resp = pipeline
+            .handle(do_query(id, &name), client.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.answers[0].data,
+            RData::A(A(marker)),
+            "the foreground keeps serving the seeded answer"
+        );
+    }
+
+    let mut upstream_called = false;
+    for _ in 0..250 {
+        if calls.load(Ordering::SeqCst) >= 1 {
+            upstream_called = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // Give the background task time to finish its rejected insert/update.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        upstream_called,
+        "the prefetch must have queried the upstream"
+    );
+
+    assert_eq!(
+        cache_size_gauge(&metrics),
+        123_456_789,
+        "an upstream error leaves the cache unchanged, so the existing gauge needs no update"
+    );
+    let (cached, _) = pipeline
+        .cache
+        .get_for_query_with_status(&seed_query)
+        .await
+        .expect("the seeded entry must survive a failed refresh");
+    assert_eq!(cached.answers[0].data, RData::A(A(marker)));
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
