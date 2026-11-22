@@ -215,15 +215,42 @@ pub async fn users_role_handler(
     Redirect::to("/users").into_response()
 }
 
+#[derive(Deserialize)]
+pub struct DeleteUserForm {
+    /// Caller's current password; every UI account deletion requires it.
+    #[serde(default)]
+    pub reauth_password: Option<String>,
+    /// Caller's TOTP or backup code when TOTP is enabled.
+    #[serde(default)]
+    pub reauth_code: Option<String>,
+}
+
 pub async fn users_delete_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Path(username): Path<String>,
+    Form(form): Form<DeleteUserForm>,
 ) -> Response {
     let (user, csrf) = match admin_or_forbidden(&ctx, &headers) {
         Ok(value) => value,
         Err(response) => return *response,
     };
+
+    // Deleting an account is destructive: prove the caller's own credential
+    // before touching the store so a stolen session cannot wipe accounts.
+    if let Err(problem) = ui_reauth(
+        &ctx,
+        &user,
+        &headers,
+        peer_addr,
+        form.reauth_password.as_deref(),
+        form.reauth_code.as_deref(),
+    )
+    .await
+    {
+        return users_problem_page(&ctx, &user, &csrf, problem);
+    }
 
     if let Err(err) = ctx.auth_mgr.delete_user_checked(&username).await {
         let problem = user_mutation_problem(&username, "delete", err);

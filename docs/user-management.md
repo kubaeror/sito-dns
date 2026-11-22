@@ -126,7 +126,8 @@ immediately and revokes all existing sessions of the affected account.
 ### Re-authentication for sensitive changes
 
 A stolen browser session must not be able to change a password, change a role,
-create an Admin account, or mint an Admin-scoped token. When the caller
+create an Admin account, mint an Admin-scoped token, delete a user account, or
+revoke an API token. When the caller
 authenticates with a **user session**, those operations require a fresh,
 session-bound re-authentication ticket from `POST /api/v2/auth/reauth`
 (`X-Reauth-Token`) or, in the web UI, the caller's current password plus a
@@ -183,9 +184,17 @@ curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" \
   "$SITO/api/v2/auth/users/alice"
 ```
 
+Deleting an account from a **user session** requires a fresh
+`X-Reauth-Token` (session cookie, `X-CSRF-Token`, and `Origin` as for other
+mutations); Admin API tokens are exempt. The web UI `/users` form asks for the
+caller's current password plus a TOTP/backup code when 2FA is enabled. A failed
+second proof returns `400` in the UI or `401` in the API and deletes nothing.
+
 The last remaining `admin` account cannot be deleted (or demoted); the API
 returns `400 Bad Request`. Create or promote another admin first. This guard
-prevents locking every administrator out of the API and UI.
+prevents locking every administrator out of the API and UI. The check runs
+after re-authentication, so the last-admin rule and the `404` for unknown
+accounts are unchanged for an authorized caller.
 
 Deleting an account revokes that account's sessions **and every API token it
 owns**. Tokens created before ownership tracking (ownerless/legacy tokens) are
@@ -393,9 +402,12 @@ curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" \
   "$SITO/api/v2/auth/tokens/<token-id>"
 ```
 
-The REST revoke endpoint is Admin-only. On `/account`, a user may revoke only
-their own tokens (Admins may also revoke legacy ownerless tokens); another
-user's token ID returns `404`, indistinguishable from a missing token.
+The REST revoke endpoint is Admin-only. Revoking from a **user session** also
+requires a fresh `X-Reauth-Token`; Admin API tokens are exempt. On `/account`,
+a user may revoke only their own tokens (Admins may also revoke legacy
+ownerless tokens) and must enter their current password (plus a TOTP/backup
+code when enabled); another user's token ID returns `404`, indistinguishable
+from a missing token, without asking for a password.
 
 Revocation takes effect immediately. To invalidate every persisted session and
 token at once, stop the service, run

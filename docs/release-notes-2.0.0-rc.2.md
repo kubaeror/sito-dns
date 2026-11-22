@@ -134,9 +134,8 @@ See [`docs/release-verification.md`](release-verification.md) and the
   closed. See the security review for the risk acceptance.
 - **SQLite schema/PII migration and API v2** are deferred; `/api/v1` is
   canonical and the 1.9.x schema is compatibility-only.
-- **Weighted upstream balancing**, a second proof for user/token deletion,
-  edit-time read-only HA enforcement and per-client upstream metric pruning are
-  deferred.
+- **Weighted upstream balancing**, edit-time read-only HA enforcement and
+  per-client upstream metric pruning are deferred.
 - **Query-log anonymization** is forward-only; historical rows are not rewritten.
 - **Release-image vulnerability scanning** covers linux/amd64 only; arm64/armv7
   are executed by artifact E2E. Root-gated HA ownership checks are manual.

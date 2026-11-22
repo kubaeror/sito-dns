@@ -675,20 +675,26 @@ pub async fn create_token(
 #[utoipa::path(
     delete,
     path = "/api/v2/auth/tokens/{id}",
+    params(("X-Reauth-Token" = Option<String>, Header, description = "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers; API-token callers are exempt.", nullable = false)),
     responses(
         (status = 200, description = "Token revoked", body = GenericMessageResponse),
         (status = 404, description = "Token not found", body = ProblemDetails),
-        (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 401, description = "Missing/invalid/expired/used re-authentication ticket, or unauthorized", body = ProblemDetails),
+        (status = 403, description = "Re-authentication requires a user session, or forbidden", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Auth",
 )]
 pub async fn delete_token(
-    _admin: RequireAdmin,
+    admin: RequireAdmin,
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
+    // Revoking a credential is destructive: a stolen browser session must
+    // prove the account's own credential first. Admin API tokens are exempt
+    // because they cannot mint a ticket and are already standalone secrets.
+    require_sensitive_reauth(&ctx, &headers, &admin)?;
     if ctx.auth_mgr.delete_token(&id).await {
         Ok(Json(GenericMessageResponse {
             message: format!("Token {id} successfully revoked"),
@@ -906,13 +912,16 @@ pub async fn update_user(
 #[utoipa::path(
     delete,
     path = "/api/v2/auth/users/{username}",
-    params(("username" = String, Path, description = "Username")),
+    params(
+        ("username" = String, Path, description = "Username"),
+        ("X-Reauth-Token" = Option<String>, Header, description = "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers; API-token callers are exempt.", nullable = false)
+    ),
     responses(
         (status = 200, description = "User deleted", body = GenericMessageResponse),
         (status = 400, description = "Last-admin protection", body = ProblemDetails),
         (status = 404, description = "User not found", body = ProblemDetails),
-        (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 401, description = "Missing/invalid/expired/used re-authentication ticket, or unauthorized", body = ProblemDetails),
+        (status = 403, description = "Re-authentication requires a user session, or forbidden", body = ProblemDetails),
         (status = 500, description = "Failed to persist the user store", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -921,8 +930,13 @@ pub async fn update_user(
 pub async fn delete_user(
     admin: RequireAdmin,
     State(ctx): State<ServerContext>,
+    headers: HeaderMap,
     Path(username): Path<String>,
 ) -> Result<Json<GenericMessageResponse>, ProblemDetails> {
+    // Deleting an account is destructive: a stolen browser session must prove
+    // the account's own credential first. Admin API tokens are exempt because
+    // they cannot mint a ticket and are already standalone secrets.
+    require_sensitive_reauth(&ctx, &headers, &admin)?;
     // Check and delete atomically so concurrent deletions/demotions cannot
     // race past the last-admin guard.
     ctx.auth_mgr
@@ -1138,10 +1152,13 @@ mod tests {
         username: &str,
         password: &str,
     ) -> (RequireAdmin, HeaderMap) {
-        // Use a separate source IP from `login_session` so routine helper logins
-        // in a single test do not trip the shared per-IP login bucket.
+        // Use a distinct source IP for every helper login so a test that needs
+        // several tickets does not trip the shared per-IP login bucket.
+        static NEXT_IP: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(1);
+        let n = NEXT_IP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let client_ip = format!("10.99.{}.{}", (n / 250) % 250, (n % 250) + 1);
         let LoginResult::Success(session) =
-            ctx.auth_mgr.login(username, password, "127.0.0.250").await
+            ctx.auth_mgr.login(username, password, &client_ip).await
         else {
             panic!("login failed for {username}");
         };
@@ -1428,9 +1445,15 @@ mod tests {
         .await
         .expect_err("last admin cannot be demoted");
         assert_eq!(demote.status, 400);
-        let delete = delete_user(admin(), State(ctx.clone()), AxumPath("admin".to_string()))
-            .await
-            .expect_err("last admin cannot be deleted");
+        let (admin_session, headers) = login_with_reauth_ticket(&ctx, "admin", "adminadmin").await;
+        let delete = delete_user(
+            admin_session,
+            State(ctx.clone()),
+            headers,
+            AxumPath("admin".to_string()),
+        )
+        .await
+        .expect_err("last admin cannot be deleted");
         assert_eq!(delete.status, 400);
 
         // Unknown accounts stay 404 on both mutations.
@@ -1447,10 +1470,15 @@ mod tests {
         .await
         .expect_err("unknown user rejected");
         assert_eq!(unknown_role.status, 404);
-        let unknown_delete =
-            delete_user(admin(), State(ctx.clone()), AxumPath("ghost".to_string()))
-                .await
-                .expect_err("unknown user rejected");
+        let (admin_session, headers) = login_with_reauth_ticket(&ctx, "admin", "adminadmin").await;
+        let unknown_delete = delete_user(
+            admin_session,
+            State(ctx.clone()),
+            headers,
+            AxumPath("ghost".to_string()),
+        )
+        .await
+        .expect_err("unknown user rejected");
         assert_eq!(unknown_delete.status, 404);
 
         // Self-service password change requires the current password and a
@@ -1549,9 +1577,16 @@ mod tests {
             LoginResult::Success(_)
         ));
 
-        let _ = delete_user(admin(), State(ctx.clone()), AxumPath("alice".to_string()))
-            .await
-            .expect("user deleted");
+        let (admin_session, headers) =
+            login_with_reauth_ticket(&ctx, "admin", "NewAdminPassword1").await;
+        let _ = delete_user(
+            admin_session,
+            State(ctx.clone()),
+            headers,
+            AxumPath("alice".to_string()),
+        )
+        .await
+        .expect("user deleted");
         assert!(!ctx.auth_mgr.has_user("alice"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -2092,6 +2127,237 @@ mod tests {
         .await
         .expect("API tokens may mint an Admin token");
         assert_eq!(token.status(), StatusCode::CREATED);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// D2: deleting a user or revoking a token is a destructive credential
+    /// operation. Session callers must present a fresh, single-use ticket;
+    /// Admin API tokens (which cannot mint one) remain exempt. Last-admin and
+    /// 404 semantics are unchanged once re-authenticated.
+    #[tokio::test]
+    async fn test_delete_user_and_token_require_sensitive_reauth() {
+        let temp_dir = crate::test_support::temp_dir("sito_auth_delete_reauth");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        for username in ["alice", "bob", "carol"] {
+            ctx.auth_mgr
+                .create_user(username, "Password1x", Role::Viewer)
+                .await;
+        }
+        let (alice_token, _) = ctx
+            .auth_mgr
+            .create_token("alice-token", Role::Viewer, Some("alice"))
+            .await
+            .expect("alice token");
+        let (bob_token, _) = ctx
+            .auth_mgr
+            .create_token("bob-token", Role::Viewer, Some("bob"))
+            .await
+            .expect("bob token");
+        let (carol_token, _) = ctx
+            .auth_mgr
+            .create_token("carol-token", Role::Viewer, Some("carol"))
+            .await
+            .expect("carol token");
+
+        // Two independent browser sessions for the same Admin account.
+        let LoginResult::Success(session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "10.10.0.1").await
+        else {
+            panic!("admin login failed");
+        };
+        let headers = session_headers(&session);
+        let admin = RequireAdmin(AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+            owner: None,
+        });
+        let LoginResult::Success(other_session) =
+            ctx.auth_mgr.login("admin", "adminadmin", "10.10.0.2").await
+        else {
+            panic!("second admin login failed");
+        };
+
+        // No ticket: both deletes are rejected and nothing changes.
+        let err = delete_user(
+            admin.clone(),
+            State(ctx.clone()),
+            headers.clone(),
+            AxumPath("alice".to_string()),
+        )
+        .await
+        .expect_err("delete user requires reauth");
+        assert_eq!(err.status, 401);
+        assert!(ctx.auth_mgr.has_user("alice"));
+        let err = delete_token(
+            admin.clone(),
+            State(ctx.clone()),
+            headers.clone(),
+            AxumPath(bob_token.id.clone()),
+        )
+        .await
+        .expect_err("delete token requires reauth");
+        assert_eq!(err.status, 401);
+        assert!(
+            ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == bob_token.id)
+        );
+
+        // Garbage ticket is rejected.
+        let err = delete_user(
+            admin.clone(),
+            State(ctx.clone()),
+            with_reauth_token(headers.clone(), "not-a-real-ticket"),
+            AxumPath("alice".to_string()),
+        )
+        .await
+        .expect_err("garbage ticket rejected");
+        assert_eq!(err.status, 401);
+        assert!(ctx.auth_mgr.has_user("alice"));
+
+        // A ticket minted for another session is not usable (stolen ticket).
+        let stolen = ctx
+            .auth_mgr
+            .reauth("admin", "adminadmin", None, &other_session.id, "")
+            .await
+            .expect("ticket for the other session");
+        let err = delete_user(
+            admin.clone(),
+            State(ctx.clone()),
+            with_reauth_token(headers.clone(), &stolen.token),
+            AxumPath("alice".to_string()),
+        )
+        .await
+        .expect_err("ticket bound to another session rejected");
+        assert_eq!(err.status, 401);
+        assert!(ctx.auth_mgr.has_user("alice"));
+
+        // A valid ticket authorizes exactly one delete (single use).
+        let ticket = ctx
+            .auth_mgr
+            .reauth("admin", "adminadmin", None, &session.id, "")
+            .await
+            .expect("reauth ticket");
+        let one_shot = with_reauth_token(headers.clone(), &ticket.token);
+        let _ = delete_user(
+            admin.clone(),
+            State(ctx.clone()),
+            one_shot.clone(),
+            AxumPath("alice".to_string()),
+        )
+        .await
+        .expect("first delete authorized");
+        assert!(!ctx.auth_mgr.has_user("alice"));
+        // Alice's owned token went with the account.
+        assert!(
+            !ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == alice_token.id)
+        );
+        let err = delete_user(
+            admin.clone(),
+            State(ctx.clone()),
+            one_shot,
+            AxumPath("bob".to_string()),
+        )
+        .await
+        .expect_err("a consumed ticket cannot authorize a second delete");
+        assert_eq!(err.status, 401);
+        assert!(ctx.auth_mgr.has_user("bob"));
+
+        // A fresh ticket authorizes token revocation.
+        let ticket = ctx
+            .auth_mgr
+            .reauth("admin", "adminadmin", None, &session.id, "")
+            .await
+            .expect("reauth ticket");
+        let _ = delete_token(
+            admin.clone(),
+            State(ctx.clone()),
+            with_reauth_token(headers.clone(), &ticket.token),
+            AxumPath(bob_token.id.clone()),
+        )
+        .await
+        .expect("token revoked");
+        assert!(
+            !ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == bob_token.id)
+        );
+
+        // Last-admin protection still applies after re-authentication.
+        let ticket = ctx
+            .auth_mgr
+            .reauth("admin", "adminadmin", None, &session.id, "")
+            .await
+            .expect("reauth ticket");
+        let err = delete_user(
+            admin.clone(),
+            State(ctx.clone()),
+            with_reauth_token(headers.clone(), &ticket.token),
+            AxumPath("admin".to_string()),
+        )
+        .await
+        .expect_err("last admin cannot be deleted");
+        assert_eq!(err.status, 400);
+        assert!(ctx.auth_mgr.has_user("admin"));
+
+        // Unknown accounts still return 404 after re-authentication.
+        let ticket = ctx
+            .auth_mgr
+            .reauth("admin", "adminadmin", None, &session.id, "")
+            .await
+            .expect("reauth ticket");
+        let err = delete_user(
+            admin.clone(),
+            State(ctx.clone()),
+            with_reauth_token(headers.clone(), &ticket.token),
+            AxumPath("ghost".to_string()),
+        )
+        .await
+        .expect_err("unknown user stays 404");
+        assert_eq!(err.status, 404);
+
+        // Admin API tokens are exempt from the session ticket.
+        let (ci_token, _) = ctx
+            .auth_mgr
+            .create_token("ci-admin", Role::Admin, Some("admin"))
+            .await
+            .expect("admin token");
+        let bearer = RequireAdmin(AuthUser {
+            username: "ci-admin".to_string(),
+            role: Role::Admin,
+            token_id: Some(ci_token.id),
+            owner: None,
+        });
+        let _ = delete_user(
+            bearer.clone(),
+            State(ctx.clone()),
+            HeaderMap::new(),
+            AxumPath("bob".to_string()),
+        )
+        .await
+        .expect("API token may delete a user without a ticket");
+        assert!(!ctx.auth_mgr.has_user("bob"));
+        let _ = delete_token(
+            bearer,
+            State(ctx.clone()),
+            HeaderMap::new(),
+            AxumPath(carol_token.id.clone()),
+        )
+        .await
+        .expect("API token may revoke a token without a ticket");
+        assert!(
+            !ctx.auth_mgr
+                .list_tokens()
+                .iter()
+                .any(|token| token.id == carol_token.id)
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
