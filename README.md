@@ -229,6 +229,10 @@ Open **`http://<server-ip>:8080`** from a trusted LAN host (or through an SSH tu
 * **Filtering:** Choose blocking modes, enable CNAME cloaking defense, and subscribe to popular blocklists (OISD, StevenBlack, HaGeZi).
 * **Web Panel & Statistics:** Configure web bind and retention policies.
 
+The wizard does not create client groups or enable parental controls; groups
+and their filters are configured after setup, and parental control stays off
+unless you enable it per group (see [parental controls](docs/parental-controls.md)).
+
 While setup is pending, the server prints a one-time setup token to the console. Open `/wizard?setup_token=<token>` (or send the `X-Setup-Token` header). Login, API tokens and every non-wizard route stay disabled until setup completes, including when `config.toml` exists but `users.toml` still contains the bootstrap `admin` / `adminadmin` credential.
 
 If credentials are lost, stop the service, reset the admin account, then start it
@@ -257,6 +261,7 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 * **[2.0 Migration Guide](docs/2.0-migration.md):** Stable 1.9.5 → 2.0 rc upgrade, breaking-change IDs, config/API/DB/HA boundary, and rollback.
 * **[Installation Guide](docs/installation.md):** Step-by-step setup for Linux systemd, Docker, Docker Compose, and HA macvlan.
 * **[Configuration Reference](docs/configuration-reference.md):** Exhaustive documentation of every TOML configuration key, default and hot-reload/restart behavior. See also [Config v2](docs/config-v2.md) and the [2.0 public API diff](docs/2.0-public-api-diff.md).
+* **[Parental Controls](docs/parental-controls.md):** Per-client-group `adult`/`gambling` category blocking, bundled-data limits, manual catalog lists, `[integrations.lists]` coverage, and off-by-default/HA/audit rules.
 * **[Benchmarking Report](docs/benchmarks.md):** Empirical benchmark results vs. Plan Section 16.1 and ADR-0008 contracts.
 * **[Performance Tuning Guide](docs/performance.md):** Kernel sysctl parameters, NIC RSS hashing, and PGO instructions.
 * **[Security Review & Threat Model](docs/security-audit.md):** Security vectors, SSRF allowlists, ReDoS DFA bounds, and constant-time auth.

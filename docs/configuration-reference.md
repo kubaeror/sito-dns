@@ -397,6 +397,13 @@ schedule = "0 0 15-21 * * MON-FRI"
 > providers only and is not continuously curated or security-reviewed. External
 > curated data (licensed source, update pipeline, checksum/version manifest) is
 > deferred past WP-2.5; configure `[integrations.lists]` for broader coverage.
+>
+> Parental control is per group and **off by default**; `parental = true` alone
+> blocks nothing until `parental_categories` names `adult` and/or `gambling`.
+> The embedded catalog has no dedicated parental filter and nothing is enabled
+> by the setup wizard. See the [parental controls guide](parental-controls.md)
+> for an end-to-end kids-group example, category limits, audit steps and HA
+> behaviour.
 
 ---
 
@@ -888,6 +895,12 @@ until the first successful refresh.
 > Shipping a maintained external dataset is deferred past WP-2.5; the bundled
 > entries and their manifest exist to make the fallback honest and
 > reproducible, not to claim upstream curation.
+
+Refreshing a category here changes the data behind the existing group policy;
+it does not enable parental control. A group still needs `parental = true` and
+the matching `parental_categories`, and no source is enabled by default. See
+[parental controls](parental-controls.md#broader-coverage-integrationslists)
+for the mapping, fallback and audit workflow.
 
 ```toml
 [integrations.lists]
