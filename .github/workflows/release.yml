@@ -530,14 +530,25 @@ jobs:
           # config, wait for a local rewrite, and require the image healthcheck
           # to turn healthy. This runs the exact attested digest, not a rebuild.
           tmp="$(mktemp -d)"
+          api_tmp="$(mktemp -d)"
           container="sito-release-smoke"
+          api_container="sito-release-smoke-api"
+          # The release image runs as uid/gid 65532. A host bind-mounted data
+          # dir would be owned by the runner (uid 1000), and the container
+          # entrypoint's post-migration ownership restore would then fail
+          # without CAP_CHOWN. Use the image's declared volume instead: Docker
+          # initialises it from /var/lib/sito with the image's 65532 owner.
+          data_volume="sito-release-smoke-data-$$"
+          api_data_volume="sito-release-smoke-api-data-$$"
           cleanup() {
-            docker rm -f "${container}" >/dev/null 2>&1 || true
-            rm -rf "${tmp}"
+            docker rm -f "${container}" "${api_container}" >/dev/null 2>&1 || true
+            docker volume rm -f "${data_volume}" "${api_data_volume}" >/dev/null 2>&1 || true
+            rm -rf "${tmp}" "${api_tmp}"
           }
           trap cleanup EXIT
-          mkdir -p "${tmp}/data" "${tmp}/etc"
-          chmod 0777 "${tmp}" "${tmp}/data" "${tmp}/etc"
+          docker volume create "${data_volume}" >/dev/null
+          mkdir -p "${tmp}/etc"
+          chmod 0755 "${tmp}" "${tmp}/etc"
           cat >"${tmp}/etc/config.toml" <<'EOF'
           config_version = 2
 
@@ -577,13 +588,13 @@ jobs:
           EOF
           sed -i 's/^ *//' "${tmp}/etc/config.toml"
           docker run --rm \
-            -v "${tmp}/etc:/etc/sito" \
-            -v "${tmp}/data:/var/lib/sito" \
+            -v "${tmp}/etc/config.toml:/etc/sito/config.toml:ro" \
+            -v "${data_volume}:/var/lib/sito" \
             "${image}" reset-admin --password release-smoke-password >/dev/null
           docker run -d --name "${container}" \
             -p 15353:5353/udp \
-            -v "${tmp}/etc:/etc/sito" \
-            -v "${tmp}/data:/var/lib/sito" \
+            -v "${tmp}/etc/config.toml:/etc/sito/config.toml:ro" \
+            -v "${data_volume}:/var/lib/sito" \
             "${image}" >/dev/null
           answered=0
           for _ in $(seq 1 40); do
@@ -609,6 +620,119 @@ jobs:
           done
           [ "${health}" = "healthy" ] || { echo "::error::release image health status is ${health}"; docker logs "${container}" || true; exit 1; }
           echo "release image answered smoke.test; healthcheck: ${health}"
+
+          # Second container, same attested digest: enable the admin web UI so
+          # the 2.0 API surface is exercised. A fresh data dir plus an admin
+          # account means `/api/v2/status` answers its real auth response
+          # (401 without a token) instead of the setup-pending 503, and the
+          # removed `/api/v1` prefix must stay unmounted (404). The container
+          # also writes a fresh stats database, whose schema version is checked
+          # after shutdown.
+          docker volume create "${api_data_volume}" >/dev/null
+          mkdir -p "${api_tmp}/etc"
+          chmod 0755 "${api_tmp}" "${api_tmp}/etc"
+          cat >"${api_tmp}/etc/config.toml" <<'EOF'
+          config_version = 2
+
+          [server]
+          role = "master"
+          instance_name = "release-smoke-api"
+          data_dir = "/var/lib/sito"
+          log_level = "info"
+          log_format = "json"
+
+          [dns]
+          bind = ["0.0.0.0"]
+          port = 5353
+          dot_port = 0
+          doh_port = 0
+          doq_port = 0
+          doh3_port = 0
+
+          [web]
+          enabled = true
+          bind = "0.0.0.0"
+          port = 8080
+
+          [filtering]
+          enabled = false
+
+          [upstream]
+          servers = ["1.1.1.1"]
+
+          [[rewrites.entries]]
+          domain = "smoke.test"
+          type = "A"
+          answer = "192.0.2.1"
+
+          [[rewrites.entries]]
+          domain = "localhost"
+          type = "A"
+          answer = "127.0.0.1"
+          EOF
+          sed -i 's/^ *//' "${api_tmp}/etc/config.toml"
+          docker run --rm \
+            -v "${api_tmp}/etc/config.toml:/etc/sito/config.toml:ro" \
+            -v "${api_data_volume}:/var/lib/sito" \
+            "${image}" reset-admin --password release-smoke-password >/dev/null
+          docker run -d --name "${api_container}" \
+            -p 18080:8080/tcp \
+            -v "${api_tmp}/etc/config.toml:/etc/sito/config.toml:ro" \
+            -v "${api_data_volume}:/var/lib/sito" \
+            "${image}" >/dev/null
+
+          api_health=""
+          for _ in $(seq 1 60); do
+            if ! docker inspect -f '{{.State.Running}}' "${api_container}" 2>/dev/null | grep -qx true; then
+              echo "::error::release image (web enabled) exited before serving the API"
+              docker logs "${api_container}" || true
+              exit 1
+            fi
+            api_health="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:18080/health || true)"
+            [ "${api_health}" = "200" ] && break
+            sleep 1
+          done
+          [ "${api_health}" = "200" ] || { echo "::error::release image /health returned ${api_health}"; docker logs "${api_container}" || true; exit 1; }
+          curl -s --max-time 5 http://127.0.0.1:18080/health |
+            grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' ||
+            { echo "::error::release image /health did not report status: ok"; docker logs "${api_container}" || true; exit 1; }
+
+          # Authentication behavior comes from the router: an anonymous
+          # GET /api/v2/status is 401 once setup is complete. Accept 200 or 401
+          # (the real auth response) and fail on 404, which would mean the v2
+          # surface is not mounted. `/api/v1/status` was removed in 2.0.
+          v2_status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18080/api/v2/status || true)"
+          case "${v2_status}" in
+            200|401) ;;
+            *) echo "::error::/api/v2/status returned ${v2_status}, expected 200 or 401"; docker logs "${api_container}" || true; exit 1 ;;
+          esac
+          v1_status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18080/api/v1/status || true)"
+          [ "${v1_status}" = "404" ] || { echo "::error::/api/v1/status returned ${v1_status}, expected 404"; docker logs "${api_container}" || true; exit 1; }
+
+          # The web-enabled container keeps the image healthcheck honest: the
+          # check now also needs the public `/health` endpoint, not just DNS.
+          api_health_status="unknown"
+          for _ in $(seq 1 90); do
+            api_health_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${api_container}")"
+            [ "${api_health_status}" = "healthy" ] && break
+            [ "${api_health_status}" = "unhealthy" ] && { echo "::error::release image (web enabled) healthcheck is unhealthy"; docker logs "${api_container}" || true; exit 1; }
+            sleep 1
+          done
+          [ "${api_health_status}" = "healthy" ] || { echo "::error::release image (web enabled) health status is ${api_health_status}"; docker logs "${api_container}" || true; exit 1; }
+
+          # A fresh 2.0 install must create a schema-v2 stats database. Stop the
+          # server first (the migration lease forbids a live inspection), then
+          # use the shipped CLI read-only dry run on the same data dir.
+          docker stop --time 30 "${api_container}" >/dev/null
+          schema_out="$(docker run --rm \
+            -v "${api_tmp}/etc/config.toml:/etc/sito/config.toml:ro" \
+            -v "${api_data_volume}:/var/lib/sito" \
+            --entrypoint /usr/bin/sito "${image}" \
+            db migrate --config /etc/sito/config.toml --dry-run)"
+          printf '%s\n' "${schema_out}"
+          printf '%s' "${schema_out}" | grep -Eq 'already at schema version 2\b' ||
+            { echo "::error::fresh release data dir is not schema v2"; docker logs "${api_container}" || true; exit 1; }
+          echo "release image API smoke: /api/v2/status=${v2_status} (real auth response); /api/v1/status=404 (removed); fresh stats schema v2; healthcheck: ${api_health_status}"
 
   publish-release:
     name: Publish GitHub Release

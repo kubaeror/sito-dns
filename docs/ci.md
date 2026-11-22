@@ -524,8 +524,16 @@ stops the workflow before any asset is built. The order is deliberate:
    SLSA provenance and SPDX SBOM attestations. It scans each promised platform
    (`linux/amd64`, `linux/arm64`, `linux/arm/v7`) with the digest-pinned Trivy
    image and fails on a fixed HIGH/CRITICAL finding. A final smoke test starts
-   the attested digest, requires a local rewrite to answer and the image
-   healthcheck to turn healthy, then runs `--version` and `check-config`.
+   the attested digest (`${IMAGE}@${DIGEST}`, never a tag or rebuild), requires
+   a local rewrite to answer and the image healthcheck to turn healthy, then
+   runs `--version` and `check-config`. A second container from the same digest
+   enables the admin web UI and proves the 2.0 surface: `/api/v2/status` returns
+   its real auth response (200 or 401, never 404), `/api/v1/status` is 404,
+   `/health` is `200 {"status":"ok"}`, and a read-only
+   `sito db migrate --dry-run` on the fresh data dir reports
+   `already at schema version 2`. The DNS/health assertions are not weakened;
+   `scripts/test-release-workflow.sh` pins both the digest pin and every new
+   assertion.
 7. **`publish-release`** — flips the staged draft to published only after
    `artifact-e2e` and `docker-build-push` are green. Stable tags also move
    `latest`; prereleases stay prereleases and never move `latest`.

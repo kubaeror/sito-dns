@@ -92,7 +92,7 @@ tag-push row leaves the release as a draft and blocks publication.
 | 11 | Root-gated HA ownership (E5) | `ha-ownership.yml` | run URL, SHA, non-root uid, `running 1 test`, `test result: ok. 1 passed` | the m8 ownership test runs under root and passes exactly once | rc.4, final if HA changed (HA owner) |
 | 12 | 24-hour fuzz | `fuzz.yml` with `fuzz_seconds=17280` and `shards=5` | run URL, SHA, five targets, per-target corpus size, empty `fuzz/artifacts/` | no crash, timeout or OOM | after rc.4 → final (ops owner) |
 | 13 | Thresholded benchmark | `bench.yml` | run URL, baseline environment `github-ubuntu-24.04`, tolerance | no `REGRESSION` line above the tolerance | rc.4 → final (performance owner) |
-| 14 | Live DNS and health smoke | `docker-build-push` → `Smoke-test the published image` | log line `release image answered smoke.test; healthcheck: healthy` | the attested digest answers a local rewrite and the image healthcheck turns healthy | rc.4 image, final (release manager) |
+| 14 | Live image smoke: DNS, health, API v2 and schema v2 | `docker-build-push` → `Smoke-test the published image` | log lines `release image answered smoke.test; healthcheck: healthy` and `release image API smoke: /api/v2/status=<200 or 401> (real auth response); /api/v1/status=404 (removed); fresh stats schema v2; healthcheck: healthy` | the attested digest answers a local rewrite, the image healthcheck turns healthy, API v2 is mounted (200/401, never 404), API v1 is 404, and the fresh data dir is schema v2 | rc.4 image, final (release manager) |
 | 15 | Security review | `docs/phase3-security-review.md`, `docs/security-audit.md` | review signed off against the final tree with the open P0/P1 list | no open P0; every open P1 accepted with an owner and review date | final (security reviewer) |
 | 16 | `latest` still on 1.9.5 | commands in [`latest` stays on 1.9.5](#latest-stays-on-195-until-the-final-tag) | `latest` image digest and GitHub latest release tag | both equal `v1.9.5` before the final tag; only `v2.0.0` moves them | rc.3, rc.4, final-before-tag (release manager) |
 | 17 | Catalog release-bound integrity (F2e) | `python3 scripts/generate-catalog.py --check`; focused `sito-clients`/`sito-api` catalog tests; CI `test` job step | `catalog check passed`, green focused tests, green `Verify the embedded catalog and pin are current` step | the committed catalog matches `CATALOG_SHA256`, canonical bytes are current, and the loader has no network path | rc.4, final (catalog owner) |
@@ -454,18 +454,59 @@ scripts are owned by E1/E2; this checklist records their evidence.
 A failed or missing transcript blocks the release. Record the command, commit
 SHA, date and transcript path for all four runs.
 
-## Live DNS and health smoke (E8)
+## Live DNS, health, API and schema smoke (E8)
 
 The `Smoke-test the published image` step in `docker-build-push` starts the
-exact attested digest with a self-contained config, queries `smoke.test`, and
-waits for the image healthcheck. It is the release-time live DNS/health gate;
-the `container.yml` compose smoke remains the pull-request mechanism and does
-not replace it.
+exact attested digest (`${IMAGE}@${DIGEST}`, never a tag or a rebuild) with a
+self-contained config, queries `smoke.test`, and waits for the image
+healthcheck. It is the release-time live DNS/health gate; the `container.yml`
+compose smoke remains the pull-request mechanism and does not replace it.
 
-Record the run URL, image digest, and the log line
-`release image answered smoke.test; healthcheck: healthy`. Pass condition: the
-step is green, the container did not exit before answering, and the healthcheck
-is `healthy`. Repeat for the rc.4 image and the final image.
+A second container from the same digest enables the admin web UI
+(`[web] enabled = true`, host port 18080, probed at `127.0.0.1:18080`) with a
+fresh data dir and a real admin account created by `reset-admin`. Both
+containers use named
+Docker volumes initialised from the image's 65532-owned `/var/lib/sito`
+(a runner-owned host bind mount would make the container entrypoint's
+post-migration ownership restore fail without `CAP_CHOWN`) and rewrite
+`localhost.` locally, so the healthcheck never depends on an upstream answer.
+It proves the 2.0 surface:
+
+- `GET /api/v2/status` returns the real authentication response (`401` without
+  a token, or `200` if anonymous access is ever allowed) and never `404`.
+- `GET /api/v1/status` returns `404`: API v1 is removed with no alias or
+  redirect.
+- `GET /health` returns `200 {"status":"ok"}` and the image healthcheck turns
+  `healthy` with the web listener enabled (so the DNS probe and the public
+  readiness endpoint are both required).
+- After the server is stopped, a read-only
+  `sito db migrate --config /etc/sito/config.toml --dry-run` on the same data
+  dir reports `already at schema version 2`, proving a fresh 2.0 install
+  creates a schema-v2 stats database without modifying it.
+
+Record the run URL, image digest, and both log lines:
+
+```text
+release image answered smoke.test; healthcheck: healthy
+release image API smoke: /api/v2/status=401 (real auth response); /api/v1/status=404 (removed); fresh stats schema v2; healthcheck: healthy
+```
+
+Pass condition: the step is green, neither container exited early, the DNS
+rewrite answered, both healthchecks are `healthy`, `/api/v2/status` is `200` or
+`401`, `/api/v1/status` is `404`, and the dry run reports schema version 2.
+Repeat for the rc.4 image and the final image.
+
+Manual caveat: the smoke needs Docker with the published digest available (the
+release runner logs in to GHCR for the push, so the digest pull is local). To
+re-run it manually for an existing release without `docker-build-push`:
+
+```bash
+IMAGE=ghcr.io/kubaeror/sito-dns
+DIGEST="$(docker buildx imagetools inspect "${IMAGE}:v2.0.0" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+docker run --rm --entrypoint /usr/bin/sito "${IMAGE}@${DIGEST}" --version
+# Then repeat the container/config/curl/db-migrate commands from the workflow
+# step; always use "${IMAGE}@${DIGEST}", never the tag.
+```
 
 ## HA certificate ownership evidence (root-gated lane)
 
