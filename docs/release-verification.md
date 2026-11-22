@@ -67,10 +67,14 @@ green `release-gate` job plus its
 
 ## 2.0 release gate checklist
 
-Complete every row before creating the `v2.0.0` tag. "Stage" is the first
-release candidate at which the gate must be green; evidence from an earlier
-candidate carries forward only when the release manager records that no
-release-relevant change landed since. A red or missing row blocks the tag.
+Complete every pre-tag row before creating the `v2.0.0` tag. Rows 1 and 2 are
+tag-push checks that can be pre-checked manually (tag/version and branch/check
+ancestry). Rows 9, 10 and 14 are produced only by the tagged release run, so
+they are verified after the tag push instead. "Stage" is the first release
+candidate at which the gate must be green; evidence from an earlier candidate
+carries forward only when the release manager records that no release-relevant
+change landed since. A red or missing pre-tag row blocks tagging; a red
+tag-push row leaves the release as a draft and blocks publication.
 
 | # | Gate | Workflow / command | Required evidence | Pass condition | Stage (owner) |
 | --- | --- | --- | --- | --- | --- |
@@ -78,7 +82,7 @@ release-relevant change landed since. A red or missing row blocks the tag.
 | 2 | Release branch and checks | `release.yml` → `release-gate` (`scripts/verify-release-gate.sh`) | run URL, tagged SHA, `release checks are green for <sha>: ci-gate, cargo-deny` | tagged commit is an ancestor of `main`; `ci-gate` and `cargo-deny` are completed and successful; no failing legacy status | rc.3, rc.4, final (release manager) |
 | 3 | All-features and default test suites | `ci.yml` → `test` (`cargo test --workspace --all-features --locked`), `ha-matrix`; plus `cargo test --workspace --locked` on the candidate | green `ci-gate` run URL and the default-suite transcript | both suites green and the no-HA/HA matrix green | rc.3, rc.4, final (CI owner) |
 | 4 | Dependency policy after W0-DEPS | `security.yml` → `cargo-deny` (`deny.toml`) | check-run URL and `cargo deny check` summary | advisories, bans, licenses and sources pass with no unreviewed suppression | rc.3, rc.4, final (security reviewer) |
-| 5 | Docs truth | `docs.yml` → `meta` | run URL and command output | config reference, migration IDs, links and P0/P1 test-matrix names resolve; no stale 2.0 claim | rc.3, rc.4, final (docs owner) |
+| 5 | Docs truth | `docs.yml` → `meta` (`python3 scripts/check_test_matrix.py`) | run URL and command output | config reference, migration IDs, links and P0/P1 test-matrix names resolve; no stale 2.0 claim | rc.3, rc.4, final (docs owner) |
 | 6 | Installer E2E | `ci.yml` → `contrib` → `bash contrib/tests/test-installer.sh` | green `contrib` job log | fresh install, live upgrade, backup order and failed-health rollback pass | rc.4, final if S5 changed (ops owner) |
 | 7 | 1.9.5 → 2.0 migration and rollback | `bash scripts/test-migration-1.9.5.sh` | transcript ending `PASS: 1.9.5 data-dir migration and rollback acceptance` | v1.9.5 data dir migrates, v2 answers, users/TOTP/stats DB stay intact, rollback answers | rc.4, final if S2/S5 changed (ops owner) |
 | 8 | Docker upgrade E2E | `bash scripts/test-docker-upgrade.sh` | transcript ending `docker upgrade E2E OK (...)` | 1.9.5 container upgrades to the candidate with healthy DNS + healthcheck, then the rollback serves again | rc.4, final if S2/S5 changed (ops owner) |
