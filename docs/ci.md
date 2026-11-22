@@ -17,6 +17,7 @@ benchmarks, the action pin policy, and the monthly runner-minute budget.
 | **Weekly Quality** | `weekly.yml` | Sunday at 03:00 UTC (`schedule`), `workflow_dispatch` | Release-mode tests plus the reusable Container and Security workflows. Benchmarks moved to `bench.yml`. |
 | **Fuzz** | `fuzz.yml` | Nightly at 04:17 UTC (`schedule`), `workflow_dispatch` (`fuzz_seconds`, `shards`) | Builds and runs the five cargo-fuzz targets with their checked-in corpus and dictionary on GitHub-hosted `ubuntu-24.04`. Default smoke is 600 s per target; the 24-hour release checklist is `fuzz_seconds=17280` with `shards=5` (five 4.8-hour shards per target, ≈24 target-hours aggregate). Uploads corpus/artifacts on failure. |
 | **Bench** | `bench.yml` | Nightly at 05:42 UTC (`schedule`), `workflow_dispatch` (`update_baseline`) | Runs the workspace Criterion suite and fails when a benchmark is more than 10% slower than `benches/baseline.json`. `update_baseline=true` writes and uploads a replacement baseline. |
+| **HA Ownership (root)** | `ha-ownership.yml` | `workflow_dispatch`, Sunday at 06:00 UTC (`schedule`) | Runs the root-only `scripts/test-ha-ownership-root.sh` under `sudo -E` with `PATH`, `CARGO_HOME`, `RUSTUP_HOME` and a workspace target dir preserved. Manual/weekly 2.0 release evidence for the HA key-ownership handoff; never part of `ci-gate` or a pull-request lane. |
 | **Release** | `release.yml` | Push of a `v*` tag only | Verifies the tag, builds and signs the three release archives, stages a draft GitHub release, verifies the artifacts, publishes the multi-arch container image, and finally publishes the release. |
 | **Artifact E2E** | `artifact-e2e.yml` | `workflow_call` from Release, `workflow_dispatch` with a tag | Re-downloads a staged draft or published release and verifies checksums, signatures, and execution of every architecture in the release runtime image. |
 
@@ -46,6 +47,10 @@ part of the required `ci-gate` check, not separate advisory workflows.
 | Dependencies (`Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml`) | `ci.yml`: the code lane plus `security-check`, `hygiene`, `ci-gate`; `security-check` calls `security.yml` (`cargo-deny`). `security-check` also runs on every pull request and merge group, independent of this filter, because a new advisory can affect an unchanged dependency set. `Cargo.*` and the toolchain also match the code classifier, so the full code lane runs as well. |
 | Workflow files (`.github/workflows/**`) | `ci.yml`: `changes`, `docs-check`, `ci-gate`; `docs-check` calls `docs.yml` (`meta` with the Markdown link check and `actionlint`). |
 | Mixed changes | Union of the matching lanes. |
+
+No automatic lane runs the root-gated HA certificate ownership test; it lives
+in the separate `ha-ownership.yml` manual/weekly workflow and is never a
+required PR check. See [Root-gated HA certificate ownership lane](#root-gated-ha-certificate-ownership-lane).
 
 The normal `test` lane also runs the bounded `proptest` suites in
 `crates/sito-core/tests/domain_properties.rs` and
@@ -217,6 +222,53 @@ container image build `embed-ui,ha,mimalloc`; the `Dockerfile` comments record
 that this preserves feature parity with those archives. The internal
 `sito-api/ha` feature is an implementation detail of `sito/ha`; enabling it
 directly without `sito/ha` is unsupported.
+
+## Root-gated HA certificate ownership lane
+
+`scripts/test-ha-ownership-root.sh` runs
+`test_m8_root_owned_key_chown_activates_ha` from `sito-test`'s m8 acceptance
+suite. The test creates root-owned 0600 certificates, proves uid/gid 65532
+(the runtime identity) cannot read the key, performs the documented `chown`,
+and then starts the real mTLS listener as that identity and waits for `/health`
+and `/api/v2/ha/status` to report ready. It needs root for the ownership
+changes, so it cannot run in the ordinary workspace `test` lane.
+
+`ha-ownership.yml` is the only lane that runs it:
+
+- `workflow_dispatch` is the release-gate trigger; a Sunday 06:00 UTC
+  `schedule` run catches environment or wrapper drift between releases.
+- `runs-on: ubuntu-24.04`, `timeout-minutes: 30`, `permissions: contents: read`.
+- Checkout and the Rust toolchain use the same pinned action SHAs and 1.99.1
+  toolchain as `ci.yml`.
+- The lane resolves a non-empty `CARGO_HOME`/`RUSTUP_HOME`, then invokes the
+  wrapper as
+  `sudo -E env PATH=... CARGO_HOME=... RUSTUP_HOME=... CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" bash scripts/test-ha-ownership-root.sh`.
+  Without that environment root would look in `/root/.cargo` and
+  `/root/.rustup` and miss the installed toolchain.
+- There is no `continue-on-error`, no job condition, and no `|| true`.
+
+The wrapper also fails closed. It refuses any effective uid other than 0,
+enables the `ha` feature (the `m8_acceptance` target is
+`#![cfg(feature = "ha")]` and would otherwise be an empty binary), uses
+`--locked`, and requires exactly one `test result: ok. 1 passed` line. A
+zero-test filter, a non-root runner, or a skipped test therefore fails the job
+instead of producing a green run.
+
+This lane is intentionally **not** part of `ci-gate`, a pull-request trigger,
+or the merge queue. A manual or scheduled run is the evidence:
+
+```bash
+gh workflow run ha-ownership.yml --ref <release-commit-or-branch>
+gh run list --workflow ha-ownership.yml --limit 1
+gh run watch <run-id> --exit-status
+```
+
+Locally, run `sudo bash scripts/test-ha-ownership-root.sh` from the repository
+root. Record the run URL, commit SHA, the non-root runner uid, and the
+`running 1 test` / `1 passed` lines in the release checklist. The static policy
+test `bash scripts/test-ha-ownership-workflow.sh` runs in the `contrib` job and
+asserts the trigger shape, `sudo -E` environment, pinned actions, absence of
+`continue-on-error`, and that the lane never enters `ci.yml`.
 
 ## Error-swallowing allowlist
 

@@ -434,6 +434,8 @@ jobs:
             scripts/test-sqlite-advisory-pin.sh \
             scripts/test-compose-defaults.sh \
             scripts/test-systemd-hardening.sh \
+            scripts/test-ha-ownership-root.sh \
+            scripts/test-ha-ownership-workflow.sh \
             scripts/save-bench-baseline.sh
       - name: Test AdGuard converter against the fixture
         run: |
@@ -451,6 +453,7 @@ jobs:
           bash scripts/test-release-attestation-gate.sh
           bash scripts/test-verify-release-gate.sh
           bash scripts/test-release-workflow.sh
+          bash scripts/test-ha-ownership-workflow.sh
           bash scripts/test-sqlite-advisory-pin.sh
       - name: Compile the CI usage helper
         run: python3 -m py_compile scripts/ci_usage.py
