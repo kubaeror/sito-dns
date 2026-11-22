@@ -137,6 +137,19 @@ See [`docs/release-verification.md`](release-verification.md) and the
 - **Weighted upstream balancing**, edit-time read-only HA enforcement and
   per-client upstream metric pruning are deferred.
 - **Query-log anonymization** is forward-only; historical rows are not rewritten.
+- **`stats_watermark` is diagnostic (B7, accepted residual).** Retention writes
+  it for progress diagnostics and v1.9 schema compatibility but never reads it
+  to skip rows; aggregate and delete share one transaction per chunk, and
+  backdated rows re-aggregate. See
+  [migration §10.1](2.0-migration.md#101-backendstats-residual-b7).
+- **A TTL-only live cache apply is cold by design (B8, accepted residual).** The
+  runtime apply advances the cache-policy epoch instead of re-clamping warm
+  entries, so old-generation entries are unservable and the cache refills; new
+  inserts use the new TTL policy. `DnsCache::update_config` keeps the warm
+  re-clamp for direct cache users. Expect a transient hit-rate drop only; there
+  is no correctness issue, and preserving warm entries is a future
+  optimization. See [migration §10.2](2.0-migration.md#102-cache-ttl-residual-b8)
+  and the [cache configuration reference](configuration-reference.md#4-dnscache--caching-layer).
 - **Release-image vulnerability scanning** covers linux/amd64 only; arm64/armv7
   are executed by artifact E2E. Root-gated HA ownership checks are manual.
 - **In-app update locking** is process-wide; a cross-process file lock is
