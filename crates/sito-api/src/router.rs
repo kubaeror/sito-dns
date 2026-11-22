@@ -61,7 +61,7 @@ pub async fn slave_read_only_middleware(
             problem.title = "Read-Only Replica".to_string();
             problem.instance = Some(path.to_string());
 
-            let mut resp = (StatusCode::CONFLICT, Json(problem)).into_response();
+            let mut resp = problem.into_response();
             if !master_url.is_empty()
                 && let Ok(val) = HeaderValue::from_str(&master_url)
             {
@@ -499,6 +499,11 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
             ctx.clone(),
             crate::security::csrf_protection_middleware,
         ))
+        // Keep this inside the security-headers layer so the normalized error
+        // still carries the baseline headers.
+        .layer(axum::middleware::from_fn(
+            crate::error::api_error_envelope_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             ctx,
             crate::security::security_headers_middleware,
@@ -699,6 +704,355 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn send(
+        app: &Router,
+        request: Request<Body>,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let response = app.clone().oneshot(request).await.expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        (status, headers, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn assert_problem(
+        status: StatusCode,
+        headers: &axum::http::HeaderMap,
+        body: &str,
+        expected: StatusCode,
+    ) -> serde_json::Value {
+        assert_eq!(status, expected, "unexpected status, body: {body}");
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/problem+json"),
+            "error responses must use the RFC 7807 media type, body: {body}"
+        );
+        let json: serde_json::Value = serde_json::from_str(body).expect("problem JSON");
+        assert_eq!(json["status"], expected.as_u16());
+        assert!(
+            json["type"].as_str().is_some_and(|value| !value.is_empty()),
+            "missing problem type: {json}"
+        );
+        assert!(
+            json["title"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "missing problem title: {json}"
+        );
+        assert!(
+            json["detail"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "missing problem detail: {json}"
+        );
+        json
+    }
+
+    /// A3: Axum-generated request errors (malformed JSON, invalid query,
+    /// unsupported media type, method mismatch) must use the same
+    /// `ProblemDetails` envelope as handler errors. Before A3 they were
+    /// `text/plain` or empty, contradicting the documented 400/415 contract.
+    #[tokio::test]
+    async fn test_api_framework_errors_use_problem_details() {
+        let temp_dir = crate::test_support::temp_dir("sito_error_envelope_framework");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .update_user_password("admin", "TestPassword123!")
+            .await;
+        ctx.set_setup_pending(false);
+        let viewer = ctx
+            .auth_mgr
+            .create_token("viewer", Role::Viewer, None)
+            .await
+            .expect("token")
+            .1
+            .token;
+        let operator = ctx
+            .auth_mgr
+            .create_token("operator", Role::Operator, None)
+            .await
+            .expect("token")
+            .1
+            .token;
+        let app = create_router(ctx);
+
+        // `Json` extraction failure -> 400.
+        let (status, headers, body) = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v2/clients")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {operator}"),
+                )
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await;
+        let json = assert_problem(status, &headers, &body, StatusCode::BAD_REQUEST);
+        assert!(
+            json["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("JSON")),
+            "the extractor detail must survive: {json}"
+        );
+
+        // Missing media type -> 415.
+        for body in ["{}", "not-json"] {
+            let (status, headers, text) = send(
+                &app,
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/clients")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {operator}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+            assert_problem(status, &headers, &text, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+            let (status, headers, text) = send(
+                &app,
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/clients")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {operator}"),
+                    )
+                    .header(axum::http::header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+            assert_problem(status, &headers, &text, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+
+        // Valid JSON with the wrong shape -> 422.
+        let (status, headers, body) = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v2/clients")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {operator}"),
+                )
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from("[]"))
+                .unwrap(),
+        )
+        .await;
+        assert_problem(status, &headers, &body, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Typed query extraction failure -> 400.
+        let (status, headers, body) = send(
+            &app,
+            Request::builder()
+                .uri("/api/v2/querylog?qtype=abc")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {viewer}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let json = assert_problem(status, &headers, &body, StatusCode::BAD_REQUEST);
+        assert!(
+            json["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("qtype")),
+            "the query extractor detail must survive: {json}"
+        );
+
+        // Method mismatch -> 405 with the `Allow` header preserved.
+        let (status, headers, body) = send(
+            &app,
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v2/status")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {viewer}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_problem(status, &headers, &body, StatusCode::METHOD_NOT_ALLOWED);
+        assert!(
+            headers.contains_key(axum::http::header::ALLOW),
+            "the 405 Allow header must be preserved"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "the normalized error must still pass through the security headers layer"
+        );
+
+        // A non-upgradable WebSocket request is normalized too.
+        let (status, headers, body) = send(
+            &app,
+            Request::builder()
+                .uri("/api/v2/querylog/stream")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {viewer}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::UPGRADE_REQUIRED
+            ),
+            "unexpected WebSocket rejection status: {status}, body: {body}"
+        );
+        assert_problem(status, &headers, &body, status);
+
+        // 401 stays the uniform JSON answer; no browser auth challenge is sent.
+        let (status, headers, body) = send(
+            &app,
+            Request::builder()
+                .uri("/api/v2/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_problem(status, &headers, &body, StatusCode::UNAUTHORIZED);
+        assert!(
+            !headers.contains_key(axum::http::header::WWW_AUTHENTICATE),
+            "401 deliberately carries no WWW-Authenticate challenge"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// A3: the two documented non-`problem+json` responses and the HA
+    /// read-only gate keep their deliberate envelopes.
+    #[tokio::test]
+    async fn test_documented_error_envelope_exceptions() {
+        let temp_dir = crate::test_support::temp_dir("sito_error_envelope_exceptions");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .update_user_password("admin", "TestPassword123!")
+            .await;
+        ctx.set_setup_pending(false);
+        let app = create_router(ctx);
+
+        // Unknown paths (including the removed v1 surface) keep the documented
+        // `application/json` fallback.
+        for path in ["/api/v2/does-not-exist", "/api/v1/status"] {
+            let (status, headers, body) = send(
+                &app,
+                Request::builder().uri(path).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(
+                headers
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json"),
+                "{path} keeps the documented fallback media type"
+            );
+            let json: serde_json::Value = serde_json::from_str(&body).expect("fallback JSON");
+            assert_eq!(json["status"], 404);
+        }
+
+        // First-boot gate: the plain-text signal is consumed by
+        // `sito healthcheck` and documented in first-time-setup.md.
+        let setup_dir = crate::test_support::temp_dir("sito_error_envelope_setup");
+        let setup_ctx = crate::test_support::mock_context(&setup_dir).await;
+        setup_ctx.set_setup_pending(true);
+        let setup_app = create_router(setup_ctx);
+        let (status, headers, body) = send(
+            &setup_app,
+            Request::builder()
+                .uri("/api/v2/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(body, "Setup not completed");
+
+        // HA read-only gate: ProblemDetails (not plain `application/json`) and
+        // the master hint survive the A3 change.
+        let slave_dir = crate::test_support::temp_dir("sito_error_envelope_slave");
+        let slave_ctx = crate::test_support::mock_context(&slave_dir).await;
+        slave_ctx
+            .auth_mgr
+            .update_user_password("admin", "TestPassword123!")
+            .await;
+        let mut config = (*slave_ctx.config.load_full()).clone();
+        config.server.role = "slave".to_string();
+        config.ha = Some(
+            toml::from_str("master_url = \"https://master.sito.lan:3000\"")
+                .expect("valid ha table"),
+        );
+        slave_ctx.config.store(std::sync::Arc::new(config));
+        slave_ctx.set_setup_pending(false);
+        let slave_token = slave_ctx
+            .auth_mgr
+            .create_token("operator", Role::Operator, None)
+            .await
+            .expect("token")
+            .1
+            .token;
+        let slave_app = create_router(slave_ctx);
+        let (status, headers, body) = send(
+            &slave_app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v2/clients")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {slave_token}"),
+                )
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        let json = assert_problem(status, &headers, &body, StatusCode::CONFLICT);
+        assert_eq!(json["type"], "urn:sito:ha:read-only");
+        assert_eq!(
+            headers
+                .get("x-dnsd-master")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://master.sito.lan:3000")
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(&setup_dir);
+        let _ = std::fs::remove_dir_all(&slave_dir);
     }
 
     #[cfg(feature = "ha")]
