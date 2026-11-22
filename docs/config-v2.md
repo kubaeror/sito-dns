@@ -172,10 +172,11 @@ not supported in place.
 }
 ```
 
-Automated migration by the installer/Docker entrypoint (only when
-`config_version = 1`) and `--no-migrate` remain unimplemented; they are deferred
-work, not part of the delivered Phase 2 tree. The CLI above is the supported
-manual path. The full narrative migration guide is
+Automated migration of `config.toml` by the installer/container entrypoint
+(only when `config_version = 1`) remains unimplemented; it is deferred work, not
+part of the delivered Phase 2 tree. The installer's `--no-migrate` and the
+container's `SITO_NO_MIGRATE=1` apply only to the statistics database. The CLI
+above is the supported manual config path. The full narrative migration guide is
 [`docs/2.0-migration.md`](2.0-migration.md).
 
 ## 6. Deprecated aliases (2.0 line)
@@ -274,8 +275,11 @@ schema also fails the fixture test.
 - `/api/v1` and its compatibility facade are absent: 2.0 removed v1, and
   `/api/v2` is the only administrative API, including
   `/api/v2/config/restart-required`.
-- Installer/Docker config auto-migration and `--no-migrate` remain
-  unimplemented and deferred. The full narrative migration guide is
-  [`docs/2.0-migration.md`](2.0-migration.md).
-- The SQLite schema/PII migration (`sito db migrate`,
-  `SITO_DB_AUTO_MIGRATE`) remains unimplemented and deferred.
+- Installer/Docker `config.toml` auto-migration remains unimplemented and
+  deferred. The installer's `--no-migrate` and the container's
+  `SITO_NO_MIGRATE=1` apply only to the statistics database. The full narrative
+  migration guide is [`docs/2.0-migration.md`](2.0-migration.md).
+- The SQLite schema/PII migration is delivered: `sito db migrate` with a 0600
+  backup and shared lock, fail-closed startup unless `SITO_DB_AUTO_MIGRATE=1`,
+  and installer/container entrypoint migration before the new server starts
+  (`--no-migrate`/`SITO_NO_MIGRATE=1` opts out).

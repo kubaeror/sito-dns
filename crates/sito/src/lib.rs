@@ -3,6 +3,7 @@
 //! Fast, memory-efficient, filtering DNS resolver server and CLI.
 
 pub mod cli;
+pub mod container_entrypoint;
 mod db_maintenance;
 mod db_startup;
 pub mod logging;

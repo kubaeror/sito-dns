@@ -229,6 +229,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Server execution path
     let config_path = default_config_path;
+
+    // The image entrypoint is the binary itself in a hidden mode (the distroless
+    // runtime has no shell). Apply the explicit `sito db migrate` path before
+    // the normal server startup; a failure exits here without binding ports.
+    if cli.container_entrypoint
+        && let Err(e) = sito::container_entrypoint::migrate_before_start(&config_path).await
+    {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+
     let config_exists = config_path.exists();
     // Read/parse the configuration before acquiring the lease: this is a
     // read-only operation. Every mutation below runs under the lease.

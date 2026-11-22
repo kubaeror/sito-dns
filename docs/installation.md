@@ -189,9 +189,30 @@ error. An existing backup is never overwritten.
 
 A new install (no `stats.db`) creates the current schema normally without a
 backup, and an already-current database opens without one. A newer schema is
-refused without writes; a corrupt marker fails closed. The installer and Docker
-entrypoint plumbing for `SITO_DB_AUTO_MIGRATE` is owned by the release E1 task
-in this branch; nothing in those files changes here.
+refused without writes; a corrupt marker fails closed.
+
+**Installer and Docker upgrades run the explicit migration.** The supported
+package upgrade paths use the same `sito db migrate` command:
+
+- `contrib/install.sh` stops the old service, installs the new binary, and runs
+  `sito db migrate --config /etc/sito/config.toml` after the stop and before the
+  new service starts. This requires an already-migrated config v2 document; the
+  installer does not rewrite `config.toml`, and it refuses to migrate the
+  database while the document is still v1. It only runs the database step when
+  the configured `server.data_dir` already contains `stats.db`, so fresh
+  installs skip it. If the migration fails, the installer restores the previous
+  binary and configuration backup, restarts the old service, and never starts
+  the new server. The migration backup is
+  `<server.data_dir>/stats.db.v<found>.bak` (normally
+  `/var/lib/sito/stats.db.v1.bak`), mode `0600`.
+- The container image entrypoint runs that migration before the server when the
+  data volume already has a `stats.db`, and exits without starting DNS/API if it
+  fails. A fresh volume has no database and is created normally on first start.
+
+Pass `--no-migrate` to the installer or set `SITO_NO_MIGRATE=1` in the
+container to skip the migration for a controlled upgrade. The new server then
+fails closed on an old database with the B3 message; run the explicit command
+yourself, restart, and re-run the upgrade without the opt-out.
 
 The command and startup both restore the data-directory ownership even under
 `sudo`: every file created or changed (`stats.db`, `-wal`/`-shm`, `stats-salt`,
@@ -404,12 +425,25 @@ location exists, `sito update` refuses to run instead of guessing the signature
 policy. `server.data_dir` must be an absolute path so the shared update lock
 cannot depend on each process's working directory.
 
-When the update crosses the 1.9.x → 2.0 line, also migrate the configuration
-and the statistics database with the service stopped (see
-[§1.1](#11-the-20-release-candidate-line)). A 1.9.x `stats.db` remains schema
-version 1 until `sudo sito db migrate --config /etc/sito/config.toml` runs, or
-until the server is started with `SITO_DB_AUTO_MIGRATE=1`; use `--dry-run` first
-to confirm the plan and the `.v1.bak` backup path.
+When the update crosses the 1.9.x → 2.0 line, migrate the configuration first
+(see [§1.1](#11-the-20-release-candidate-line)); the installer does not rewrite
+`config.toml` automatically. The installer does migrate the statistics
+database: after stopping the service and replacing the binary, it runs
+`sudo sito db migrate --config /etc/sito/config.toml` (only when the configured
+data directory already has `stats.db`) and then starts the new service. The
+`0600` backup is `<server.data_dir>/stats.db.v1.bak` (normally
+`/var/lib/sito/stats.db.v1.bak`). If the migration fails, the installer restores
+the previous binary and config backup, restarts the old service, and does not
+start the new server. For a controlled upgrade, `--no-migrate` (or
+`SITO_NO_MIGRATE=1`) skips the automatic migration; the 2.0 server then fails
+closed until you run `sudo sito db migrate --config /etc/sito/config.toml`
+yourself. Use `--dry-run` first to confirm the plan and the backup path.
+
+A health-check rollback after a *successful* migration restores the previous
+binary and config but leaves the database at schema version 2. That is safe:
+version 2 is additive and 1.9.x can open it. To roll the database itself back,
+stop the service, remove `stats.db-wal`/`stats.db-shm`, restore the `.v1.bak`
+over `stats.db`, and start the service.
 
 `sito update` verifies the release with cosign because
 `server.update_require_signature` defaults to `true`. The installer installs a
@@ -491,6 +525,28 @@ The image defines a healthcheck that probes DNS on the configured port and only
 accepts the admin web interface while the API reports first-boot setup pending
 (`sito healthcheck --setup-fallback`).
 
+> **Stats database upgrade.** The image entrypoint runs `sito db migrate`
+> before the server when `/var/lib/sito/stats.db` already exists. The migration
+> writes a consistent `0600` snapshot (`stats.db.v1.bak` for a 1.9.x database),
+> takes the service lease and migration lock, and only then starts DNS/API. A
+> failed migration exits the container without starting the server. Fresh
+> volumes and already-current databases start normally. To run the migration
+> yourself during a controlled upgrade, stop the container, run the explicit
+> command against the same volumes, then start it with `SITO_NO_MIGRATE=1` (or
+> `SITO_NO_MIGRATE: "1"` in Compose); the server then fails closed on an old
+> database until the migration has run. Example:
+>
+> ```bash
+> docker stop sito
+> docker run --rm \
+>   -v sito-data:/var/lib/sito \
+>   -v sito-config:/etc/sito \
+>   <new-image> db migrate --config /etc/sito/config.toml
+> docker start sito
+> ```
+>
+> Back up the data volume and the config volume together before an upgrade.
+
 > **Config directory permissions.** The image runs as UID/GID `65532`
 > (non-root). When bind-mounting a host directory for `/etc/sito`, hand it to
 > that user once: `sudo chown -R 65532:65532 /opt/sito/config`. Alternatively
@@ -555,6 +611,19 @@ volumes:
 The `--setup-fallback` healthcheck flag keeps the container healthy while the
 first-boot wizard is active; once setup completes the DNS probe must succeed, so
 a broken DNS listener still turns the container unhealthy.
+
+The entrypoint migrates an existing stats database before starting the server
+(see [§3.1](#31-standard-container-docker-run)). For a controlled upgrade, add
+the opt-out to the service:
+
+```yaml
+environment:
+  SITO_NO_MIGRATE: "1"
+```
+
+The server then fails closed on an un-migrated database; run
+`sito db migrate --config /etc/sito/config.toml` against the same data volume,
+then remove the variable and recreate the container.
 
 `/etc/sito` defaults to the named `sito-config` volume, which the image
 initialises with uid/gid `65532` ownership. To keep configuration on the host,

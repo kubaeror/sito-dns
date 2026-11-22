@@ -16,6 +16,18 @@ case "${SITO_REQUIRE_SIGNATURE}" in
         exit 1
         ;;
 esac
+# Upgrades run the new binary's `sito db migrate` after stopping the old
+# service and before starting the new one. `--no-migrate` (or the equivalent
+# SITO_NO_MIGRATE=1) skips that step for a controlled upgrade; the 2.0 server
+# then fails closed if the stats database still needs a migration.
+NO_MIGRATE="${SITO_NO_MIGRATE:-0}"
+case "${NO_MIGRATE}" in
+    0 | 1) ;;
+    *)
+        echo "Error: SITO_NO_MIGRATE must be 0 or 1 (got '${NO_MIGRATE}')." >&2
+        exit 1
+        ;;
+esac
 # Production defaults. Tests override these paths and the systemctl binary so
 # the installer E2E can run unprivileged without touching the real system.
 INSTALL_BIN="${SITO_INSTALL_BIN:-/usr/local/bin/sito}"
@@ -40,10 +52,16 @@ for arg in "$@"; do
         --uninstall)
             UNINSTALL=1
             ;;
+        --no-migrate)
+            NO_MIGRATE=1
+            ;;
         -h|--help)
-            echo "Usage: install.sh [--uninstall]"
-            echo "  --uninstall  Remove the sito binary and systemd unit (keeps config, env and data)"
+            echo "Usage: install.sh [--uninstall] [--no-migrate]"
+            echo "  --uninstall     Remove the sito binary and systemd unit (keeps config, env and data)"
+            echo "  --no-migrate    Do not run 'sito db migrate' before starting an upgraded server;"
+            echo "                  the 2.0 server then fails closed if the stats database needs migration"
             echo "  SITO_VERSION=<version>  Pin a specific release version (default: latest)"
+            echo "  SITO_NO_MIGRATE=1       Environment equivalent of --no-migrate"
             echo "  SITO_INSTALL_COSIGN=0   Skip automatic cosign installation"
             echo "  COSIGN_VERSION=<tag>    Pin the cosign release (default: v2.6.5)"
             echo "  SITO_REQUIRE_SIGNATURE=0  Allow an unsigned (SHA-256 only) release"
@@ -290,6 +308,106 @@ rollback_install() {
     fi
     if have_systemctl; then
         run_systemctl restart sito || true
+    fi
+}
+
+# Prints the `[server] data_dir` from a config file, falling back to the
+# installer's DATA_DIR when the key or file is absent. Only used to decide
+# whether a stats database exists for the pre-start migration.
+read_config_data_dir() {
+    local file="$1" value
+    value="$(
+        awk '
+            function strip(line) {
+                sub(/#.*/, "", line)
+                return line
+            }
+            function value(line) {
+                sub(/^[^=]*=[[:space:]]*/, "", line)
+                gsub(/["[:space:]]/, "", line)
+                return line
+            }
+            /^\[server\][[:space:]]*(#.*)?$/ { section="server"; next }
+            /^\[/ { section="" }
+            section == "server" && strip($0) ~ /^[[:space:]]*data_dir[[:space:]]*=/ {
+                print value(strip($0))
+                exit
+            }
+        ' "${file}" 2>/dev/null || true
+    )"
+    printf '%s\n' "${value:-${DATA_DIR}}"
+}
+
+# Prints the top-level `config_version` value, or an empty string when the
+# document does not declare one (an unversioned document is config v1).
+read_config_version() {
+    awk '
+        function strip(line) {
+            sub(/#.*/, "", line)
+            return line
+        }
+        strip($0) ~ /^[[:space:]]*config_version[[:space:]]*=/ {
+            line = strip($0)
+            sub(/^[^=]*=[[:space:]]*/, "", line)
+            gsub(/["[:space:]]/, "", line)
+            print line
+            exit
+        }
+    ' "$1" 2>/dev/null || true
+}
+
+# Upgrades run the new binary's explicit migration after the old service was
+# stopped and before the replacement is started. B2 owns the backup, service
+# lease and migration lock; the installer only sequences it and rolls back the
+# binary/config if the migration fails, so a half-migrated server never starts.
+migrate_database_before_start() {
+    if [ "${IS_UPGRADE}" -ne 1 ]; then
+        return 0
+    fi
+
+    if [ "${NO_MIGRATE}" -eq 1 ]; then
+        echo "SITO_NO_MIGRATE/--no-migrate is set: skipping the stats database migration."
+        echo "The 2.0 server will fail closed if the database still needs a migration."
+        return 0
+    fi
+
+    if [ ! -f "${CONFIG_FILE}" ]; then
+        echo "No configuration file at ${CONFIG_FILE}; skipping the stats database migration."
+        return 0
+    fi
+
+    # `sito db migrate` needs a config v2 document to resolve server.data_dir.
+    # Config auto-migration is deferred, so refuse early with an actionable
+    # message instead of letting the new binary fail on the v1 document.
+    local data_dir db_path config_version
+    data_dir="$(read_config_data_dir "${CONFIG_FILE}")"
+    db_path="${data_dir%/}/stats.db"
+    if [ ! -f "${db_path}" ]; then
+        echo "No stats database at ${db_path}; skipping the stats database migration."
+        return 0
+    fi
+
+    config_version="$(read_config_version "${CONFIG_FILE}")"
+    if [ "${config_version}" != "2" ]; then
+        echo "Error: ${CONFIG_FILE} is not config v2 (config_version='${config_version}')." >&2
+        echo "Error: migrate it with the 2.0 binary before upgrading:" >&2
+        echo "Error:   sito config migrate --from v1 --to v2 --backup --config ${CONFIG_FILE}" >&2
+        echo "Error: restoring the previous binary and configuration; the new server was not started." >&2
+        if ! rollback_install; then
+            echo "Error: rollback did not complete cleanly; inspect the service manually." >&2
+        fi
+        exit 1
+    fi
+
+    echo "Migrating stats database ${db_path} with the new binary..."
+    echo "The migration takes the service lease and a 0600 backup before writing."
+    if ! "${INSTALL_BIN}" db migrate --config "${CONFIG_FILE}"; then
+        echo "Error: stats database migration failed; restoring the previous binary and configuration." >&2
+        echo "Error: the new server was not started. Inspect the migration backup next to ${db_path} if one was written." >&2
+        if ! rollback_install; then
+            echo "Error: rollback did not complete cleanly; inspect the service manually." >&2
+        fi
+        exit 1
     fi
 }
 
@@ -624,6 +742,17 @@ fi
 
 if [ -f "${INSTALL_BIN}" ]; then
     apply_capabilities
+fi
+
+# 6b. Migrate the stats database before the new server starts. Only an upgrade
+# can have an existing database, and only a systemd install starts the service
+# here; without systemd the operator supervises the binary and runs the
+# migration explicitly.
+if have_systemctl; then
+    migrate_database_before_start
+elif [ "${IS_UPGRADE}" -eq 1 ]; then
+    echo "Notice: systemd is unavailable, so the service was not started." >&2
+    echo "Notice: run '${INSTALL_BIN} db migrate --config ${CONFIG_FILE}' manually before starting the new binary." >&2
 fi
 
 # 7. Install systemd service. Prefer the unit shipped in the release archive

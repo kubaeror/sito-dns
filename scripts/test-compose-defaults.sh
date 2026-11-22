@@ -51,6 +51,15 @@ case "$image" in
         ;;
 esac
 assert_not_contains "$COMPOSE" 'image: sito:local' "local builds belong in the build override"
+assert_contains "$COMPOSE" 'SITO_NO_MIGRATE: "1"' "the DB migration opt-out must stay documented"
+
+# --- Container entrypoint ----------------------------------------------------
+# The distroless image has no shell, so the entrypoint is the binary in its
+# hidden migration-before-start mode. Keep the opt-out documented next to it.
+for dockerfile in Dockerfile Dockerfile.release; do
+    assert_contains "$dockerfile" '--container-entrypoint' "entrypoint must migrate the stats DB before the server"
+    assert_contains "$dockerfile" 'SITO_NO_MIGRATE=1' "the migration opt-out must stay documented"
+done
 
 # The development override is optional, but if present it must not leak into
 # the shipped default file above.
@@ -78,6 +87,7 @@ done
 assert_contains "$HA" 'driver_opts:' "macvlan parent must stay configurable"
 assert_contains "$HA" 'chown -R 65532:65532' "HA config/cert chown requirement must stay explicit"
 assert_contains "$HA" 'chmod 0600' "HA certificate key permissions must stay explicit"
+assert_contains "$HA" 'SITO_NO_MIGRATE=1' "HA nodes must document the DB migration opt-out"
 assert_not_contains "$HA" 'value="0xc0a8010a0c0a8010b"' "the 18-digit DHCP hex value is invalid"
 
 ha_images="$(grep -Ec '^[[:space:]]*image:[[:space:]]*ghcr\.io/kubaeror/sito-dns:[0-9]' "$HA")"

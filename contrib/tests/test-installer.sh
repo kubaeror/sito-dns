@@ -43,19 +43,56 @@ assert_file_missing() {
 # The held-process upgrade test needs a real ELF executable: bash closes a
 # script's file descriptor before the final `exec`, so `cp -f` over a running
 # shell script does not reproduce ETXTBSY. Compile a tiny binary that answers
-# `--version` and otherwise sleeps.
+# `--version`, logs invocations, simulates `db migrate`, and otherwise sleeps.
 write_fake_binary() {
     local path="$1" version="$2"
     local source="${path}.c"
     command -v cc >/dev/null 2>&1 || fail "a C compiler (cc) is required for the installer E2E"
     cat >"${source}" <<EOF
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+static void log_argv(int argc, char **argv) {
+    const char *log = getenv("FAKE_SITO_LOG");
+    if (log != NULL) {
+        FILE *file = fopen(log, "a");
+        if (file != NULL) {
+            fprintf(file, "sito");
+            for (int i = 1; i < argc; i++) {
+                fprintf(file, " %s", argv[i]);
+            }
+            fprintf(file, "\n");
+            fclose(file);
+        }
+    }
+    const char *events = getenv("FAKE_EVENT_LOG");
+    if (events != NULL) {
+        FILE *file = fopen(events, "a");
+        if (file != NULL) {
+            fprintf(file, "sito");
+            for (int i = 1; i < argc; i++) {
+                fprintf(file, " %s", argv[i]);
+            }
+            fprintf(file, "\n");
+            fclose(file);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
+    log_argv(argc, argv);
     if (argc > 1 && strcmp(argv[1], "--version") == 0) {
         printf("sito ${version}\\n");
+        return 0;
+    }
+    if (argc > 2 && strcmp(argv[1], "db") == 0 && strcmp(argv[2], "migrate") == 0) {
+        const char *rc = getenv("FAKE_DB_MIGRATE_RC");
+        if (rc != NULL && atoi(rc) != 0) {
+            fprintf(stderr, "simulated database migration failure\\n");
+            return atoi(rc);
+        }
         return 0;
     }
     sleep(600);
@@ -169,6 +206,7 @@ reset_sandbox() {
         "${SANDBOX}/logs"
     : >"${SANDBOX}/logs/systemctl.log"
     : >"${SANDBOX}/logs/events.log"
+    : >"${SANDBOX}/logs/sito.log"
     : >"${SANDBOX}/logs/setcap.log"
     : >"${SANDBOX}/logs/getcap.log"
     write_fake_systemctl
@@ -194,8 +232,11 @@ run_installer() {
             SITO_SYSTEMCTL="${SITO_SYSTEMCTL_FOR_TEST:-${SANDBOX}/bin/systemctl}" \
             SITO_CONFIG_DIR="${SANDBOX}/etc/sito" \
             SITO_DATA_DIR="${SANDBOX}/var/lib/sito" \
+            SITO_NO_MIGRATE="${SITO_NO_MIGRATE_FOR_TEST:-0}" \
             SITO_INSTALL_COSIGN="${SITO_INSTALL_COSIGN_FOR_TEST:-0}" \
             SITO_INSTALL_COSIGN_BIN="${SANDBOX}/install/cosign" \
+            FAKE_SITO_LOG="${SANDBOX}/logs/sito.log" \
+            FAKE_DB_MIGRATE_RC="${FAKE_DB_MIGRATE_RC:-0}" \
             FAKE_EVENT_LOG="${SANDBOX}/logs/events.log" \
             FAKE_SETCAP_LOG="${SANDBOX}/logs/setcap.log" \
             FAKE_GETCAP_LOG="${SANDBOX}/logs/getcap.log" \
@@ -314,6 +355,138 @@ if FAKE_INSTALL_FAIL=1 SITO_VERSION_FOR_TEST=1.9.4 run_installer >"${INSTALLER_O
 fi
 grep -q 'restart sito' "${SANDBOX}/logs/systemctl.log" || fail "failed install did not restart the existing service"
 assert_eq "sito 1.9.3" "$(installed_version)" "failed install left the previous binary in place"
+
+# ---------------------------------------------------------------------------
+# Database migration: fresh installs skip it, upgrades run it before start
+# ---------------------------------------------------------------------------
+reset_sandbox
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.3"
+# A fresh install has no previous binary. Even a leftover stats.db must not be
+# migrated: there is no service to stop and no upgrade to sequence.
+mkdir -p "${SANDBOX}/var/lib/sito"
+printf 'legacy database placeholder\n' >"${SANDBOX}/var/lib/sito/stats.db"
+printf 'config_version = 2\n[server]\ndata_dir = "%s"\n[dns]\nport = 0\n[web]\nenabled = false\n' \
+    "${SANDBOX}/var/lib/sito" >"${SANDBOX}/etc/sito/config.toml"
+: >"${SANDBOX}/logs/sito.log"
+: >"${SANDBOX}/logs/events.log"
+SITO_VERSION_FOR_TEST=1.9.3 run_installer >"${INSTALLER_OUT}" 2>&1 || fail "fresh install with a leftover database failed"
+if grep -q '^sito db migrate' "${SANDBOX}/logs/sito.log"; then
+    fail "fresh install ran a database migration"
+fi
+assert_eq "sito 1.9.3" "$(installed_version)" "fresh install binary version"
+
+# Upgrade with an existing stats.db: the new binary's `db migrate --config`
+# must run after the old service stopped and before the new one starts.
+reset_sandbox
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.3"
+SITO_VERSION_FOR_TEST=1.9.3 run_installer >"${INSTALLER_OUT}" 2>&1 || fail "migration upgrade setup failed"
+printf 'config_version = 2\n[server]\ndata_dir = "%s"\n[dns]\nport = 0\n[web]\nenabled = false\n' \
+    "${SANDBOX}/var/lib/sito" >"${SANDBOX}/etc/sito/config.toml"
+printf 'legacy database placeholder\n' >"${SANDBOX}/var/lib/sito/stats.db"
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.4"
+: >"${SANDBOX}/logs/sito.log"
+: >"${SANDBOX}/logs/events.log"
+SITO_VERSION_FOR_TEST=1.9.4 run_installer >"${INSTALLER_OUT}" 2>&1 || fail "upgrade with database migration failed"
+assert_eq "sito 1.9.4" "$(installed_version)" "migrated upgrade binary version"
+grep -Fq -- "sito db migrate --config ${SANDBOX}/etc/sito/config.toml" "${SANDBOX}/logs/sito.log" ||
+    fail "upgrade did not run the new binary's db migrate with the installed config"
+stop_line="$(grep -n 'systemctl stop sito' "${SANDBOX}/logs/events.log" | head -n 1 | cut -d: -f1)"
+migrate_line="$(grep -n 'sito db migrate' "${SANDBOX}/logs/events.log" | head -n 1 | cut -d: -f1)"
+start_line="$(grep -n 'systemctl start sito' "${SANDBOX}/logs/events.log" | head -n 1 | cut -d: -f1)"
+[ -n "${stop_line}" ] || fail "upgrade did not log the service stop"
+[ -n "${migrate_line}" ] || fail "upgrade did not log the database migration"
+[ -n "${start_line}" ] || fail "upgrade did not log the service start"
+[ "${stop_line}" -lt "${migrate_line}" ] || fail "database migration ran before the old service stopped"
+[ "${migrate_line}" -lt "${start_line}" ] || fail "database migration did not run before the new server started"
+
+# --no-migrate must skip the migration entirely; the new server then fails
+# closed on an old database (B3), so the installer's health check rolls back.
+reset_sandbox
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.3"
+SITO_VERSION_FOR_TEST=1.9.3 run_installer >"${INSTALLER_OUT}" 2>&1 || fail "--no-migrate setup failed"
+printf 'config_version = 2\n[server]\ndata_dir = "%s"\n[dns]\nport = 0\n[web]\nenabled = false\n' \
+    "${SANDBOX}/var/lib/sito" >"${SANDBOX}/etc/sito/config.toml"
+printf 'legacy database placeholder\n' >"${SANDBOX}/var/lib/sito/stats.db"
+cp "${SANDBOX}/etc/sito/config.toml" "${TMP}/config.before-no-migrate"
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.4"
+: >"${SANDBOX}/logs/sito.log"
+: >"${SANDBOX}/logs/events.log"
+if FAKE_SYSTEMCTL_ACTIVE=0 SITO_VERSION_FOR_TEST=1.9.4 \
+    run_installer --no-migrate >"${INSTALLER_OUT}" 2>&1; then
+    fail "installer reported success when --no-migrate left an old database for the fail-closed server"
+fi
+if grep -q 'sito db migrate' "${SANDBOX}/logs/sito.log" "${SANDBOX}/logs/events.log"; then
+    fail "--no-migrate still ran a database migration"
+fi
+grep -q 'SITO_NO_MIGRATE/--no-migrate is set' "${INSTALLER_OUT}" ||
+    fail "--no-migrate did not explain that the migration was skipped"
+grep -q 'fail closed' "${INSTALLER_OUT}" ||
+    fail "--no-migrate did not warn that the new server fails closed"
+assert_eq "sito 1.9.3" "$(installed_version)" "--no-migrate rollback restored the previous binary"
+cmp -s "${TMP}/config.before-no-migrate" "${SANDBOX}/etc/sito/config.toml" ||
+    fail "--no-migrate rollback did not restore the config backup"
+
+# The environment equivalent is validated like the other installer switches.
+if SITO_NO_MIGRATE_FOR_TEST=maybe SITO_VERSION_FOR_TEST=1.9.3 \
+    run_installer >"${INSTALLER_OUT}" 2>&1; then
+    fail "invalid SITO_NO_MIGRATE was accepted"
+fi
+grep -q 'SITO_NO_MIGRATE must be 0 or 1' "${INSTALLER_OUT}" ||
+    fail "invalid SITO_NO_MIGRATE did not report the accepted values"
+run_installer --help >"${INSTALLER_OUT}" 2>&1 || fail "installer --help failed"
+grep -q -- '--no-migrate' "${INSTALLER_OUT}" || fail "installer help does not document --no-migrate"
+grep -q 'SITO_NO_MIGRATE=1' "${INSTALLER_OUT}" || fail "installer help does not document SITO_NO_MIGRATE"
+
+# A failed migration restores the previous binary/config and never starts the
+# new server. The rollback restart is the old service, not a half-migrated one.
+reset_sandbox
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.3"
+SITO_VERSION_FOR_TEST=1.9.3 run_installer >"${INSTALLER_OUT}" 2>&1 || fail "migration-failure setup failed"
+printf 'config_version = 2\n[server]\ndata_dir = "%s"\n[dns]\nport = 0\n[web]\nenabled = false\n' \
+    "${SANDBOX}/var/lib/sito" >"${SANDBOX}/etc/sito/config.toml"
+printf 'legacy database placeholder\n' >"${SANDBOX}/var/lib/sito/stats.db"
+cp "${SANDBOX}/etc/sito/config.toml" "${TMP}/config.before-migration-failure"
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.4"
+: >"${SANDBOX}/logs/sito.log"
+: >"${SANDBOX}/logs/events.log"
+if FAKE_DB_MIGRATE_RC=1 SITO_VERSION_FOR_TEST=1.9.4 \
+    run_installer >"${INSTALLER_OUT}" 2>&1; then
+    fail "installer succeeded despite a failed database migration"
+fi
+grep -q 'sito db migrate' "${SANDBOX}/logs/sito.log" || fail "failed migration was not attempted"
+grep -q 'stats database migration failed' "${INSTALLER_OUT}" ||
+    fail "migration failure did not produce a clear error"
+if grep -q 'systemctl start sito' "${SANDBOX}/logs/events.log"; then
+    fail "installer started the new server after a failed migration"
+fi
+grep -q 'systemctl restart sito' "${SANDBOX}/logs/events.log" ||
+    fail "migration failure did not restart the previous service"
+assert_eq "sito 1.9.3" "$(installed_version)" "migration failure restored the previous binary"
+cmp -s "${TMP}/config.before-migration-failure" "${SANDBOX}/etc/sito/config.toml" ||
+    fail "migration failure did not restore the config backup"
+
+# A v1 config cannot resolve server.data_dir for `sito db migrate`; the
+# installer must refuse early and roll back instead of starting a 2.0 binary
+# that cannot parse the document. Config auto-migration is deliberately not
+# part of this installer.
+reset_sandbox
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.3"
+SITO_VERSION_FOR_TEST=1.9.3 run_installer >"${INSTALLER_OUT}" 2>&1 || fail "v1-config guard setup failed"
+printf '[server]\ndata_dir = "%s"\n[dns]\nport = 0\n[web]\nenabled = false\n' \
+    "${SANDBOX}/var/lib/sito" >"${SANDBOX}/etc/sito/config.toml"
+printf 'legacy database placeholder\n' >"${SANDBOX}/var/lib/sito/stats.db"
+write_fake_binary "${SANDBOX}/work/target/release/sito" "1.9.4"
+: >"${SANDBOX}/logs/sito.log"
+: >"${SANDBOX}/logs/events.log"
+if SITO_VERSION_FOR_TEST=1.9.4 run_installer >"${INSTALLER_OUT}" 2>&1; then
+    fail "installer upgraded a v1 config with an existing database"
+fi
+if grep -q 'sito db migrate' "${SANDBOX}/logs/sito.log"; then
+    fail "installer ran db migrate before refusing a v1 config"
+fi
+grep -q 'is not config v2' "${INSTALLER_OUT}" ||
+    fail "v1 config failure did not explain the config version requirement"
+assert_eq "sito 1.9.3" "$(installed_version)" "v1 config guard restored the previous binary"
 
 # ---------------------------------------------------------------------------
 # Uninstall keeps config and data

@@ -343,8 +343,11 @@ scripts are owned by E1/E2; this checklist records their evidence.
    ```
 
    Expected: a fresh install, a live upgrade over a running binary, the config
-   backup after the service stop, capability/`getcap` checks, and the
-   failed-health rollback all pass. Record the green `contrib` job URL.
+   backup after the service stop, capability/`getcap` checks, the
+   failed-health rollback, the default stats-DB migration before the new server
+   starts, the `--no-migrate` skip (fail-closed rollback), and the
+   migration-failure binary/config rollback all pass. Record the green
+   `contrib` job URL.
 
 2. Binary migration and rollback, against a real v1.9.5 data directory:
 
@@ -372,8 +375,10 @@ scripts are owned by E1/E2; this checklist records their evidence.
 
    Expected transcript tail:
    `docker upgrade E2E OK (sito:1.9.5 -> sito:phase3 -> rollback)`, after the
-   candidate answered DNS and reported `healthy`, and the rollback container
-   answered again with the v1 data.
+   candidate answered DNS and reported `healthy`, the `SITO_NO_MIGRATE=1` run
+   stayed fail-closed without a backup, the default candidate start wrote a
+   0600 `stats.db.v1.bak`, and the rollback container answered again with the
+   v1 data.
 
 A failed or missing transcript blocks the release. Record the command, commit
 SHA, date and transcript path for all three runs.
