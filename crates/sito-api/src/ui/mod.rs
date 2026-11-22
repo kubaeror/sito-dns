@@ -432,6 +432,38 @@ mod tests {
         );
     }
 
+    /// A5 fix: run the executable DOM/JS regression test for the actual HTMX
+    /// interaction (Load older swaps, stale-poll cancellation, filter reset,
+    /// Back to live, duplicate de-duplication). The repo has no browser harness;
+    /// this drives the real app.js with a fake DOM and htmx-shaped events.
+    /// Node is optional in some build environments, so a missing runtime skips
+    /// the test instead of failing the Rust suite.
+    #[test]
+    fn test_querylog_history_dom_behaviour() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/test-querylog-history.mjs");
+        let output = match std::process::Command::new("node").arg(&script).output() {
+            Ok(output) => output,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping DOM test: node is not installed");
+                return;
+            }
+            Err(err) => panic!("failed to start node for {}: {err}", script.display()),
+        };
+
+        assert!(
+            output.status.success(),
+            "query-log history DOM test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("query-log history DOM tests passed"),
+            "the DOM test did not report success: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
     #[test]
     fn test_render_all_views() {
         let filter_tmpl = FilteringTemplate {

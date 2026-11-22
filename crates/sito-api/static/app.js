@@ -78,6 +78,10 @@ document.addEventListener('DOMContentLoaded', initQueryChart);
 
 let queryLogFocusAfterSwap = false;
 let queryLogFocusedControl = null;
+// XHRs that belong to the every-3s live poll. The poll is the only request
+// started from the rows container; Load older, filters, and refresh start on
+// their own controls but still swap into the same rows container.
+const queryLogPollRequests = new WeakSet();
 
 function queryLogHistoryControls() {
   return document.getElementById('query-history-controls');
@@ -109,7 +113,8 @@ function dedupeQueryLogRows() {
 }
 
 document.addEventListener('htmx:beforeRequest', (event) => {
-  const elt = event.detail && event.detail.elt;
+  const detail = event.detail || {};
+  const elt = detail.elt;
   if (!elt) return;
 
   if (elt.hasAttribute('data-querylog-load-older')) {
@@ -128,19 +133,56 @@ document.addEventListener('htmx:beforeRequest', (event) => {
 
   // The rows container only issues the 3 s poll; filters and refresh start on
   // their own controls, so those still reset history mode via the OOB response.
-  if (elt.id === 'query-table-body' && queryLogHistoryModeActive()) {
-    event.preventDefault();
+  if (elt.id === 'query-table-body') {
+    // Remember which XHR is a poll. htmx dispatches beforeSwap on the swap
+    // target, so the target alone cannot tell a poll response apart from a
+    // Load-older/filter/refresh response.
+    if (detail.xhr) queryLogPollRequests.add(detail.xhr);
+    if (queryLogHistoryModeActive()) {
+      event.preventDefault();
+    }
   }
 });
 
 document.addEventListener('htmx:beforeSwap', (event) => {
-  const elt = event.detail && event.detail.elt;
-  // A live poll may already be in flight when history mode begins. Drop its
-  // response instead of letting it replace the rows just appended below.
-  if (elt && elt.id === 'query-table-body' && queryLogHistoryModeActive()) {
-    event.detail.shouldSwap = false;
+  const detail = event.detail;
+  if (!detail) return;
+  // A live poll may already be in flight when history mode begins. Drop only
+  // that poll's response; Load older, filters, and refresh also target
+  // #query-table-body and must still swap.
+  if (
+    detail.xhr &&
+    queryLogPollRequests.has(detail.xhr) &&
+    queryLogHistoryModeActive()
+  ) {
+    detail.shouldSwap = false;
   }
 });
+
+document.addEventListener('htmx:afterRequest', (event) => {
+  const xhr = event.detail && event.detail.xhr;
+  if (xhr) queryLogPollRequests.delete(xhr);
+});
+
+// Load older switches the controls to history mode optimistically. If the
+// request fails before the OOB controls arrive, revert that optimistic state so
+// polling is not paused behind controls that have no Back to live button.
+function revertFailedLoadOlder(event) {
+  const detail = event.detail || {};
+  const elt = detail.elt;
+  if (!elt || !elt.hasAttribute || !elt.hasAttribute('data-querylog-load-older')) {
+    return;
+  }
+  queryLogFocusAfterSwap = false;
+  const controls = queryLogHistoryControls();
+  if (controls && !controls.querySelector('[data-querylog-back-live]')) {
+    setQueryLogHistoryMode(false);
+  }
+}
+
+document.addEventListener('htmx:responseError', revertFailedLoadOlder);
+document.addEventListener('htmx:sendError', revertFailedLoadOlder);
+document.addEventListener('htmx:timeout', revertFailedLoadOlder);
 
 document.addEventListener('htmx:afterSwap', (event) => {
   const target = event.detail && event.detail.target;
