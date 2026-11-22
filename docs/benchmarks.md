@@ -20,6 +20,13 @@ Current performance gates:
   `--reference-only` and is not the release gate; regenerate the baseline only
   through the GitHub-hosted `update_baseline=true` workflow and commit the
   downloaded artifact. See [docs/ci.md](ci.md#benchmark-baseline).
+- The pathological wildcard-compile unit test
+  (`test_pathological_wildcard_set_compiles_in_bounded_batches`) is bounded by
+  **thread CPU time**, not wall time, with a generous wall-clock hang guard.
+  This keeps the performance signal while removing the flake from concurrent
+  builds on the host; the nightly Criterion run adds
+  `filter_compile::wildcard_set_3_batches` for the same workload. See
+  [docs/ci.md](ci.md#load-robust-compile-timing).
 - The 24-hour fuzz run and a green benchmark comparison are release-checklist
   items, not PR gates; see
   [docs/release-verification.md](release-verification.md#fuzz-evidence-24-hour-release-checklist).

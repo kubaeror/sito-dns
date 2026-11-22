@@ -23,6 +23,9 @@ serde_json.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+# Thread CPU time (`CLOCK_THREAD_CPUTIME_ID`) for the load-robust compile
+# timing gate. Test-only; the crate itself does not call libc.
+libc.workspace = true
 proptest.workspace = true
 
 [[bench]]

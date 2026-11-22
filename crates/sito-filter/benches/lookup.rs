@@ -137,10 +137,42 @@ fn bench_filter_snapshot_lookup(c: &mut Criterion) {
     });
 }
 
+fn bench_wildcard_batch_compile(c: &mut Criterion) {
+    // Mirrors `test_pathological_wildcard_set_compiles_in_bounded_batches`:
+    // three full in-limit batches. The unit test gates the compiling thread's
+    // CPU time so host load cannot flake it; this benchmark gives the nightly
+    // runner a thresholded wall-clock signal for the same workload.
+    use sito_filter::structures::RuleSetBuilder;
+    use sito_filter::structures::compiled::REGEX_BATCH_SIZE;
+
+    let count = (REGEX_BATCH_SIZE * 3) as u32;
+    let wildcards: Vec<(String, u32)> = (0..count)
+        .map(|i| (format!("*.sub{i}.example.com"), i))
+        .collect();
+
+    let mut group = c.benchmark_group("filter_compile");
+    // One iteration compiles the whole set (seconds, not microseconds), so use
+    // the minimum Criterion sample count instead of the default 100.
+    group.sample_size(10);
+    group.bench_function("wildcard_set_3_batches", |b| {
+        b.iter(|| {
+            let mut interner = LabelInterner::new();
+            let mut builder = RuleSetBuilder::new();
+            for (wildcard, rule_id) in &wildcards {
+                builder.add_wildcard(wildcard, *rule_id);
+            }
+            let compiled = builder.build(&mut interner);
+            black_box(compiled.regex_batches.len())
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_exact_hashset,
     bench_suffix_trie,
-    bench_filter_snapshot_lookup
+    bench_filter_snapshot_lookup,
+    bench_wildcard_batch_compile
 );
 criterion_main!(benches);
