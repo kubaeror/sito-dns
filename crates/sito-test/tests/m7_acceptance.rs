@@ -489,7 +489,7 @@ async fn test_m7_anti_doh_bypass_filter_and_pipeline() {
         .await
         .unwrap();
     let trusted_entry = logs
-        .entries
+        .items
         .iter()
         .find(|e| e.client_ip == "192.168.1.50")
         .expect("trusted client query must be logged");

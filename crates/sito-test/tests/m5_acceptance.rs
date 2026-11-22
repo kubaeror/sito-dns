@@ -472,7 +472,7 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     let (status, json) =
         get_json(app.clone(), "/api/v2/querylog?domain=track.me", &admin_tok).await;
     assert_eq!(status, StatusCode::OK);
-    let entries = json["entries"].as_array().unwrap();
+    let entries = json["items"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["qname"], "ads.track.me.");
     assert_eq!(entries[0]["verdict"], "blocked");
@@ -485,19 +485,19 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let entries = json["entries"].as_array().unwrap();
+    let entries = json["items"].as_array().unwrap();
     assert_eq!(entries.len(), 2);
 
     // Filter by status (verdict)
     let (status, json) = get_json(app.clone(), "/api/v2/querylog?status=blocked", &admin_tok).await;
     assert_eq!(status, StatusCode::OK);
-    let entries = json["entries"].as_array().unwrap();
+    let entries = json["items"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
 
     // Cursor pagination: page size 1
     let (status, json_page1) = get_json(app.clone(), "/api/v2/querylog?limit=1", &admin_tok).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json_page1["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(json_page1["items"].as_array().unwrap().len(), 1);
     assert!(json_page1["next_cursor"].is_string());
     let cursor = json_page1["next_cursor"].as_str().unwrap();
 
@@ -509,10 +509,10 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let page2_entries = json_page2["entries"].as_array().unwrap();
+    let page2_entries = json_page2["items"].as_array().unwrap();
     assert_eq!(page2_entries.len(), 1);
     assert_ne!(
-        json_page1["entries"][0]["id"], page2_entries[0]["id"],
+        json_page1["items"][0]["id"], page2_entries[0]["id"],
         "Pagination cursor must return sequential non-overlapping items"
     );
 
@@ -529,7 +529,7 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     let (status, json_cleared) =
         get_json(app.clone(), "/api/v2/querylog?limit=10", &admin_tok).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json_cleared["entries"].as_array().unwrap().len(), 0);
+    assert_eq!(json_cleared["items"].as_array().unwrap().len(), 0);
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

@@ -17,8 +17,9 @@ pub struct QueryLogParams {
 
 /// Builds the query-log filter used by the live UI refresh.
 ///
-/// Exposed to the tests so a regression cannot silently re-enable the
-/// `COUNT(*)` on every poll; the 3 s HTMX refresh must not run it.
+/// Exposed to the tests so a regression cannot silently bring back a total
+/// count on every poll. The page read path never counts; `next_cursor` is
+/// ignored here because the live 3 s refresh always shows the newest page.
 pub(crate) fn live_query_log_filter(p: &QueryLogParams) -> QueryLogFilter {
     let qtype_num = p.qtype.as_deref().and_then(|s| {
         if s == "all" || s.is_empty() {
@@ -45,8 +46,6 @@ pub(crate) fn live_query_log_filter(p: &QueryLogParams) -> QueryLogFilter {
         to: None,
         cursor: None,
         limit: Some(50),
-        // Live 3 s polling must not run a filtered COUNT(*) over query_log.
-        include_total: Some(false),
     }
 }
 
@@ -58,7 +57,7 @@ pub(crate) async fn fetch_query_rows(
 
     let page_res = ctx.stats_db.query_logs(&filter).await;
     let entries = match page_res {
-        Ok(p) => p.entries,
+        Ok(page) => page.items,
         Err(_) => Vec::new(),
     };
 

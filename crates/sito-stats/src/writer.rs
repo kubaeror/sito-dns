@@ -473,7 +473,7 @@ mod tests {
             .unwrap();
         assert!(
             stored
-                .entries
+                .items
                 .iter()
                 .any(|entry| entry.qname == "listener.example"),
             "the moved entry must still reach the writer channel"
@@ -539,7 +539,7 @@ mod tests {
             .query_logs(&crate::QueryLogFilter::default())
             .await
             .unwrap();
-        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.items.len(), 1);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

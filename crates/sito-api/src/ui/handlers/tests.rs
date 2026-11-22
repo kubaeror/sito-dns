@@ -203,9 +203,10 @@ fn test_bundled_list_views_corrupt_manifest_returns_runtime_rows_without_panic()
     );
 }
 
-/// P1-23: the live 3 s paths must stay cheap. The query-log route builds a
-/// filter with `include_total=false`, and the dashboard route serves the cached
-/// aggregate instead of rescanning on every poll.
+/// P1-23: the live 3 s paths must stay cheap. The query-log route always reads
+/// a bounded page (there is no total count on the read path at all), and the
+/// dashboard route serves the cached aggregate instead of rescanning on every
+/// poll.
 #[tokio::test]
 async fn test_live_routes_skip_query_log_total_and_use_cached_dashboard() {
     use axum::body::to_bytes;
@@ -225,12 +226,16 @@ async fn test_live_routes_skip_query_log_total_and_use_cached_dashboard() {
     let mut headers = HeaderMap::new();
     headers.insert(COOKIE, session.to_cookie_header().parse().unwrap());
 
-    // The route's filter must not request the whole-table COUNT(*).
+    // The route's live filter is the first page only: no cursor, bounded size.
     let filter = live_query_log_filter(&QueryLogParams::default());
     assert_eq!(
-        filter.include_total,
-        Some(false),
-        "the live query-log refresh must not run a filtered COUNT(*)"
+        filter.limit,
+        Some(50),
+        "the live query-log refresh must stay a bounded page"
+    );
+    assert!(
+        filter.cursor.is_none(),
+        "the live refresh must not carry a pagination cursor"
     );
 
     let now = chrono::Utc::now().timestamp_millis();

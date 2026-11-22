@@ -3,6 +3,36 @@
 #[allow(clippy::wildcard_imports, unused_imports)]
 use super::*;
 
+/// Builds one newest-first query-log page statement.
+///
+/// The cursor predicate is the row-value form `(ts, id) < (?, ?)` so SQLite can
+/// seek the `(ts, id)` keyset index (`idx_ql_ts_id`, or `idx_ql_ts`, which
+/// carries the rowid `id`) instead of scanning and sorting. `fetch_limit` is
+/// `page_limit + 1`; the caller drops the extra row and uses it only as a
+/// "there is another page" signal.
+fn query_log_page_builder(
+    filter: &QueryLogFilter,
+    cursor: Option<(i64, i64)>,
+    fetch_limit: usize,
+) -> sqlx::QueryBuilder<Sqlite> {
+    let mut builder = filtered_query(
+        "SELECT id, ts, client_ip, client_name, qname, qtype, rcode, verdict, rule, list_source, upstream, elapsed_us, dnssec, proto FROM query_log WHERE 1=1",
+        filter,
+    );
+
+    if let Some((ts, id)) = cursor {
+        builder.push(" AND (ts, id) < (");
+        builder.push_bind(ts);
+        builder.push(", ");
+        builder.push_bind(id);
+        builder.push(")");
+    }
+
+    builder.push(" ORDER BY ts DESC, id DESC LIMIT ");
+    builder.push_bind(i64::try_from(fetch_limit).unwrap_or(i64::MAX));
+    builder
+}
+
 impl StatsDb {
     /// Inserts a batch of query log entries within a single transaction.
     pub async fn insert_batch(&self, entries: &[QueryLogEntry]) -> Result<(), StatsError> {
@@ -43,42 +73,31 @@ impl StatsDb {
         Ok(())
     }
 
-    /// Queries logs with filters and cursor-based pagination.
+    /// Queries logs with filters and opaque keyset pagination.
+    ///
+    /// The page is ordered newest first by `(ts, id)` and the cursor predicate
+    /// is the row-value form `(ts, id) < (?, ?)`, which lets SQLite seek the
+    /// `(ts, id)` keyset index. No `COUNT(*)` runs on this path: callers learn
+    /// that the end was reached from `next_cursor == None`.
     pub async fn query_logs(&self, filter: &QueryLogFilter) -> Result<QueryLogPage, StatsError> {
-        let limit = filter.limit.unwrap_or(50).clamp(1, 1000);
+        let limit = filter
+            .limit
+            .unwrap_or(DEFAULT_QUERYLOG_LIMIT)
+            .clamp(1, MAX_QUERYLOG_LIMIT);
+        // Fetch one extra row to decide whether another page exists without a
+        // second query or a count.
         let fetch_limit = limit + 1;
 
-        // `total_count` counts every row matching the filters regardless of the
-        // cursor, so it stays stable while paging. It is optional because the
-        // live UI refresh must not run a whole-table count every few seconds.
-        let total_count = if filter.include_total.unwrap_or(true) {
-            let mut count_builder =
-                filtered_query("SELECT COUNT(*) FROM query_log WHERE 1=1", filter);
-            let total: i64 = count_builder
-                .build_query_scalar()
-                .fetch_one(&self.pool)
-                .await?;
-            Some(total)
-        } else {
-            None
-        };
+        let cursor = filter
+            .cursor
+            .as_deref()
+            .map(|raw| cursor::decode_cursor(filter, raw))
+            .transpose()?;
 
-        let mut builder = filtered_query(
-            "SELECT id, ts, client_ip, client_name, qname, qtype, rcode, verdict, rule, list_source, upstream, elapsed_us, dnssec, proto FROM query_log WHERE 1=1",
-            filter,
-        );
-
-        if let Some(cursor) = filter.cursor {
-            builder.push(" AND id < ");
-            builder.push_bind(cursor);
-        }
-
-        builder.push(" ORDER BY id DESC LIMIT ");
-        builder.push_bind(i64::try_from(fetch_limit).unwrap_or(1001));
-
+        let mut builder = query_log_page_builder(filter, cursor, fetch_limit);
         let rows = builder.build().fetch_all(&self.pool).await?;
 
-        let mut entries = Vec::with_capacity(rows.len());
+        let mut items = Vec::with_capacity(rows.len());
         for row in rows {
             let id: i64 = row.get(0);
             let ts: i64 = row.get(1);
@@ -95,7 +114,7 @@ impl StatsDb {
             let dnssec: Option<String> = row.get(12);
             let proto: String = row.get(13);
 
-            entries.push(QueryLogEntry {
+            items.push(QueryLogEntry {
                 id: Some(id),
                 ts,
                 client_ip,
@@ -113,18 +132,20 @@ impl StatsDb {
             });
         }
 
-        let next_cursor = if entries.len() > limit {
-            entries.truncate(limit);
-            entries.last().and_then(|e| e.id).map(|id| id.to_string())
+        // The extra row only signals another page; the cursor points at the
+        // last row actually returned so the next page starts strictly below it.
+        let next_cursor = if items.len() > limit {
+            items.truncate(limit);
+            items.last().and_then(|entry| {
+                entry
+                    .id
+                    .map(|id| cursor::encode_cursor(filter, entry.ts, id))
+            })
         } else {
             None
         };
 
-        Ok(QueryLogPage {
-            entries,
-            next_cursor,
-            total_count,
-        })
+        Ok(QueryLogPage { items, next_cursor })
     }
 
     /// Deletes the query log and hourly rollups. This is the default
@@ -805,5 +826,299 @@ impl StatsDb {
                 )
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn entry(ts: i64, qname: &str, verdict: &str) -> QueryLogEntry {
+        QueryLogEntry::new(ts, "192.0.2.10", None, qname, 1, Some(0), verdict, "udp")
+    }
+
+    /// Walks every page and returns `(ts, id)` for each row in order. Panics if
+    /// the cursor ever repeats or the walk does not terminate quickly.
+    async fn walk(db: &StatsDb, filter: QueryLogFilter) -> Vec<(i64, i64)> {
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        for _ in 0..1_000 {
+            let page = db
+                .query_logs(&QueryLogFilter {
+                    cursor: cursor.clone(),
+                    ..filter.clone()
+                })
+                .await
+                .expect("page query");
+            for item in &page.items {
+                seen.push((item.ts, item.id.expect("query rows always carry an id")));
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return seen,
+            }
+        }
+        panic!("cursor walk did not terminate; rows={}", seen.len());
+    }
+
+    #[tokio::test]
+    async fn test_query_logs_pages_newest_first_without_duplicates() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let base = 1_700_000_000_000;
+        let entries: Vec<_> = (0..120)
+            .map(|i| entry(base + i, &format!("host-{i}.example"), "allowed"))
+            .collect();
+        db.insert_batch(&entries).await.unwrap();
+
+        let rows = walk(
+            &db,
+            QueryLogFilter {
+                limit: Some(25),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(rows.len(), 120, "every row must be returned exactly once");
+        assert_eq!(
+            rows.iter().map(|(_, id)| *id).collect::<HashSet<_>>().len(),
+            120,
+            "no row may be duplicated across pages"
+        );
+        assert!(
+            rows.windows(2).all(|pair| pair[0] > pair[1]),
+            "rows must be strictly descending by (ts, id)"
+        );
+        assert_eq!(rows.first().unwrap().0, base + 119, "newest row first");
+        assert_eq!(rows.last().unwrap().0, base, "oldest row last");
+    }
+
+    #[tokio::test]
+    async fn test_query_logs_same_timestamp_pages_by_id() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let ts = 1_700_000_000_000;
+        let entries: Vec<_> = (0..9)
+            .map(|i| entry(ts, &format!("same-{i}.example"), "allowed"))
+            .collect();
+        db.insert_batch(&entries).await.unwrap();
+
+        let rows = walk(
+            &db,
+            QueryLogFilter {
+                limit: Some(2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(rows.len(), 9);
+        assert!(rows.iter().all(|(row_ts, _)| *row_ts == ts));
+        let ids: Vec<i64> = rows.iter().map(|(_, id)| *id).collect();
+        assert_eq!(
+            ids.iter().copied().collect::<HashSet<_>>().len(),
+            9,
+            "same-timestamp rows must not repeat"
+        );
+        assert!(
+            ids.windows(2).all(|pair| pair[0] > pair[1]),
+            "same-timestamp ties must page deterministically by id: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_logs_pages_keep_filters_and_bind_cursor_to_them() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let base = 1_700_000_000_000;
+        let mut entries = Vec::new();
+        for i in 0..30 {
+            entries.push(entry(base + i * 2, "blocked.example", "blocked"));
+            entries.push(entry(base + i * 2 + 1, "allowed.example", "allowed"));
+        }
+        db.insert_batch(&entries).await.unwrap();
+
+        let blocked_filter = QueryLogFilter {
+            status: Some("blocked".into()),
+            limit: Some(7),
+            ..Default::default()
+        };
+        let rows = walk(&db, blocked_filter.clone()).await;
+        assert_eq!(rows.len(), 30, "filter must apply on every page");
+
+        // Changing the page size is allowed: `limit` is not filter-bound.
+        let first = db.query_logs(&blocked_filter).await.unwrap();
+        let resized = db
+            .query_logs(&QueryLogFilter {
+                status: Some("blocked".into()),
+                limit: Some(30),
+                cursor: first.next_cursor.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resized.items.len(),
+            23,
+            "changing limit must continue from the same keyset position"
+        );
+
+        // Replaying the cursor under a different filter is a clear error, not
+        // a silently wrong page.
+        let err = db
+            .query_logs(&QueryLogFilter {
+                status: Some("allowed".into()),
+                limit: Some(7),
+                cursor: first.next_cursor,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StatsError::InvalidCursor(_)),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_logs_last_page_has_no_cursor() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let empty = db.query_logs(&QueryLogFilter::default()).await.unwrap();
+        assert_eq!(
+            empty.items,
+            Vec::<QueryLogEntry>::new(),
+            "an empty table has an empty first page"
+        );
+        assert!(empty.next_cursor.is_none());
+
+        let base = 1_700_000_000_000;
+        let entries: Vec<_> = (0..3)
+            .map(|i| entry(base + i, "small.example", "allowed"))
+            .collect();
+        db.insert_batch(&entries).await.unwrap();
+
+        let page = db.query_logs(&QueryLogFilter::default()).await.unwrap();
+        assert_eq!(page.items.len(), 3);
+        assert!(
+            page.next_cursor.is_none(),
+            "a page that consumed every row is the last page"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_logs_limit_clamps_between_one_and_five_hundred() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let base = 1_700_000_000_000;
+        let entries: Vec<_> = (0..510)
+            .map(|i| entry(base + i, "clamp.example", "allowed"))
+            .collect();
+        db.insert_batch(&entries).await.unwrap();
+
+        let one = db
+            .query_logs(&QueryLogFilter {
+                limit: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(one.items.len(), 1, "limit=0 clamps to 1");
+
+        let capped = db
+            .query_logs(&QueryLogFilter {
+                limit: Some(usize::MAX),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(capped.items.len(), MAX_QUERYLOG_LIMIT);
+        assert!(capped.next_cursor.is_some());
+
+        let rest = db
+            .query_logs(&QueryLogFilter {
+                limit: Some(usize::MAX),
+                cursor: capped.next_cursor,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rest.items.len(), 10);
+        assert!(rest.next_cursor.is_none());
+
+        let default_page = db.query_logs(&QueryLogFilter::default()).await.unwrap();
+        assert_eq!(default_page.items.len(), DEFAULT_QUERYLOG_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn test_query_logs_rejects_invalid_cursor() {
+        let db = StatsDb::in_memory().await.unwrap();
+        db.insert_batch(&[entry(1_700_000_000_000, "cursor.example", "allowed")])
+            .await
+            .unwrap();
+
+        for bad in ["not base64!!", "AAAA", "e30"] {
+            let err = db
+                .query_logs(&QueryLogFilter {
+                    cursor: Some(bad.into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, StatsError::InvalidCursor(_)),
+                "'{bad}' must be rejected as InvalidCursor, got {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_log_page_uses_ts_index_seek_and_no_count() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let filter = QueryLogFilter::default();
+
+        let builder = query_log_page_builder(&filter, None, 51);
+        let sql = builder.sql().as_str().to_string();
+        assert!(
+            !sql.to_ascii_uppercase().contains("COUNT("),
+            "the query-log read path must not run COUNT(*): {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY ts DESC, id DESC"),
+            "pages must be newest first: {sql}"
+        );
+
+        let builder = query_log_page_builder(&filter, Some((10, 20)), 51);
+        let sql = builder.sql().as_str().to_string();
+        assert!(
+            sql.contains("(ts, id) < (?, ?)"),
+            "cursor must use the row-value form: {sql}"
+        );
+
+        // The row-value predicate is seekable: SQLite reports a ts index range
+        // rather than a scan plus a temporary sort B-tree. `id` is the rowid,
+        // so both `idx_ql_ts(ts)` and `idx_ql_ts_id(ts, id)` encode the same
+        // `(ts, id)` keyset order; the planner may pick either.
+        let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+            .bind(10i64)
+            .bind(20i64)
+            .bind(51i64)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        let plan = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("USING INDEX idx_ql_ts"),
+            "cursor page must seek a (ts, id) index: {plan}"
+        );
+        assert!(
+            !plan.to_ascii_uppercase().contains("TEMP B-TREE"),
+            "cursor page must not sort into a temp B-tree: {plan}"
+        );
+        assert!(
+            !plan.to_ascii_uppercase().contains("SCAN query_log"),
+            "cursor page must seek, not scan the table: {plan}"
+        );
     }
 }

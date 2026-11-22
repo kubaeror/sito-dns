@@ -16,9 +16,9 @@ pub mod writer;
 
 pub use anonymize::anonymize_ip;
 pub use db::{
-    ClientStats, GlobalStats, HourlyActivity, LEGACY_SCHEMA_VERSION, MAX_AGGREGATE_ROWS,
-    MigrationMode, QueryLogFilter, QueryLogPage, RetentionReport, SCHEMA_VERSION, SchemaInspection,
-    StatsDb, StatsOpenOptions, UpstreamStats,
+    ClientStats, DEFAULT_QUERYLOG_LIMIT, GlobalStats, HourlyActivity, LEGACY_SCHEMA_VERSION,
+    MAX_AGGREGATE_ROWS, MAX_QUERYLOG_LIMIT, MigrationMode, QueryLogFilter, QueryLogPage,
+    RetentionReport, SCHEMA_VERSION, SchemaInspection, StatsDb, StatsOpenOptions, UpstreamStats,
 };
 pub use entry::QueryLogEntry;
 pub use error::StatsError;
@@ -70,21 +70,21 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(page1.entries.len(), 20);
+        assert_eq!(page1.items.len(), 20);
         assert!(page1.next_cursor.is_some());
 
         // Paginate using cursor
-        let cursor_id: i64 = page1.next_cursor.unwrap().parse().unwrap();
+        let cursor = page1.next_cursor.clone();
         let page2 = db
             .query_logs(&QueryLogFilter {
-                cursor: Some(cursor_id),
+                cursor,
                 limit: Some(20),
                 ..Default::default()
             })
             .await
             .unwrap();
 
-        assert_eq!(page2.entries.len(), 20);
+        assert_eq!(page2.items.len(), 20);
 
         // Filter by verdict = blocked
         let blocked_page = db
@@ -96,7 +96,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(blocked_page.entries.len(), 25);
+        assert_eq!(blocked_page.items.len(), 25);
 
         // Global stats
         let stats = db.get_global_stats(86_400_000 * 365).await.unwrap();
@@ -148,7 +148,7 @@ mod tests {
 
         let page = db.query_logs(&QueryLogFilter::default()).await.unwrap();
         assert!(
-            !page.entries.is_empty(),
+            !page.items.is_empty(),
             "query log must contain at least one entry"
         );
 
@@ -187,9 +187,9 @@ mod tests {
         sender.flush().await;
 
         let page = db.query_logs(&QueryLogFilter::default()).await.unwrap();
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries[0].client_ip, "192.168.1.0");
-        assert_eq!(page.entries[0].upstream, Some("1.1.1.1:53".into()));
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].client_ip, "192.168.1.0");
+        assert_eq!(page.items[0].upstream, Some("1.1.1.1:53".into()));
 
         // Toggle off
         sender.set_anonymize(false);
@@ -216,9 +216,9 @@ mod tests {
 
         sender.flush().await;
         let page2 = db.query_logs(&QueryLogFilter::default()).await.unwrap();
-        assert_eq!(page2.entries.len(), 2);
-        assert_eq!(page2.entries[0].client_ip, "10.45.99.123");
-        assert_eq!(page2.entries[0].upstream, Some("8.8.8.8:53".into()));
+        assert_eq!(page2.items.len(), 2);
+        assert_eq!(page2.items[0].client_ip, "10.45.99.123");
+        assert_eq!(page2.items[0].upstream, Some("8.8.8.8:53".into()));
 
         sender.shutdown().await;
     }
@@ -274,8 +274,8 @@ mod tests {
 
         // Verify ancient log was deleted and recent log remains
         let remaining = db.query_logs(&QueryLogFilter::default()).await.unwrap();
-        assert_eq!(remaining.entries.len(), 1);
-        assert_eq!(remaining.entries[0].qname, "recent.com");
+        assert_eq!(remaining.items.len(), 1);
+        assert_eq!(remaining.items[0].qname, "recent.com");
     }
 
     /// Representative multi-day retention sweep: 72 consecutive expired hours
@@ -395,12 +395,9 @@ mod tests {
         {
             let db = StatsDb::open(&db_path).await.unwrap();
             let page = db.query_logs(&QueryLogFilter::default()).await.unwrap();
-            assert_eq!(page.entries.len(), 1);
-            assert_eq!(page.entries[0].qname, "persisted.org");
-            assert_eq!(
-                page.entries[0].client_name.as_deref(),
-                Some("persisted-host")
-            );
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items[0].qname, "persisted.org");
+            assert_eq!(page.items[0].client_name.as_deref(), Some("persisted-host"));
         }
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
@@ -466,15 +463,15 @@ mod tests {
         loop {
             let page = db
                 .query_logs(&QueryLogFilter {
-                    limit: Some(1000),
+                    limit: Some(MAX_QUERYLOG_LIMIT),
                     cursor,
                     ..Default::default()
                 })
                 .await
                 .unwrap();
-            total += page.entries.len();
+            total += page.items.len();
             match page.next_cursor {
-                Some(next) => cursor = next.parse::<i64>().ok(),
+                Some(next) => cursor = Some(next),
                 None => break,
             }
         }
@@ -695,8 +692,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(res_client.entries.len(), 1);
-        assert_eq!(res_client.entries[0].qname, "foo%bar'baz.com");
+        assert_eq!(res_client.items.len(), 1);
+        assert_eq!(res_client.items[0].qname, "foo%bar'baz.com");
 
         // Query by domain with percent and quote
         let res_domain = db
@@ -706,8 +703,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(res_domain.entries.len(), 1);
-        assert_eq!(res_domain.entries[0].qname, "foo%bar'baz.com");
+        assert_eq!(res_domain.items.len(), 1);
+        assert_eq!(res_domain.items[0].qname, "foo%bar'baz.com");
 
         // Query with malicious status injection
         let res_status = db
@@ -717,7 +714,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(res_status.entries.len(), 0);
+        assert_eq!(res_status.items.len(), 0);
     }
 
     #[test]
@@ -819,9 +816,9 @@ mod tests {
         // The row was aggregated and pruned, not silently deleted.
         let remaining = db.query_logs(&QueryLogFilter::default()).await.unwrap();
         assert!(
-            remaining.entries.is_empty(),
+            remaining.items.is_empty(),
             "pruned query log must have no entries left: {:?}",
-            remaining.entries
+            remaining.items
         );
     }
 
@@ -849,8 +846,8 @@ mod tests {
         // Aggregate, watermark update and delete share one transaction, so the
         // row must survive the failed cleanup.
         let page = db.query_logs(&QueryLogFilter::default()).await.unwrap();
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries[0].qname, "rollback.test");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].qname, "rollback.test");
     }
 
     #[tokio::test]
@@ -1107,9 +1104,9 @@ mod tests {
         assert_eq!(deleted, 2);
         let remaining = db.query_logs(&QueryLogFilter::default()).await.unwrap();
         assert!(
-            remaining.entries.is_empty(),
+            remaining.items.is_empty(),
             "delete_query_logs must remove all entries: {:?}",
-            remaining.entries
+            remaining.items
         );
 
         let rollups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_hourly")
@@ -1137,7 +1134,7 @@ mod tests {
         let deleted = db.delete_query_logs_keep_aggregates().await.unwrap();
         assert_eq!(deleted, 2);
         let remaining = db.query_logs(&QueryLogFilter::default()).await.unwrap();
-        assert_eq!(remaining.entries.len(), 0);
+        assert_eq!(remaining.items.len(), 0);
 
         let rollups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_hourly")
             .fetch_one(db.pool())
@@ -1194,9 +1191,11 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
-    /// WP-7.2: pagination exposes the number of rows matching the filters.
+    /// A4: a page exposes only `items` and `next_cursor`; the old
+    /// `include_total`/`total_count` contract is gone (enforced at compile
+    /// time by the struct shape).
     #[tokio::test]
-    async fn test_query_logs_total_count_matches_filters() {
+    async fn test_query_logs_filter_pages_have_no_total() {
         let db = StatsDb::in_memory().await.unwrap();
         let now = chrono::Utc::now().timestamp_millis();
         let mut entries = Vec::new();
@@ -1213,8 +1212,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(page.entries.len(), 10);
-        assert_eq!(page.total_count, Some(50));
+        assert_eq!(page.items.len(), 10);
+        let cursor = page.next_cursor.expect("50 rows must have a second page");
 
         let blocked = db
             .query_logs(&QueryLogFilter {
@@ -1224,19 +1223,24 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(blocked.total_count, Some(25));
+        assert_eq!(blocked.items.len(), 25);
 
-        // The cursor must not change the total.
-        let cursor = page.next_cursor.unwrap().parse::<i64>().unwrap();
-        let page2 = db
+        let second = db
             .query_logs(&QueryLogFilter {
-                cursor: Some(cursor),
                 limit: Some(10),
+                cursor: Some(cursor),
                 ..Default::default()
             })
             .await
             .unwrap();
-        assert_eq!(page2.total_count, Some(50));
+        assert_eq!(second.items.len(), 10);
+        assert!(
+            second
+                .items
+                .iter()
+                .all(|item| item.ts < page.items.last().unwrap().ts),
+            "the cursor must continue strictly below the previous page"
+        );
     }
 
     /// WP-7.3: the per-client aggregate is bounded, deterministically ordered
@@ -1817,34 +1821,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(page.entries.len(), 500);
-        assert!(page.entries.iter().all(|e| e.qname == "concurrent.example"));
-    }
-
-    /// P1-23: the live query-log refresh can skip the filtered `COUNT(*)`.
-    #[tokio::test]
-    async fn test_query_logs_include_total_is_optional() {
-        let db = StatsDb::in_memory().await.unwrap();
-        let now = chrono::Utc::now().timestamp_millis();
-        db.insert_batch(&[
-            retention_entry(now, "total.example", "allowed", None),
-            retention_entry(now + 1, "total.example", "allowed", None),
-        ])
-        .await
-        .unwrap();
-
-        let page = db
-            .query_logs(&QueryLogFilter {
-                include_total: Some(false),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(page.entries.len(), 2);
-        assert_eq!(page.total_count, None);
-
-        let with_total = db.query_logs(&QueryLogFilter::default()).await.unwrap();
-        assert_eq!(with_total.total_count, Some(2));
+        assert_eq!(page.items.len(), 500);
+        assert!(page.items.iter().all(|e| e.qname == "concurrent.example"));
     }
 
     /// P1-23: dashboard aggregates are cached briefly and clear/retention

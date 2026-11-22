@@ -12,16 +12,19 @@ use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use sito_stats::{QueryLogFilter, QueryLogPage};
+use sito_stats::{
+    DEFAULT_QUERYLOG_LIMIT as STATS_DEFAULT_QUERYLOG_LIMIT,
+    MAX_QUERYLOG_LIMIT as STATS_MAX_QUERYLOG_LIMIT, QueryLogFilter, QueryLogPage, StatsError,
+};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use utoipa::IntoParams;
 
 /// Hard cap on the number of query-log rows returned by a REST request.
-pub const MAX_QUERYLOG_LIMIT: usize = 1_000;
+pub const MAX_QUERYLOG_LIMIT: usize = STATS_MAX_QUERYLOG_LIMIT;
 /// Default number of rows when no `limit` is supplied.
-pub const DEFAULT_QUERYLOG_LIMIT: usize = 100;
+pub const DEFAULT_QUERYLOG_LIMIT: usize = STATS_DEFAULT_QUERYLOG_LIMIT;
 /// Maximum REST query-log requests per client IP within `REST_RATE_WINDOW`.
 const REST_RATE_LIMIT: u32 = 120;
 const REST_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -40,11 +43,13 @@ pub struct QueryLogQueryParams {
     pub qtype: Option<u16>,
     pub from: Option<i64>,
     pub to: Option<i64>,
-    pub cursor: Option<i64>,
+    /// Opaque cursor from the previous response's `next_cursor`.
+    ///
+    /// Bound to the other filter parameters: reusing it with a different
+    /// filter set returns `400 Bad Request`.
+    pub cursor: Option<String>,
+    /// Page size, clamped to `1..=500`. Defaults to `50`.
     pub limit: Option<usize>,
-    /// Defaults to `true` for API compatibility. The live UI refresh passes
-    /// `false` so the 3 s poll does not run a whole-table `COUNT(*)`.
-    pub include_total: Option<bool>,
 }
 
 /// Query parameters for clearing the log.
@@ -109,6 +114,7 @@ impl IntoResponse for QueryLogHandlerError {
     params(QueryLogQueryParams),
     responses(
         (status = 200, description = "Query logs retrieved with cursor pagination", body = QueryLogPage),
+        (status = 400, description = "Invalid or filter-mismatched cursor", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 429, description = "Rate limited", body = ProblemDetails,
@@ -148,12 +154,20 @@ pub async fn get_querylog(
         to: params.to,
         cursor: params.cursor,
         limit: Some(limit),
-        include_total: params.include_total,
     };
 
-    let page = ctx.stats_db.query_logs(&filter).await.map_err(|e| {
-        QueryLogHandlerError::Problem(ProblemDetails::internal_error(e.to_string()))
-    })?;
+    let page = ctx
+        .stats_db
+        .query_logs(&filter)
+        .await
+        .map_err(|e| match e {
+            StatsError::InvalidCursor(message) => {
+                QueryLogHandlerError::Problem(ProblemDetails::bad_request(message))
+            }
+            other => {
+                QueryLogHandlerError::Problem(ProblemDetails::internal_error(other.to_string()))
+            }
+        })?;
     Ok(Json(page))
 }
 
@@ -366,5 +380,142 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_querylog_page_shape_and_cursor_contract() {
+        use crate::auth::token::Role;
+        use crate::auth::{AuthUser, MaybeConnectInfo, RequireViewer};
+
+        let temp_dir = crate::test_support::temp_dir("sito_querylog_page");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let entries: Vec<_> = (0..3)
+            .map(|i| {
+                sito_stats::QueryLogEntry::new(
+                    now + i,
+                    "192.0.2.60",
+                    None,
+                    format!("page-{i}.example"),
+                    1,
+                    Some(0),
+                    "allowed",
+                    "udp",
+                )
+            })
+            .collect();
+        ctx.stats_db.insert_batch(&entries).await.unwrap();
+
+        let viewer = || {
+            RequireViewer(AuthUser {
+                username: "viewer".to_string(),
+                role: Role::Viewer,
+                token_id: None,
+            })
+        };
+        let peer = std::net::SocketAddr::from(([198, 51, 100, 251], 12_345));
+
+        let first = get_querylog(
+            viewer(),
+            State(ctx.clone()),
+            MaybeConnectInfo(Some(peer)),
+            HeaderMap::new(),
+            Query(QueryLogQueryParams {
+                limit: Some(2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("first page");
+        assert_eq!(first.0.items.len(), 2);
+        let cursor = first.0.next_cursor.clone().expect("another page exists");
+        assert_eq!(
+            first.0.items[0].qname, "page-2.example",
+            "the API must return newest rows first"
+        );
+
+        let json = serde_json::to_value(&first.0).unwrap();
+        assert!(json.get("items").is_some(), "response must expose items");
+        assert!(json.get("next_cursor").is_some());
+        assert!(
+            json.get("entries").is_none() && json.get("total_count").is_none(),
+            "the old entries/total_count shape must be gone: {json}"
+        );
+
+        let second = get_querylog(
+            viewer(),
+            State(ctx.clone()),
+            MaybeConnectInfo(Some(peer)),
+            HeaderMap::new(),
+            Query(QueryLogQueryParams {
+                limit: Some(2),
+                cursor: Some(cursor.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("second page");
+        assert_eq!(second.0.items.len(), 1);
+        assert!(
+            second.0.next_cursor.is_none(),
+            "the last page must report a null cursor"
+        );
+
+        // The cursor is filter-bound; replaying it under another filter is a
+        // clear 400 rather than a silently wrong page.
+        let Err(error) = get_querylog(
+            viewer(),
+            State(ctx.clone()),
+            MaybeConnectInfo(Some(peer)),
+            HeaderMap::new(),
+            Query(QueryLogQueryParams {
+                limit: Some(2),
+                cursor: Some(cursor),
+                status: Some("blocked".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        else {
+            panic!("a filter-mismatched cursor must be rejected");
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("filter set"),
+            "the 400 should explain the cursor/filter mismatch: {body}"
+        );
+
+        // A syntactically invalid cursor is also a 400.
+        let Err(error) = get_querylog(
+            viewer(),
+            State(ctx.clone()),
+            MaybeConnectInfo(Some(peer)),
+            HeaderMap::new(),
+            Query(QueryLogQueryParams {
+                cursor: Some("not a cursor!!".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        else {
+            panic!("a malformed cursor must be rejected");
+        };
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_querylog_default_limit_is_fifty() {
+        assert_eq!(DEFAULT_QUERYLOG_LIMIT, 50);
+        assert_eq!(MAX_QUERYLOG_LIMIT, 500);
     }
 }

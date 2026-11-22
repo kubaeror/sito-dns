@@ -20,10 +20,17 @@ use std::time::{Duration, Instant};
 
 use utoipa::ToSchema;
 
+mod cursor;
 mod querylog;
 mod retention;
 mod schema;
 mod support;
+
+/// Default number of query-log rows returned by [`StatsDb::query_logs`].
+pub const DEFAULT_QUERYLOG_LIMIT: usize = 50;
+
+/// Hard cap on the number of query-log rows in one page.
+pub const MAX_QUERYLOG_LIMIT: usize = 500;
 
 /// Maximum number of rows returned by the per-client/per-upstream aggregate
 /// queries. The endpoints used to return one row per distinct client or
@@ -265,20 +272,24 @@ pub struct QueryLogFilter {
     pub qtype: Option<u16>,
     pub from: Option<i64>,
     pub to: Option<i64>,
-    pub cursor: Option<i64>,
+    /// Opaque cursor from the previous page's [`QueryLogPage::next_cursor`].
+    ///
+    /// The string is bound to the other filter fields: replaying it with a
+    /// different filter set is rejected with [`StatsError::InvalidCursor`].
+    /// Its wire format is internal and may change between releases.
+    pub cursor: Option<String>,
+    /// Page size. Clamped to `1..=`[`MAX_QUERYLOG_LIMIT`]; defaults to
+    /// [`DEFAULT_QUERYLOG_LIMIT`]. Not part of the cursor's filter binding.
     pub limit: Option<usize>,
-    /// Whether to run the `COUNT(*)` used for `total_count`. Defaults to
-    /// `true` for API compatibility; the live UI refresh sets it to `false`
-    /// so the 3 s poll does not scan the filtered table.
-    pub include_total: Option<bool>,
 }
 
-/// Paginated page of query logs.
+/// Paginated page of query logs, newest first.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueryLogPage {
-    pub entries: Vec<QueryLogEntry>,
+    /// Rows for this page, ordered by `(ts, id)` descending.
+    pub items: Vec<QueryLogEntry>,
+    /// Cursor for the next page, or `None` when this is the last page.
     pub next_cursor: Option<String>,
-    pub total_count: Option<i64>,
 }
 
 /// Aggregated global statistics.
@@ -371,9 +382,8 @@ pub struct StatsDb {
     cache: Arc<StatsCache>,
 }
 
-/// Builds the shared `query_log` filter predicate used by both the page query
-/// and the `total_count` query. Cursor pagination and `LIMIT` are deliberately
-/// not part of this predicate.
+/// Builds the shared `query_log` filter predicate used by the page query.
+/// Cursor pagination and `LIMIT` are deliberately not part of this predicate.
 fn filtered_query(base: &str, filter: &QueryLogFilter) -> sqlx::QueryBuilder<Sqlite> {
     let mut builder = sqlx::QueryBuilder::new(base);
 
