@@ -28,20 +28,59 @@ and in the catalog's own `source` block.
 
 ## Generation and update policy
 
-The catalog is **release-bound**, not fetched at runtime.
+The catalog is **release-bound**, not fetched at runtime. The binary embeds the
+committed `crates/sito-clients/src/catalog/catalog.json` with `include_str!`;
+2.0 has no catalog URL, HTTP client or update command. Metadata never updates
+itself, and list bodies remain runtime downloads (see
+[Runtime behaviour](#runtime-behaviour)).
 
-Release-time regeneration (network) refreshes the catalog and prints its
-SHA-256:
+### Release-time refresh runbook
 
-```bash
-python3 scripts/generate-catalog.py
-python3 scripts/generate-catalog.py --check
-```
+Run this only when cutting a release (or when deliberately refreshing metadata):
 
-The generator fetches the two indexes and writes the deterministic
-`crates/sito-clients/src/catalog/catalog.json`. When intentionally refreshing
-the catalog, review the diff, update `CATALOG_SHA256` in the generator to the
-digest it prints, and commit the JSON, the pin and the consuming code together.
+1. **Fetch the upstream indexes at release time only.** Either let the
+   generator fetch them, or download them yourself so the input is reviewable:
+
+   ```bash
+   curl -fsSL https://adguardteam.github.io/HostlistsRegistry/assets/filters.json \
+     -o /tmp/opencode/filters.json
+   curl -fsSL https://adguardteam.github.io/HostlistsRegistry/assets/services.json \
+     -o /tmp/opencode/services.json
+   ```
+
+2. **Regenerate and review the diff.** The generator is deterministic and
+   prints the new SHA-256. List bodies are never read.
+
+   ```bash
+   python3 scripts/generate-catalog.py \
+     --filters-file /tmp/opencode/filters.json \
+     --services-file /tmp/opencode/services.json
+   git diff -- crates/sito-clients/src/catalog/catalog.json
+   ```
+
+3. **Update the pin.** `--check` is the offline tamper/canonicalization guard:
+   the committed bytes must match `CATALOG_SHA256` *and* equal the canonical
+   bytes the generator would emit. Copy the digest printed by step 2 into
+   `CATALOG_SHA256` in `scripts/generate-catalog.py`, then run
+   `python3 scripts/generate-catalog.py --check` until it passes.
+
+4. **Bump `catalog_version` only on schema changes.** The JSON value (currently
+   `1`) guards compatibility; a metadata-only refresh must not change it. A
+   schema change also needs the Rust loader, consuming UI/handlers and the
+   tests updated in the same commit.
+
+5. **Review license and attribution.** Confirm the catalog still records
+   `GPL-3.0-only`, that `THIRD_PARTY_NOTICES` names
+   AdguardTeam/HostlistsRegistry with both source URLs, and that the
+   metadata-only/no-list-bodies statement still matches what was generated.
+
+6. **Commit together.** The regenerated JSON, the `CATALOG_SHA256` pin and any
+   consuming code or tests belong in one reviewable change. Never commit a
+   catalog file and its pin in separate commits.
+
+7. **Keep list bodies runtime-downloaded.** The refresh changes metadata and
+   URLs only. Existing `[filtering].lists` subscriptions still refresh through
+   the normal scheduler, **Update All**, or the force-refresh API.
 
 The default `--check` is the **offline tamper/canonicalization guard**. It
 never touches the network and requires:
@@ -62,6 +101,18 @@ without network access.
 Rust loader `Catalog::embedded()` rejects unknown versions, unknown fields,
 duplicate ids, empty names/URLs/rules, unexpected source URLs/license and
 references to undeclared categories or service groups.
+
+### What 2.0 does not do
+
+- It does **not** fetch the catalog at runtime (startup, UI request or refresh).
+- It has **no** `sito catalog update` command and no background metadata
+  auto-update.
+- It does **not** auto-update catalog versions, URLs or service rules.
+- Future signed/checksummed catalog updates are out of scope for 2.0.
+
+The release gate records the integrity evidence in
+[release verification](release-verification.md#catalog-release-bound-integrity-f2e);
+the requirement-to-test audit is in the [catalog coverage matrix](catalog-coverage.md).
 
 ## Choose from catalog (web UI)
 

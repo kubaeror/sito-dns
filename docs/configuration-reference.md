@@ -293,6 +293,12 @@ enabled = true
 | `lists.enabled` | boolean | `true` | Download and compile this list. |
 | `lists.refresh_hours` | integer | `None` | Per-list refresh interval in hours. When unset, `filtering.refresh_interval_hours` is used. Must be greater than 0 and at most 8760 (one year) when set. |
 
+The Filtering page can add these entries from the embedded HostlistsRegistry
+catalog or from a custom URL. Catalog selection writes the same
+`[[filtering.lists]]` name/URL/enabled fields from release-bound metadata; the
+catalog itself is never fetched at runtime, and its list bodies download
+through the normal subscription path. See [Embedded catalog](catalog.md).
+
 ---
 
 ## 9. `[clients]` — Client Identification & Policies

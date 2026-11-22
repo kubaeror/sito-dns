@@ -766,6 +766,81 @@ mod tests {
         assert!(matches!(error, CatalogError::UnexpectedLicense(_)));
     }
 
+    /// The catalog loader is release-bound: it reads the JSON embedded at
+    /// compile time and must not gain an HTTP client or socket path. This
+    /// source/manifest guard keeps a future edit from turning the embedded
+    /// metadata into a runtime fetch (F2e).
+    #[test]
+    fn catalog_module_has_no_network_path() {
+        let source = include_str!("catalog.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("catalog module has production source");
+        // Ignore line comments so documentation that mentions "network" or
+        // upstream URLs does not make the assertion brittle.
+        let code = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            code.contains("Self::parse(CATALOG_JSON)"),
+            "Catalog::embedded must parse the compile-time embedded JSON"
+        );
+        for forbidden in [
+            "reqwest",
+            "ureq",
+            "hyper::",
+            "curl::",
+            "surf::",
+            "isahc",
+            "attohttpc",
+            "TcpStream",
+            "UdpSocket",
+            "std::net",
+            "tokio::net",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the catalog loader must stay offline; found '{forbidden}'"
+            );
+        }
+
+        // No HTTP client may sneak in through the crate dependency graph.
+        let manifest = include_str!("../Cargo.toml");
+        for forbidden in [
+            "reqwest",
+            "ureq",
+            "hyper",
+            "curl",
+            "surf",
+            "isahc",
+            "attohttpc",
+        ] {
+            assert!(
+                !manifest.contains(forbidden),
+                "sito-clients must not depend on an HTTP client: '{forbidden}'"
+            );
+        }
+    }
+
+    /// Attribution is part of the license claim, so the notices must name the
+    /// same project, source URLs and license as the embedded catalog.
+    #[test]
+    fn catalog_attribution_names_embedded_source() {
+        let notices = include_str!("../../../THIRD_PARTY_NOTICES");
+        assert!(notices.contains("AdguardTeam/HostlistsRegistry"));
+        assert!(notices.contains(FILTERS_SOURCE_URL));
+        assert!(notices.contains(SERVICES_SOURCE_URL));
+        assert!(notices.contains("GPL-3.0"));
+        assert!(
+            notices.contains("metadata"),
+            "the notices must say that only metadata is embedded"
+        );
+    }
+
     fn run_catalog_check(out: &Path) -> std::process::Output {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let script = root.join("scripts/generate-catalog.py");
