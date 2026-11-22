@@ -207,6 +207,23 @@ async fn main() -> anyhow::Result<()> {
                     }
                     return Ok(());
                 }
+                sito::cli::DbCommands::Anonymize {
+                    config,
+                    all,
+                    dry_run,
+                } => {
+                    let config_path = config.unwrap_or(default_config_path.clone());
+                    if let Err(e) = sito::cli::run_db_anonymize(
+                        &config_path,
+                        sito::cli::DbAnonymizeOptions { all, dry_run },
+                    )
+                    .await
+                    {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
             },
             Commands::Update {
                 config,

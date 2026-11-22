@@ -20,12 +20,18 @@ use std::time::{Duration, Instant};
 
 use utoipa::ToSchema;
 
+mod anonymize;
 mod backup;
 mod cursor;
 mod querylog;
 mod retention;
 mod schema;
 mod support;
+
+pub use anonymize::{
+    ANONYMIZE_QUERYLOG_CHUNK_ROWS, QueryLogAnonymizeChunk, QueryLogAnonymizePlan,
+    QueryLogAnonymizeReport,
+};
 
 /// Default number of query-log rows returned by [`StatsDb::query_logs`].
 pub const DEFAULT_QUERYLOG_LIMIT: usize = 50;

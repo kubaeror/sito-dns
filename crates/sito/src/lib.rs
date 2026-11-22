@@ -4,6 +4,7 @@
 
 pub mod cli;
 pub mod container_entrypoint;
+mod db_anonymize;
 mod db_maintenance;
 mod db_startup;
 pub mod logging;
