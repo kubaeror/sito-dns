@@ -298,7 +298,7 @@ The catalog lists every material finding from the eight audits. Some P2/P3 items
 | P3-18 | CI | `cargo clippy` lacks `--locked`; security workflow only runs on dependency-path changes or weekly; no coverage tool/cargo-machete/udeps. |
 | P3-19 | CI | `deny.toml` ignores `RUSTSEC-2026-0374` but cargo-deny reports `advisory-not-detected`; stale suppression. |
 | P3-20 | Ops | Uninstall leaves cosign installed; installer proceeds without systemd; `setcap || true`; no uninstaller test. |
-| P3-21 | Ops | `scripts/test-ha-ownership-root.sh` is root-gated and not in CI. |
+| P3-21 | Ops | `scripts/test-ha-ownership-root.sh` is root-gated; the manual/weekly `ha-ownership.yml` lane wires it into CI without making it a PR gate. |
 | P3-22 | Ops | `fuzz/target` is 2.2 GB and root `target` 39 GB; `.opencode` 63 MB; `__pycache__` tracked/untracked artifacts. |
 | P3-23 | Ops | Two systemd unit copies and two hook systems can drift. |
 | P3-24 | Ops | `.dockerignore` may not exclude `fuzz/target`; add explicit exclusion. |
@@ -1515,9 +1515,12 @@ decisions:
   `--version`/`check-config` rather than start/healthcheck/DNS. Extending the
   scan to arm64/armv7 and running a live release-image DNS query is deferred to
   WP-3.1 (documented in the release workflow and matrix P2-70/P3-26).
-- **Root HA lane:** `scripts/test-ha-ownership-root.sh` remains a root-gated
-  manual/weekly operator step; wiring it into a root-capable CI runner is
-  deferred to WP-3.1 (P3-21).
+- **Root HA lane:** `scripts/test-ha-ownership-root.sh` now runs in the
+  root-gated manual/weekly `.github/workflows/ha-ownership.yml` lane. The
+  wrapper fails on a non-root uid and on a zero-test filter, and
+  `scripts/test-ha-ownership-workflow.sh` pins the lane's trigger, `sudo -E`
+  environment and lack of `continue-on-error`. A green run on the release
+  candidate commit is 2.0 release evidence (P3-21).
 - **Digest-pin docs:** the shipped examples use pinned release tags and explain
   digest pinning, but do not hardcode a per-release digest. Operators should
   resolve and record the published digest at deploy time; a generated

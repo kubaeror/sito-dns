@@ -1,0 +1,61 @@
+name: HA Ownership (root)
+
+# Root-gated HA certificate ownership gate. This lane is deliberately not a
+# pull-request or push trigger: GitHub-hosted runners run as a non-root user
+# and the test must chown a root-owned 0600 key to uid/gid 65532 and execute a
+# probe as that identity. It is a manual 2.0 release-gate lane, with a weekly
+# scheduled run so the environment and wrapper cannot rot between releases.
+#
+# `scripts/test-ha-ownership-root.sh` refuses to run unprivileged, and the
+# wrapper additionally fails unless exactly one test ran. No error-swallowing
+# option is set: a missing sudo, a non-root run, or a zero-test filter is a
+# failure, never a skip.
+on:
+  workflow_dispatch:
+  schedule:
+    # Sunday 06:00 UTC drift check. The release gate is a manual dispatch on
+    # the release-candidate commit; see docs/release-verification.md.
+    - cron: '0 6 * * 0'
+
+# Least privilege: the lane only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ha-ownership-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  root-ownership:
+    name: root-ownership
+    # Same explicit runner image as every other job; `ubuntu-latest` floats and
+    # is forbidden by the runner-pin policy in docs/ci.md.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: 1.99.1
+
+      # `sudo` starts from a clean environment. Resolve non-empty cargo/rustup
+      # homes first so root cannot fall back to `/root/.cargo` and `/root/
+      # .rustup`, where the pinned toolchain is not installed.
+      - name: Resolve the root cargo environment
+        run: |
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+
+      - name: Run the root-gated HA ownership test
+        run: |
+          echo "runner uid: $(id -u)"
+          sudo -E env \
+            PATH="$PATH" \
+            CARGO_HOME="$CARGO_HOME" \
+            RUSTUP_HOME="$RUSTUP_HOME" \
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+            bash scripts/test-ha-ownership-root.sh

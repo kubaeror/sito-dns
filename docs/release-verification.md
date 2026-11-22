@@ -22,6 +22,12 @@ published.
 | `docker-build-push` | The multi-arch image is pushed; its digest, platform list, tags, provenance, and SBOM are verified; the digest is scanned by a digest-pinned Trivy (fixed HIGH/CRITICAL gate; unfixed findings are ignored) and signed/verified with cosign keyless signing. The attested digest is also started with a self-contained config: a local rewrite must answer and the image healthcheck must turn `healthy`. | `verify-tag`, `release-gate`, `build-binaries`, `sbom-and-release`, `artifact-e2e` |
 | `publish-release` | The staged draft is flipped to published and verified not to be a draft; stable tags are marked latest and prereleases stay prereleases. | `sbom-and-release`, `artifact-e2e`, `docker-build-push` |
 
+The 2.0 gate additionally requires one green root-gated HA ownership run on the
+release candidate commit (see
+[HA certificate ownership evidence](#ha-certificate-ownership-evidence-root-gated-lane)).
+That lane needs `sudo` and uid/gid 65532, so it is a separate manual/weekly
+workflow rather than a job in the tag-push chain.
+
 Consequences:
 
 - A tag that does not match the workspace version fails in `verify-tag`, before
@@ -224,6 +230,39 @@ tar -xzf "${archive}"
 
 Expected: both checksum checks print `OK`, `cosign verify-blob` prints
 `Verified OK`, and `--version` prints the version matching the tag.
+
+## HA certificate ownership evidence (root-gated lane)
+
+The HA key-ownership handoff is verified by
+[`ha-ownership.yml`](../.github/workflows/ha-ownership.yml), which runs
+`scripts/test-ha-ownership-root.sh` under `sudo -E` with `PATH`, `CARGO_HOME`,
+`RUSTUP_HOME` and `CARGO_TARGET_DIR` preserved. It is a manual/weekly lane, not
+a pull-request or `ci-gate` check, because GitHub-hosted runners are non-root
+and the test chowns a root-owned 0600 key to uid/gid 65532 and runs a probe as
+that identity.
+
+Before publishing a 2.0 release, run it on the release candidate commit:
+
+```bash
+gh workflow run ha-ownership.yml --ref <release-commit-or-branch>
+gh run list --workflow ha-ownership.yml --limit 1
+gh run watch <run-id> --exit-status
+```
+
+Record in the release checklist:
+
+- the run URL and commit SHA;
+- the non-root `runner uid:` line printed before `sudo`;
+- `running 1 test` and `test result: ok. 1 passed` for
+  `test_m8_root_owned_key_chown_activates_ha` (a zero-test or non-root run
+  fails the job; it is never a skip);
+- confirmation from the test output that uid/gid 65532 could not read the
+  root-owned key, that the `chown` succeeded, and that the real mTLS listener,
+  `/health` and `/api/v2/ha/status` became ready.
+
+A red or missing run blocks the 2.0 release. Locally the same check is
+`sudo bash scripts/test-ha-ownership-root.sh`; the workflow itself cannot be
+executed without a root-capable runner.
 
 ## Fuzz evidence (24-hour release checklist)
 
