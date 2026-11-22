@@ -106,6 +106,33 @@ enabled = false
 }
 
 #[test]
+fn test_ha_slave_readiness_requirements_load_from_config() {
+    // These keys must be in the v2 schema map as well as `HaConfig`; without
+    // the map entries, startup/check-config rejects them as unknown keys.
+    let toml_str = format!(
+        "{TEST_BASE}[ha]\nreplication_port = 8953\nrequire_slaves = true\nrequire_all_slaves = true\n"
+    );
+    let config = Config::from_toml_str(&toml_str)
+        .expect("ha.require_slaves/require_all_slaves must be accepted in v2");
+    let ha = config.ha.expect("[ha] section");
+    assert_eq!(
+        ha.get("require_slaves").and_then(toml::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        ha.get("require_all_slaves").and_then(toml::Value::as_bool),
+        Some(true)
+    );
+
+    // Absent keys keep the documented default (`false`) and remain valid.
+    let without = Config::from_toml_str(&format!("{TEST_BASE}[ha]\nreplication_port = 8953\n"))
+        .expect("omitting the opt-in keys must stay valid");
+    let ha = without.ha.expect("[ha] section");
+    assert!(ha.get("require_slaves").is_none());
+    assert!(ha.get("require_all_slaves").is_none());
+}
+
+#[test]
 fn test_reject_invalid_config() {
     // Bad config version: v1 must be rejected with the migration hint.
     let bad_ver = "config_version = 1\n[upstream]\nservers = [\"1.1.1.1\"]";
@@ -1089,6 +1116,8 @@ pinned_slave_fingerprints = ["blake3:def"]
 slave_token = "token"
 allow_unpinned_tls = false
 allow_insecure_ws = false
+require_slaves = true
+require_all_slaves = true
 stats_interval_secs = 30
 ping_interval_secs = 15
 

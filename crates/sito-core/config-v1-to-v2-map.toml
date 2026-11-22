@@ -655,6 +655,14 @@ path = "ha.allow_insecure_ws"
 status = "kept"
 
 [[field]]
+path = "ha.require_slaves"
+status = "kept"
+
+[[field]]
+path = "ha.require_all_slaves"
+status = "kept"
+
+[[field]]
 path = "ha.stats_interval_secs"
 status = "kept"
 
