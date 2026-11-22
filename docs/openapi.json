@@ -20,8 +20,8 @@
           {
             "name": "X-Reauth-Token",
             "in": "header",
-            "description": "Session-bound re-authentication ticket; required for an Admin overriding another account",
-            "required": true,
+            "description": "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers when an Admin overrides another account's password; API-token callers are exempt.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -70,6 +70,26 @@
           },
           "403": {
             "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Target user not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to persist the user store",
             "content": {
               "application/json": {
                 "schema": {
@@ -301,8 +321,8 @@
           {
             "name": "X-Reauth-Token",
             "in": "header",
-            "description": "Session-bound re-authentication ticket; required to mint an Admin-scoped token from a user session",
-            "required": true,
+            "description": "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers minting an Admin-scoped token; API-token callers are exempt.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -451,8 +471,8 @@
           {
             "name": "X-Reauth-Token",
             "in": "header",
-            "description": "Short-lived re-authentication ticket from POST /api/v2/auth/reauth",
-            "required": true,
+            "description": "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers only; API-token callers are exempt (API tokens cannot manage TOTP and receive 403).",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -475,6 +495,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/GenericMessageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid TOTP verification code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             }
@@ -508,6 +538,16 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Failed to persist the user store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -531,8 +571,8 @@
           {
             "name": "X-Reauth-Token",
             "in": "header",
-            "description": "Short-lived re-authentication ticket from POST /api/v2/auth/reauth",
-            "required": true,
+            "description": "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers only; API-token callers are exempt (API tokens cannot manage TOTP and receive 403).",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -588,6 +628,26 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "User account not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to persist the user store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -611,8 +671,8 @@
           {
             "name": "X-Reauth-Token",
             "in": "header",
-            "description": "Short-lived re-authentication ticket from POST /api/v2/auth/reauth",
-            "required": true,
+            "description": "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers only; API-token callers are exempt (API tokens cannot manage TOTP and receive 403).",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -641,6 +701,16 @@
           },
           "403": {
             "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to generate TOTP credentials",
             "content": {
               "application/json": {
                 "schema": {
@@ -690,6 +760,16 @@
           },
           "401": {
             "description": "Invalid or expired code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Locked out or rate limited",
             "content": {
               "application/json": {
                 "schema": {
@@ -762,8 +842,8 @@
           {
             "name": "X-Reauth-Token",
             "in": "header",
-            "description": "Session-bound re-authentication ticket; required to create an Admin from a user session",
-            "required": true,
+            "description": "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers creating an Admin user; API-token callers are exempt.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -829,6 +909,16 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Failed to persist the user store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -861,8 +951,8 @@
           {
             "name": "X-Reauth-Token",
             "in": "header",
-            "description": "Session-bound re-authentication ticket; required for session callers",
-            "required": true,
+            "description": "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers; API-token callers are exempt.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -921,6 +1011,16 @@
           },
           "404": {
             "description": "User not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to persist the user store",
             "content": {
               "application/json": {
                 "schema": {
@@ -999,6 +1099,16 @@
           },
           "404": {
             "description": "User not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to persist the user store",
             "content": {
               "application/json": {
                 "schema": {
@@ -1206,6 +1316,19 @@
           },
           "403": {
             "description": "Forbidden"
+          },
+          "409": {
+            "description": "Client name or shared secret already exists"
+          },
+          "500": {
+            "description": "Configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1280,6 +1403,9 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid configuration"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -1288,6 +1414,16 @@
           },
           "409": {
             "description": "Group already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration could not be applied or persisted",
             "content": {
               "application/json": {
                 "schema": {
@@ -1391,11 +1527,27 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid configuration"
+          },
           "401": {
             "description": "Unauthorized"
           },
           "403": {
             "description": "Forbidden"
+          },
+          "409": {
+            "description": "Configuration generation changed while the write was staged"
+          },
+          "500": {
+            "description": "Configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1434,6 +1586,9 @@
               }
             }
           },
+          "400": {
+            "description": "The default group cannot be deleted"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -1442,6 +1597,19 @@
           },
           "404": {
             "description": "Group not found"
+          },
+          "409": {
+            "description": "Group is still referenced by clients, or the configuration generation changed"
+          },
+          "500": {
+            "description": "Configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1599,6 +1767,9 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid configuration"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -1610,6 +1781,16 @@
           },
           "409": {
             "description": "Renaming onto an existing client name"
+          },
+          "500": {
+            "description": "Configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1648,6 +1829,9 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid configuration"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -1656,6 +1840,19 @@
           },
           "404": {
             "description": "Not Found"
+          },
+          "409": {
+            "description": "Configuration generation changed while the write was staged"
+          },
+          "500": {
+            "description": "Configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1705,6 +1902,16 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "The configuration file could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1738,7 +1945,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericMessageResponse"
+                  "$ref": "#/components/schemas/ConfigUpdateResponse"
                 }
               }
             }
@@ -1775,6 +1982,16 @@
           },
           "409": {
             "description": "Configuration changes restart-only fields; nothing was persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration could not be applied or persisted",
             "content": {
               "application/json": {
                 "schema": {
@@ -1827,6 +2044,16 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "The backup could not be read or archived",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1852,7 +2079,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericMessageResponse"
+                  "$ref": "#/components/schemas/ConfigUpdateResponse"
                 }
               }
             }
@@ -1879,6 +2106,26 @@
           },
           "403": {
             "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The reload changes restart-only fields or the configuration generation changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration could not be read, applied, or persisted",
             "content": {
               "application/json": {
                 "schema": {
@@ -2084,6 +2331,16 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Restored configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2213,6 +2470,19 @@
           },
           "403": {
             "description": "Forbidden"
+          },
+          "409": {
+            "description": "Filter list already exists, or the configuration generation changed"
+          },
+          "500": {
+            "description": "Filter configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2264,6 +2534,9 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid list name or URL"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -2272,6 +2545,19 @@
           },
           "404": {
             "description": "Not Found"
+          },
+          "409": {
+            "description": "List name already exists, a client group still references the list, or the configuration generation changed"
+          },
+          "500": {
+            "description": "Filter configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2311,6 +2597,9 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid configuration"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -2319,6 +2608,19 @@
           },
           "404": {
             "description": "Not Found"
+          },
+          "409": {
+            "description": "A client group still references the list, or the configuration generation changed"
+          },
+          "500": {
+            "description": "Filter configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2348,11 +2650,27 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid configuration"
+          },
           "401": {
             "description": "Unauthorized"
           },
           "403": {
             "description": "Forbidden"
+          },
+          "409": {
+            "description": "The configuration generation changed while the refresh was staged"
+          },
+          "500": {
+            "description": "Refresh failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2424,11 +2742,27 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid configuration"
+          },
           "401": {
             "description": "Unauthorized"
           },
           "403": {
             "description": "Forbidden"
+          },
+          "409": {
+            "description": "The configuration generation changed while the write was staged"
+          },
+          "500": {
+            "description": "Filter configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2722,6 +3056,9 @@
           "404": {
             "description": "Category is not configured in [integrations.lists]"
           },
+          "500": {
+            "description": "The category state could not be read after refresh"
+          },
           "502": {
             "description": "Source could not be fetched"
           }
@@ -2884,6 +3221,16 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Query log could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2927,6 +3274,16 @@
           },
           "403": {
             "description": "Forbidden"
+          },
+          "500": {
+            "description": "Query log could not be cleared",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -2973,6 +3330,16 @@
           },
           "403": {
             "description": "Forbidden"
+          },
+          "500": {
+            "description": "Query log could not be cleared",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3084,6 +3451,19 @@
           },
           "403": {
             "description": "Forbidden"
+          },
+          "409": {
+            "description": "The configuration generation changed while the write was staged"
+          },
+          "500": {
+            "description": "Rewrite configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3145,6 +3525,19 @@
           },
           "404": {
             "description": "Not Found"
+          },
+          "409": {
+            "description": "The configuration generation changed while the write was staged"
+          },
+          "500": {
+            "description": "Rewrite configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3183,6 +3576,9 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid configuration"
+          },
           "401": {
             "description": "Unauthorized"
           },
@@ -3191,6 +3587,19 @@
           },
           "404": {
             "description": "Not Found"
+          },
+          "409": {
+            "description": "The configuration generation changed while the write was staged"
+          },
+          "500": {
+            "description": "Rewrite configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3260,6 +3669,16 @@
                 "description": "Seconds to wait before retrying"
               }
             },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Statistics could not be read",
             "content": {
               "application/json": {
                 "schema": {
@@ -3354,6 +3773,16 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Statistics could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3434,6 +3863,16 @@
                 "description": "Seconds to wait before retrying"
               }
             },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Statistics could not be read",
             "content": {
               "application/json": {
                 "schema": {
@@ -3729,6 +4168,26 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The configuration changes restart-only fields or the generation changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Upstream configuration could not be applied or persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -3835,6 +4294,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/UpstreamTestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Too many upstream servers in one request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             }
@@ -6048,13 +6517,14 @@
       "bearer_auth": {
         "type": "http",
         "scheme": "bearer",
-        "bearerFormat": "JWT",
-        "description": "API token in `Authorization: Bearer <token>`"
+        "bearerFormat": "API token",
+        "description": "API token in `Authorization: Bearer <token>`. API-token callers are exempt from `X-Reauth-Token` on sensitive mutations."
       },
       "cookie_auth": {
         "type": "apiKey",
         "in": "cookie",
-        "name": "sito_session"
+        "name": "__Host-sito_session",
+        "description": "Browser session cookie. The canonical secure cookie is `__Host-sito_session`; `sito_session` is only the plaintext/loopback fallback used when TLS is not active. Session callers need a fresh `X-Reauth-Token` for sensitive mutations."
       }
     }
   },

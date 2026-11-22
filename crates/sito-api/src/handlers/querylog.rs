@@ -112,7 +112,8 @@ impl IntoResponse for QueryLogHandlerError {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 429, description = "Rate limited", body = ProblemDetails,
-            headers(("Retry-After", description = "Seconds to wait before retrying")))
+            headers(("Retry-After", description = "Seconds to wait before retrying"))),
+        (status = 500, description = "Query log could not be read", body = ProblemDetails)
     ),
     tag = "QueryLog",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -163,7 +164,8 @@ pub async fn get_querylog(
     responses(
         (status = 200, description = "Query log cleared successfully", body = GenericMessageResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Query log could not be cleared", body = ProblemDetails)
     ),
     tag = "QueryLog",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -202,7 +204,8 @@ pub async fn delete_querylog(
     responses(
         (status = 200, description = "Query log cleared successfully", body = GenericMessageResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Query log could not be cleared", body = ProblemDetails)
     ),
     tag = "QueryLog",
     security(("bearer_auth" = []), ("cookie_auth" = [])),

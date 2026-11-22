@@ -159,8 +159,10 @@ pub async fn get_rewrites(
     responses(
         (status = 201, description = "DNS rewrite created", body = RewriteDto),
         (status = 400, description = "Bad Request"),
+        (status = 409, description = "The configuration generation changed while the write was staged"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Rewrite configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Rewrites",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -207,8 +209,10 @@ pub async fn add_rewrite(
         (status = 200, description = "DNS rewrite updated", body = RewriteDto),
         (status = 400, description = "Bad Request"),
         (status = 404, description = "Not Found"),
+        (status = 409, description = "The configuration generation changed while the write was staged"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Rewrite configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Rewrites",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -249,9 +253,12 @@ pub async fn update_rewrite(
     params(("id" = String, Path, description = "Stable rewrite ID")),
     responses(
         (status = 200, description = "DNS rewrite deleted", body = GenericMessageResponse),
+        (status = 400, description = "Invalid configuration"),
         (status = 404, description = "Not Found"),
+        (status = 409, description = "The configuration generation changed while the write was staged"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Rewrite configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Rewrites",
     security(("bearer_auth" = []), ("cookie_auth" = [])),

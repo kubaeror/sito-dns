@@ -149,7 +149,8 @@ pub fn parse_window_ms(window: Option<&str>) -> Result<i64, ProblemDetails> {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 429, description = "Rate limited", body = ProblemDetails,
-            headers(("Retry-After", description = "Seconds to wait before retrying")))
+            headers(("Retry-After", description = "Seconds to wait before retrying"))),
+        (status = 500, description = "Statistics could not be read", body = ProblemDetails)
     ),
     tag = "Stats",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -182,7 +183,8 @@ pub async fn get_stats(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 429, description = "Rate limited", body = ProblemDetails,
-            headers(("Retry-After", description = "Seconds to wait before retrying")))
+            headers(("Retry-After", description = "Seconds to wait before retrying"))),
+        (status = 500, description = "Statistics could not be read", body = ProblemDetails)
     ),
     tag = "Stats",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -220,7 +222,8 @@ pub async fn get_client_stats(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 429, description = "Rate limited", body = ProblemDetails,
-            headers(("Retry-After", description = "Seconds to wait before retrying")))
+            headers(("Retry-After", description = "Seconds to wait before retrying"))),
+        (status = 500, description = "Statistics could not be read", body = ProblemDetails)
     ),
     tag = "Stats",
     security(("bearer_auth" = []), ("cookie_auth" = [])),

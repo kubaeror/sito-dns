@@ -183,6 +183,7 @@ pub async fn get_integration_lists(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Category is not configured in [integrations.lists]"),
+        (status = 500, description = "The category state could not be read after refresh"),
         (status = 502, description = "Source could not be fetched")
     ),
     tag = "Integrations",
@@ -288,8 +289,10 @@ pub async fn refresh_integration_list(
     responses(
         (status = 201, description = "Filter list added", body = FilterListDto),
         (status = 400, description = "Bad Request"),
+        (status = 409, description = "Filter list already exists, or the configuration generation changed"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Filter configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Filtering",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -338,9 +341,12 @@ pub async fn add_filter_list(
     params(("id" = usize, Path, description = "Filter list index ID")),
     responses(
         (status = 200, description = "Filter list updated", body = FilterListDto),
+        (status = 400, description = "Invalid list name or URL"),
         (status = 404, description = "Not Found"),
+        (status = 409, description = "List name already exists, a client group still references the list, or the configuration generation changed"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Filter configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Filtering",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -411,9 +417,12 @@ pub async fn update_filter_list(
     params(("id" = usize, Path, description = "Filter list index ID")),
     responses(
         (status = 200, description = "Filter list deleted", body = GenericMessageResponse),
+        (status = 400, description = "Invalid configuration"),
         (status = 404, description = "Not Found"),
+        (status = 409, description = "A client group still references the list, or the configuration generation changed"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Filter configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Filtering",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -450,8 +459,11 @@ pub async fn delete_filter_list(
     path = "/api/v2/filtering/refresh",
     responses(
         (status = 200, description = "Filter lists refreshed", body = GenericMessageResponse),
+        (status = 400, description = "Invalid configuration"),
+        (status = 409, description = "The configuration generation changed while the refresh was staged"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Refresh failed", body = ProblemDetails)
     ),
     tag = "Filtering",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -523,8 +535,11 @@ pub async fn get_filtering_rules(
     request_body = CustomRulesDto,
     responses(
         (status = 200, description = "Custom rules updated", body = CustomRulesDto),
+        (status = 400, description = "Invalid configuration"),
+        (status = 409, description = "The configuration generation changed while the write was staged"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Filter configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Filtering",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
