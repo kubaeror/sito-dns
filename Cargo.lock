@@ -3291,6 +3291,7 @@ dependencies = [
  "criterion",
  "fnv",
  "hickory-proto",
+ "libc",
  "proptest",
  "regex-automata",
  "reqwest",

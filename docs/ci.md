@@ -372,6 +372,70 @@ thresholded gate is **active**. To regenerate it, dispatch `bench.yml` with
 to make a real regression pass; a re-baseline needs a reviewed reason and the
 GitHub-hosted artifact.
 
+The exact nightly and manual commands are:
+
+```bash
+# Nightly (bench.yml, cron 42 5 * * *) / manual comparison against the baseline
+gh workflow run bench.yml
+# Equivalent local steps on the GitHub-hosted runner class:
+cargo bench --workspace --all-features --locked
+python3 scripts/check-bench-regression.py \
+  --github --environment github-ubuntu-24.04
+
+# Regenerate the baseline on the same runner class (uploads bench-<run_id>)
+gh workflow run bench.yml -f update_baseline=true
+gh run download <run_id> -n bench-<run_id>   # then commit benches/baseline.json
+```
+
+The committed baseline was generated on 2026-11-12. It has **not** been
+regenerated for the load-robust timing change below, and no local measurement
+was used to edit it; a new baseline requires the `update_baseline=true`
+GitHub-hosted run. The new `filter_compile::wildcard_set_3_batches` benchmark is
+therefore reported as informational (`new ... not in the baseline`) until that
+regeneration, not thresholded.
+
+### Load-robust compile timing
+
+Performance bounds inside unit tests must not depend on unrelated host load.
+The `sito-filter` regression test
+`test_pathological_wildcard_set_compiles_in_bounded_batches` compiles three
+full `REGEX_BATCH_SIZE` wildcard batches. It used to assert `elapsed < 60 s` of
+wall time. On an idle host the healthy **debug** build takes ≈12 s, but under
+six concurrent builds it took 78–118 s of wall time and failed although the code
+was fine. Wall time measures scheduler delay, not compile work.
+
+The test now:
+
+- samples the compiling thread's CPU time with
+  `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` and fails above a **60 s CPU
+  budget**. This is the old gate's numeric bound, now measured as CPU time:
+  this workload is single-threaded and CPU-bound, so CPU≈wall when unloaded and
+  the effective threshold is not loosened. The budget is ≈5× the ≈12 s debug
+  cost and ≈2× the ≈32 s observed on a heavily loaded 20-core host, so load
+  cannot trip it; a return to the pre-batching superlinear build, which
+  consumed minutes of CPU, still fails.
+- runs the build on a worker thread and waits with `recv_timeout` on a
+  **600 s hang guard**, so a deadlock or a compile that never returns actually
+  fails the test instead of blocking the suite until the CI job timeout. The
+  guard is not the performance signal.
+- keeps every correctness assertion: `has_regex`, exactly three batches, zero
+  dropped patterns, and the first/last rule reachable through matching.
+
+The helper lives in `crates/sito-filter/src/structures/timing.rs` and is
+covered by `thread_cpu_time_tracks_cpu_work_but_not_sleep`, which also asserts
+that sleeping does not accrue thread CPU time (the property that removes the
+load flake). On Unix a failed `clock_gettime` fails the test rather than
+silently skipping the CPU gate. Non-Unix hosts have no portable thread CPU
+clock: only the hang guard applies there, and this repository's CI and
+benchmark runner are Ubuntu-only, so no non-Unix performance bound is claimed.
+The new benchmark is also informational until the next re-baseline (above).
+
+`cargo bench -p sito-filter --all-features --bench lookup` also measures
+`filter_compile::wildcard_set_3_batches` — the same three-batch compile
+workload, with pattern registration outside the timed region — for the nightly
+comparison. Do not replace the CPU bound with a larger wall-clock threshold:
+that would restore the flake without measuring compile work.
+
 ## Required check and branch protection
 
 `ci-gate` is the single check that should be required for `main`. It depends on

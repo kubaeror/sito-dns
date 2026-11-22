@@ -1,5 +1,8 @@
 pub mod compiled;
 pub mod interner;
+/// Test-only CPU-time sampling for load-robust performance assertions.
+#[cfg(test)]
+mod timing;
 pub mod trie;
 
 pub use compiled::{

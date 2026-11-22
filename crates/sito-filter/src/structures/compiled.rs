@@ -844,13 +844,37 @@ mod tests {
         assert_eq!(results[0][0], 10);
     }
 
+    /// Wall-clock hang guard for the wildcard compile regression test.
+    ///
+    /// The compile runs on a worker thread and the test waits on a channel with
+    /// this timeout, so a deadlock or a build that never returns fails the test
+    /// after 600 s instead of hanging until the CI job timeout. This is only a
+    /// hang guard, not the performance signal.
+    const WILDCARD_COMPILE_HANG_GUARD: Duration = Duration::from_secs(600);
+
+    /// Thread CPU-time budget for compiling three in-limit wildcard batches.
+    ///
+    /// This keeps the old gate's numeric bound: 60 s wall before, now 60 s of
+    /// thread CPU. For this single-threaded CPU-bound workload CPU≈wall when
+    /// unloaded, so the effective threshold is not loosened. It is ≈5× the
+    /// ≈12 s debug cost and ≈2× the ≈32 s observed on a heavily loaded host,
+    /// so host load cannot trip it; a return to the pre-batching superlinear
+    /// build, which consumed minutes of CPU, still fails.
+    const WILDCARD_COMPILE_CPU_BUDGET: Duration = Duration::from_secs(60);
+
     /// Regression (audit 6, WP-3.2): a large but in-limit wildcard set must
     /// compile in bounded time and keep every rule active. Previously the
     /// unified build could take minutes and then silently dropped the whole
     /// regex/wildcard class (allow-all for those rules) while still counting
     /// them as active.
+    ///
+    /// The performance bound is thread CPU time rather than wall time; see the
+    /// budget constants above. The build runs on a worker thread so the wall
+    /// deadline is a real hang guard.
     #[test]
     fn test_pathological_wildcard_set_compiles_in_bounded_batches() {
+        use crate::structures::timing::{ThreadCpuTimer, with_hang_guard};
+
         let mut interner = LabelInterner::new();
         let mut builder = RuleSetBuilder::new();
         // Three full batches: compilation work per build is bounded by
@@ -860,9 +884,23 @@ mod tests {
             builder.add_wildcard(&format!("*.sub{i}.example.com"), i);
         }
 
-        let started = std::time::Instant::now();
-        let compiled = builder.build(&mut interner);
-        let elapsed = started.elapsed();
+        // Compile on a worker thread so a hang is caught by the real timeout
+        // guard instead of blocking forever. CPU time is sampled inside the
+        // worker, so it measures only the compiling thread.
+        let (compiled, interner, wall_elapsed, cpu_elapsed) =
+            with_hang_guard(WILDCARD_COMPILE_HANG_GUARD, move || {
+                let cpu_timer = ThreadCpuTimer::start();
+                let started = Instant::now();
+                let compiled = builder.build(&mut interner);
+                let wall_elapsed = started.elapsed();
+                let cpu_elapsed = cpu_timer.elapsed();
+                (compiled, interner, wall_elapsed, cpu_elapsed)
+            });
+        // Optional diagnostics for reproducing loaded-run evidence; silent in
+        // normal test runs.
+        if std::env::var_os("SITO_TIMING_EVIDENCE").is_some() {
+            eprintln!("wildcard compile timing: wall={wall_elapsed:?} cpu={cpu_elapsed:?}");
+        }
 
         assert!(
             compiled.has_regex(),
@@ -877,10 +915,13 @@ mod tests {
             compiled.dropped_regex_patterns, 0,
             "no pattern may be silently dropped"
         );
-        assert!(
-            elapsed < std::time::Duration::from_secs(60),
-            "batched compilation must be bounded, took {elapsed:?}"
-        );
+        if let Some(cpu) = cpu_elapsed {
+            assert!(
+                cpu < WILDCARD_COMPILE_CPU_BUDGET,
+                "batched compilation must stay within the CPU budget, used {cpu:?} \
+                 (wall {wall_elapsed:?})"
+            );
+        }
 
         // Every rule must still be reachable through matching.
         let mut candidates = Vec::new();
