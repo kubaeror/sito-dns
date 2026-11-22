@@ -299,10 +299,22 @@ pub async fn account_token_create_handler(
     )
 }
 
+#[derive(Deserialize)]
+pub struct RevokeTokenForm {
+    /// Caller's current password; every UI token revocation requires it.
+    #[serde(default)]
+    pub reauth_password: Option<String>,
+    /// Caller's TOTP or backup code when TOTP is enabled.
+    #[serde(default)]
+    pub reauth_code: Option<String>,
+}
+
 pub async fn account_token_delete_handler(
     State(ctx): State<ServerContext>,
+    crate::auth::MaybeConnectInfo(peer_addr): crate::auth::MaybeConnectInfo,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Form(form): Form<RevokeTokenForm>,
 ) -> Response {
     let (user, csrf) = match session_or_redirect(&ctx, &headers) {
         Ok(value) => value,
@@ -334,6 +346,22 @@ pub async fn account_token_delete_handler(
             &csrf,
             ProblemDetails::not_found(format!("Token '{id}' not found")),
         );
+    }
+
+    // Revoking a credential is destructive: prove the caller's own credential
+    // before deleting it. The ownership checks above stay first so a foreign
+    // token ID is still indistinguishable from a missing one.
+    if let Err(problem) = ui_reauth(
+        &ctx,
+        &user,
+        &headers,
+        peer_addr,
+        form.reauth_password.as_deref(),
+        form.reauth_code.as_deref(),
+    )
+    .await
+    {
+        return account_problem_page(&ctx, &user, &csrf, problem);
     }
 
     if !ctx.auth_mgr.delete_token(&id).await {

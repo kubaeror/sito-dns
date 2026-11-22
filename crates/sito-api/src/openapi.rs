@@ -357,6 +357,8 @@ mod tests {
             ("/api/v2/auth/tokens", "post"),
             ("/api/v2/auth/users", "post"),
             ("/api/v2/auth/users/{username}", "put"),
+            ("/api/v2/auth/users/{username}", "delete"),
+            ("/api/v2/auth/tokens/{id}", "delete"),
             ("/api/v2/auth/change-password", "post"),
         ]
         .into_iter()

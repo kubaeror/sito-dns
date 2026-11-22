@@ -130,6 +130,30 @@ async fn test_reauth_lockout_triggers_on_the_fifth_failure() {
     );
 }
 
+/// D2: an expired re-authentication ticket is never accepted, and validation
+/// prunes it from the store instead of leaving stale grants behind.
+#[test]
+fn test_expired_reauth_ticket_is_rejected_and_pruned() {
+    let mgr = AuthManager::new();
+    let token = "expired-ticket".to_string();
+    lock(&mgr.reauth_tokens).insert(
+        token.clone(),
+        ReauthGrant {
+            username: "admin".to_string(),
+            session_id: "session".to_string(),
+            credential_epoch: 0,
+            expires_at: Instant::now(),
+        },
+    );
+
+    assert!(!mgr.take_reauth_token(&token, "admin", "session"));
+    assert_eq!(
+        mgr.reauth_tokens_len(),
+        0,
+        "an expired ticket must be pruned on validation"
+    );
+}
+
 /// Deferred D4b: oversized re-auth credentials are rejected before the
 /// lockout check and Argon2 (matching login), including while locked out.
 #[tokio::test]

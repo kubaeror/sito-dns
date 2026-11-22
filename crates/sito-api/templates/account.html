@@ -147,10 +147,14 @@
           <td class="mono" style="color: var(--text-secondary);">{{ t.last_used }}</td>
           <td class="mono" style="color: var(--text-secondary);">{{ t.expires_at }}</td>
           <td style="text-align: center;">
-            <form action="/ui/account/tokens/{{ t.id }}/delete" method="POST" style="display:inline;"
+            <form action="/ui/account/tokens/{{ t.id }}/delete" method="POST" style="display:inline-flex; align-items:center; gap:6px;"
                   data-confirm="Revoke token {{ t.name }}?"
                   @submit="if (!confirm($el.dataset.confirm)) { $event.preventDefault(); }">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="password" name="reauth_password" class="form-input" style="width: 130px; padding: 4px 8px;" placeholder="Your password" autocomplete="current-password" required aria-label="Your password to revoke {{ t.name }}">
+              {% if totp_enabled %}
+              <input type="text" name="reauth_code" class="form-input" style="width: 110px; padding: 4px 8px;" placeholder="TOTP code" autocomplete="one-time-code" inputmode="numeric" required aria-label="Your TOTP code to revoke {{ t.name }}">
+              {% endif %}
               <button type="submit" class="btn-icon" style="color: var(--accent-danger);" title="Revoke token">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
               </button>

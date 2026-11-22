@@ -399,6 +399,15 @@
         "operationId": "delete_token",
         "parameters": [
           {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers; API-token callers are exempt.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "id",
             "in": "path",
             "required": true,
@@ -419,7 +428,7 @@
             }
           },
           "401": {
-            "description": "Unauthorized",
+            "description": "Missing/invalid/expired/used re-authentication ticket, or unauthorized",
             "content": {
               "application/json": {
                 "schema": {
@@ -429,7 +438,7 @@
             }
           },
           "403": {
-            "description": "Forbidden",
+            "description": "Re-authentication requires a user session, or forbidden",
             "content": {
               "application/json": {
                 "schema": {
@@ -1054,6 +1063,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "X-Reauth-Token",
+            "in": "header",
+            "description": "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers; API-token callers are exempt.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1078,7 +1096,7 @@
             }
           },
           "401": {
-            "description": "Unauthorized",
+            "description": "Missing/invalid/expired/used re-authentication ticket, or unauthorized",
             "content": {
               "application/json": {
                 "schema": {
@@ -1088,7 +1106,7 @@
             }
           },
           "403": {
-            "description": "Forbidden",
+            "description": "Re-authentication requires a user session, or forbidden",
             "content": {
               "application/json": {
                 "schema": {
@@ -4677,6 +4695,16 @@
           },
           "400": {
             "description": "Invalid repository parameter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another update is already in progress",
             "content": {
               "application/json": {
                 "schema": {

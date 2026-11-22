@@ -3126,8 +3126,13 @@ async fn test_users_create_role_delete_flow() {
 
     let resp = users_delete_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         headers.clone(),
         Path("alice".to_string()),
+        Form(DeleteUserForm {
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -3172,7 +3177,17 @@ async fn test_users_last_admin_protected() {
     );
     assert_eq!(ctx.auth_mgr.role_of("admin"), Some(Role::Admin));
 
-    let resp = users_delete_handler(State(ctx.clone()), headers, Path("admin".to_string())).await;
+    let resp = users_delete_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers,
+        Path("admin".to_string()),
+        Form(DeleteUserForm {
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = response_body(resp).await;
     assert!(
@@ -3180,6 +3195,161 @@ async fn test_users_last_admin_protected() {
         "visible error missing: {body}"
     );
     assert!(ctx.auth_mgr.has_user("admin"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// D2: a destructive account deletion from the UI must prove the caller's own
+/// credential, mirroring role changes and Admin creation.
+#[tokio::test]
+async fn test_users_delete_requires_reauth() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_users_delete_reauth_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    ctx.auth_mgr
+        .create_user("alice", "AlicePassword1", Role::Viewer)
+        .await;
+
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+    let headers = session_headers(&session);
+    // Use a peer address that no other helper in this test logs in from, so
+    // failed attempts charge an isolated per-IP throttle.
+    let peer =
+        crate::auth::MaybeConnectInfo(Some(std::net::SocketAddr::from(([127, 0, 0, 21], 5000))));
+
+    let missing = users_delete_handler(
+        State(ctx.clone()),
+        peer,
+        headers.clone(),
+        Path("alice".to_string()),
+        Form(DeleteUserForm {
+            reauth_password: None,
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    let body = response_body(missing).await;
+    assert!(
+        body.contains("Current password is required"),
+        "missing-password problem not shown: {body}"
+    );
+    assert!(ctx.auth_mgr.has_user("alice"));
+
+    let wrong = users_delete_handler(
+        State(ctx.clone()),
+        peer,
+        headers.clone(),
+        Path("alice".to_string()),
+        Form(DeleteUserForm {
+            reauth_password: Some("not-the-password".to_string()),
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+    let body = response_body(wrong).await;
+    assert!(
+        body.contains("Re-authentication failed"),
+        "wrong-password problem not shown: {body}"
+    );
+    assert!(
+        ctx.auth_mgr.has_user("alice"),
+        "a failed re-authentication must not delete the account"
+    );
+
+    let deleted = users_delete_handler(
+        State(ctx.clone()),
+        peer,
+        headers,
+        Path("alice".to_string()),
+        Form(DeleteUserForm {
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+    assert!(!ctx.auth_mgr.has_user("alice"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// D2: when the caller has 2FA enabled, account deletion also requires a
+/// current TOTP or backup code.
+#[tokio::test]
+async fn test_users_delete_requires_totp_code_when_enabled() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_users_delete_totp_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    ctx.auth_mgr
+        .create_user("alice", "AlicePassword1", Role::Viewer)
+        .await;
+
+    let setup = ctx.auth_mgr.init_totp_setup("admin").await.expect("setup");
+    assert!(
+        ctx.auth_mgr
+            .confirm_totp_setup("admin", &setup.backup_codes[0])
+            .await
+    );
+    let LoginResult::TotpRequired { partial_token } =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.2").await
+    else {
+        panic!("TOTP login should require a second factor");
+    };
+    let crate::auth::manager::TotpVerifyResult::Success(session) = ctx
+        .auth_mgr
+        .verify_totp(&partial_token, &setup.backup_codes[1], "127.0.0.2")
+        .await
+    else {
+        panic!("TOTP verification failed");
+    };
+    let headers = session_headers(&session);
+    let peer =
+        crate::auth::MaybeConnectInfo(Some(std::net::SocketAddr::from(([127, 0, 0, 22], 5000))));
+
+    let no_code = users_delete_handler(
+        State(ctx.clone()),
+        peer,
+        headers.clone(),
+        Path("alice".to_string()),
+        Form(DeleteUserForm {
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(no_code.status(), StatusCode::BAD_REQUEST);
+    let body = response_body(no_code).await;
+    assert!(
+        body.contains("TOTP or backup code is required"),
+        "second-factor problem not shown: {body}"
+    );
+    assert!(ctx.auth_mgr.has_user("alice"));
+
+    let deleted = users_delete_handler(
+        State(ctx.clone()),
+        peer,
+        headers,
+        Path("alice".to_string()),
+        Form(DeleteUserForm {
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: Some(setup.backup_codes[2].clone()),
+        }),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+    assert!(!ctx.auth_mgr.has_user("alice"));
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -3638,9 +3808,111 @@ async fn test_account_tokens_create_and_revoke() {
     );
     assert!(reloaded.contains("ci-deploy"));
 
-    let resp = account_token_delete_handler(State(ctx.clone()), headers, Path(token_id)).await;
+    let resp = account_token_delete_handler(
+        State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
+        headers,
+        Path(token_id),
+        Form(RevokeTokenForm {
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
+        }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert!(ctx.auth_mgr.list_tokens().is_empty());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// D2: revoking a token from the account page must prove the caller's own
+/// credential before the credential is destroyed.
+#[tokio::test]
+async fn test_account_token_revoke_requires_reauth() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_token_revoke_reauth_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    let (token, _) = ctx
+        .auth_mgr
+        .create_token("ci-deploy", Role::Viewer, Some("admin"))
+        .await
+        .expect("token");
+
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+    let headers = session_headers(&session);
+    let peer =
+        crate::auth::MaybeConnectInfo(Some(std::net::SocketAddr::from(([127, 0, 0, 23], 5000))));
+
+    let missing = account_token_delete_handler(
+        State(ctx.clone()),
+        peer,
+        headers.clone(),
+        Path(token.id.clone()),
+        Form(RevokeTokenForm {
+            reauth_password: None,
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        ctx.auth_mgr
+            .list_tokens()
+            .iter()
+            .any(|candidate| candidate.id == token.id),
+        "a missing proof must not revoke the token"
+    );
+
+    let wrong = account_token_delete_handler(
+        State(ctx.clone()),
+        peer,
+        headers.clone(),
+        Path(token.id.clone()),
+        Form(RevokeTokenForm {
+            reauth_password: Some("not-the-password".to_string()),
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+    let body = response_body(wrong).await;
+    assert!(
+        body.contains("Re-authentication failed"),
+        "wrong-password problem not shown: {body}"
+    );
+    assert!(
+        ctx.auth_mgr
+            .list_tokens()
+            .iter()
+            .any(|candidate| candidate.id == token.id),
+        "a failed re-authentication must not revoke the token"
+    );
+
+    let revoked = account_token_delete_handler(
+        State(ctx.clone()),
+        peer,
+        headers,
+        Path(token.id.clone()),
+        Form(RevokeTokenForm {
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
+        }),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::SEE_OTHER);
+    assert!(
+        !ctx.auth_mgr
+            .list_tokens()
+            .iter()
+            .any(|candidate| candidate.id == token.id)
+    );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -3898,8 +4170,13 @@ async fn test_account_tokens_are_per_owner() {
     for foreign_id in [&oper_token.id, &admin_token.id, &legacy_token.id] {
         let resp = account_token_delete_handler(
             State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
             view_headers.clone(),
             Path(foreign_id.clone()),
+            Form(RevokeTokenForm {
+                reauth_password: Some("ViewerPass1".to_string()),
+                reauth_code: None,
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -3914,8 +4191,13 @@ async fn test_account_tokens_are_per_owner() {
 
     let resp = account_token_delete_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         view_headers,
         Path(viewer_token.id.clone()),
+        Form(RevokeTokenForm {
+            reauth_password: Some("ViewerPass1".to_string()),
+            reauth_code: None,
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -3938,8 +4220,13 @@ async fn test_account_tokens_are_per_owner() {
     for foreign_id in [&admin_token.id, &legacy_token.id] {
         let resp = account_token_delete_handler(
             State(ctx.clone()),
+            crate::auth::MaybeConnectInfo(None),
             oper_headers.clone(),
             Path(foreign_id.clone()),
+            Form(RevokeTokenForm {
+                reauth_password: Some("OperPass1".to_string()),
+                reauth_code: None,
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -3976,8 +4263,13 @@ async fn test_account_tokens_are_per_owner() {
     // token survives.
     let resp = account_token_delete_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         admin_headers.clone(),
         Path(oper_token.id.clone()),
+        Form(RevokeTokenForm {
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -3991,8 +4283,13 @@ async fn test_account_tokens_are_per_owner() {
 
     let resp = account_token_delete_handler(
         State(ctx.clone()),
+        crate::auth::MaybeConnectInfo(None),
         admin_headers,
         Path(legacy_token.id.clone()),
+        Form(RevokeTokenForm {
+            reauth_password: Some("adminadmin".to_string()),
+            reauth_code: None,
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
