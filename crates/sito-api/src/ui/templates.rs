@@ -232,6 +232,13 @@ pub struct CatalogFilterView {
     /// `download_url`, falling back to `subscription_url` when needed.
     pub source_url: String,
     pub version: String,
+    /// Effective name persisted when this entry is added. It can differ from
+    /// [`Self::name`] when the upstream name contains characters that are not
+    /// valid in a filter-list id (for example `/`).
+    pub stored_name: String,
+    /// True when [`Self::stored_name`] differs from [`Self::name`], so the UI
+    /// can tell the operator which name will be saved.
+    pub name_sanitized: bool,
     pub deprecated: bool,
     /// True when a configured list already matches this catalog entry by
     /// case-insensitive name or URL.

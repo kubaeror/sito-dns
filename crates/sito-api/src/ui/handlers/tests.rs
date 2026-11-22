@@ -1166,7 +1166,23 @@ fn test_catalog_page_views_sorted_and_already_added_flags() {
     assert_eq!(first_view.source_url, first.download_url);
     assert_eq!(first_view.category_name, "General");
     assert_eq!(first_view.version, first.version);
+    assert_eq!(first_view.stored_name, catalog_list_name(first));
+    assert!(
+        !first_view.name_sanitized,
+        "a routing-safe upstream name must not be marked as renamed"
+    );
     assert!(first_view.already_added, "case-insensitive name match");
+
+    // The UI gets the effective stored name from the view model, not by
+    // re-running sanitization in the template.
+    let slashed = catalog
+        .filter_by_id("hagezi_windows_office_tracker_blocklist")
+        .expect("catalog entry");
+    let slashed_view = view(&slashed.id);
+    assert!(slashed_view.name.contains('/'));
+    assert!(slashed_view.name_sanitized);
+    assert_eq!(slashed_view.stored_name, catalog_list_name(slashed));
+    assert!(!slashed_view.stored_name.contains('/'));
     assert!(
         view(&second.id).already_added,
         "case-insensitive download URL match"
@@ -1363,6 +1379,76 @@ async fn test_filtering_add_catalog_handler_adds_multiple_lists_once() {
         2,
         "already-added catalog lists must not be duplicated"
     );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// The global CSRF middleware buffers a form-encoded body to read the token
+/// and restores it for the handler. This route-level test proves repeated
+/// `selected` fields survive that buffering and reach the `Form<Vec<_>>`
+/// extractor as separate catalog ids.
+#[tokio::test]
+async fn test_add_catalog_route_preserves_repeated_selected_fields_through_csrf() {
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use tower::ServiceExt;
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_catalog_route_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    // Clear the bootstrap state so the setup middleware lets the request
+    // reach the normal UI route and CSRF layer.
+    ctx.auth_mgr
+        .update_user_password("admin", "TestPassword123!")
+        .await;
+    ctx.set_setup_pending(false);
+
+    ctx.auth_mgr
+        .create_user("oper_user", "pass", Role::Operator)
+        .await;
+    let LoginResult::Success(session) = ctx.auth_mgr.login("oper_user", "pass", "127.0.0.1").await
+    else {
+        panic!("login failed");
+    };
+
+    let catalog = sito_clients::Catalog::embedded().expect("embedded catalog must be valid");
+    let first = &catalog.filters[0];
+    let second = &catalog.filters[1];
+    let cookie = format!(
+        "{}; {}",
+        session.to_cookie_header_secure(false),
+        crate::auth::session::build_csrf_cookie(&session.csrf_token, 3600, false)
+    );
+    let body = format!(
+        "csrf_token={}&selected={}&selected={}&selected={}",
+        session.csrf_token, first.id, second.id, first.id
+    );
+    let app = crate::create_router(ctx.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/filtering/add-catalog")
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::COOKIE, cookie)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let lists = ctx.config.load().filtering.lists.clone();
+    assert_eq!(
+        lists.len(),
+        2,
+        "both repeated selected fields must reach the handler, and the duplicate must dedupe"
+    );
+    assert_eq!(lists[0].name, catalog_list_name(first));
+    assert_eq!(lists[1].name, catalog_list_name(second));
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
