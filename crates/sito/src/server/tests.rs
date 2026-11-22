@@ -1224,6 +1224,10 @@ token_file = "{}"
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let runtime = init_ha(&config, &config_path, &metrics, &shutdown_rx)
         .expect("promotion-enabled master must start read-only, not exit");
+    runtime.start_master_promotion(
+        Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())),
+        &shutdown_rx,
+    );
 
     assert!(
         runtime.write_gate.blocked().is_some(),
@@ -1325,6 +1329,10 @@ token_file = "{}"
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let runtime = init_ha(&config, &config_path, &metrics, &shutdown_rx)
         .expect("promotion-enabled master starts");
+    runtime.start_master_promotion(
+        Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())),
+        &shutdown_rx,
+    );
     let coordinator = runtime.coordinator.clone().expect("coordinator");
     assert!(runtime.write_gate.blocked().is_some());
 
@@ -1426,6 +1434,10 @@ token_file = "{}"
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let runtime = init_ha(&config, &config_path, &metrics, &shutdown_rx)
         .expect("fenced master must stay read-only, not exit");
+    runtime.start_master_promotion(
+        Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())),
+        &shutdown_rx,
+    );
     let coordinator = runtime.coordinator.clone().expect("coordinator");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -1441,6 +1453,250 @@ token_file = "{}"
     }
     assert_eq!(coordinator.get_current_version(), 0);
     assert!(runtime.write_gate.blocked().is_some());
+
+    let _ = shutdown_tx.send(true);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C3b2b2 Critical 1: a promoted slave writes through the shared coordinator
+/// slot, not the (still `None`) configured-master field, and the published
+/// baseline used by the renewal loop advances.
+#[cfg(feature = "ha")]
+#[tokio::test]
+async fn promoted_slave_api_publish_uses_the_shared_coordinator() {
+    use chrono::Utc;
+    use sito_ha::master::ActiveSlave;
+    use sito_ha::{PromotionBookkeeping, PublicationBaseline};
+
+    let dir = sito_api::test_support::temp_dir("sito_promoted_publish");
+    let ctx = sito_api::test_support::mock_context(&dir).await;
+    let mut config = (*ctx.config.load_full()).clone();
+    config.server.role = "slave".to_string();
+    ctx.config.store(Arc::new(config.clone()));
+    std::fs::write(
+        ctx.config_path.clone(),
+        toml::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let key = Arc::new(sito_ha::Ed25519SigningKey::generate().unwrap());
+    let coordinator = sito_ha::MasterCoordinator::new(
+        "promoted-master".to_string(),
+        1,
+        key,
+        sito_stats::MetricsRegistry::new("2.0.0", "test"),
+    )
+    .with_state_path(dir.join("ha_state.toml"));
+    coordinator.set_term(3);
+    coordinator.set_promotion_bookkeeping(Some(PromotionBookkeeping::published(
+        PublicationBaseline::new(1, &"ab".repeat(32)).unwrap(),
+    )));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    coordinator.slaves.lock().unwrap().insert(
+        "slave-1".to_string(),
+        ActiveSlave {
+            instance: "slave-1".to_string(),
+            remote_addr: "127.0.0.1:1000".parse().unwrap(),
+            synced_version: 1,
+            last_ping: std::time::Instant::now(),
+            connected_at: Utc::now(),
+            last_stats: None,
+            sender: tx,
+            capabilities: vec![],
+            have_term: 1,
+            have_version: 1,
+            have_bundle_hash: Some("ab".repeat(32)),
+            connection_id: 1,
+        },
+    );
+    ctx.promoted_master_coordinator
+        .lock()
+        .unwrap()
+        .replace(coordinator.clone());
+    ctx.ha_write_gate.mark_effective_master();
+    ctx.ha_write_gate.allow();
+
+    let outcome = ctx
+        .publish_bundle()
+        .await
+        .expect("promoted slave publish must reach the shared coordinator");
+    assert_eq!(coordinator.get_current_version(), 2);
+    assert!(matches!(
+        outcome,
+        sito_ha::PublishOutcome::Published { version: 2, .. }
+    ));
+    let push = rx.try_recv().expect("slave receives the pushed bundle");
+    assert!(matches!(
+        push,
+        sito_ha::HaMessage::ConfigPush { version: 2, .. }
+    ));
+    let baseline = coordinator
+        .promotion_bookkeeping()
+        .expect("promotion bookkeeping");
+    assert_eq!(
+        baseline.published_version, 2,
+        "the renewal baseline advances with the normal publish"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C3b2b2 Critical 2: watcher/retry publishes are refused while the gate is
+/// blocked, and a corrupt state file is never overwritten.
+#[cfg(feature = "ha")]
+#[tokio::test]
+async fn watcher_and_retry_publish_are_refused_while_read_only() {
+    let dir = sito_api::test_support::temp_dir("sito_publish_gate_refuse");
+    let mut ctx = sito_api::test_support::mock_context(&dir).await;
+    let mut config = (*ctx.config.load_full()).clone();
+    config.server.role = "master".to_string();
+    ctx.config.store(Arc::new(config.clone()));
+    std::fs::write(
+        ctx.config_path.clone(),
+        toml::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let state_path = dir.join("ha_state.toml");
+    std::fs::write(&state_path, b"corrupt-state-must-not-be-overwritten").unwrap();
+    let key = Arc::new(sito_ha::Ed25519SigningKey::generate().unwrap());
+    let coordinator = sito_ha::MasterCoordinator::new(
+        "master".to_string(),
+        1,
+        key,
+        sito_stats::MetricsRegistry::new("2.0.0", "test"),
+    )
+    .with_state_path(state_path.clone());
+    ctx.master_coordinator = Some(coordinator.clone());
+    ctx.ha_write_gate.block("ha_promotion_quiescing");
+
+    let error = ctx
+        .publish_bundle()
+        .await
+        .expect_err("watcher publish must be refused while read-only");
+    assert!(
+        error.to_string().contains("ha_promotion_read_only"),
+        "{error}"
+    );
+    let (retry_result, retry_delay) = ctx.publish_bundle_with_retry().await;
+    assert!(retry_result.is_err());
+    assert!(
+        retry_delay.is_none(),
+        "a blocked node must not schedule a background publish retry"
+    );
+    assert_eq!(coordinator.get_current_version(), 1);
+    assert_eq!(
+        std::fs::read(&state_path).unwrap(),
+        b"corrupt-state-must-not-be-overwritten",
+        "a read-only node must not rewrite/corrupt ha_state.toml"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C3b2b2 Important 1: a fenced configured master stops accepting new slaves.
+#[cfg(feature = "ha")]
+#[tokio::test]
+async fn fenced_configured_master_stops_its_listener() {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_fenced_master_listener_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let certs = sito_ha::generate_ha_certs(&dir.join("certs"), true, false).unwrap();
+    let token_file = dir.join("witness.token");
+    let mut token = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&token_file)
+        .unwrap();
+    token.write_all(b"test-token-0123456789abcdef").unwrap();
+    drop(token);
+    let fence = serde_json::json!({
+        "protocol_version": 2,
+        "cluster_id": "home-dns",
+        "node_id": "node-a",
+        "fenced_term": 2,
+        "reason": "lease_lost",
+        "fenced_at_unix_ms": 1,
+        "reconciled": false
+    });
+    std::fs::write(
+        dir.join("ha_fence.json"),
+        serde_json::to_vec_pretty(&fence).unwrap(),
+    )
+    .unwrap();
+
+    let mut replication = sito_test_support::reserve_port().unwrap();
+    let port = replication.port();
+    replication.release_listener();
+    let config_path = dir.join("config.toml");
+    let mut config = Config::default();
+    config.server.role = "master".to_string();
+    config.server.data_dir = dir.clone();
+    config.ha = Some(
+        toml::from_str(&format!(
+            r#"
+replication_port = {port}
+allow_insecure_ws = true
+slave_token = "test-token"
+
+[promotion]
+enabled = true
+candidate = false
+cluster_id = "home-dns"
+node_id = "node-a"
+
+[promotion.witness]
+url = "https://127.0.0.1:1"
+ca = "{}"
+token_file = "{}"
+"#,
+            certs.ca_cert_path.display(),
+            token_file.display()
+        ))
+        .unwrap(),
+    );
+    std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+    let metrics = sito_stats::MetricsRegistry::new("2.0.0", "test");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let runtime = init_ha(&config, &config_path, &metrics, &shutdown_rx)
+        .expect("fenced master starts read-only");
+    runtime.start_master_promotion(
+        Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())),
+        &shutdown_rx,
+    );
+
+    let addr = std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), port);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut listener_was_up = false;
+    while tokio::time::Instant::now() < deadline {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            listener_was_up = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    if listener_was_up {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_err() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a fenced configured master kept accepting new slave connections"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
 
     let _ = shutdown_tx.send(true);
     let _ = std::fs::remove_dir_all(&dir);

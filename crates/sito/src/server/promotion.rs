@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use sito_core::config::Config;
 use sito_ha::promotion::{
     ConfiguredRole, EffectiveRole, Eligibility, HaStateStore, LoadedState, PreparedBundle,
@@ -35,6 +36,9 @@ pub(super) struct PromotionRuntimeState {
     pub(super) tracker: Option<SlaveStatusTracker>,
     pub(super) slave_shutdown: Mutex<Option<watch::Sender<bool>>>,
     pub(super) master_shutdown: Mutex<Option<watch::Sender<bool>>>,
+    pub(super) live_config: Mutex<Option<Arc<ArcSwap<Config>>>>,
+    pub(super) slave_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub(super) master_slot: Arc<Mutex<Option<MasterCoordinator>>>,
     pub(super) initial_toml: Mutex<Option<String>>,
     pub(super) known_secrets: Vec<String>,
 }
@@ -264,11 +268,82 @@ async fn run_supervisor(state: Arc<PromotionRuntimeState>, mut shutdown_rx: watc
     }
 }
 
+/// Stops the slave replication worker and waits for it to exit.
+///
+/// The master listener must not accept a session before this returns: running
+/// both roles at once is forbidden by ADR-0010.
+async fn stop_slave_worker(state: &PromotionRuntimeState) {
+    let handle = state
+        .slave_handle
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(tx) = state
+        .slave_shutdown
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().cloned())
+    {
+        let _ = tx.send(true);
+    }
+    if let Some(handle) = handle {
+        let _ = handle.await;
+    }
+}
+
+/// Evaluates the ADR-0010 candidate gates that depend on the slave tracker and
+/// the local `ha_state.toml`.
+fn candidate_eligibility(
+    tracker: &SlaveStatusTracker,
+    state_path: &std::path::Path,
+    identity_mismatch: bool,
+) -> Eligibility {
+    let watermark = tracker.get_watermark();
+    let applied_term = watermark.as_ref().map_or(0, |watermark| watermark.term);
+    let applied_version = watermark.as_ref().map_or(0, |watermark| watermark.version);
+    let loaded = HaStateStore::new(state_path.to_path_buf()).load();
+    let foreign_or_stale_state = match loaded {
+        Ok(LoadedState::Missing) => false,
+        Ok(loaded @ LoadedState::Present { .. }) => {
+            if matches!(
+                loaded,
+                LoadedState::Present {
+                    bookkeeping: Some(_),
+                    ..
+                }
+            ) {
+                false
+            } else {
+                loaded.bundle().is_some_and(|bundle| {
+                    bundle.term > applied_term || bundle.version > applied_version
+                })
+            }
+        }
+        Err(_) => true,
+    };
+    Eligibility {
+        degraded: tracker.get_state() == sito_ha::SlaveState::Degraded,
+        diverged_or_forked: tracker.is_forked() || tracker.has_local_config_drift(),
+        restart_required: tracker.requires_full_apply(),
+        foreign_or_stale_state,
+        identity_mismatch,
+    }
+}
+
 struct RuntimePromotionHost {
     state: Arc<PromotionRuntimeState>,
 }
 
 impl RuntimePromotionHost {
+    fn live_config(&self) -> Config {
+        self.state
+            .live_config
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|config| (**config.load()).clone()))
+            .unwrap_or_else(|| self.state.config.clone())
+    }
+
     fn config_document(&self) -> String {
         if let Ok(raw) = std::fs::read_to_string(&self.state.config_path) {
             return raw;
@@ -321,8 +396,9 @@ impl RuntimePromotionHost {
 impl PromotionHost for RuntimePromotionHost {
     fn prepare_bundle(&self, term: u64, version: u64) -> Result<PreparedBundle, String> {
         let document = self.config_document();
+        let live_config = self.live_config();
         let bundle = build_config_bundle(
-            &self.state.config,
+            &live_config,
             &document,
             version,
             term,
@@ -375,13 +451,7 @@ impl PromotionHost for RuntimePromotionHost {
         let Some(tracker) = self.state.tracker.as_ref() else {
             return Eligibility::default();
         };
-        Eligibility {
-            degraded: tracker.get_state() == sito_ha::SlaveState::Degraded,
-            diverged_or_forked: tracker.is_forked(),
-            restart_required: false,
-            foreign_or_stale_state: false,
-            identity_mismatch: self.key().is_err(),
-        }
+        candidate_eligibility(tracker, &self.state.state_path(), self.key().is_err())
     }
 
     fn master_alive(&self) -> bool {
@@ -414,19 +484,14 @@ impl PromotionHost for RuntimePromotionHost {
             if role != EffectiveRole::Master {
                 return Ok(());
             }
-            if self.state.coordinator().is_some() {
+            if let Some(coordinator) = self.state.coordinator() {
+                if let Ok(mut slot) = self.state.master_slot.lock() {
+                    *slot = Some(coordinator);
+                }
                 self.state.write_gate.mark_effective_master();
                 return Ok(());
             }
-            if let Some(tx) = self
-                .state
-                .slave_shutdown
-                .lock()
-                .ok()
-                .and_then(|slot| slot.as_ref().cloned())
-            {
-                let _ = tx.send(true);
-            }
+            stop_slave_worker(&self.state).await;
             let key = self.key()?;
             if self.state.ha_config.replication_port > 0
                 && !self.state.ha_config.allow_insecure_ws
@@ -462,7 +527,10 @@ impl PromotionHost for RuntimePromotionHost {
                 .coordinator
                 .lock()
                 .map_err(|_| "promotion coordinator lock poisoned".to_string())? =
-                Some(coordinator);
+                Some(coordinator.clone());
+            if let Ok(mut slot) = self.state.master_slot.lock() {
+                *slot = Some(coordinator);
+            }
             self.state.write_gate.mark_effective_master();
             info!("Promoted node switched to the master replication role");
             Ok(())
@@ -550,5 +618,357 @@ impl PromotionHost for RuntimePromotionHost {
             "CRITICAL: HA promotion fence could not be recorded; exiting"
         );
         std::process::exit(70);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn test_state(label: &str) -> Arc<PromotionRuntimeState> {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_promotion_runtime_{label}_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir;
+        Arc::new(PromotionRuntimeState {
+            config_path: std::path::PathBuf::from("missing-config.toml"),
+            config,
+            ha_config: HaConfig::default(),
+            role: ConfiguredRole::Slave,
+            metrics: sito_stats::MetricsRegistry::new("2.0.0", "test"),
+            write_gate: Arc::new(sito_api::state::HaWriteGate::new()),
+            signing_key: Mutex::new(None),
+            coordinator: Mutex::new(None),
+            tracker: None,
+            slave_shutdown: Mutex::new(None),
+            master_shutdown: Mutex::new(None),
+            live_config: Mutex::new(None),
+            slave_handle: Mutex::new(None),
+            master_slot: Arc::new(Mutex::new(None)),
+            initial_toml: Mutex::new(None),
+            known_secrets: Vec::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn role_switch_waits_for_the_slave_worker_to_exit() {
+        let state = test_state("handoff_wait");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            worker_stopped.store(true, Ordering::SeqCst);
+        });
+        *state.slave_handle.lock().unwrap() = Some(handle);
+
+        let started = std::time::Instant::now();
+        stop_slave_worker(&state).await;
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the handoff must wait for the worker join, not just send shutdown"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        assert!(state.slave_handle.lock().unwrap().is_none());
+    }
+
+    fn write_legacy_state(path: &std::path::Path, term: u64, version: u64) {
+        let bundle = ConfigBundle {
+            version,
+            term,
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
+            ..ConfigBundle::default()
+        };
+        let state = serde_json::json!({
+            "protocol_version": 2,
+            "bundle": serde_json::to_value(&bundle).unwrap(),
+        });
+        std::fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn candidate_eligibility_rejects_legacy_state_ahead_of_the_watermark() {
+        let state = test_state("eligibility");
+        let tracker = SlaveStatusTracker::new("slave".to_string(), 0, None);
+        tracker.persist_watermark(5, 1, "abc").unwrap();
+        let path = state.state_path();
+
+        write_legacy_state(&path, 2, 9);
+        let eligibility = candidate_eligibility(&tracker, &path, false);
+        assert!(
+            eligibility.foreign_or_stale_state,
+            "a legacy state ahead of the watermark must block candidacy"
+        );
+
+        write_legacy_state(&path, 1, 5);
+        let eligibility = candidate_eligibility(&tracker, &path, false);
+        assert!(!eligibility.foreign_or_stale_state);
+        assert!(
+            eligibility.restart_required,
+            "a watermark without an applied-config digest requires a full apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_bundle_uses_the_live_hot_reloaded_config() {
+        let state = test_state("live_config");
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        *state.signing_key.lock().unwrap() = Some(key);
+        *state.initial_toml.lock().unwrap() = Some(
+            "config_version = 2\n[server]\nrole = \"slave\"\n[upstream]\nservers = [\"1.1.1.1\"]\n"
+                .to_string(),
+        );
+        let mut live = Config::default();
+        live.filtering.custom_rules = vec!["||live.example^".to_string()];
+        *state.live_config.lock().unwrap() = Some(Arc::new(ArcSwap::from_pointee(live)));
+
+        let host = RuntimePromotionHost { state };
+        let prepared = host.prepare_bundle(1, 1).expect("bundle");
+        assert_eq!(prepared.bundle.custom_rules, vec!["||live.example^"]);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use chrono::Utc;
+    use sito_ha::master::ActiveSlave;
+    use sito_ha::{ManualClock, WitnessClient, WitnessConfig, start_witness_server};
+
+    fn write_secret(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_promotes_end_to_end_and_shared_publish_reaches_slave_and_witness() {
+        let dir = temp_path("candidate_e2e");
+        let certs = sito_ha::generate_ha_certs(&dir.join("certs"), true, false).unwrap();
+        let token_file = dir.join("witness.token");
+        write_secret(&token_file, b"test-token-0123456789abcdef");
+        let witness_clock = Arc::new(ManualClock::new(1_760_000_000_000));
+        let witness = start_witness_server(
+            WitnessConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                cluster_id: "home-dns".to_string(),
+                cert: certs.master_cert_path.clone().unwrap(),
+                key: certs.master_key_path.clone().unwrap(),
+                token_file: token_file.clone(),
+                state_dir: dir.join("witness-state"),
+            },
+            witness_clock.clone(),
+        )
+        .await
+        .unwrap();
+        let witness_addr = witness.local_addr();
+
+        let mut promotion = HaConfig::default().promotion;
+        promotion.enabled = true;
+        promotion.candidate = true;
+        promotion.cluster_id = Some("home-dns".to_string());
+        promotion.node_id = Some("node-b".to_string());
+        promotion.lease_ttl_secs = 5;
+        promotion.renew_interval_secs = 1;
+        promotion.heartbeat_timeout_secs = Some(3);
+        promotion.reconcile_window_secs = 1;
+        promotion.witness.url = Some(format!("https://{witness_addr}"));
+        promotion.witness.ca = Some(certs.ca_cert_path.clone());
+        promotion.witness.token_file = Some(token_file.clone());
+
+        let baseline = format!("{:02x}", 0xab).repeat(32);
+        let client = WitnessClient::new(&promotion).unwrap();
+        let seed = client
+            .acquire(&sito_ha::witness::AcquireRequest {
+                holder: "node-a/seed".to_string(),
+                node_id: "node-a".to_string(),
+                expected_term: None,
+                expected_revision: None,
+                term: 1,
+                version: 5,
+                bundle_hash: baseline.clone(),
+                ttl_secs: 5,
+            })
+            .await
+            .unwrap();
+        assert_eq!(seed.version, 5);
+        witness_clock.advance(5_000);
+
+        let mut config = Config::default();
+        config.server.role = "slave".to_string();
+        config.server.instance_name = "candidate-b".to_string();
+        config.server.data_dir = dir.clone();
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        let signing = Ed25519SigningKey::generate().unwrap();
+        let signing_path = dir.join("ha_signing.key");
+        write_secret(&signing_path, signing.pkcs8_bytes());
+
+        let watermark_path = dir.join("ha_watermark.toml");
+        let tracker = SlaveStatusTracker::new("candidate-b".to_string(), 0, None)
+            .with_watermark_path(watermark_path)
+            .unwrap();
+        tracker
+            .persist_watermark_with_config_digest(5, 1, &baseline, Some("digest"))
+            .unwrap();
+
+        let mut ha_config = HaConfig {
+            replication_port: reserve_port(),
+            listen_addr: "127.0.0.1".to_string(),
+            master_url: Some("ws://127.0.0.1:1".to_string()),
+            master_pubkey: Some(signing.public_key_hex()),
+            allow_insecure_ws: true,
+            slave_token: Some("test-token".to_string()),
+            ping_interval_secs: 1,
+            ..HaConfig::default()
+        };
+        ha_config.promotion = promotion.clone();
+
+        let gate = Arc::new(sito_api::state::HaWriteGate::new());
+        gate.block("ha_promotion_starting");
+        let master_slot = Arc::new(Mutex::new(None));
+        let state = Arc::new(PromotionRuntimeState {
+            config: config.clone(),
+            config_path,
+            ha_config,
+            role: ConfiguredRole::Slave,
+            metrics: sito_stats::MetricsRegistry::new("2.0.0", "test"),
+            write_gate: gate.clone(),
+            signing_key: Mutex::new(Some(Arc::new(signing))),
+            coordinator: Mutex::new(None),
+            tracker: Some(tracker),
+            slave_shutdown: Mutex::new(None),
+            master_shutdown: Mutex::new(None),
+            live_config: Mutex::new(Some(Arc::new(ArcSwap::from_pointee(config.clone())))),
+            slave_handle: Mutex::new(None),
+            master_slot: master_slot.clone(),
+            initial_toml: Mutex::new(Some(toml::to_string_pretty(&config).unwrap())),
+            known_secrets: Vec::new(),
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        spawn_promotion_supervisor(state.clone(), shutdown_rx);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if gate.blocked().is_none() && master_slot.lock().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "candidate did not promote: gate={:?}",
+                gate.blocked()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let coordinator = master_slot.lock().unwrap().clone().unwrap();
+        assert_eq!(coordinator.get_current_term(), 2);
+        assert_eq!(coordinator.get_current_version(), 6);
+        assert!(gate.is_effective_master());
+
+        // Normal API publish through the shared context slot reaches a slave
+        // and the running renewal loop advances the witness baseline.
+        let ctx_dir = temp_path("candidate_ctx");
+        let ctx = sito_api::test_support::mock_context(&ctx_dir).await;
+        let mut context_config = (*ctx.config.load_full()).clone();
+        context_config.server.role = "slave".to_string();
+        ctx.config.store(Arc::new(context_config.clone()));
+        std::fs::write(
+            ctx.config_path.clone(),
+            toml::to_string_pretty(&context_config).unwrap(),
+        )
+        .unwrap();
+        ctx.promoted_master_coordinator
+            .lock()
+            .unwrap()
+            .replace(coordinator.clone());
+        ctx.ha_write_gate.mark_effective_master();
+        ctx.ha_write_gate.allow();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        coordinator.slaves.lock().unwrap().insert(
+            "slave-1".to_string(),
+            ActiveSlave {
+                instance: "slave-1".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 6,
+                last_ping: std::time::Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                have_term: 2,
+                have_version: 6,
+                have_bundle_hash: None,
+                connection_id: 1,
+            },
+        );
+        assert_eq!(
+            coordinator.connected_slave_count(),
+            1,
+            "test slave must be registered before publish"
+        );
+        let outcome = ctx.publish_bundle().await.expect("promoted publish");
+        assert!(
+            matches!(
+                outcome,
+                sito_ha::PublishOutcome::Published { version: 7, .. }
+            ),
+            "unexpected publish outcome {outcome:?} (coordinator version {}, connected {}, slot same {}, gate {:?}, fence {:?})",
+            coordinator.get_current_version(),
+            coordinator.connected_slave_count(),
+            ctx.active_master_coordinator().is_some(),
+            gate.blocked(),
+            sito_ha::FenceStore::new(&dir, "home-dns", "node-b")
+                .load()
+                .ok()
+                .flatten()
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            sito_ha::HaMessage::ConfigPush { version: 7, .. }
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let record = client.lease().await.unwrap().unwrap();
+            if record.version == 7 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "witness baseline did not advance to the normal-published version: {record:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let _ = shutdown_tx.send(true);
+        witness.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ctx_dir);
+    }
+
+    fn temp_path(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_promotion_{label}_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn reserve_port() -> u16 {
+        sito_test_support::reserve_port_number().expect("reserve port")
     }
 }

@@ -39,6 +39,7 @@ tracing-subscriber.workspace = true
 mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
+sito-api = { workspace = true, features = ["test-support"] }
 async-trait.workspace = true
 # Enable the cache's test-only accessors for `cargo test -p sito` without
 # exposing them in a normal build.

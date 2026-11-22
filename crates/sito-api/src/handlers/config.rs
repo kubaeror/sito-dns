@@ -835,7 +835,7 @@ pub async fn reload_config(
             )));
         }
         Ok(outcome) => {
-            if ctx.master_coordinator.is_some() {
+            if ctx.active_master_coordinator().is_some() {
                 report.ha_publish =
                     Some(crate::config_apply::HaPublishReport::from_outcome(outcome));
             }

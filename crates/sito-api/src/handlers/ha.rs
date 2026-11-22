@@ -97,7 +97,7 @@ pub async fn get_ha_status(
 
     if role == "master" {
         let (version, slaves_connected, diverged, diverged_reason, master_pubkey) =
-            if let Some(ref coord) = ctx.master_coordinator {
+            if let Some(ref coord) = ctx.active_master_coordinator() {
                 (
                     coord.get_current_version(),
                     coord.connected_slave_count(),
@@ -179,7 +179,7 @@ pub async fn get_ha_slaves(
     _admin: RequireAdmin,
     State(ctx): State<ServerContext>,
 ) -> Result<Json<Vec<HaSlaveSummary>>, ProblemDetails> {
-    if let Some(ref coord) = ctx.master_coordinator {
+    if let Some(ref coord) = ctx.active_master_coordinator() {
         let summaries = coord
             .list_slaves()
             .into_iter()
@@ -210,9 +210,26 @@ pub async fn trigger_ha_resync(
     State(ctx): State<ServerContext>,
 ) -> Result<Json<HaResyncResponse>, ProblemDetails> {
     let role = ctx.config.load().server.role.clone();
+    if let Some((reason, fenced)) = ctx.ha_write_gate.blocked()
+        && (fenced || role == "master" || ctx.ha_write_gate.is_effective_master())
+    {
+        let mut problem = ProblemDetails::conflict(if fenced {
+            "Resynchronization is disabled while this node is fenced for HA promotion."
+        } else {
+            "Resynchronization is disabled until this node holds the lease and has published."
+        });
+        problem.error_type = if fenced {
+            "urn:sito:ha:promotion_fenced".to_string()
+        } else {
+            "urn:sito:ha:promotion_read_only".to_string()
+        };
+        problem.title = "HA Promotion Read-Only".to_string();
+        problem.detail = reason;
+        return Err(problem);
+    }
 
     let response = if role == "master" {
-        resync_master(ctx.master_coordinator.as_ref(), &role)?
+        resync_master(ctx.active_master_coordinator().as_ref(), &role)?
     } else {
         resync_slave(
             ctx.slave_tracker.as_ref(),
@@ -402,5 +419,66 @@ mod tests {
             rx.try_recv().is_err(),
             "each slave must receive exactly one push"
         );
+    }
+    #[tokio::test]
+    async fn resync_is_refused_on_a_fenced_or_read_only_master() {
+        use crate::auth::AuthUser;
+        use crate::auth::Role;
+
+        let dir = crate::test_support::temp_dir("sito_ha_resync_gate");
+        let ctx = crate::test_support::mock_context(&dir).await;
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+        let mut config = (*ctx.config.load_full()).clone();
+        config.server.role = "master".to_string();
+        config.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+        ctx.config.store(Arc::new(config));
+
+        // Publish/replication paths read the effective coordinator, including a
+        // promoted slave's shared slot.
+        ctx.promoted_master_coordinator
+            .lock()
+            .unwrap()
+            .replace(coordinator.clone());
+        ctx.ha_write_gate.fence("ha_promotion_fenced");
+
+        let admin = RequireAdmin(AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+            owner: None,
+        });
+        let error = trigger_ha_resync(admin, State(ctx.clone()))
+            .await
+            .expect_err("a fenced master must not broadcast a resync");
+        assert_eq!(error.status, StatusCode::CONFLICT.as_u16());
+        assert_eq!(error.error_type, "urn:sito:ha:promotion_fenced");
+        assert_eq!(coordinator.get_current_version(), 2);
+
+        // A read-only (not yet fenced) node reports the distinct reason.
+        let ctx = crate::test_support::mock_context(&dir).await;
+        let mut config = (*ctx.config.load_full()).clone();
+        config.server.role = "master".to_string();
+        config.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+        ctx.config.store(Arc::new(config));
+        ctx.promoted_master_coordinator
+            .lock()
+            .unwrap()
+            .replace(coordinator.clone());
+        ctx.ha_write_gate.block("ha_promotion_witness_unavailable");
+        let admin = RequireAdmin(AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+            owner: None,
+        });
+        let error = trigger_ha_resync(admin, State(ctx))
+            .await
+            .expect_err("a read-only master must not broadcast a resync");
+        assert_eq!(error.status, StatusCode::CONFLICT.as_u16());
+        assert_eq!(error.error_type, "urn:sito:ha:promotion_read_only");
+        assert_eq!(error.detail, "ha_promotion_witness_unavailable");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

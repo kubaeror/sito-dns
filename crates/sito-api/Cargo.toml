@@ -63,6 +63,8 @@ embed-ui = ["dep:rust-embed", "dep:mime_guess", "dep:askama"]
 # integration crate into sito-api; it only tells configuration validation that
 # this build can honour `[integrations.mikrotik]`.
 routeros = []
+# Test-only in-memory ServerContext helpers for dependent crate integration tests.
+test-support = []
 
 [lints]
 workspace = true

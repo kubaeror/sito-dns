@@ -19,6 +19,9 @@ pub(super) struct HaRuntime {
     pub(super) slave_shutdown: Option<tokio::sync::watch::Sender<bool>>,
     /// Promotion runtime state (enabled only).
     pub(super) promotion: Option<Arc<PromotionRuntimeState>>,
+    /// Coordinator created by an in-memory slave→master promotion, shared with
+    /// `ServerContext` so normal API/watcher publishes are not dropped.
+    pub(super) promoted_master: Arc<Mutex<Option<sito_ha::MasterCoordinator>>>,
 }
 
 /// Initializes the HA role. Master setup is complete on return; a slave only
@@ -37,6 +40,7 @@ pub(super) fn init_ha(
         .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
 
     let write_gate = Arc::new(sito_api::state::HaWriteGate::new());
+    let promoted_master = Arc::new(Mutex::new(None));
     if ha_config.promotion.enabled {
         write_gate.block("ha_promotion_starting");
     }
@@ -175,19 +179,43 @@ pub(super) fn init_ha(
             info!("Published initial HA configuration bundle version 1");
         }
 
-        // Spawn master replication listener if replication_port > 0
+        // Spawn master replication listener if replication_port > 0. A
+        // promotion-enabled master gets its own shutdown switch so fencing can
+        // stop accepting new slaves; the global shutdown is forwarded to it.
+        let mut configured_master_shutdown = None;
         let _master_server_handle = if ha_config.replication_port > 0 {
+            let listener_shutdown = if promotion_enabled {
+                let (tx, rx) = watch::channel(false);
+                let mut global = shutdown_rx.clone();
+                let forward_tx = tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if *global.borrow() {
+                            let _ = forward_tx.send(true);
+                            break;
+                        }
+                        if global.changed().await.is_err() {
+                            let _ = forward_tx.send(true);
+                            break;
+                        }
+                    }
+                });
+                configured_master_shutdown = Some(tx);
+                rx
+            } else {
+                shutdown_rx.clone()
+            };
             Some(sito_ha::spawn_master_server(
                 ha_config.clone(),
                 coordinator.clone(),
-                shutdown_rx.clone(),
+                listener_shutdown,
             ))
         } else {
             None
         };
 
         let promotion = promotion_enabled.then(|| {
-            let state = Arc::new(PromotionRuntimeState {
+            Arc::new(PromotionRuntimeState {
                 config: config.clone(),
                 config_path: config_path.to_path_buf(),
                 ha_config: ha_config.clone(),
@@ -198,12 +226,13 @@ pub(super) fn init_ha(
                 coordinator: Mutex::new(Some(coordinator.clone())),
                 tracker: None,
                 slave_shutdown: Mutex::new(None),
-                master_shutdown: Mutex::new(None),
+                master_shutdown: Mutex::new(configured_master_shutdown),
+                live_config: Mutex::new(None),
+                slave_handle: Mutex::new(None),
+                master_slot: Arc::clone(&promoted_master),
                 initial_toml: Mutex::new(Some(initial_toml.clone())),
                 known_secrets: known_secrets.iter().map(|s| (*s).to_string()).collect(),
-            });
-            spawn_promotion_supervisor(Arc::clone(&state), shutdown_rx.clone());
-            state
+            })
         });
 
         (Some(coordinator), None, None, None, promotion)
@@ -246,6 +275,9 @@ pub(super) fn init_ha(
                 tracker: Some(tracker.clone()),
                 slave_shutdown: Mutex::new(None),
                 master_shutdown: Mutex::new(None),
+                live_config: Mutex::new(None),
+                slave_handle: Mutex::new(None),
+                master_slot: Arc::clone(&promoted_master),
                 initial_toml: Mutex::new(None),
                 known_secrets: Vec::new(),
             })
@@ -268,7 +300,29 @@ pub(super) fn init_ha(
         write_gate,
         slave_shutdown: None,
         promotion,
+        promoted_master,
     })
+}
+
+impl HaRuntime {
+    /// Starts the master promotion supervisor after the live config handle
+    /// exists. Candidate promotion is started by the slave worker bootstrap.
+    pub(super) fn start_master_promotion(
+        &self,
+        config: Arc<ArcSwap<Config>>,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) {
+        let Some(promotion) = self.promotion.as_ref() else {
+            return;
+        };
+        if promotion.role != sito_ha::ConfiguredRole::Master {
+            return;
+        }
+        if let Ok(mut slot) = promotion.live_config.lock() {
+            *slot = Some(config);
+        }
+        spawn_promotion_supervisor(Arc::clone(promotion), shutdown_rx.clone());
+    }
 }
 
 /// Production [`sito_ha::SlaveConfigApplier`] backed by the shared

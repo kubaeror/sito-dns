@@ -633,6 +633,9 @@ impl PromotionEngine {
             drop(inner);
             self.host
                 .set_writable(false, Some("ha_promotion_fenced".to_string()));
+            // A fenced configured master must stop accepting new slaves too.
+            self.host.stop_publishing();
+            self.host.close_replication_sessions("fenced");
             self.lock().booted = true;
             return Ok(PromotionOutcome::Fenced);
         }

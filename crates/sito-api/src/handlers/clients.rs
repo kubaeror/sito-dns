@@ -880,6 +880,7 @@ mod tests {
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             ha_write_gate: Arc::new(crate::state::HaWriteGate::new()),
             master_coordinator: None,
+            promoted_master_coordinator: std::sync::Arc::new(std::sync::Mutex::new(None)),
             slave_tracker: None,
             resync_sender: None,
             setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),

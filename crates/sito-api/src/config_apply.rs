@@ -659,7 +659,7 @@ async fn apply_and_persist_document_locked(
             )));
         }
         Ok(outcome) => {
-            if ctx.master_coordinator.is_some() {
+            if ctx.active_master_coordinator().is_some() {
                 report.ha_publish = Some(HaPublishReport::from_outcome(outcome));
             }
         }
