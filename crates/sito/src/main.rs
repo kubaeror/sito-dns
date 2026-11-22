@@ -107,17 +107,58 @@ async fn main() -> anyhow::Result<()> {
                     dir,
                     master,
                     slave,
+                    witness,
                     san,
                     uid,
                     gid,
                 } => {
-                    if let Err(e) = sito::cli::run_ha_gen_certs(&dir, master, slave, &san, uid, gid)
+                    if let Err(e) = sito::cli::run_ha_gen_certs_extended(
+                        &dir, master, slave, witness, &san, uid, gid,
+                    ) {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+                sito::cli::HaCommands::LeaseServer {
+                    listen,
+                    cluster_id,
+                    cert,
+                    key,
+                    token_file,
+                    state_dir,
+                } => {
+                    if let Err(e) = sito::cli::run_ha_lease_server(
+                        listen, cluster_id, cert, key, token_file, state_dir,
+                    )
+                    .await
                     {
                         eprintln!("{e}");
                         std::process::exit(1);
                     }
                     return Ok(());
                 }
+                sito::cli::HaCommands::LeaseAdmin { command } => match command {
+                    sito::cli::LeaseAdminCommands::Set {
+                        state_dir,
+                        term,
+                        version,
+                        bundle_hash,
+                        confirm,
+                    } => {
+                        if let Err(e) = sito::cli::run_ha_lease_admin_set(
+                            &state_dir,
+                            term,
+                            version,
+                            &bundle_hash,
+                            confirm,
+                        ) {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
+                        return Ok(());
+                    }
+                },
             },
             Commands::Config { command } => match command {
                 sito::cli::ConfigCommands::Migrate {

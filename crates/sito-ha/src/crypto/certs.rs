@@ -133,6 +133,200 @@ fn append_extra_sans(
     Ok(())
 }
 
+/// Loads the CA in `dir`, creating a new self-signed CA when it is absent.
+///
+/// Returns `(cert_path, cert_pem, key_path, key_pem, params, key)`. Reusing an
+/// existing CA repairs an insecure `ca.key` mode before signing anything.
+fn load_or_create_ca(
+    dir: &Path,
+) -> Result<(PathBuf, String, PathBuf, String, CertificateParams, KeyPair), HaError> {
+    let ca_cert_path = dir.join("ca.crt");
+    let ca_key_path = dir.join("ca.key");
+
+    if ca_cert_path.exists() && ca_key_path.exists() {
+        // Reusing a CA must not preserve an insecure key mode: repair an
+        // existing ca.key before it is used to sign new certificates.
+        repair_private_key_permissions(&ca_key_path)?;
+        let cert_pem = std::fs::read_to_string(&ca_cert_path)?;
+        let key_pem = std::fs::read_to_string(&ca_key_path)?;
+        let ca_key = KeyPair::from_pem(&key_pem).map_err(|e| {
+            HaError::Crypto(format!("Failed to parse existing CA private key: {e}"))
+        })?;
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "sito-ha-ca");
+        ca_params.distinguished_name = dn;
+        return Ok((
+            ca_cert_path,
+            cert_pem,
+            ca_key_path,
+            key_pem,
+            ca_params,
+            ca_key,
+        ));
+    }
+
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "sito-ha-ca");
+    ca_params.distinguished_name = dn;
+
+    let ca_key = KeyPair::generate()
+        .map_err(|e| HaError::Crypto(format!("Failed to generate CA keypair: {e}")))?;
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .map_err(|e| HaError::Crypto(format!("Failed to generate self-signed CA cert: {e}")))?;
+
+    let cert_pem = ca_cert.pem();
+    let key_pem = ca_key.serialize_pem();
+
+    std::fs::write(&ca_cert_path, &cert_pem)?;
+    write_private_key_file(&ca_key_path, &key_pem)?;
+
+    Ok((
+        ca_cert_path,
+        cert_pem,
+        ca_key_path,
+        key_pem,
+        ca_params,
+        ca_key,
+    ))
+}
+
+/// A generated witness (lease-server) certificate and its BLAKE3 fingerprint.
+#[derive(Debug, Clone)]
+pub struct WitnessCert {
+    pub ca_cert_path: PathBuf,
+    pub ca_cert_pem: String,
+    pub cert_path: PathBuf,
+    pub cert_pem: String,
+    pub key_path: PathBuf,
+    pub key_pem: String,
+    pub fingerprint: String,
+    pub sans: Vec<String>,
+}
+
+impl WitnessCert {
+    /// Human-readable setup instructions for the witness and its clients.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "=== sito HA Witness Certificate Generated Successfully ===\n"
+        );
+        let _ = writeln!(out, "CA Certificate: {}", self.ca_cert_path.display());
+        let _ = writeln!(out, "Certificate:    {}", self.cert_path.display());
+        let _ = writeln!(out, "Private Key:    {}", self.key_path.display());
+        let _ = writeln!(out, "Fingerprint:    {}\n", self.fingerprint);
+        let _ = writeln!(out, "Witness server:");
+        let _ = writeln!(out, "sito ha lease-server \\");
+        let _ = writeln!(out, "  --listen 0.0.0.0:8954 \\");
+        let _ = writeln!(out, "  --cluster-id <CLUSTER_ID> \\");
+        let _ = writeln!(out, "  --cert {} \\", self.cert_path.display());
+        let _ = writeln!(out, "  --key {} \\", self.key_path.display());
+        let _ = writeln!(out, "  --token-file /etc/sito/lease/witness.token \\");
+        let _ = writeln!(out, "  --state-dir /var/lib/sito-lease\n");
+        let _ = writeln!(out, "Every HA node config.toml:");
+        let _ = writeln!(out, "[ha.promotion.witness]");
+        let _ = writeln!(out, "url = \"https://<WITNESS_HOST>:8954\"");
+        let _ = writeln!(out, "ca = \"{}\"", self.ca_cert_path.display());
+        if let Some(name) = self.sans.first() {
+            let _ = writeln!(out, "server_name = \"{name}\"");
+        }
+        let _ = writeln!(
+            out,
+            "# fingerprint = \"{}\"   # optional additional pin",
+            self.fingerprint
+        );
+        let _ = writeln!(out, "token_file = \"/etc/sito/lease/witness.token\"\n");
+        out
+    }
+}
+
+/// Generates a witness server-auth certificate signed by the CA in `dir`.
+///
+/// The CA is reused when `ca.crt`/`ca.key` already exist (the normal case
+/// after `gen-certs --master --slave`), so the clients keep one trust anchor.
+/// The certificate always carries `localhost`, `127.0.0.1` and `::1` plus the
+/// caller's `--san` values.
+pub fn generate_witness_cert(
+    dir: &Path,
+    extra_sans: &[String],
+    ownership: Option<CertOwnership>,
+) -> Result<WitnessCert, HaError> {
+    if ownership.is_some() && !cfg!(unix) {
+        return Err(HaError::Validation {
+            field: "uid".to_string(),
+            reason: "certificate ownership transfer is only supported on Unix".to_string(),
+        });
+    }
+    std::fs::create_dir_all(dir)?;
+
+    let (ca_cert_path, ca_cert_pem, _ca_key_path, _ca_key_pem, ca_params, ca_key) =
+        load_or_create_ca(dir)?;
+    let issuer = Issuer::from_params(&ca_params, &ca_key);
+
+    let mut params = CertificateParams::new(vec!["localhost".to_string()])
+        .map_err(|e| HaError::Crypto(format!("Witness cert params error: {e}")))?;
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    append_extra_sans(&mut params, extra_sans, "witness")?;
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "sito-witness");
+    params.distinguished_name = dn;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+
+    let key = KeyPair::generate()
+        .map_err(|e| HaError::Crypto(format!("Failed to generate witness keypair: {e}")))?;
+    let cert = params
+        .signed_by(&key, &issuer)
+        .map_err(|e| HaError::Crypto(format!("Failed to sign witness certificate: {e}")))?;
+
+    let cert_path = dir.join("witness.crt");
+    let key_path = dir.join("witness.key");
+    let cert_pem = cert.pem();
+    let key_pem = key.serialize_pem();
+    let fingerprint = compute_blake3_fingerprint(cert.der());
+
+    std::fs::write(&cert_path, &cert_pem)?;
+    write_private_key_file(&key_path, &key_pem)?;
+
+    let cert = WitnessCert {
+        ca_cert_path,
+        ca_cert_pem,
+        cert_path,
+        cert_pem,
+        key_path,
+        key_pem,
+        fingerprint,
+        sans: extra_sans.to_vec(),
+    };
+    if let Some(owner) = ownership {
+        transfer_paths(
+            &[&cert.ca_cert_path, &cert.cert_path, &cert.key_path],
+            owner,
+        )?;
+    }
+    Ok(cert)
+}
+
 /// Generates self-signed CA, master and/or slave certificates, writing them to `dir`.
 /// If both `gen_master` and `gen_slave` are false, generates the complete set (both).
 pub fn generate_ha_certs(
@@ -181,52 +375,8 @@ pub fn generate_ha_certs_with_options(
 
     std::fs::create_dir_all(dir)?;
 
-    let ca_cert_path = dir.join("ca.crt");
-    let ca_key_path = dir.join("ca.key");
-
-    // Check if CA already exists; if not, create new CA
-    let (ca_cert_pem, ca_key_pem, ca_params, ca_key) =
-        if ca_cert_path.exists() && ca_key_path.exists() {
-            // Reusing a CA must not preserve an insecure key mode: repair an
-            // existing ca.key before it is used to sign new certificates.
-            repair_private_key_permissions(&ca_key_path)?;
-            let cert_pem = std::fs::read_to_string(&ca_cert_path)?;
-            let key_pem = std::fs::read_to_string(&ca_key_path)?;
-            let ca_key = KeyPair::from_pem(&key_pem).map_err(|e| {
-                HaError::Crypto(format!("Failed to parse existing CA private key: {e}"))
-            })?;
-            let mut ca_params = CertificateParams::default();
-            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-            let mut dn = DistinguishedName::new();
-            dn.push(DnType::CommonName, "sito-ha-ca");
-            ca_params.distinguished_name = dn;
-            (cert_pem, key_pem, ca_params, ca_key)
-        } else {
-            let mut ca_params = CertificateParams::default();
-            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-            ca_params.key_usages = vec![
-                KeyUsagePurpose::KeyCertSign,
-                KeyUsagePurpose::CrlSign,
-                KeyUsagePurpose::DigitalSignature,
-            ];
-            let mut dn = DistinguishedName::new();
-            dn.push(DnType::CommonName, "sito-ha-ca");
-            ca_params.distinguished_name = dn;
-
-            let ca_key = KeyPair::generate()
-                .map_err(|e| HaError::Crypto(format!("Failed to generate CA keypair: {e}")))?;
-            let ca_cert = ca_params.self_signed(&ca_key).map_err(|e| {
-                HaError::Crypto(format!("Failed to generate self-signed CA cert: {e}"))
-            })?;
-
-            let cert_pem = ca_cert.pem();
-            let key_pem = ca_key.serialize_pem();
-
-            std::fs::write(&ca_cert_path, &cert_pem)?;
-            write_private_key_file(&ca_key_path, &key_pem)?;
-
-            (cert_pem, key_pem, ca_params, ca_key)
-        };
+    let (ca_cert_path, ca_cert_pem, ca_key_path, ca_key_pem, ca_params, ca_key) =
+        load_or_create_ca(dir)?;
 
     let issuer = Issuer::from_params(&ca_params, &ca_key);
 
@@ -365,8 +515,6 @@ pub fn generate_ha_certs_with_options(
 /// silently skipped chown would recreate the original bug.
 #[cfg(unix)]
 fn transfer_ownership(certs: &GeneratedCerts, owner: CertOwnership) -> Result<(), HaError> {
-    use std::os::unix::fs::chown;
-
     let mut paths: Vec<&Path> = vec![&certs.ca_cert_path, &certs.ca_key_path];
     for path in [
         certs.master_cert_path.as_deref(),
@@ -379,6 +527,13 @@ fn transfer_ownership(certs: &GeneratedCerts, owner: CertOwnership) -> Result<()
     {
         paths.push(path);
     }
+    transfer_paths(&paths, owner)
+}
+
+/// Transfers `paths` to `owner`, failing if any chown is rejected.
+#[cfg(unix)]
+fn transfer_paths(paths: &[&Path], owner: CertOwnership) -> Result<(), HaError> {
+    use std::os::unix::fs::chown;
 
     for path in paths {
         chown(path, Some(owner.uid), Some(owner.gid)).map_err(|e| {
@@ -394,7 +549,7 @@ fn transfer_ownership(certs: &GeneratedCerts, owner: CertOwnership) -> Result<()
 }
 
 #[cfg(not(unix))]
-fn transfer_ownership(_certs: &GeneratedCerts, _owner: CertOwnership) -> Result<(), HaError> {
+fn transfer_paths(_paths: &[&Path], _owner: CertOwnership) -> Result<(), HaError> {
     Err(HaError::Validation {
         field: "uid".to_string(),
         reason: "certificate ownership transfer is only supported on Unix".to_string(),
@@ -504,6 +659,63 @@ mod tests {
                 let mode = std::fs::metadata(key_path).unwrap().permissions().mode() & 0o777;
                 assert_eq!(mode, 0o600, "{} must be 0600", key_path.display());
             }
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_witness_cert_reuses_ca_and_covers_requested_san() {
+        use rustls::client::danger::ServerCertVerifier as _;
+        use rustls::pki_types::{ServerName, UnixTime};
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito_ha_witness_certs_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let ha = generate_ha_certs(&temp_dir, true, false).unwrap();
+        let witness =
+            generate_witness_cert(&temp_dir, &["witness.example".to_string()], None).unwrap();
+
+        assert_eq!(
+            witness.ca_cert_pem, ha.ca_cert_pem,
+            "witness must reuse the existing CA"
+        );
+        assert!(witness.cert_path.exists());
+        assert!(witness.key_path.exists());
+        assert!(witness.fingerprint.starts_with("blake3:"));
+        assert!(witness.summary().contains("witness"));
+
+        let der = crate::transport::load_certs_pem(&witness.cert_path)
+            .unwrap()
+            .remove(0);
+        let verifier = crate::transport::PinnedServerCertVerifier::new(None, false)
+            .with_ca(&ha.ca_cert_path)
+            .unwrap();
+        let name = |value: &str| ServerName::try_from(value.to_string()).unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&der, &[], &name("witness.example"), &[], UnixTime::now())
+                .is_ok(),
+            "the requested SAN must validate against the shared CA"
+        );
+        assert!(
+            verifier
+                .verify_server_cert(&der, &[], &name("other.example"), &[], UnixTime::now())
+                .is_err(),
+            "an unrelated server name must not validate"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&witness.key_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "witness.key must be 0600");
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);

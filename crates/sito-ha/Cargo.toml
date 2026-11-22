@@ -16,6 +16,7 @@ sito-stats.workspace = true
 sito-ha-types.workspace = true
 
 arc-swap.workspace = true
+axum.workspace = true
 base64.workspace = true
 blake3.workspace = true
 chrono.workspace = true
@@ -28,7 +29,7 @@ rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 subtle.workspace = true
-tokio = { workspace = true, features = ["macros", "time", "sync", "fs", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync", "fs", "net", "io-util"] }
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 toml.workspace = true

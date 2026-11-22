@@ -16,6 +16,7 @@ pub mod readiness;
 pub mod session;
 pub mod slave;
 pub mod transport;
+pub mod witness;
 
 pub use bundle::{
     AppliedWatermark, ConfigBundle, FilterListMetadata, build_and_sign_push, build_config_bundle,
@@ -26,9 +27,9 @@ pub use bundle::{
 };
 pub use config::{HaConfig, config_from, config_from_unvalidated, readiness_required};
 pub use crypto::{
-    CertOwnership, Ed25519SigningKey, GeneratedCerts, compute_blake3_fingerprint,
+    CertOwnership, Ed25519SigningKey, GeneratedCerts, WitnessCert, compute_blake3_fingerprint,
     generate_ha_certs, generate_ha_certs_with_options, generate_ha_certs_with_sans,
-    parse_public_key, verify_ed25519_signature,
+    generate_witness_cert, parse_public_key, verify_ed25519_signature,
 };
 pub use error::HaError;
 pub use master::{
@@ -43,6 +44,12 @@ pub use slave::{
 pub use transport::{
     ExponentialBackoff, MAX_WS_MESSAGE_SIZE, PinnedClientCertVerifier, PinnedServerCertVerifier,
     build_client_tls_config, build_server_tls_config, ws_config,
+};
+pub use witness::{
+    AcquireRequest, Clock, LeaseAdminOutcome, LeaseInfo, LeaseOpError, LeaseRecord, LeaseStore,
+    ManualClock, RenewRequest, SystemClock, WitnessConfig, WitnessError, WitnessHandle,
+    lease_admin_set, normalize_bundle_hash, normalize_hash, read_token_file, start_witness_server,
+    validate_token_file,
 };
 
 #[cfg(test)]
