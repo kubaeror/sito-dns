@@ -309,6 +309,10 @@ pub enum HaCommands {
         /// Generate slave client certificate
         #[arg(long)]
         slave: bool,
+        /// Generate the witness lease-server certificate (server auth) using the
+        /// same CA as the master/slave certificates
+        #[arg(long)]
+        witness: bool,
         /// Additional subject alternative name for the generated certificates
         /// (hostname or IP address). Repeatable.
         #[arg(long = "san", value_name = "HOST_OR_IP", action = clap::ArgAction::Append)]
@@ -322,6 +326,56 @@ pub enum HaCommands {
         /// Requires --uid.
         #[arg(long, requires = "uid", value_name = "GID")]
         gid: Option<u32>,
+    },
+    /// Run the built-in TLS witness lease server (a separate host, not an HA node)
+    LeaseServer {
+        /// TCP listen address
+        #[arg(long, default_value = "0.0.0.0:8954")]
+        listen: SocketAddr,
+        /// Cluster identifier; every client request must match it
+        #[arg(long)]
+        cluster_id: String,
+        /// PEM server certificate (server-auth)
+        #[arg(long)]
+        cert: PathBuf,
+        /// PEM private key for --cert (mode 0600)
+        #[arg(long)]
+        key: PathBuf,
+        /// Shared bearer token file (mode 0600)
+        #[arg(long)]
+        token_file: PathBuf,
+        /// Durable state directory (created mode 0700)
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
+    /// Offline witness lease maintenance (stop the witness first)
+    LeaseAdmin {
+        #[command(subcommand)]
+        command: LeaseAdminCommands,
+    },
+}
+
+/// Offline witness lease administration.
+#[cfg(feature = "ha")]
+#[derive(Subcommand, Debug)]
+pub enum LeaseAdminCommands {
+    /// Raise the witness record above the cluster high-water mark
+    Set {
+        /// Witness state directory (the running witness must be stopped)
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// New term; must be greater than the current record term
+        #[arg(long)]
+        term: u64,
+        /// New published version; must be greater than the current record version
+        #[arg(long)]
+        version: u64,
+        /// Published bundle hash (64 hex characters, with or without blake3:)
+        #[arg(long)]
+        bundle_hash: String,
+        /// Required confirmation; the previous record is backed up first
+        #[arg(long)]
+        confirm: bool,
     },
 }
 
@@ -1366,6 +1420,24 @@ pub fn run_ha_gen_certs(
     uid: Option<u32>,
     gid: Option<u32>,
 ) -> Result<(), anyhow::Error> {
+    run_ha_gen_certs_extended(dir, master, slave, false, san, uid, gid)
+}
+
+/// Executes `sito ha gen-certs`, optionally including the witness certificate.
+///
+/// When `witness` is set and neither `master` nor `slave` is requested, only
+/// the witness certificate (plus the shared CA) is generated. The witness
+/// certificate reuses an existing CA so every HA node keeps one trust anchor.
+#[cfg(feature = "ha")]
+pub fn run_ha_gen_certs_extended(
+    dir: &Path,
+    master: bool,
+    slave: bool,
+    witness: bool,
+    san: &[String],
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), anyhow::Error> {
     let ownership = match (uid, gid) {
         (Some(uid), Some(gid)) => Some(sito_ha::CertOwnership { uid, gid }),
         (None, None) => None,
@@ -1376,15 +1448,90 @@ pub fn run_ha_gen_certs(
         }
     };
 
-    let certs = sito_ha::generate_ha_certs_with_options(dir, master, slave, san, ownership)
-        .map_err(|e| anyhow::anyhow!("Failed to generate HA certificates: {e}"))?;
-    print!("{}", certs.summary());
-    if let Some(owner) = ownership {
+    let mut printed = false;
+    if master || slave || !witness {
+        let certs = sito_ha::generate_ha_certs_with_options(dir, master, slave, san, ownership)
+            .map_err(|e| anyhow::anyhow!("Failed to generate HA certificates: {e}"))?;
+        print!("{}", certs.summary());
+        printed = true;
+    }
+    if witness {
+        let cert = sito_ha::generate_witness_cert(dir, san, ownership)
+            .map_err(|e| anyhow::anyhow!("Failed to generate witness certificate: {e}"))?;
+        print!("{}", cert.summary());
+        printed = true;
+    }
+    if printed && let Some(owner) = ownership {
         println!(
             "Certificate files are owned by {}:{}; private keys remain mode 0600.",
             owner.uid, owner.gid
         );
     }
+    Ok(())
+}
+
+/// Runs the built-in witness lease server until the process receives a signal.
+#[cfg(feature = "ha")]
+pub async fn run_ha_lease_server(
+    listen: SocketAddr,
+    cluster_id: String,
+    cert: PathBuf,
+    key: PathBuf,
+    token_file: PathBuf,
+    state_dir: PathBuf,
+) -> Result<(), anyhow::Error> {
+    let config = sito_ha::WitnessConfig {
+        listen,
+        cluster_id,
+        cert,
+        key,
+        token_file,
+        state_dir,
+    };
+    let handle = sito_ha::start_witness_server(config, std::sync::Arc::new(sito_ha::SystemClock))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start witness lease server: {e}"))?;
+    println!(
+        "Witness lease server listening on https://{} (state: {})",
+        handle.local_addr(),
+        handle.state_dir().display()
+    );
+    println!("Press Ctrl-C to stop. A clean stop does not release an active lease; it expires.");
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        eprintln!("Failed to wait for shutdown signal: {e}");
+    }
+    handle.shutdown().await;
+    Ok(())
+}
+
+/// Executes `sito ha lease-admin set`.
+#[cfg(feature = "ha")]
+pub fn run_ha_lease_admin_set(
+    state_dir: &Path,
+    term: u64,
+    version: u64,
+    bundle_hash: &str,
+    confirm: bool,
+) -> Result<(), anyhow::Error> {
+    if !confirm {
+        return Err(anyhow::anyhow!(
+            "Refusing to modify witness state without --confirm. Stop the witness, back up '{}', then re-run with --confirm.",
+            state_dir.display()
+        ));
+    }
+    let outcome = sito_ha::lease_admin_set(state_dir, term, version, bundle_hash)
+        .map_err(|e| anyhow::anyhow!("Failed to raise witness lease record: {e}"))?;
+    if let Some(backup) = &outcome.backup_path {
+        println!("Previous lease record backed up to '{}'.", backup.display());
+    }
+    println!(
+        "Witness record set to term {}, revision {}, version {}, bundle_hash {}. The record is expired; the next acquire takes over at term {}.",
+        outcome.record.term,
+        outcome.record.revision,
+        outcome.record.version,
+        outcome.record.bundle_hash,
+        outcome.record.term.saturating_add(1)
+    );
     Ok(())
 }
 
@@ -2369,6 +2516,112 @@ mod tests {
             Some(Commands::Healthcheck { setup_fallback, .. }) => assert!(setup_fallback),
             other => panic!("expected healthcheck command, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "ha")]
+    #[test]
+    fn test_cli_ha_lease_server_and_lease_admin_flags() {
+        let cli = Cli::try_parse_from([
+            "sito",
+            "ha",
+            "lease-server",
+            "--cluster-id",
+            "home-dns",
+            "--cert",
+            "/etc/sito/lease/witness.crt",
+            "--key",
+            "/etc/sito/lease/witness.key",
+            "--token-file",
+            "/etc/sito/lease/witness.token",
+            "--state-dir",
+            "/var/lib/sito-lease",
+        ])
+        .expect("parse lease-server");
+        match cli.command {
+            Some(Commands::Ha {
+                command:
+                    HaCommands::LeaseServer {
+                        listen,
+                        cluster_id,
+                        state_dir,
+                        ..
+                    },
+            }) => {
+                assert_eq!(listen.port(), 8954);
+                assert_eq!(listen.ip().to_string(), "0.0.0.0");
+                assert_eq!(cluster_id, "home-dns");
+                assert_eq!(state_dir, std::path::PathBuf::from("/var/lib/sito-lease"));
+            }
+            other => panic!("expected ha lease-server command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "sito",
+            "ha",
+            "lease-admin",
+            "set",
+            "--state-dir",
+            "/var/lib/sito-lease",
+            "--term",
+            "9",
+            "--version",
+            "128",
+            "--bundle-hash",
+            &"ab".repeat(32),
+            "--confirm",
+        ])
+        .expect("parse lease-admin set");
+        match cli.command {
+            Some(Commands::Ha {
+                command:
+                    HaCommands::LeaseAdmin {
+                        command:
+                            LeaseAdminCommands::Set {
+                                term,
+                                version,
+                                confirm,
+                                ..
+                            },
+                    },
+            }) => {
+                assert_eq!(term, 9);
+                assert_eq!(version, 128);
+                assert!(confirm);
+            }
+            other => panic!("expected ha lease-admin set command, got {other:?}"),
+        }
+
+        let error = run_ha_lease_admin_set(Path::new("/nonexistent"), 9, 128, "none", false)
+            .expect_err("without --confirm the tool must refuse before touching disk");
+        assert!(error.to_string().contains("--confirm"));
+    }
+
+    #[cfg(feature = "ha")]
+    #[test]
+    fn test_run_ha_gen_certs_witness_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "sito_ha_gen_witness_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        run_ha_gen_certs_extended(
+            &dir,
+            false,
+            false,
+            true,
+            &["witness.test".to_string()],
+            None,
+            None,
+        )
+        .expect("witness-only gen-certs");
+        assert!(dir.join("ca.crt").is_file());
+        assert!(dir.join("witness.crt").is_file());
+        assert!(dir.join("witness.key").is_file());
+        assert!(
+            !dir.join("master.crt").exists() && !dir.join("slave.crt").exists(),
+            "witness-only generation must not default to the master/slave pair"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "ha")]

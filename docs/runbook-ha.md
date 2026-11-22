@@ -14,6 +14,27 @@ This runbook provides step-by-step operational procedures for managing, maintain
 - **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master.
 - **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master stores the latest report per slave and exposes it through `GET /api/v2/ha/slaves`; replica counters are **not** merged into the master's own Prometheus registry. Scrape each replica's `/metrics` endpoint separately (labels such as `sito_ha_config_version{instance="..."}` identify the node).
 
+### Witness server for automatic promotion
+
+Opt-in automatic promotion (`[ha.promotion]`, ADR-0010) additionally needs the
+built-in witness lease server on a **third host**:
+
+```bash
+sito ha lease-server \
+  --listen 0.0.0.0:8954 \
+  --cluster-id home-dns \
+  --cert /etc/sito/lease/witness.crt \
+  --key /etc/sito/lease/witness.key \
+  --token-file /etc/sito/lease/witness.token \
+  --state-dir /var/lib/sito-lease
+```
+
+Provisioning, TLS/token/state permissions, backup/restore, rotation and the
+offline `sito ha lease-admin set` recovery tool are documented in the
+[Witness lease server runbook](runbook-witness.md). Running the witness on an
+HA node is supported only for lab/test and is **not** HA: it shares that node's
+failure domain.
+
 ### Build prerequisites and the optional HA module
 
 HA is an optional Cargo feature, not a runtime toggle:

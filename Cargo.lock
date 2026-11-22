@@ -3308,6 +3308,7 @@ name = "sito-ha"
 version = "2.0.0-rc.2"
 dependencies = [
  "arc-swap",
+ "axum",
  "base64 0.23.1",
  "blake3",
  "chrono",
