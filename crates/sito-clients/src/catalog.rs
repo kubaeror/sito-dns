@@ -827,17 +827,25 @@ mod tests {
     }
 
     /// Attribution is part of the license claim, so the notices must name the
-    /// same project, source URLs and license as the embedded catalog.
+    /// same project, source URLs, upstream license and metadata-only scope as
+    /// the embedded catalog.
     #[test]
     fn catalog_attribution_names_embedded_source() {
         let notices = include_str!("../../../THIRD_PARTY_NOTICES");
         assert!(notices.contains("AdguardTeam/HostlistsRegistry"));
         assert!(notices.contains(FILTERS_SOURCE_URL));
         assert!(notices.contains(SERVICES_SOURCE_URL));
-        assert!(notices.contains("GPL-3.0"));
         assert!(
-            notices.contains("metadata"),
-            "the notices must say that only metadata is embedded"
+            notices.contains("GNU General Public License, version 3"),
+            "the notices must state the upstream license"
+        );
+        assert!(
+            notices.contains("Only **metadata** is embedded"),
+            "the notices must state the metadata-only scope"
+        );
+        assert!(
+            notices.contains("No filter-list text or other filter-list body is included"),
+            "the notices must state that list bodies are not embedded"
         );
     }
 

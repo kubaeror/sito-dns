@@ -1941,9 +1941,10 @@ async fn test_ui_handlers_persist_failure_returns_500_and_preserves_in_memory_st
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
-/// The catalog dialog keeps the custom-URL fallback. Exercise that fallback end
-/// to end (add, duplicate-name conflict, toggle both ways, delete) so the
-/// existing Filtering list controls remain covered alongside the catalog path.
+/// The catalog dialog keeps the custom-URL fallback. Exercise that fallback at
+/// the handler/config level (add, duplicate-name conflict, toggle both ways,
+/// delete) so the existing Filtering list controls remain covered alongside the
+/// catalog path.
 #[tokio::test]
 async fn test_filtering_custom_url_add_toggle_and_delete_round_trip() {
     let temp_dir = std::env::temp_dir().join(format!(
@@ -1988,6 +1989,30 @@ async fn test_filtering_custom_url_add_toggle_and_delete_round_trip() {
         ctx.config_path.exists(),
         "a custom URL must be persisted like a catalog selection"
     );
+    let persisted: toml::Value = toml::from_str(
+        &std::fs::read_to_string(&ctx.config_path).expect("read persisted config.toml"),
+    )
+    .expect("persisted config.toml must parse");
+    let persisted_list = persisted["filtering"]["lists"]
+        .as_array()
+        .and_then(|lists| lists.first())
+        .expect("persisted filtering list");
+    assert_eq!(
+        persisted_list["name"].as_str(),
+        Some("Custom source"),
+        "persisted name"
+    );
+    assert_eq!(
+        persisted_list["url"].as_str(),
+        Some(url.as_str()),
+        "persisted URL"
+    );
+    assert_eq!(
+        persisted_list["refresh_hours"].as_integer(),
+        Some(12),
+        "persisted refresh interval"
+    );
+    assert_eq!(persisted_list["enabled"].as_bool(), Some(true));
 
     // The same name is a conflict and must not add a second list.
     let resp = filtering_add_handler(

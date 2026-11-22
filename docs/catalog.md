@@ -2,9 +2,8 @@
 
 `sito-clients` embeds a catalog of filter and blocked-service metadata derived
 from the [AdGuard HostlistsRegistry](https://github.com/AdguardTeam/HostlistsRegistry).
-The catalog lets the UI and API offer AdGuard-style filter selection (and,
-later, service selection) without making a network request to discover what is
-available.
+The web UI uses the catalog to offer AdGuard-style filter and blocked-service
+selection without making a network request to discover what is available.
 
 The catalog is **metadata only**:
 
@@ -42,19 +41,23 @@ Run this only when cutting a release (or when deliberately refreshing metadata):
    generator fetch them, or download them yourself so the input is reviewable:
 
    ```bash
+   refresh_dir="$(mktemp -d)"
    curl -fsSL https://adguardteam.github.io/HostlistsRegistry/assets/filters.json \
-     -o /tmp/opencode/filters.json
+     -o "$refresh_dir/filters.json"
    curl -fsSL https://adguardteam.github.io/HostlistsRegistry/assets/services.json \
-     -o /tmp/opencode/services.json
+     -o "$refresh_dir/services.json"
    ```
 
+   Keep this shell for step 2 so `$refresh_dir` is still set.
+
 2. **Regenerate and review the diff.** The generator is deterministic and
-   prints the new SHA-256. List bodies are never read.
+   never reads list bodies. If the catalog changed it prints the new SHA-256;
+   an unchanged regeneration reports `catalog unchanged`.
 
    ```bash
    python3 scripts/generate-catalog.py \
-     --filters-file /tmp/opencode/filters.json \
-     --services-file /tmp/opencode/services.json
+     --filters-file "$refresh_dir/filters.json" \
+     --services-file "$refresh_dir/services.json"
    git diff -- crates/sito-clients/src/catalog/catalog.json
    ```
 
@@ -69,10 +72,13 @@ Run this only when cutting a release (or when deliberately refreshing metadata):
    schema change also needs the Rust loader, consuming UI/handlers and the
    tests updated in the same commit.
 
-5. **Review license and attribution.** Confirm the catalog still records
-   `GPL-3.0-only`, that `THIRD_PARTY_NOTICES` names
-   AdguardTeam/HostlistsRegistry with both source URLs, and that the
-   metadata-only/no-list-bodies statement still matches what was generated.
+5. **Review upstream license and attribution.** Check the upstream
+   HostlistsRegistry license and README (not the hardcoded
+   `CATALOG_LICENSE`/`THIRD_PARTY_NOTICES` values) before release. If the
+   upstream project, license or index URLs changed, update
+   `THIRD_PARTY_NOTICES`, `FILTERS_URL`/`SERVICES_URL`, `CATALOG_LICENSE` and
+   the catalog `source` fields together, and keep the metadata-only/no-list-bodies
+   statement accurate.
 
 6. **Commit together.** The regenerated JSON, the `CATALOG_SHA256` pin and any
    consuming code or tests belong in one reviewable change. Never commit a

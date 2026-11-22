@@ -715,6 +715,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// Route-level coverage for `POST /api/v2/filtering/refresh`: a successful
+    /// refresh reports the compiled rules, and a failed staged load returns
+    /// 500 while the previous snapshot stays live.
+    #[tokio::test]
+    async fn test_filtering_refresh_route_success_and_failure() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, header};
+        use tower::ServiceExt;
+
+        let temp_dir = crate::test_support::temp_dir("sito_filter_refresh_route");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        // Rotate the bootstrap password so the setup gate lets API requests
+        // reach the normal auth layer.
+        ctx.auth_mgr
+            .update_user_password("admin", "TestPassword123!")
+            .await;
+        let token = ctx
+            .auth_mgr
+            .create_token("filter-refresh-test", Role::Operator, None)
+            .await
+            .expect("create operator token")
+            .1
+            .token;
+
+        let list_path = temp_dir.join("refresh.txt");
+        tokio::fs::write(&list_path, "||refresh.example^\n")
+            .await
+            .unwrap();
+        let mut config = (**ctx.config.load()).clone();
+        config.server.data_dir = temp_dir.clone();
+        config.filtering.enabled = true;
+        config.filtering.lists = vec![FilterListConfig {
+            name: "refresh".to_string(),
+            url: format!("file://{}", list_path.display()),
+            enabled: true,
+            refresh_hours: None,
+        }];
+        ctx.set_config(config);
+
+        let app = crate::create_router(ctx.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/filtering/refresh")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let message: GenericMessageResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            message.message.contains("1 active rules compiled"),
+            "unexpected refresh response: {message:?}"
+        );
+        assert_eq!(ctx.filter.rule_count(), 1);
+
+        // Two rules under a max_rules cap of one makes the staged load fail.
+        // The route returns 500 and the previously published rule survives.
+        let failing_path = temp_dir.join("refresh-fail.txt");
+        tokio::fs::write(&failing_path, "||one.example^\n||two.example^\n")
+            .await
+            .unwrap();
+        let mut failing = (**ctx.config.load()).clone();
+        failing.filtering.max_rules = 1;
+        failing.filtering.lists = vec![FilterListConfig {
+            name: "refresh-fail".to_string(),
+            url: format!("file://{}", failing_path.display()),
+            enabled: true,
+            refresh_hours: None,
+        }];
+        ctx.set_config(failing);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/filtering/refresh")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let problem: ProblemDetails = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            problem.detail.contains("Refresh failed"),
+            "unexpected refresh failure: {problem:?}"
+        );
+        assert_eq!(
+            ctx.filter.rule_count(),
+            1,
+            "a failed refresh must retain the previous snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     /// P2-41: renaming or deleting a list still referenced by a client group
     /// is a 409 and changes neither the live config nor the persisted file.
     #[tokio::test]

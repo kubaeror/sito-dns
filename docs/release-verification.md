@@ -108,7 +108,7 @@ candidate (and confirm the CI `test` job ran the same check on the tagged SHA):
 ```bash
 python3 scripts/generate-catalog.py --check
 cargo test -p sito-clients --all-features catalog
-cargo test -p sito-api --all-features ui::handlers::tests::catalog
+cargo test -p sito-api --all-features catalog
 ```
 
 Expected evidence:
@@ -117,7 +117,8 @@ Expected evidence:
   uses the network; the SHA-256 pin and canonical bytes catch any hand edit.
 - The focused tests pass, including
   `catalog_module_has_no_network_path` and
-  `catalog_attribution_names_embedded_source`.
+  `catalog_attribution_names_embedded_source`. The no-network test is a
+  source/manifest tripwire, not a formal proof.
 - The green CI step `Verify the embedded catalog and pin are current` in the
   `test` job.
 - If the release intentionally refreshed metadata, the same PR records the
