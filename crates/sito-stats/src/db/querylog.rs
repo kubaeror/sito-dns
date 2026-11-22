@@ -1092,33 +1092,92 @@ mod tests {
             "cursor must use the row-value form: {sql}"
         );
 
+        // A filtered cursor page must keep the same no-count, seekable shape.
+        let filtered = QueryLogFilter {
+            status: Some("blocked".into()),
+            qtype: Some(1),
+            ..Default::default()
+        };
+        let builder = query_log_page_builder(&filtered, Some((10, 20)), 51);
+        let filtered_sql = builder.sql().as_str().to_string();
+        assert!(
+            !filtered_sql.to_ascii_uppercase().contains("COUNT("),
+            "a filtered page must not run COUNT(*): {filtered_sql}"
+        );
+
         // The row-value predicate is seekable: SQLite reports a ts index range
         // rather than a scan plus a temporary sort B-tree. `id` is the rowid,
         // so both `idx_ql_ts(ts)` and `idx_ql_ts_id(ts, id)` encode the same
         // `(ts, id)` keyset order; the planner may pick either.
-        let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
-            .bind(10i64)
-            .bind(20i64)
-            .bind(51i64)
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
-        let plan = plan_rows
-            .iter()
-            .map(|row| row.get::<String, _>("detail"))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        assert!(
-            plan.contains("USING INDEX idx_ql_ts"),
-            "cursor page must seek a (ts, id) index: {plan}"
-        );
-        assert!(
-            !plan.to_ascii_uppercase().contains("TEMP B-TREE"),
-            "cursor page must not sort into a temp B-tree: {plan}"
-        );
-        assert!(
-            !plan.to_ascii_uppercase().contains("SCAN query_log"),
-            "cursor page must seek, not scan the table: {plan}"
-        );
+        // Bind counts must match each statement so SQLite can compile it. The
+        // actual values do not affect the plan/opcode shape.
+        for (page_sql, bind_count) in [(&sql, 3usize), (&filtered_sql, 5usize)] {
+            let mut plan_query = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN QUERY PLAN {page_sql}"
+            )));
+            for _ in 0..bind_count {
+                plan_query = plan_query.bind(10i64);
+            }
+            let plan_rows = plan_query.fetch_all(db.pool()).await.unwrap();
+            let plan = plan_rows
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(
+                plan.contains("USING INDEX idx_ql_ts"),
+                "cursor page must seek a (ts, id) index: {plan}"
+            );
+            assert!(
+                !plan.to_ascii_uppercase().contains("TEMP B-TREE"),
+                "cursor page must not sort into a temp B-tree: {plan}"
+            );
+            assert!(
+                !plan.to_ascii_uppercase().contains("SCAN query_log"),
+                "cursor page must seek, not scan the table: {plan}"
+            );
+
+            // Strengthen the evidence from the plan to the VDBE program: an
+            // indexed seek/prev loop, no `Count` opcode for a COUNT(*), and no
+            // sorter opcode. This inspects exactly the SQL the page builder
+            // produces rather than trusting the source text alone.
+            let opcode_rows = {
+                let mut opcode_query =
+                    sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN {page_sql}")));
+                for _ in 0..bind_count {
+                    opcode_query = opcode_query.bind(10i64);
+                }
+                opcode_query.fetch_all(db.pool()).await.unwrap()
+            };
+            let opcodes = opcode_rows
+                .iter()
+                .map(|row| row.get::<String, _>("opcode"))
+                .collect::<Vec<_>>();
+            assert!(
+                !opcodes
+                    .iter()
+                    .any(|opcode| opcode == "Count" || opcode == "CountZero"),
+                "the page program must not count rows: {opcodes:?}"
+            );
+            assert!(
+                opcodes.iter().any(|opcode| {
+                    matches!(opcode.as_str(), "SeekGE" | "SeekGT" | "SeekLE" | "SeekLT")
+                }),
+                "the page program must seek the keyset index: {opcodes:?}"
+            );
+            assert!(
+                !opcodes.iter().any(|opcode| {
+                    matches!(
+                        opcode.as_str(),
+                        "SorterOpen" | "SorterInsert" | "SorterSort"
+                    )
+                }),
+                "the page program must not sort: {opcodes:?}"
+            );
+            assert!(
+                opcodes.iter().any(|opcode| opcode == "Prev"),
+                "newest-first pages must walk the index backwards: {opcodes:?}"
+            );
+        }
     }
 }
