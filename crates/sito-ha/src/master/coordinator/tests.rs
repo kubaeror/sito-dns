@@ -3340,3 +3340,104 @@ fn read_only_or_fenced_master_never_queues_a_push_for_an_inflight_hello() {
         .expect("fenced listener refuses new slave sessions");
     assert!(error.contains("fenced"), "{error}");
 }
+
+#[test]
+fn hello_only_with_pushes_disabled_still_admits_and_reports_peers() {
+    use crate::promotion::PeerReport;
+    use crate::promotion::reconcile::{ReconcileDecision, ReconcileInput, evaluate};
+    use crate::promotion::state::PublicationBaseline;
+
+    let coordinator = test_coordinator();
+    coordinator.update_bundle(test_bundle(2)).unwrap();
+    // The runtime does this before entering hello-only: no pushes, but Hellos
+    // must still be admitted and registered.
+    coordinator.set_serving(false);
+    coordinator.allow_sessions();
+    coordinator.begin_hello_only();
+
+    let peer_hash = "ab".repeat(32);
+    let hello = HelloFields {
+        instance: "reconcile-peer".to_string(),
+        have_version: 1,
+        have_term: 1,
+        capabilities: vec![],
+        token: None,
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: Some(peer_hash.clone()),
+    };
+    let session = SessionMachine::admit(&coordinator, "127.0.0.1:1000".parse().unwrap(), hello)
+        .expect("hello-only must still admit a peer");
+    let mut rx = session.register();
+    assert!(
+        rx.try_recv().is_err(),
+        "hello-only must not queue the active push"
+    );
+
+    let reports = coordinator.hello_only_peer_reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].instance, "reconcile-peer");
+    assert_eq!(
+        reports[0].have_bundle_hash.as_deref(),
+        Some(peer_hash.as_str())
+    );
+
+    let witness = crate::witness::LeaseRecord {
+        schema: 1,
+        cluster_id: "home-dns".to_string(),
+        holder: "node-a/boot".to_string(),
+        node_id: "node-a".to_string(),
+        term: 1,
+        revision: 1,
+        version: 1,
+        bundle_hash: "cd".repeat(32),
+        acquired_unix_ms: 1,
+        expires_unix_ms: 2,
+    };
+    let baseline = PublicationBaseline::new(1, &"cd".repeat(32)).unwrap();
+    let input = ReconcileInput {
+        term: 2,
+        witness,
+        baseline: baseline.clone(),
+        publish_version: 2,
+        publication_state: sito_ha_types::status::PublicationState::Pending,
+        pending_hash: None,
+        peers: reports.clone(),
+    };
+    assert_eq!(
+        evaluate(&input),
+        ReconcileDecision::Abort(crate::promotion::acquisition::PromotionRefusal::ClusterForked),
+        "a real same-version/different-hash Hello must abort reconciliation"
+    );
+
+    let ahead = PeerReport {
+        instance: "ahead-peer".to_string(),
+        have_term: 1,
+        have_version: 3,
+        have_bundle_hash: Some("ef".repeat(32)),
+    };
+    let input = ReconcileInput {
+        peers: vec![ahead],
+        ..input
+    };
+    assert_eq!(
+        evaluate(&input),
+        ReconcileDecision::Abort(crate::promotion::acquisition::PromotionRefusal::CandidateBehind),
+        "a real ahead Hello must abort reconciliation"
+    );
+
+    // After the window the same registered peer must receive the first push.
+    coordinator.end_hello_only();
+    coordinator.set_serving(true);
+    let push = coordinator
+        .active_push
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("active push");
+    coordinator.broadcast(&push);
+    assert!(
+        matches!(rx.try_recv(), Ok(HaMessage::ConfigPush { version: 2, .. })),
+        "the registered reconciliation peer must receive the first publish"
+    );
+}

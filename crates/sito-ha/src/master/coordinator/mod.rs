@@ -276,6 +276,12 @@ pub struct MasterCoordinator {
     /// write carries the published baseline so a normal configuration publish
     /// cannot silently drop it.
     promotion_bookkeeping: Arc<Mutex<Option<crate::promotion::state::PromotionBookkeeping>>>,
+    /// True while the master may admit new slave Hellos. Admission and
+    /// configuration pushes are separate: hello-only reconciliation admits and
+    /// registers peers while refusing to queue pushes.
+    accepting_sessions: Arc<AtomicBool>,
+    /// Reason reported when a new session is refused.
+    session_refusal_reason: Arc<Mutex<String>>,
     /// True while the master listener may queue/push configuration bundles.
     /// Cleared synchronously at the first fence/read-only transition, before
     /// the listener shutdown is signalled.

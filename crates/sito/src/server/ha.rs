@@ -85,6 +85,12 @@ pub(super) fn init_ha(
         if ha_config.replication_port == 0 {
             coordinator.mark_replication_disabled();
         }
+        if promotion_enabled {
+            // The listener may exist before the supervisor acquires the lease,
+            // but it must not admit slaves or serve pushes in that window.
+            coordinator.set_serving(false);
+            coordinator.deny_sessions("read_only");
+        }
 
         // Continue the version sequence across restarts in the normal path.
         // With promotion enabled the engine reads the state file strictly and

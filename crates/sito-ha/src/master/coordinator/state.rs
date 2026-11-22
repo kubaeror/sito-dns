@@ -45,6 +45,8 @@ impl MasterCoordinator {
             require_slaves: Arc::new(AtomicBool::new(false)),
             require_all_slaves: Arc::new(AtomicBool::new(false)),
             promotion_bookkeeping: Arc::new(Mutex::new(None)),
+            accepting_sessions: Arc::new(AtomicBool::new(true)),
+            session_refusal_reason: Arc::new(Mutex::new("read_only".to_string())),
             serving: Arc::new(AtomicBool::new(true)),
             hello_only: Arc::new(AtomicBool::new(false)),
         }
@@ -63,6 +65,29 @@ impl MasterCoordinator {
     #[must_use]
     pub fn is_serving(&self) -> bool {
         self.serving.load(Ordering::SeqCst)
+    }
+
+    /// Allows new slave Hellos without enabling configuration pushes.
+    pub fn allow_sessions(&self) {
+        self.accepting_sessions.store(true, Ordering::SeqCst);
+    }
+
+    /// Refuses new slave Hellos with a specific reason.
+    pub fn deny_sessions(&self, reason: impl Into<String>) {
+        *sito_core::sync::lock_or_recover(&self.session_refusal_reason) = reason.into();
+        self.accepting_sessions.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether new slave Hellos may be admitted.
+    #[must_use]
+    pub fn is_accepting_sessions(&self) -> bool {
+        self.accepting_sessions.load(Ordering::SeqCst)
+    }
+
+    /// The stable reason returned for a refused Hello.
+    #[must_use]
+    pub fn session_refusal_reason(&self) -> String {
+        sito_core::sync::lock_or_recover(&self.session_refusal_reason).clone()
     }
 
     /// Installs (or clears) the ADR-0010 promotion bookkeeping persisted with

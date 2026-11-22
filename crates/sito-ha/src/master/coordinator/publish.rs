@@ -255,6 +255,15 @@ impl MasterCoordinator {
         let version = bundle.version;
         {
             let _publish_guard = sito_core::sync::lock_or_recover(&self.publish_lock);
+            // Narrow the fence/persist race: a serving transition must be
+            // observed before the bundle is persisted. If it closes after this
+            // check, recovery is explicit via reconciliation on restart.
+            if !self.is_serving() {
+                return Err(HaError::Validation {
+                    field: "ha_promotion".to_string(),
+                    reason: "master stopped serving before the promoted publish".to_string(),
+                });
+            }
             self.persist_bundle(&bundle)?;
             self.publish_prepared(bundle.clone(), version, &push);
         }
@@ -305,6 +314,7 @@ impl MasterCoordinator {
     /// Stops serving and drops every tracked replication session (fence path).
     pub fn close_all_sessions(&self) {
         self.set_serving(false);
+        self.deny_sessions("fenced");
         let mut slaves = sito_core::sync::lock_or_recover(&self.slaves);
         slaves.clear();
         self.metrics.set_ha_slaves_connected(0);
@@ -342,6 +352,12 @@ impl MasterCoordinator {
         // otherwise both pass the monotonicity check and store out of order,
         // regressing the active version and broadcasting a stale bundle.
         let _publish_guard = sito_core::sync::lock_or_recover(&self.publish_lock);
+        if !self.is_serving() {
+            return Err(HaError::Validation {
+                field: "ha_promotion".to_string(),
+                reason: "master stopped serving before the publish persisted".to_string(),
+            });
+        }
 
         let (bundle, version, push_msg, _previous) = self.prepare_bundle(bundle)?;
         // Persist before publishing: a failed write must leave both the
@@ -456,6 +472,12 @@ impl MasterCoordinator {
 
         let (bundle, version, push_msg, previous_version) = {
             let _publish_guard = sito_core::sync::lock_or_recover(&self.publish_lock);
+            if !self.is_serving() {
+                return Err(HaError::Validation {
+                    field: "ha_promotion".to_string(),
+                    reason: "master stopped serving before the publish persisted".to_string(),
+                });
+            }
             self.prepare_bundle(bundle)?
         };
 

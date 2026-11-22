@@ -140,7 +140,8 @@ impl MasterCoordinator {
                             instance = %session.state.slave_instance,
                             "Master stopped serving; dropping queued HA push"
                         );
-                        break;
+                        session.account_drained(wire_size(&msg));
+                        continue;
                     }
                     session.account_drained(wire_size(&msg));
                     if send_ha_message(&mut ws_stream, &msg, "master", "configuration push").await.is_err() {
@@ -150,7 +151,7 @@ impl MasterCoordinator {
 
                 // Periodic ping + liveness watchdog
                 _ = ping_interval.tick() => {
-                    if !self.is_serving() {
+                    if !self.is_accepting_sessions() {
                         break;
                     }
                     match session.heartbeat() {

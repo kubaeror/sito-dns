@@ -483,8 +483,18 @@ impl PromotionHost for RuntimePromotionHost {
     fn set_writable(&self, writable: bool, reason: Option<String>) {
         if let Some(coordinator) = self.state.coordinator() {
             coordinator.set_serving(writable);
-            if !writable {
+            if writable {
+                coordinator.allow_sessions();
+            } else if coordinator.is_hello_only() {
+                // Reconciliation must keep admitting/registering peers.
+                coordinator.allow_sessions();
+            } else {
                 coordinator.close_all_sessions();
+                coordinator.deny_sessions(
+                    reason
+                        .clone()
+                        .unwrap_or_else(|| "ha_promotion_read_only".to_string()),
+                );
             }
         }
         if writable {
@@ -543,6 +553,7 @@ impl PromotionHost for RuntimePromotionHost {
                 self.state.ha_config.require_all_slaves,
             );
             coordinator.set_serving(false);
+            coordinator.deny_sessions("read_only");
             let (master_shutdown_tx, master_shutdown_rx) = watch::channel(false);
             let handle = sito_ha::spawn_master_server(
                 self.state.ha_config.clone(),
@@ -581,6 +592,7 @@ impl PromotionHost for RuntimePromotionHost {
         Box::pin(async move {
             let coordinator = self.coordinator()?;
             coordinator.set_serving(false);
+            coordinator.allow_sessions();
             coordinator.begin_hello_only();
             Ok(())
         })
@@ -588,7 +600,10 @@ impl PromotionHost for RuntimePromotionHost {
 
     fn end_hello_only(&self) -> sito_ha::promotion::BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
-            self.coordinator()?.end_hello_only();
+            let coordinator = self.coordinator()?;
+            coordinator.set_serving(false);
+            coordinator.allow_sessions();
+            coordinator.end_hello_only();
             Ok(())
         })
     }
@@ -643,6 +658,7 @@ impl PromotionHost for RuntimePromotionHost {
         // enqueue a push after this returns, even before the listener joins.
         if let Some(coordinator) = self.state.coordinator() {
             coordinator.set_serving(false);
+            coordinator.deny_sessions("fenced");
             coordinator.close_all_sessions();
         }
         if let Some(tx) = self

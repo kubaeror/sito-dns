@@ -79,11 +79,11 @@ impl<'a> SessionMachine<'a> {
         peer_addr: SocketAddr,
         hello: HelloFields,
     ) -> Result<Self, String> {
-        if !coordinator.is_serving() {
-            return Err(
-                "fenced: the master is not serving replication; new slave sessions are refused"
-                    .to_string(),
-            );
+        if !coordinator.is_accepting_sessions() {
+            return Err(format!(
+                "{}: the master is read-only; new slave sessions are refused",
+                coordinator.session_refusal_reason()
+            ));
         }
         let HelloFields {
             instance: slave_instance,
