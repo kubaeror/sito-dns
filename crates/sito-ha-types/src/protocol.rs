@@ -1,6 +1,6 @@
 //! High Availability (HA) replication protocol message definitions.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 
 use crate::error::HaError;
@@ -12,6 +12,42 @@ use crate::error::HaError;
 /// with it. A v1 peer (or a v1 state file) is rejected with an actionable
 /// `protocol_mismatch` reason instead of being interpreted with v2 semantics.
 pub const PROTOCOL_VERSION: u32 = 2;
+
+/// True when an optional Hello hash should be omitted from the wire.
+#[allow(clippy::ref_option)] // serde's skip_serializing_if always passes &T
+fn is_absent_hash(value: &Option<String>) -> bool {
+    value
+        .as_deref()
+        .is_none_or(|hash| hash.trim().eq_ignore_ascii_case("none"))
+}
+
+/// Deserializes `Hello.have_bundle_hash`, normalizing and validating it.
+fn deserialize_have_bundle_hash<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(value) => {
+            crate::hash::normalize_optional_hash(&value).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// Serializes `Hello.have_bundle_hash` in canonical form.
+#[allow(clippy::ref_option)] // serde's serialize_with always passes &T
+fn serialize_have_bundle_hash<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        None => serializer.serialize_none(),
+        Some(value) => serializer.serialize_str(
+            &crate::hash::normalize_blake3_hash(value).map_err(serde::ser::Error::custom)?,
+        ),
+    }
+}
 
 /// Structured reason a slave rejected a pushed bundle.
 ///
@@ -54,6 +90,21 @@ pub enum HaMessage {
         /// treated as protocol version 1 and rejected by a v2 master.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         protocol_version: Option<u32>,
+        /// BLAKE3 hash of the slave's applied signed configuration payload.
+        ///
+        /// Additive and optional (ADR-0010): older v2 peers omit it, which is
+        /// treated as unknown. A present value is normalized to 64 lowercase
+        /// hex characters (`blake3:` prefix accepted and stripped); `"none"`
+        /// means "no published bundle" and normalizes to an absent field. A
+        /// malformed present value is rejected instead of silently treated as
+        /// unknown.
+        #[serde(
+            default,
+            skip_serializing_if = "is_absent_hash",
+            deserialize_with = "deserialize_have_bundle_hash",
+            serialize_with = "serialize_have_bundle_hash"
+        )]
+        have_bundle_hash: Option<String>,
     },
 
     /// Master pushes a signed configuration state bundle to connected slave(s).
@@ -159,6 +210,7 @@ mod tests {
             token: None,
             role: Some("slave".to_string()),
             protocol_version: Some(PROTOCOL_VERSION),
+            have_bundle_hash: None,
         };
         let json = hello.to_json().unwrap();
         assert!(json.contains("\"type\":\"hello\""));
@@ -251,6 +303,115 @@ mod tests {
         assert_eq!(
             pong,
             HaMessage::from_json(&pong.to_json().unwrap()).unwrap()
+        );
+    }
+
+    fn hello_json(have_bundle_hash: &str) -> String {
+        format!(
+            r#"{{"type":"hello","instance":"slave-pi","have_version":41,"have_term":3,"capabilities":[],"role":"slave","protocol_version":2,"have_bundle_hash":{have_bundle_hash}}}"#
+        )
+    }
+
+    #[test]
+    fn hello_bundle_hash_is_optional_and_normalized() {
+        let bare = "ab".repeat(32);
+
+        // Older v2 peers omit the field: unknown, not an error.
+        let legacy =
+            HaMessage::from_json(r#"{"type":"hello","instance":"old","have_version":7}"#).unwrap();
+        assert!(matches!(
+            legacy,
+            HaMessage::Hello {
+                have_bundle_hash: None,
+                ..
+            }
+        ));
+
+        // A prefixed/uppercase value normalizes to bare lowercase hex.
+        let parsed =
+            HaMessage::from_json(&hello_json(&format!("\"blake3:{}\"", bare.to_uppercase())))
+                .unwrap();
+        assert!(matches!(
+            parsed,
+            HaMessage::Hello {
+                have_bundle_hash: Some(ref hash),
+                ..
+            } if hash == &bare
+        ));
+
+        // `"none"` means "no published bundle", represented as absent.
+        let none = HaMessage::from_json(&hello_json("\"none\"")).unwrap();
+        assert!(matches!(
+            none,
+            HaMessage::Hello {
+                have_bundle_hash: None,
+                ..
+            }
+        ));
+
+        // A present malformed hash is rejected rather than treated as unknown.
+        assert!(HaMessage::from_json(&hello_json("\"not-a-hash\"")).is_err());
+        assert!(HaMessage::from_json(&hello_json("\"\"")).is_err());
+
+        // Serialization normalizes and omits absent/`none` values.
+        let hello = HaMessage::Hello {
+            instance: "slave-pi".to_string(),
+            have_version: 41,
+            have_term: 3,
+            capabilities: Vec::new(),
+            token: None,
+            role: Some("slave".to_string()),
+            protocol_version: Some(PROTOCOL_VERSION),
+            have_bundle_hash: Some(bare.clone()),
+        };
+        let json = hello.to_json().unwrap();
+        assert!(json.contains(&format!("\"have_bundle_hash\":\"{bare}\"")));
+        assert_eq!(hello, HaMessage::from_json(&json).unwrap());
+
+        // A local prefixed/uppercase value is normalized before it reaches the
+        // wire, even though the in-memory value keeps its original spelling.
+        let prefixed = HaMessage::Hello {
+            instance: "slave-pi".to_string(),
+            have_version: 41,
+            have_term: 3,
+            capabilities: Vec::new(),
+            token: None,
+            role: Some("slave".to_string()),
+            protocol_version: Some(PROTOCOL_VERSION),
+            have_bundle_hash: Some(format!("blake3:{}", bare.to_uppercase())),
+        };
+        assert!(
+            prefixed
+                .to_json()
+                .unwrap()
+                .contains(&format!("\"have_bundle_hash\":\"{bare}\""))
+        );
+
+        let absent = HaMessage::Hello {
+            instance: "slave-pi".to_string(),
+            have_version: 41,
+            have_term: 3,
+            capabilities: Vec::new(),
+            token: None,
+            role: Some("slave".to_string()),
+            protocol_version: Some(PROTOCOL_VERSION),
+            have_bundle_hash: Some("none".to_string()),
+        };
+        assert!(!absent.to_json().unwrap().contains("have_bundle_hash"));
+
+        let malformed = HaMessage::Hello {
+            instance: "slave-pi".to_string(),
+            have_version: 41,
+            have_term: 3,
+            capabilities: Vec::new(),
+            token: None,
+            role: Some("slave".to_string()),
+            protocol_version: Some(PROTOCOL_VERSION),
+            have_bundle_hash: Some("abc".to_string()),
+        };
+        assert!(
+            malformed.to_json().is_err(),
+            "a malformed local hash must not reach the wire"
         );
     }
 }

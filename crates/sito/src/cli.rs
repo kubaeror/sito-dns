@@ -2161,7 +2161,6 @@ mod tests {
     fn test_check_config_accepts_clients_trust_arp() {
         let dir = temp_config_dir("check_config_trust_arp");
         let path = dir.join("config.toml");
-
         // The key is in the v1→v2 map and the typed `[clients]` conversion,
         // so the real loader used by startup/`check-config` accepts it.
         std::fs::write(
@@ -2179,6 +2178,154 @@ mod tests {
         .unwrap();
         run_check_config(&path).expect("an absent clients.trust_arp must stay valid");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "ha")]
+    fn ha_promotion_document(promotion: &str) -> String {
+        format!(
+            "config_version = 2\n\
+             [server]\n\
+             role = \"master\"\n\
+             [upstream]\n\
+             servers = [\"1.1.1.1\"]\n\
+             [ha]\n\
+             replication_port = 0\n\
+             ping_interval_secs = 30\n\
+             \n\
+             {promotion}"
+        )
+    }
+
+    #[cfg(feature = "ha")]
+    fn valid_promotion_table() -> &'static str {
+        "[ha.promotion]\n\
+         enabled = true\n\
+         candidate = false\n\
+         cluster_id = \"home-dns\"\n\
+         node_id = \"sito-node-a\"\n\
+         backend = \"witness\"\n\
+         lease_ttl_secs = 30\n\
+         renew_interval_secs = 10\n\
+         heartbeat_timeout_secs = 90\n\
+         require_manual_confirmation = false\n\
+         reconcile_window_secs = 10\n\
+         \n\
+         [ha.promotion.witness]\n\
+         url = \"https://witness.lan:8954\"\n\
+         ca = \"/etc/sito/certs/witness-ca.crt\"\n\
+         server_name = \"witness.lan\"\n\
+         fingerprint = \"blake3:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"\n\
+         token_file = \"/etc/sito/witness.token\"\n"
+    }
+
+    #[cfg(feature = "ha")]
+    #[test]
+    fn test_check_config_accepts_ha_promotion() {
+        let dir = temp_config_dir("check_config_promotion");
+        let path = dir.join("config.toml");
+
+        // Disabled: all keys are accepted and the section stays inert.
+        std::fs::write(
+            &path,
+            ha_promotion_document(
+                "[ha.promotion]\nenabled = false\ncandidate = true\nbackend = \"witness\"\n",
+            ),
+        )
+        .unwrap();
+        run_check_config(&path).expect("a disabled promotion section must load");
+
+        // Enabled with the full ADR table and the derived-default upgrade case
+        // (ping = 30, heartbeat = 90).
+        std::fs::write(&path, ha_promotion_document(valid_promotion_table())).unwrap();
+        run_check_config(&path).expect("a full promotion section must load");
+
+        // Enabled with no heartbeat key derives max(45, 3 * 30) = 90.
+        std::fs::write(
+            &path,
+            ha_promotion_document(
+                &valid_promotion_table().replace("heartbeat_timeout_secs = 90\n", ""),
+            ),
+        )
+        .unwrap();
+        run_check_config(&path).expect("the derived heartbeat must load with ping = 30");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "ha")]
+    #[test]
+    fn test_check_config_rejects_invalid_ha_promotion() {
+        let dir = temp_config_dir("check_config_promotion_bad");
+        let path = dir.join("config.toml");
+
+        let cases = [
+            (
+                "heartbeat_timeout_secs = 45",
+                valid_promotion_table()
+                    .replace("heartbeat_timeout_secs = 90", "heartbeat_timeout_secs = 45"),
+                "heartbeat_timeout_secs",
+            ),
+            (
+                "unsupported backend",
+                "[ha.promotion]\nenabled = false\nbackend = \"etcd\"\n".to_string(),
+                "unsupported_lease_backend",
+            ),
+            (
+                "plaintext url",
+                valid_promotion_table()
+                    .replace("https://witness.lan:8954", "http://witness.lan:8954"),
+                "witness.url",
+            ),
+            (
+                "candidate on master",
+                valid_promotion_table().replace("candidate = false", "candidate = true"),
+                "candidate",
+            ),
+            (
+                "missing cluster id",
+                valid_promotion_table().replace("cluster_id = \"home-dns\"\n", ""),
+                "cluster_id",
+            ),
+            (
+                "bad fingerprint",
+                valid_promotion_table().replace(
+                    "blake3:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                    "blake3:abc",
+                ),
+                "fingerprint",
+            ),
+        ];
+
+        for (label, promotion, expected) in cases {
+            std::fs::write(&path, ha_promotion_document(&promotion)).unwrap();
+            let err = run_check_config(&path)
+                .expect_err(&format!("{label} must be rejected by check-config"));
+            assert!(
+                err.to_string().contains(expected),
+                "{label}: expected '{expected}' in {err}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(feature = "ha"))]
+    #[test]
+    fn test_check_config_rejects_promotion_without_ha_feature() {
+        let dir = temp_config_dir("check_config_promotion_no_feature");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n[ha.promotion]\nenabled = false\n",
+        )
+        .unwrap();
+        let err = run_check_config(&path).expect_err("a no-HA build must reject [ha.promotion]");
+        assert!(
+            err.to_string()
+                .contains("compiled without high-availability"),
+            "expected the HA-feature error, got: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

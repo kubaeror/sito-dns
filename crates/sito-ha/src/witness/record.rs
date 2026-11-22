@@ -110,7 +110,7 @@ impl LeaseRecord {
 }
 
 /// `POST /v1/lease/acquire` request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcquireRequest {
     pub holder: String,
     pub node_id: String,
@@ -125,7 +125,7 @@ pub struct AcquireRequest {
 }
 
 /// `POST /v1/lease/renew` request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenewRequest {
     pub holder: String,
     pub term: u64,

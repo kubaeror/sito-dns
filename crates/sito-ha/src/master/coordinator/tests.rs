@@ -1179,6 +1179,7 @@ async fn test_reconnect_resets_per_slave_queue_accounting() {
         token: None,
         role: Some("slave".to_string()),
         protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: None,
     };
     client_ws
         .send(WsMessage::Text(hello.to_json().unwrap().into()))
@@ -1513,6 +1514,7 @@ async fn test_master_pong_watchdog_marks_stale_and_pong_refreshes() {
             token: None,
             role: Some("slave".to_string()),
             protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+            have_bundle_hash: None,
         },
     )
     .expect("a v2 slave must be admitted");
@@ -1929,6 +1931,7 @@ async fn test_ahead_slave_same_term_does_not_seed_or_rebase() {
         token: None,
         role: Some("slave".to_string()),
         protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: None,
     };
     client_ws
         .send(WsMessage::Text(hello.to_json().unwrap().into()))
@@ -2558,6 +2561,7 @@ async fn test_hello_from_newer_term_rejects_stale_master() {
         token: None,
         role: Some("slave".to_string()),
         protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: None,
     };
     client_ws
         .send(WsMessage::Text(hello.to_json().unwrap().into()))
@@ -2832,6 +2836,7 @@ async fn test_master_rejects_v1_slave_and_keeps_listening() {
         token: None,
         role: Some("slave".to_string()),
         protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: None,
     };
     ws2.send(WsMessage::Text(hello.to_json().unwrap().into()))
         .await
@@ -2882,6 +2887,7 @@ async fn test_master_rejects_oversized_websocket_hello() {
         token: Some("tok".to_string()),
         role: Some("slave".to_string()),
         protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: None,
     };
     let _ = ws
         .send(WsMessage::Text(hello.to_json().unwrap().into()))
@@ -2992,6 +2998,7 @@ async fn test_hello_u64_max_does_not_seed_or_register() {
         token: None,
         role: Some("slave".to_string()),
         protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: None,
     };
     client_ws
         .send(WsMessage::Text(hello.to_json().unwrap().into()))

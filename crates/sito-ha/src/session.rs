@@ -91,6 +91,7 @@ mod tests {
             token: None,
             role: Some("slave".to_string()),
             protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+            have_bundle_hash: None,
         };
         let json = message.to_json().unwrap();
         assert_eq!(wire_size(&message), json.len());
@@ -110,6 +111,7 @@ mod tests {
             token: None,
             role: None,
             protocol_version: None,
+            have_bundle_hash: None,
         };
         let json = r#"{"type":"hello","instance":"réplica-λ","have_version":1,"have_term":0,"capabilities":[]}"#;
         assert_eq!(wire_size(&message), 90);
@@ -229,6 +231,7 @@ mod tests {
             token: None,
             role: Some("slave".to_string()),
             protocol_version: None,
+            have_bundle_hash: None,
         };
         let err = send_ha_message(&mut ws, &message, "slave", "Hello")
             .await

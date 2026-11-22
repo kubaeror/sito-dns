@@ -70,6 +70,7 @@ where
             token,
             role,
             protocol_version,
+            have_bundle_hash,
         }) => Some(HelloFields {
             instance,
             have_version,
@@ -78,6 +79,7 @@ where
             token,
             role,
             protocol_version,
+            have_bundle_hash,
         }),
         Ok(other) => {
             warn!(peer = %peer_addr, "Unexpected message instead of Hello: {other:?}");

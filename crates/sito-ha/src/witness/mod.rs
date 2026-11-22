@@ -105,18 +105,8 @@ impl From<std::io::Error> for WitnessError {
 /// A `blake3:` prefix is accepted and stripped. Anything else (wrong length,
 /// non-hex characters, an empty value) is rejected.
 pub fn normalize_hash(input: &str) -> Result<String, WitnessError> {
-    let trimmed = input.trim();
-    let hex = trimmed
-        .strip_prefix("blake3:")
-        .or_else(|| trimmed.strip_prefix("BLAKE3:"))
-        .unwrap_or(trimmed);
-    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(WitnessError::new(
-            "invalid_bundle_hash",
-            format!("'{trimmed}' is not a 64-character hexadecimal BLAKE3 hash"),
-        ));
-    }
-    Ok(hex.to_ascii_lowercase())
+    sito_ha_types::hash::normalize_blake3_hash(input)
+        .map_err(|error| WitnessError::new("invalid_bundle_hash", error.to_string()))
 }
 
 /// Normalizes the `(version, bundle_hash)` pair carried by a lease request.
@@ -124,22 +114,8 @@ pub fn normalize_hash(input: &str) -> Result<String, WitnessError> {
 /// `version == 0` requires exactly `"none"`; a positive version requires a
 /// valid BLAKE3 hash and rejects `"none"`.
 pub fn normalize_bundle_hash(version: u64, input: &str) -> Result<String, WitnessError> {
-    if version == 0 {
-        if input.trim() == "none" {
-            return Ok("none".to_string());
-        }
-        return Err(WitnessError::new(
-            "invalid_bundle_hash",
-            "version 0 requires bundle_hash \"none\"",
-        ));
-    }
-    if input.trim() == "none" {
-        return Err(WitnessError::new(
-            "invalid_bundle_hash",
-            "bundle_hash \"none\" is only valid for version 0",
-        ));
-    }
-    normalize_hash(input)
+    sito_ha_types::hash::normalize_bundle_hash(version, input)
+        .map_err(|error| WitnessError::new("invalid_bundle_hash", error.to_string()))
 }
 
 /// Validates a stable cluster identifier (`[A-Za-z0-9._-]{1,64}`).

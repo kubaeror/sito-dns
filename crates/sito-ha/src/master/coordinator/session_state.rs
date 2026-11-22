@@ -16,6 +16,8 @@ pub(super) struct HelloFields {
     pub token: Option<String>,
     pub role: Option<String>,
     pub protocol_version: Option<u32>,
+    /// Applied signed-payload hash advertised by the slave, if any.
+    pub have_bundle_hash: Option<String>,
 }
 
 /// The per-connection identity and negotiated state.
@@ -79,6 +81,7 @@ impl<'a> SessionMachine<'a> {
             token,
             role,
             protocol_version,
+            have_bundle_hash,
         } = hello;
 
         // Protocol version negotiation: a Hello without the field comes from a
@@ -134,6 +137,7 @@ impl<'a> SessionMachine<'a> {
         info!(
             instance = %slave_instance,
             have_version,
+            have_bundle_hash = ?have_bundle_hash,
             peer = %peer_addr,
             "Received authenticated Hello from replica slave"
         );
