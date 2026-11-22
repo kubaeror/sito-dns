@@ -92,6 +92,11 @@ pub struct LocalContent {
     pub applied_hash: Option<String>,
     /// Term of the local `ha_state.toml` bundle (0 for a slave).
     pub state_term: u64,
+    /// Version of the local `ha_state.toml` bundle.
+    pub state_version: u64,
+    /// Signed-payload hash of the local `ha_state.toml` bundle, when it can be
+    /// recomputed (legacy state has no stored promotion hash).
+    pub state_hash: Option<String>,
     /// Promotion bookkeeping from `ha_state.toml`, if any.
     pub bookkeeping: Option<PromotionBookkeeping>,
     /// Version of the staged bundle in `ha_state.toml` (0 when none). This is
@@ -113,6 +118,8 @@ impl LocalContent {
             applied_version: last_applied_version,
             applied_hash: last_applied_hash,
             state_term,
+            state_version: 0,
+            state_hash: None,
             bookkeeping,
             pending_version: 0,
         }
@@ -131,6 +138,8 @@ impl LocalContent {
             applied_version,
             applied_hash,
             state_term: 0,
+            state_version: 0,
+            state_hash: None,
             bookkeeping,
             pending_version: 0,
         }
@@ -156,6 +165,9 @@ pub struct AcquirePlan {
     /// Whether a prior pending/publishing bundle at `publish_version` is being
     /// reused.
     pub reusing_pending: bool,
+    /// The witness already holds this node's live grant; resume renewal rather
+    /// than issuing an acquire.
+    pub existing_grant: bool,
 }
 
 /// The decision for one acquisition attempt.
@@ -163,8 +175,6 @@ pub struct AcquirePlan {
 pub enum AcquisitionDecision {
     /// Acquire with these fields.
     Acquire(AcquirePlan),
-    /// An existing grant is already ours; renew instead.
-    ExistingGrant,
     /// Do not acquire; the stable reason is reported.
     Refuse(PromotionRefusal),
 }
@@ -198,12 +208,7 @@ pub fn decide_acquisition(
     let max_term = local.applied_term.max(local.state_term);
     let record_term = record.map_or(0, |record| record.term);
 
-    if let Some(record) = record
-        && record.holder == holder
-        && record.term > 0
-    {
-        return AcquisitionDecision::ExistingGrant;
-    }
+    let existing_grant = record.is_some_and(|record| record.holder == holder && record.term > 0);
 
     if record.is_none() && max_term > 0 {
         return AcquisitionDecision::Refuse(PromotionRefusal::LeaseRecordMissing);
@@ -252,10 +257,10 @@ pub fn decide_acquisition(
         && let Some(record) = record
         && record.version > 0
     {
-        let state_bundle_version = local.applied_version;
+        let state_bundle_version = local.state_version;
         if state_bundle_version == record.version
             && local
-                .applied_hash
+                .state_hash
                 .as_deref()
                 .is_some_and(|hash| hashes_equal(hash, &record.bundle_hash))
         {
@@ -318,6 +323,7 @@ pub fn decide_acquisition(
     };
     let term = match record {
         None => 1,
+        Some(record) if existing_grant => record.term,
         Some(record) => match record.term.checked_add(1) {
             Some(term) => term,
             None => return AcquisitionDecision::Refuse(PromotionRefusal::ArithmeticOverflow),
@@ -332,6 +338,7 @@ pub fn decide_acquisition(
         publish_version,
         inferred_published,
         reusing_pending,
+        existing_grant,
     })
 }
 
@@ -427,6 +434,8 @@ mod tests {
             applied_version: version,
             applied_hash: Some(hash.to_string()),
             state_term: 0,
+            state_version: 0,
+            state_hash: None,
             bookkeeping: None,
             pending_version: 0,
         }
@@ -634,7 +643,9 @@ mod tests {
     #[test]
     fn master_restart_publishes_a_new_version_without_a_config_change() {
         let hash = "ab".repeat(32);
-        let master = LocalContent::master(3, None, 7, Some(hash.clone()));
+        let mut master = LocalContent::master(3, None, 7, Some(hash.clone()));
+        master.state_version = 7;
+        master.state_hash = Some(hash.clone());
         let AcquisitionDecision::Acquire(plan) = decide_acquisition(
             AcquisitionRole::Master,
             &master,
@@ -648,6 +659,22 @@ mod tests {
         assert_eq!(
             plan.publish_version, 8,
             "a restart always bumps the version"
+        );
+    }
+
+    #[test]
+    fn candidate_state_term_participates_in_term_ahead_refusal() {
+        let hash = "ab".repeat(32);
+        let mut local = candidate(1, 7, &hash);
+        local.state_term = 5;
+        assert_eq!(
+            decide_acquisition(
+                AcquisitionRole::Candidate,
+                &local,
+                Some(&record(3, 1, 7, &hash)),
+                "node-b/boot"
+            ),
+            AcquisitionDecision::Refuse(PromotionRefusal::CandidateTermAhead)
         );
     }
 

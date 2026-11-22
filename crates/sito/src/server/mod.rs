@@ -36,6 +36,8 @@ mod common;
 #[cfg(feature = "ha")]
 mod ha;
 mod listeners;
+#[cfg(feature = "ha")]
+mod promotion;
 mod runtime;
 mod shutdown;
 mod startup;
@@ -49,6 +51,9 @@ pub use common::*;
 pub use ha::*;
 #[allow(clippy::wildcard_imports)]
 use listeners::*;
+#[cfg(feature = "ha")]
+#[allow(clippy::wildcard_imports)]
+use promotion::*;
 #[allow(clippy::wildcard_imports)]
 use runtime::*;
 #[allow(clippy::wildcard_imports)]

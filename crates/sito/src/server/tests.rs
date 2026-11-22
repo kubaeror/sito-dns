@@ -1160,3 +1160,288 @@ async fn test_doh_alt_svc_not_advertised_when_doh3_fails() {
     drop(occupied);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// ADR-0010 Critical regression: enabling promotion on a master must not
+/// restore/publish/mutate before the lease is acquired. With an unreachable
+/// witness the daemon starts read-only, the API gate blocks mutations, and no
+/// configuration version is published.
+#[cfg(feature = "ha")]
+#[tokio::test]
+async fn test_promotion_enabled_master_starts_read_only_without_publishing() {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_promotion_daemon_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let certs = sito_ha::generate_ha_certs(&dir.join("certs"), true, false).unwrap();
+    let token_file = dir.join("witness.token");
+    let mut token = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&token_file)
+        .unwrap();
+    token.write_all(b"test-token-0123456789abcdef").unwrap();
+    drop(token);
+
+    let config_path = dir.join("config.toml");
+    let mut config = Config::default();
+    config.server.role = "master".to_string();
+    config.server.instance_name = "promotion-master".to_string();
+    config.server.data_dir = dir.clone();
+    config.ha = Some(
+        toml::from_str(&format!(
+            r#"
+replication_port = 0
+
+[promotion]
+enabled = true
+candidate = false
+cluster_id = "home-dns"
+node_id = "node-a"
+lease_ttl_secs = 30
+renew_interval_secs = 10
+reconcile_window_secs = 10
+
+[promotion.witness]
+url = "https://127.0.0.1:1"
+ca = "{}"
+token_file = "{}"
+"#,
+            certs.ca_cert_path.display(),
+            token_file.display()
+        ))
+        .unwrap(),
+    );
+    std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+    let metrics = sito_stats::MetricsRegistry::new("2.0.0", "test");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let runtime = init_ha(&config, &config_path, &metrics, &shutdown_rx)
+        .expect("promotion-enabled master must start read-only, not exit");
+
+    assert!(
+        runtime.write_gate.blocked().is_some(),
+        "an enabled master must be read-only until it acquires and publishes"
+    );
+    let coordinator = runtime.coordinator.clone().expect("coordinator");
+    assert_eq!(
+        coordinator.get_current_version(),
+        0,
+        "no configuration may be published before the lease"
+    );
+    assert!(
+        coordinator.active_bundle.lock().unwrap().is_none(),
+        "no active bundle may exist before the lease"
+    );
+    assert!(
+        !dir.join("ha_state.toml").exists(),
+        "no ha_state.toml may be written before the lease"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ADR-0010 daemon integration: with a reachable witness, an enabled master
+/// acquires the lease, quiesces, reconciles and publishes; only then does the
+/// API write gate open.
+#[cfg(feature = "ha")]
+#[tokio::test]
+async fn test_promotion_enabled_master_acquires_and_publishes() {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_promotion_daemon_ok_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let certs = sito_ha::generate_ha_certs(&dir.join("certs"), true, false).unwrap();
+    let token_file = dir.join("witness.token");
+    let mut token = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&token_file)
+        .unwrap();
+    token.write_all(b"test-token-0123456789abcdef").unwrap();
+    drop(token);
+
+    let witness = sito_ha::start_witness_server(
+        sito_ha::WitnessConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            cluster_id: "home-dns".to_string(),
+            cert: certs.master_cert_path.clone().unwrap(),
+            key: certs.master_key_path.clone().unwrap(),
+            token_file: token_file.clone(),
+            state_dir: dir.join("witness-state"),
+        },
+        std::sync::Arc::new(sito_ha::SystemClock),
+    )
+    .await
+    .expect("witness starts");
+    let witness_addr = witness.local_addr();
+
+    let config_path = dir.join("config.toml");
+    let mut config = Config::default();
+    config.server.role = "master".to_string();
+    config.server.instance_name = "promotion-master".to_string();
+    config.server.data_dir = dir.clone();
+    config.ha = Some(
+        toml::from_str(&format!(
+            r#"
+replication_port = 0
+
+[promotion]
+enabled = true
+candidate = false
+cluster_id = "home-dns"
+node_id = "node-a"
+lease_ttl_secs = 5
+renew_interval_secs = 1
+reconcile_window_secs = 1
+
+[promotion.witness]
+url = "https://{witness_addr}"
+ca = "{}"
+token_file = "{}"
+"#,
+            certs.ca_cert_path.display(),
+            token_file.display()
+        ))
+        .unwrap(),
+    );
+    std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+    let metrics = sito_stats::MetricsRegistry::new("2.0.0", "test");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let runtime = init_ha(&config, &config_path, &metrics, &shutdown_rx)
+        .expect("promotion-enabled master starts");
+    let coordinator = runtime.coordinator.clone().expect("coordinator");
+    assert!(runtime.write_gate.blocked().is_some());
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if coordinator.get_current_version() == 1 && runtime.write_gate.blocked().is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon did not acquire/publish before the deadline (version {}, gate {:?})",
+            coordinator.get_current_version(),
+            runtime.write_gate.blocked()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(coordinator.get_current_version(), 1);
+    assert_eq!(coordinator.get_current_term(), 1);
+    assert!(runtime.write_gate.blocked().is_none());
+    assert!(
+        std::fs::read_to_string(dir.join("ha_state.toml"))
+            .unwrap()
+            .contains("\"publication_state\": \"published\"")
+    );
+
+    let _ = shutdown_tx.send(true);
+    witness.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ADR-0010 daemon integration: a durable fence marker makes the node refuse
+/// to acquire/publish across a restart and keeps the write gate closed.
+#[cfg(feature = "ha")]
+#[tokio::test]
+async fn test_promotion_fenced_master_restart_stays_read_only() {
+    let dir = std::env::temp_dir().join(format!(
+        "sito_promotion_fenced_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let certs = sito_ha::generate_ha_certs(&dir.join("certs"), true, false).unwrap();
+    let token_file = dir.join("witness.token");
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut token = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&token_file)
+            .unwrap();
+        token.write_all(b"test-token-0123456789abcdef").unwrap();
+    }
+    let fence = serde_json::json!({
+        "protocol_version": 2,
+        "cluster_id": "home-dns",
+        "node_id": "node-a",
+        "fenced_term": 4,
+        "reason": "lease_lost",
+        "fenced_at_unix_ms": 1,
+        "reconciled": false
+    });
+    std::fs::write(
+        dir.join("ha_fence.json"),
+        serde_json::to_vec_pretty(&fence).unwrap(),
+    )
+    .unwrap();
+
+    let config_path = dir.join("config.toml");
+    let mut config = Config::default();
+    config.server.role = "master".to_string();
+    config.server.data_dir = dir.clone();
+    config.ha = Some(
+        toml::from_str(&format!(
+            r#"
+replication_port = 0
+
+[promotion]
+enabled = true
+candidate = false
+cluster_id = "home-dns"
+node_id = "node-a"
+
+[promotion.witness]
+url = "https://127.0.0.1:1"
+ca = "{}"
+token_file = "{}"
+"#,
+            certs.ca_cert_path.display(),
+            token_file.display()
+        ))
+        .unwrap(),
+    );
+    std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+    let metrics = sito_stats::MetricsRegistry::new("2.0.0", "test");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let runtime = init_ha(&config, &config_path, &metrics, &shutdown_rx)
+        .expect("fenced master must stay read-only, not exit");
+    let coordinator = runtime.coordinator.clone().expect("coordinator");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if runtime.write_gate.blocked() == Some(("ha_promotion_fenced".to_string(), true)) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fenced restart never reported the durable fence: {:?}",
+            runtime.write_gate.blocked()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(coordinator.get_current_version(), 0);
+    assert!(runtime.write_gate.blocked().is_some());
+
+    let _ = shutdown_tx.send(true);
+    let _ = std::fs::remove_dir_all(&dir);
+}

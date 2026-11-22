@@ -3279,3 +3279,18 @@ fn normal_publish_preserves_promotion_published_baseline() {
     assert_eq!(bookkeeping.published_hash.len(), 64);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn hello_only_blocks_normal_publishes_before_reconciliation() {
+    let coordinator = test_coordinator();
+    coordinator.update_bundle(test_bundle(2)).unwrap();
+    coordinator.begin_hello_only();
+    let error = coordinator.update_bundle(test_bundle(3)).unwrap_err();
+    assert!(
+        error.to_string().contains("hello-only"),
+        "a normal publish during reconciliation must be refused: {error}"
+    );
+    assert_eq!(coordinator.get_current_version(), 2);
+    coordinator.end_hello_only();
+    assert_eq!(coordinator.update_bundle(test_bundle(3)).unwrap(), 3);
+}

@@ -188,18 +188,31 @@ impl ConfirmationStore {
         now_unix_ms: i64,
         max_age_ms: i64,
     ) -> Result<ConfirmationFile, ConfirmationError> {
-        let confirmation = match self.peek() {
-            Ok(Some(confirmation)) => confirmation,
-            Ok(None) => return Err(ConfirmationError::Missing),
-            Err(_) => {
-                let _ = std::fs::remove_file(&self.path);
-                return Err(ConfirmationError::Invalid);
+        // Atomically take ownership of the file. `rename` succeeds for exactly
+        // one consumer; a concurrent/racing attempt gets `NotFound` and can
+        // never observe the same authorization twice.
+        let mut nonce = [0u8; 8];
+        rand::rng().fill_bytes(&mut nonce);
+        let staged = self.path.with_extension(format!(
+            "consume.{}.{}",
+            std::process::id(),
+            hex::encode(nonce)
+        ));
+        match std::fs::rename(&self.path, &staged) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ConfirmationError::Missing);
             }
+            Err(_) => return Err(ConfirmationError::Invalid),
+        }
+        let Some(confirmation) = std::fs::read_to_string(&staged)
+            .ok()
+            .and_then(|data| serde_json::from_str::<ConfirmationFile>(&data).ok())
+        else {
+            let _ = std::fs::remove_file(&staged);
+            return Err(ConfirmationError::Invalid);
         };
-        // Remove first: even a process crash after this point must not leave a
-        // reusable authorization behind. The acquisition itself is still
-        // gated by the witness.
-        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&staged);
 
         if confirmation.protocol_version != CONFIRM_PROTOCOL_VERSION
             || confirmation.cluster_id != self.cluster_id

@@ -340,6 +340,33 @@ impl PromotionBookkeeping {
                 reason: format!("invalid published baseline: {error}"),
             }
         })?;
+        if publication_state.is_pending() {
+            let pending_version = state.bundle.version;
+            if pending_version > 0 && state.pending_hash.is_none() {
+                return Err(HaError::Validation {
+                    field: "ha_state.pending_hash".to_string(),
+                    reason: format!(
+                        "publication_state is {publication_state:?} at version {pending_version} but no pending_hash is recorded"
+                    ),
+                });
+            }
+            if state
+                .pending_hash
+                .as_deref()
+                .is_some_and(|hash| normalize_bundle_hash(pending_version, hash).is_err())
+            {
+                return Err(HaError::Validation {
+                    field: "ha_state.pending_hash".to_string(),
+                    reason: "pending_hash is not valid for the pending bundle version".to_string(),
+                });
+            }
+        } else if published_version > 0 && state.published_hash.is_none() {
+            return Err(HaError::Validation {
+                field: "ha_state.published_hash".to_string(),
+                reason: "published state has a positive published_version but no published_hash"
+                    .to_string(),
+            });
+        }
         Ok(Some(Self {
             publication_state,
             published_version,

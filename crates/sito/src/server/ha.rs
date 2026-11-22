@@ -13,6 +13,12 @@ pub(super) struct HaRuntime {
     /// apply hooks exist so the worker can receive the shared
     /// [`HaConfigApplier`].
     pub(super) resync_receiver: Option<tokio::sync::mpsc::Receiver<()>>,
+    /// ADR-0010 write gate shared with the API middleware.
+    pub(super) write_gate: Arc<sito_api::state::HaWriteGate>,
+    /// Per-slave worker shutdown so a promotion can stop the slave role.
+    pub(super) slave_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// Promotion runtime state (enabled only).
+    pub(super) promotion: Option<Arc<PromotionRuntimeState>>,
 }
 
 /// Initializes the HA role. Master setup is complete on return; a slave only
@@ -30,6 +36,11 @@ pub(super) fn init_ha(
         .validate(&config.server.role)
         .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
 
+    let write_gate = Arc::new(sito_api::state::HaWriteGate::new());
+    if ha_config.promotion.enabled {
+        write_gate.block("ha_promotion_starting");
+    }
+
     // ADR-0010: with promotion disabled the entire section is inert. A
     // disabled `candidate = true` remains accepted for upgrade compatibility,
     // but it must not silently look like an active candidate.
@@ -39,7 +50,10 @@ pub(super) fn init_ha(
         );
     }
 
-    let (master_coordinator, slave_tracker, resync_sender, resync_receiver) = if config.server.role
+    let promotion_enabled = ha_config.promotion.enabled;
+    let (master_coordinator, slave_tracker, resync_sender, resync_receiver, promotion) = if config
+        .server
+        .role
         == "master"
     {
         // The replication listener is only spawned when the port is non-zero;
@@ -70,9 +84,15 @@ pub(super) fn init_ha(
             coordinator.mark_replication_disabled();
         }
 
-        // Continue the version sequence across restarts; only a master with no
-        // recoverable state starts a fresh v1 sequence.
-        let restored_version = coordinator.restore_state()?;
+        // Continue the version sequence across restarts in the normal path.
+        // With promotion enabled the engine reads the state file strictly and
+        // must not mutate anything before it holds the lease, so the
+        // coordinator is not restored/written here.
+        let restored_version = if promotion_enabled {
+            None
+        } else {
+            coordinator.restore_state()?
+        };
 
         let initial_toml = match std::fs::read_to_string(config_path) {
             Ok(raw) => raw,
@@ -102,7 +122,14 @@ pub(super) fn init_ha(
             })
         };
 
-        if let Some(restored_version) = restored_version {
+        if promotion_enabled {
+            // The promotion supervisor acquires the lease, quiesces,
+            // reconciles and publishes the first bundle. Nothing may mutate or
+            // publish before that point.
+            info!(
+                "Automatic promotion is enabled; master starts read-only until the lease is acquired"
+            );
+        } else if let Some(restored_version) = restored_version {
             // A restart must never resume a bundle that no longer matches the
             // current `config.toml`: slaves would stay on the old shared
             // configuration indefinitely. Republish a fresh `N + 1` bundle
@@ -159,7 +186,27 @@ pub(super) fn init_ha(
             None
         };
 
-        (Some(coordinator), None, None, None)
+        let promotion = promotion_enabled.then(|| {
+            let state = Arc::new(PromotionRuntimeState {
+                config: config.clone(),
+                config_path: config_path.to_path_buf(),
+                ha_config: ha_config.clone(),
+                role: sito_ha::ConfiguredRole::Master,
+                metrics: metrics.clone(),
+                write_gate: Arc::clone(&write_gate),
+                signing_key: Mutex::new(Some(signing_key.clone())),
+                coordinator: Mutex::new(Some(coordinator.clone())),
+                tracker: None,
+                slave_shutdown: Mutex::new(None),
+                master_shutdown: Mutex::new(None),
+                initial_toml: Mutex::new(Some(initial_toml.clone())),
+                known_secrets: known_secrets.iter().map(|s| (*s).to_string()).collect(),
+            });
+            spawn_promotion_supervisor(Arc::clone(&state), shutdown_rx.clone());
+            state
+        });
+
+        (Some(coordinator), None, None, None, promotion)
     } else {
         // Slave role. The worker is spawned by `run_server_full` once the
         // server context and apply hooks exist, so a push can apply every
@@ -186,7 +233,30 @@ pub(super) fn init_ha(
             }
         }
         let (resync_tx, resync_rx) = tokio::sync::mpsc::channel(4);
-        (None, Some(tracker), Some(resync_tx), Some(resync_rx))
+        let promotion = promotion_enabled.then(|| {
+            Arc::new(PromotionRuntimeState {
+                config: config.clone(),
+                config_path: config_path.to_path_buf(),
+                ha_config: ha_config.clone(),
+                role: sito_ha::ConfiguredRole::Slave,
+                metrics: metrics.clone(),
+                write_gate: Arc::clone(&write_gate),
+                signing_key: Mutex::new(None),
+                coordinator: Mutex::new(None),
+                tracker: Some(tracker.clone()),
+                slave_shutdown: Mutex::new(None),
+                master_shutdown: Mutex::new(None),
+                initial_toml: Mutex::new(None),
+                known_secrets: Vec::new(),
+            })
+        });
+        (
+            None,
+            Some(tracker),
+            Some(resync_tx),
+            Some(resync_rx),
+            promotion,
+        )
     };
 
     Ok(HaRuntime {
@@ -195,6 +265,9 @@ pub(super) fn init_ha(
         tracker: slave_tracker,
         resync_sender,
         resync_receiver,
+        write_gate,
+        slave_shutdown: None,
+        promotion,
     })
 }
 

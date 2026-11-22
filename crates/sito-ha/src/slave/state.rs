@@ -31,6 +31,8 @@ pub struct SlaveStatusTracker {
     /// True when the on-disk configuration no longer matches the digest of the
     /// document that was last applied from the master.
     local_config_drift: Arc<std::sync::atomic::AtomicBool>,
+    /// Last received master frame (liveness only, never a safety input).
+    last_master_frame: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl SlaveStatusTracker {
@@ -47,6 +49,7 @@ impl SlaveStatusTracker {
             watermark: Arc::new(Mutex::new(None)),
             watermark_path: Arc::new(Mutex::new(None)),
             local_config_drift: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_master_frame: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -429,6 +432,28 @@ impl SlaveStatusTracker {
         *sito_core::sync::lock_or_recover(&self.last_synced_at) = Some(Utc::now());
     }
 
+    /// Records a frame received from the master.
+    ///
+    /// This is a liveness hint for the promotion engine only; the lease, not
+    /// heartbeat delivery, is the safety decision.
+    pub fn record_master_frame(&self) {
+        *sito_core::sync::lock_or_recover(&self.last_master_frame) =
+            Some(std::time::Instant::now());
+    }
+
+    /// Seconds since the last master frame, if one has ever arrived.
+    #[must_use]
+    pub fn seconds_since_master_frame(&self) -> Option<u64> {
+        sito_core::sync::lock_or_recover(&self.last_master_frame)
+            .map(|instant| instant.elapsed().as_secs())
+    }
+
+    /// Whether a master frame arrived within `timeout`.
+    #[must_use]
+    pub fn master_alive(&self, timeout: std::time::Duration) -> bool {
+        sitio_frame_recent(self.seconds_since_master_frame(), timeout)
+    }
+
     pub fn mark_degraded(&self, reason: String) {
         *sito_core::sync::lock_or_recover(&self.state) = SlaveState::Degraded;
         *sito_core::sync::lock_or_recover(&self.degraded_reason) = Some(reason);
@@ -436,6 +461,10 @@ impl SlaveStatusTracker {
         // do not let an earlier transport error mask the actual reason.
         *sito_core::sync::lock_or_recover(&self.connection_error) = None;
     }
+}
+
+fn sitio_frame_recent(seconds: Option<u64>, timeout: std::time::Duration) -> bool {
+    seconds.is_some_and(|seconds| u128::from(seconds) <= u128::from(timeout.as_secs()))
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use super::engine::{
     PromotionHost, PromotionOutcome, PromotionPhase,
 };
 use super::reconcile::PeerReport;
-use super::state::{HaStateStore, LoadedState, PersistedMasterState};
+use super::state::{HaStateStore, LoadedState, PersistedMasterState, PublicationBaseline};
 use super::witness_client::WitnessClient;
 use super::witness_client::WitnessClientError;
 use crate::bundle::{build_and_sign_push, push_payload_hash};
@@ -112,15 +112,30 @@ impl Fixture {
         clock: Arc<ManualMonotonicClock>,
         events: Arc<Mutex<Vec<String>>>,
     ) -> PromotionEngine {
-        let config = self.config(node_id);
+        self.engine_with_config(self.config(node_id), role, host, clock, events)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn engine_with_config(
+        &self,
+        config: PromotionConfig,
+        role: ConfiguredRole,
+        host: Arc<TestHost>,
+        clock: Arc<ManualMonotonicClock>,
+        events: Arc<Mutex<Vec<String>>>,
+    ) -> PromotionEngine {
         let backend = Arc::new(RecordingBackend {
-            inner: Arc::new(self.client(node_id)),
+            inner: Arc::new(self.client(config.node_id.as_deref().unwrap_or("node"))),
             events: clone_events(&events),
         });
+        let data_dir = self.dir.join(format!(
+            "data-{}",
+            config.node_id.as_deref().unwrap_or("node")
+        ));
         PromotionEngine::with_runtime(
             config,
             role,
-            self.dir.join(format!("data-{node_id}")),
+            data_dir,
             backend,
             host,
             clock.clone(),
@@ -206,6 +221,50 @@ impl LeaseBackend for RecordingBackend {
     }
 }
 
+struct ConflictBackend {
+    inner: Arc<WitnessClient>,
+    conflict: Mutex<Option<LeaseRecord>>,
+}
+
+impl LeaseBackend for ConflictBackend {
+    fn info(&self) -> super::clock::BoxFuture<'_, Result<LeaseInfo, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.info().await })
+    }
+
+    fn lease(
+        &self,
+    ) -> super::clock::BoxFuture<'_, Result<Option<LeaseRecord>, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.lease().await })
+    }
+
+    fn acquire(
+        &self,
+        request: AcquireRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.acquire(&request).await })
+    }
+
+    fn renew(
+        &self,
+        request: RenewRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        if let Some(current) = self.conflict.lock().unwrap().clone() {
+            return Box::pin(async move {
+                Err(WitnessClientError::Conflict {
+                    reason: Some("holder_mismatch".to_string()),
+                    detail: Some("injected conflict".to_string()),
+                    current: Some(Box::new(current)),
+                })
+            });
+        }
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.renew(&request).await })
+    }
+}
+
 struct TestHost {
     key: Ed25519SigningKey,
     state_path: PathBuf,
@@ -222,6 +281,8 @@ struct TestHost {
     pushed: Mutex<Option<PreparedBundle>>,
     adopted: Mutex<Option<PreparedBundle>>,
     publish_during_hello_only: AtomicBool,
+    published_baseline: Mutex<Option<PublicationBaseline>>,
+    latched: Mutex<Vec<String>>,
 }
 
 impl TestHost {
@@ -242,6 +303,8 @@ impl TestHost {
             pushed: Mutex::new(None),
             adopted: Mutex::new(None),
             publish_during_hello_only: AtomicBool::new(false),
+            published_baseline: Mutex::new(None),
+            latched: Mutex::new(Vec::new()),
         }
     }
 
@@ -273,6 +336,20 @@ impl PromotionHost for TestHost {
 
     fn applied_watermark(&self) -> Option<AppliedWatermark> {
         self.watermark.lock().unwrap().clone()
+    }
+
+    fn current_published_baseline(&self) -> Option<PublicationBaseline> {
+        self.published_baseline.lock().unwrap().clone()
+    }
+
+    fn hash_bundle(&self, bundle: &ConfigBundle) -> Result<String, String> {
+        let push = build_and_sign_push(bundle, &self.key).map_err(|error| error.to_string())?;
+        push_payload_hash(&push).map_err(|error| error.to_string())
+    }
+
+    fn latch_peer(&self, instance: &str, reason: &str) {
+        self.log(format!("latch:{instance}:{reason}"));
+        self.latched.lock().unwrap().push(instance.to_string());
     }
 
     fn eligibility(&self) -> Eligibility {
@@ -545,8 +622,8 @@ async fn master_startup_runs_acquire_quiesce_reconcile_publish() {
     assert_eq!(
         engine.boot().unwrap(),
         PromotionOutcome::ReadOnly {
-            reason: "not_candidate".to_string(),
-            retryable: false
+            reason: "witness_unavailable".to_string(),
+            retryable: true
         }
     );
     let outcome = engine.start_master().await;
@@ -1343,4 +1420,223 @@ async fn restart_with_slave_role_is_a_candidate_and_never_writable_from_state() 
         }
     );
     assert!(!host.writable.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn reconcile_window_longer_than_the_ttl_keeps_renewing() {
+    let harness = Harness::new("window_gt_ttl", "node-a").await;
+    let mut config = harness.fixture.config("node-a");
+    config.lease_ttl_secs = 5;
+    config.reconcile_window_secs = 10;
+    let engine = harness.fixture.engine_with_config(
+        config,
+        ConfiguredRole::Master,
+        Arc::clone(&harness.host),
+        Arc::clone(&harness.clock),
+        Arc::clone(&harness.events),
+    );
+    let outcome = engine.start_master().await;
+    assert_eq!(outcome, PromotionOutcome::Master);
+    let events = harness.events();
+    let publish = events
+        .iter()
+        .position(|event| event.starts_with("publish:1:"))
+        .unwrap();
+    let renewals = events[..publish]
+        .iter()
+        .filter(|event| event.starts_with("lease_resp:0:"))
+        .count();
+    assert!(
+        renewals >= 2,
+        "the reconcile window must renew the lease while it waits: {events:?}"
+    );
+    let record = harness
+        .fixture
+        .client("node-a")
+        .lease()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.version, 1);
+    assert_eq!(record.term, 1);
+}
+
+#[tokio::test]
+async fn legacy_state_without_bookkeeping_infers_from_the_bundle_not_applied_version() {
+    let harness = Harness::new("legacy_state", "node-a").await;
+    let bundle = ConfigBundle {
+        version: 7,
+        term: 2,
+        config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
+        ..ConfigBundle::default()
+    };
+    let hash = harness.host.hash_bundle(&bundle).unwrap();
+    seed_witness_record(&harness.fixture, "node-a", 3, 7, &hash).await;
+    seed_state(
+        &harness.data_dir("node-a"),
+        2,
+        7,
+        PublicationState::Published,
+        (7, &hash),
+        None,
+        (7, &hash),
+    );
+    // Rewrite the state in the older shape: no promotion bookkeeping at all.
+    let mut legacy: PersistedMasterState =
+        match HaStateStore::new(harness.data_dir("node-a").join("ha_state.toml"))
+            .load()
+            .unwrap()
+        {
+            LoadedState::Present { state, .. } => *state,
+            LoadedState::Missing => panic!("seeded state missing"),
+        };
+    legacy.publication_state = None;
+    legacy.published_version = None;
+    legacy.published_hash = None;
+    legacy.pending_hash = None;
+    HaStateStore::new(harness.data_dir("node-a").join("ha_state.toml"))
+        .save(&legacy)
+        .unwrap();
+
+    let loaded = HaStateStore::new(harness.data_dir("node-a").join("ha_state.toml"))
+        .load()
+        .unwrap();
+    let LoadedState::Present { ref state, .. } = loaded else {
+        panic!()
+    };
+    let recomputed = harness.host.hash_bundle(&state.bundle).unwrap();
+    assert_eq!(recomputed, hash, "test fixture hash mismatch");
+    let witness_hash = harness
+        .fixture
+        .client("node-a")
+        .lease()
+        .await
+        .unwrap()
+        .unwrap()
+        .bundle_hash;
+    assert_eq!(witness_hash, hash, "witness/state hash mismatch");
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    engine.boot().unwrap();
+    let outcome = engine.start_master().await;
+    assert_eq!(outcome, PromotionOutcome::Master);
+    let events = harness.events();
+    assert!(events.iter().any(|e| e == "prepare:8"), "{events:?}");
+    assert!(
+        events.iter().any(|e| e == "acquire_req:7"),
+        "the legacy bundle baseline must be used, never applied_version 0: {events:?}"
+    );
+    let record = harness
+        .fixture
+        .client("node-a")
+        .lease()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.term, 4);
+    assert_eq!(record.version, 8);
+}
+
+#[tokio::test]
+async fn renewal_refreshes_the_baseline_after_a_normal_publish() {
+    let harness = Harness::new("baseline_refresh", "node-a").await;
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    assert_eq!(engine.start_master().await, PromotionOutcome::Master);
+    *harness.host.published_baseline.lock().unwrap() =
+        Some(PublicationBaseline::new(2, &hash(0xef)).unwrap());
+    engine.renew_once().await.unwrap();
+    let events = harness.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event == &format!("lease_resp:2:{}", hash(0xef))),
+        "renewal must advertise the latest normal-published baseline: {events:?}"
+    );
+    let record = harness
+        .fixture
+        .client("node-a")
+        .lease()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.version, 2);
+}
+
+#[tokio::test]
+async fn pending_state_write_failure_fences_without_publishing() {
+    let harness = Harness::new("pending_fail", "node-a").await;
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    engine.fail_pending_state_write();
+    let outcome = engine.start_master().await;
+    assert_eq!(outcome, PromotionOutcome::Fenced);
+    assert_eq!(
+        engine.fence_store().load().unwrap().unwrap().reason,
+        "state_write_failed"
+    );
+    assert!(harness.event_index("publish:").is_none());
+}
+
+#[tokio::test]
+async fn late_ahead_peer_is_reported_to_the_runtime_latch() {
+    let harness = Harness::new("late_latch_host", "node-a").await;
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    assert_eq!(engine.start_master().await, PromotionOutcome::Master);
+    let late = PeerReport {
+        instance: "late-host".to_string(),
+        have_term: 9,
+        have_version: 99,
+        have_bundle_hash: Some(hash(0xaa)),
+    };
+    assert!(engine.note_late_peer(&late));
+    assert_eq!(
+        harness.host.latched.lock().unwrap().as_slice(),
+        ["late-host".to_string()]
+    );
+    assert!(
+        harness
+            .events()
+            .iter()
+            .any(|event| event.starts_with("latch:late-host:")),
+        "the runtime latch hook must receive the late ahead peer"
+    );
+}
+
+#[tokio::test]
+async fn engine_level_renewal_409_fences_immediately() {
+    let harness = Harness::new("renew_409", "node-a").await;
+    let conflict_backend = Arc::new(ConflictBackend {
+        inner: Arc::new(harness.fixture.client("node-a")),
+        conflict: Mutex::new(None),
+    });
+    let config = harness.fixture.config("node-a");
+    let clock: Arc<dyn MonotonicClock> = harness.clock.clone();
+    let host: Arc<dyn PromotionHost> = harness.host.clone();
+    let engine = PromotionEngine::with_runtime(
+        config,
+        ConfiguredRole::Master,
+        harness.data_dir("node-a"),
+        conflict_backend.clone(),
+        host,
+        clock,
+        Arc::new(ManualTimers::new(Arc::clone(&harness.clock))),
+    )
+    .unwrap();
+    assert_eq!(engine.start_master().await, PromotionOutcome::Master);
+    *conflict_backend.conflict.lock().unwrap() = Some(LeaseRecord {
+        schema: 1,
+        cluster_id: CLUSTER.to_string(),
+        holder: "node-b/other-boot".to_string(),
+        node_id: "node-b".to_string(),
+        term: 1,
+        revision: 2,
+        version: 1,
+        bundle_hash: hash(0xab),
+        acquired_unix_ms: 1,
+        expires_unix_ms: i64::MAX,
+    });
+    assert!(engine.renew_once().await.is_err());
+    assert!(engine.snapshot().fenced);
+    assert_eq!(
+        engine.fence_store().load().unwrap().unwrap().reason,
+        "lease_lost"
+    );
 }

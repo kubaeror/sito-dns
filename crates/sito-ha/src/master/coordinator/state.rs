@@ -251,6 +251,11 @@ impl MasterCoordinator {
         self
     }
 
+    /// Sets the cluster epoch/term for an ex-post promotion runtime.
+    pub fn set_term(&self, term: u64) {
+        self.current_term.store(term, Ordering::SeqCst);
+    }
+
     /// Sets the cluster epoch/term for an explicit promotion.
     ///
     /// Normal nodes restore the term from `ha_state.toml`. This builder exists

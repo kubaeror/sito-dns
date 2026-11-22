@@ -458,6 +458,7 @@ where
 
             msg_opt = ws_stream.next() => {
                 last_frame = Instant::now();
+                tracker.record_master_frame();
                 match msg_opt {
                     Some(Ok(frame)) => {
                         if let Some(text) = frame_text(&frame) {
@@ -466,6 +467,7 @@ where
                             // the frame arrived in time, so restart the clock after
                             // processing it instead of falsely timing out.
                             last_frame = Instant::now();
+                            tracker.record_master_frame();
                         } else if let WsMessage::Ping(p) = frame {
                             send_frame(&mut ws_stream, WsMessage::Pong(p), "slave", "Pong").await?;
                         } else if let WsMessage::Close(_) = frame {

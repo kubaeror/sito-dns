@@ -233,6 +233,10 @@ pub async fn run_server_with_lease(
     #[cfg(feature = "ha")]
     let mut ha_runtime = init_ha(&config, &config_path_buf, &metrics, &shutdown_rx)?;
     #[cfg(feature = "ha")]
+    let ha_write_gate = ha_runtime.write_gate.clone();
+    #[cfg(not(feature = "ha"))]
+    let ha_write_gate = Arc::new(sito_api::state::HaWriteGate::new());
+    #[cfg(feature = "ha")]
     let _ha_config = ha_runtime.config.clone();
     #[cfg(feature = "ha")]
     let (master_coordinator, slave_tracker, resync_sender) = (
@@ -332,6 +336,7 @@ pub async fn run_server_with_lease(
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+        ha_write_gate: ha_write_gate.clone(),
         master_coordinator,
         slave_tracker,
         resync_sender,

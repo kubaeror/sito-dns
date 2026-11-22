@@ -177,6 +177,13 @@ impl MasterCoordinator {
         version: u64,
         push_msg: &HaMessage,
     ) {
+        if self.is_hello_only() {
+            warn!(
+                version,
+                "Refusing to install an active bundle during hello-only reconciliation"
+            );
+            return;
+        }
         self.current_version.store(version, Ordering::SeqCst);
         *sito_core::sync::lock_or_recover(&self.active_bundle) = Some(bundle);
         *sito_core::sync::lock_or_recover(&self.active_push) = Some(push_msg.clone());
@@ -205,6 +212,96 @@ impl MasterCoordinator {
         }
     }
 
+    /// Publishes a bundle already validated by the ADR-0010 promotion engine.
+    ///
+    /// Unlike [`Self::update_bundle`], this accepts an equal version when the
+    /// engine is publishing a pending bundle at the term it re-acquired. The
+    /// engine has already confirmed the version is above the published
+    /// baseline; this method must not be used by normal API publishes.
+    pub fn publish_promoted_bundle(&self, bundle: ConfigBundle) -> Result<String, HaError> {
+        let mut bundle = bundle;
+        bundle.strip_structured_secrets();
+        seal_bundle_identity(&mut bundle, &self.signing_key.public_key());
+        let current = self.get_current_version();
+        if bundle.version < current {
+            return Err(HaError::Validation {
+                field: "version".to_string(),
+                reason: format!(
+                    "promotion publish version {} is below the active version {current}",
+                    bundle.version
+                ),
+            });
+        }
+        if bundle.term != self.get_current_term() {
+            return Err(HaError::Validation {
+                field: "term".to_string(),
+                reason: format!(
+                    "promotion publish term {} does not match the coordinator term {}",
+                    bundle.term,
+                    self.get_current_term()
+                ),
+            });
+        }
+        let push = build_and_sign_push(&bundle, &self.signing_key)?;
+        Self::ensure_push_fits(&push)?;
+        let hash = crate::bundle::push_payload_hash(&push)?;
+        let version = bundle.version;
+        {
+            let _publish_guard = sito_core::sync::lock_or_recover(&self.publish_lock);
+            self.persist_bundle(&bundle)?;
+            self.publish_prepared(bundle.clone(), version, &push);
+        }
+        self.record_published_from_push(&push);
+        self.persist_bundle(&bundle)?;
+        self.record_published_version(version);
+        self.broadcast(&push);
+        Ok(hash)
+    }
+
+    /// Makes a bundle published by an interrupted promotion active without
+    /// re-pushing it. Used only by the ADR-0010 reconciliation recovery path.
+    pub fn adopt_promoted_bundle(&self, bundle: ConfigBundle) -> Result<String, HaError> {
+        let mut bundle = bundle;
+        bundle.strip_structured_secrets();
+        seal_bundle_identity(&mut bundle, &self.signing_key.public_key());
+        if bundle.term != self.get_current_term() {
+            return Err(HaError::Validation {
+                field: "term".to_string(),
+                reason: format!(
+                    "adopted promotion term {} does not match the coordinator term {}",
+                    bundle.term,
+                    self.get_current_term()
+                ),
+            });
+        }
+        let push = build_and_sign_push(&bundle, &self.signing_key)?;
+        Self::ensure_push_fits(&push)?;
+        let hash = crate::bundle::push_payload_hash(&push)?;
+        let version = bundle.version;
+        {
+            let _publish_guard = sito_core::sync::lock_or_recover(&self.publish_lock);
+            self.persist_bundle(&bundle)?;
+            self.publish_prepared(bundle, version, &push);
+        }
+        self.record_published_version(version);
+        Ok(hash)
+    }
+
+    /// Returns the signed-payload hash of the current active bundle.
+    #[must_use]
+    pub fn active_payload_hash(&self) -> Option<String> {
+        sito_core::sync::lock_or_recover(&self.active_push)
+            .as_ref()
+            .and_then(|push| crate::bundle::push_payload_hash(push).ok())
+    }
+
+    /// Drops every tracked replication session (fence path).
+    pub fn close_all_sessions(&self) {
+        let mut slaves = sito_core::sync::lock_or_recover(&self.slaves);
+        slaves.clear();
+        self.metrics.set_ha_slaves_connected(0);
+    }
+
     /// Sets and signs a new configuration bundle, immediately broadcasting it to all connected slaves.
     ///
     /// This synchronous variant is startup/test-only: `init_ha` publishes the
@@ -219,6 +316,13 @@ impl MasterCoordinator {
     }
 
     pub(super) fn update_bundle_inner(&self, bundle: ConfigBundle) -> Result<u64, HaError> {
+        if self.is_hello_only() {
+            return Err(HaError::Validation {
+                field: "ha_promotion".to_string(),
+                reason: "configuration publishes are disabled during hello-only reconciliation"
+                    .to_string(),
+            });
+        }
         // Serialize the check-then-store: two concurrent publishers could
         // otherwise both pass the monotonicity check and store out of order,
         // regressing the active version and broadcasting a stale bundle.
@@ -319,6 +423,13 @@ impl MasterCoordinator {
         &self,
         bundle: ConfigBundle,
     ) -> Result<(u64, BroadcastOutcome), HaError> {
+        if self.is_hello_only() {
+            return Err(HaError::Validation {
+                field: "ha_promotion".to_string(),
+                reason: "configuration publishes are disabled during hello-only reconciliation"
+                    .to_string(),
+            });
+        }
         let _persist_guard = self.persist_lock.lock().await;
 
         let (bundle, version, push_msg, previous_version) = {

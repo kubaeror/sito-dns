@@ -38,6 +38,81 @@ pub type SlaveTrackerHandle = sito_ha::SlaveStatusTracker;
 #[cfg(not(feature = "ha"))]
 pub type SlaveTrackerHandle = ();
 
+/// Runtime write gate for ADR-0010 automatic promotion.
+///
+/// While blocked, every mutating API request returns `409 Conflict` with a
+/// stable `ha_promotion_fenced` type/detail. The gate is independent of the
+/// configured role: an enabled master is blocked from startup until it holds
+/// the lease and has published, and a fenced node stays blocked across restarts.
+#[derive(Debug, Default)]
+pub struct HaWriteGate {
+    blocked: AtomicBool,
+    fenced: AtomicBool,
+    effective_master: AtomicBool,
+    reason: Mutex<Option<String>>,
+}
+
+impl HaWriteGate {
+    /// Creates an open gate (the pre-promotion default).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Blocks mutating requests until [`Self::allow`] is called.
+    pub fn block(&self, reason: impl Into<String>) {
+        *self
+            .reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.into());
+        self.blocked.store(true, Ordering::SeqCst);
+    }
+
+    /// Blocks and marks the node durably fenced.
+    pub fn fence(&self, reason: impl Into<String>) {
+        self.fenced.store(true, Ordering::SeqCst);
+        self.block(reason);
+    }
+
+    /// Marks the in-memory effective role as master after promotion.
+    ///
+    /// `config.toml` intentionally remains `role = "slave"`; the API must use
+    /// this effective-role flag instead of the configured role.
+    pub fn mark_effective_master(&self) {
+        self.effective_master.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this process has been promoted to the master role in memory.
+    #[must_use]
+    pub fn is_effective_master(&self) -> bool {
+        self.effective_master.load(Ordering::SeqCst)
+    }
+
+    /// Opens the gate after a successful first publish.
+    pub fn allow(&self) {
+        *self
+            .reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.blocked.store(false, Ordering::SeqCst);
+    }
+
+    /// Returns `(reason, fenced)` when mutating requests are blocked.
+    #[must_use]
+    pub fn blocked(&self) -> Option<(String, bool)> {
+        if !self.blocked.load(Ordering::SeqCst) {
+            return None;
+        }
+        let reason = self
+            .reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| "ha_promotion_read_only".to_string());
+        Some((reason, self.fenced.load(Ordering::SeqCst)))
+    }
+}
+
 /// Shared application state container across all REST API handlers.
 #[derive(Clone)]
 pub struct ServerContext {
@@ -77,6 +152,8 @@ pub struct ServerContext {
     /// watcher, REST/UI handlers) so a slower older document cannot overwrite
     /// a newer one after the newer push already reached the runtime.
     pub apply_lock: Arc<tokio::sync::Mutex<()>>,
+    /// ADR-0010 write gate for opt-in automatic promotion.
+    pub ha_write_gate: Arc<HaWriteGate>,
 }
 
 impl ServerContext {

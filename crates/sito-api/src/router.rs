@@ -41,18 +41,34 @@ pub async fn slave_read_only_middleware(
         Method::POST | Method::PUT | Method::DELETE | Method::PATCH
     );
 
-    let is_slave = ctx.config.load().server.role == "slave";
+    let is_slave =
+        ctx.config.load().server.role == "slave" && !ctx.ha_write_gate.is_effective_master();
+    let path = request.uri().path();
+    let is_allowed = path.starts_with("/api/v2/auth")
+        || path == "/api/v2/ha/resync"
+        || path == "/ha/resync"
+        || path == "/ui/login"
+        || path == "/ui/logout"
+        || path.starts_with("/auth");
 
-    if is_slave && is_mutating {
-        let path = request.uri().path();
-        let is_allowed = path.starts_with("/api/v2/auth")
-            || path == "/api/v2/ha/resync"
-            || path == "/ha/resync"
-            || path == "/ui/login"
-            || path == "/ui/logout"
-            || path.starts_with("/auth");
+    if is_mutating
+        && !is_allowed
+        && let Some((reason, fenced)) = ctx.ha_write_gate.blocked()
+    {
+        let mut problem = ProblemDetails::conflict(if fenced {
+            "This node is fenced for HA automatic promotion. Reconcile the cluster and clear the fence before submitting changes."
+        } else {
+            "HA automatic promotion is not writable yet. Configuration changes are disabled until the node holds the lease and has published."
+        });
+        problem.error_type = "urn:sito:ha:promotion_fenced".to_string();
+        problem.title = "HA Promotion Read-Only".to_string();
+        problem.detail = reason;
+        problem.instance = Some(path.to_string());
+        return (StatusCode::CONFLICT, Json(problem)).into_response();
+    }
 
-        if !is_allowed {
+    if is_slave && is_mutating && !is_allowed {
+        {
             let master_url = ctx.resolve_master_url();
             let mut problem = ProblemDetails::conflict(
                 "Modifications are disabled on HA replica slaves. Submit configuration changes directly to the master node.",
@@ -717,6 +733,101 @@ mod tests {
             "a master with a configured replication listener but no coordinator is not ready"
         );
         assert_eq!(body, serde_json::json!({ "status": "unavailable" }));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+    /// ADR-0010: a promoted slave keeps `role = "slave"` in `config.toml` but
+    /// the in-memory effective role is master; the slave middleware must stop
+    /// rejecting its mutations.
+    #[tokio::test]
+    async fn test_promoted_effective_master_is_not_slave_read_only() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let temp_dir = crate::test_support::temp_dir("sito_promoted_master");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let mut config = (*ctx.config.load_full()).clone();
+        config.server.role = "slave".to_string();
+        ctx.config.store(Arc::new(config));
+        ctx.auth_mgr
+            .update_user_password("admin", "TestPassword123!")
+            .await;
+        ctx.set_setup_pending(false);
+        let token = ctx
+            .auth_mgr
+            .create_token("operator", Role::Operator, None)
+            .await
+            .expect("token")
+            .1
+            .token;
+        ctx.ha_write_gate.mark_effective_master();
+        ctx.ha_write_gate.allow();
+        let app = create_router(ctx);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/config/reload")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "a promoted effective master must not be rejected as a replica slave"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// ADR-0010: an enabled promotion node is read-only until it holds the
+    /// lease and has published; a fenced node returns `409` with the stable
+    /// `ha_promotion_fenced` problem type for every mutating request.
+    #[tokio::test]
+    async fn test_promotion_gate_rejects_mutations_with_409() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let temp_dir = crate::test_support::temp_dir("sito_promotion_gate");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .update_user_password("admin", "TestPassword123!")
+            .await;
+        ctx.set_setup_pending(false);
+        let token = ctx
+            .auth_mgr
+            .create_token("operator", Role::Operator, None)
+            .await
+            .expect("token")
+            .1
+            .token;
+        ctx.ha_write_gate.fence("ha_promotion_fenced");
+        let app = create_router(ctx);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/config/reload")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["type"], "urn:sito:ha:promotion_fenced");
+        assert_eq!(problem["detail"], "ha_promotion_fenced");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

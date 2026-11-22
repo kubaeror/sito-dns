@@ -126,7 +126,10 @@ fn classify_record(
         );
     }
     if record.version < baseline.version {
-        return RenewalAction::AdoptRevision {
+        // The witness is behind our published baseline (for example a lost
+        // renewal ACK from an earlier publish). Adopt the revision and retry
+        // with the higher baseline; never move our baseline backwards.
+        return RenewalAction::RetryHigherBaseline {
             revision: record.revision,
         };
     }
@@ -311,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn witness_below_our_baseline_adopts_revision_for_a_higher_retry() {
+    fn witness_below_our_baseline_retries_with_the_higher_baseline() {
         let action = classify_renewal_error(
             &conflict(Some(record("node-a/boot", 4, 12, 6, &"cd".repeat(32)))),
             "node-a/boot",
@@ -319,7 +322,7 @@ mod tests {
             &baseline(),
             Some(5_000),
         );
-        assert_eq!(action, RenewalAction::AdoptRevision { revision: 12 });
+        assert_eq!(action, RenewalAction::RetryHigherBaseline { revision: 12 });
     }
 
     #[test]
