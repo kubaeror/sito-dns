@@ -60,6 +60,8 @@ pub(crate) fn render_account_page(
         totp_setup,
         can_create_operator_token: user.role >= Role::Operator,
         can_create_admin_token: user.role >= Role::Admin,
+        token_default_ttl_days: ctx.auth_mgr.token_default_ttl_days(),
+        token_max_ttl_days: ctx.auth_mgr.token_max_ttl_days(),
         error_message,
         notice_message,
         new_token: token_value,
@@ -181,6 +183,10 @@ pub struct CreateAccountTokenForm {
     /// Caller's TOTP or backup code when TOTP is enabled.
     #[serde(default)]
     pub reauth_code: Option<String>,
+    /// Optional lifetime in days. Blank uses the configured default. `0` is a
+    /// request for no expiry and is accepted only when no maximum is set.
+    #[serde(default)]
+    pub expires_in_days: Option<String>,
 }
 
 pub async fn account_token_create_handler(
@@ -222,6 +228,22 @@ pub async fn account_token_create_handler(
             );
         }
     };
+    let expires_in_days = match form.expires_in_days.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(days) => Some(days),
+            Err(_) => {
+                return account_problem_page(
+                    &ctx,
+                    &user,
+                    &csrf,
+                    ProblemDetails::bad_request(
+                        "Token expiry must be a whole number of days (0 requests no expiry where allowed)",
+                    ),
+                );
+            }
+        },
+    };
     // Tokens are owned per account, and a token must never outrank its owner.
     if scope > user.role {
         return account_problem_page(
@@ -249,7 +271,7 @@ pub async fn account_token_create_handler(
 
     let (_meta, token) = match ctx
         .auth_mgr
-        .create_token(name, scope, Some(&user.username))
+        .create_token_with_expiry(name, scope, Some(&user.username), expires_in_days)
         .await
     {
         Ok(token) => token,

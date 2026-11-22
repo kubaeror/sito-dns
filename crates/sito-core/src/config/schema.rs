@@ -263,6 +263,12 @@ pub struct AuthConfig {
     /// Defaults to 90 days so credentials do not live forever by omission.
     #[serde(default = "default_token_ttl_days")]
     pub token_default_ttl_days: u64,
+    /// Maximum lifetime an operator may request for a newly created API token
+    /// in days (`0` = no maximum). Defaults to 365 days. This caps the optional
+    /// per-token `expires_in_days`; existing persisted tokens are never
+    /// rewritten or shortened by a change to this value.
+    #[serde(default = "default_token_max_ttl_days")]
+    pub token_max_ttl_days: u64,
     /// Maximum authenticated API requests per minute per account.
     ///
     /// Sessions and API tokens owned by the same account share one bucket;
@@ -285,12 +291,26 @@ pub const MAX_API_RATE_LIMIT_PER_MINUTE: u32 = 1_000_000;
 /// Default per-account API rate limit (requests per minute).
 pub const DEFAULT_API_RATE_LIMIT_PER_MINUTE: u32 = 600;
 
+/// Default maximum lifetime for newly created API tokens in days.
+pub const DEFAULT_TOKEN_MAX_TTL_DAYS: u64 = 365;
+
+/// Upper bound accepted for [`AuthConfig::token_max_ttl_days`].
+///
+/// Ten years is already far beyond a reasonable credential lifetime; a larger
+/// value is indistinguishable from no cap for practical purposes and can be
+/// requested explicitly with `0` (= no maximum).
+pub const MAX_TOKEN_MAX_TTL_DAYS: u64 = 3_650;
+
 fn default_api_rate_limit_per_minute() -> u32 {
     DEFAULT_API_RATE_LIMIT_PER_MINUTE
 }
 
 fn default_token_ttl_days() -> u64 {
     90
+}
+
+fn default_token_max_ttl_days() -> u64 {
+    DEFAULT_TOKEN_MAX_TTL_DAYS
 }
 
 fn default_session_ttl_hours() -> u64 {
@@ -312,6 +332,7 @@ impl Default for AuthConfig {
             login_rate_limit: default_login_rate_limit(),
             session_persist: default_session_persist(),
             token_default_ttl_days: default_token_ttl_days(),
+            token_max_ttl_days: default_token_max_ttl_days(),
             api_rate_limit_per_minute: default_api_rate_limit_per_minute(),
         }
     }
@@ -331,6 +352,24 @@ impl AuthConfig {
                 format!(
                     "api_rate_limit_per_minute must be 0 (disabled) or between 1 and {MAX_API_RATE_LIMIT_PER_MINUTE} (got {})",
                     self.api_rate_limit_per_minute
+                ),
+            ));
+        }
+        if self.token_max_ttl_days > MAX_TOKEN_MAX_TTL_DAYS {
+            return Err(ConfigError::validation(
+                "auth.token_max_ttl_days",
+                format!(
+                    "token_max_ttl_days must be 0 (no maximum) or between 1 and {MAX_TOKEN_MAX_TTL_DAYS} (got {})",
+                    self.token_max_ttl_days
+                ),
+            ));
+        }
+        if self.token_max_ttl_days > 0 && self.token_default_ttl_days > self.token_max_ttl_days {
+            return Err(ConfigError::validation(
+                "auth.token_default_ttl_days",
+                format!(
+                    "token_default_ttl_days ({}) must be 0 or at most token_max_ttl_days ({}) when a maximum is configured",
+                    self.token_default_ttl_days, self.token_max_ttl_days
                 ),
             ));
         }

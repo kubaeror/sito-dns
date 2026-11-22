@@ -34,12 +34,41 @@ impl AuthManager {
     /// capacity limit only a token owned by the same account is evicted
     /// (oldest first). If the owner has no token to evict, the create fails
     /// instead of silently deleting another account's credential.
+    ///
+    /// The token uses the configured default lifetime
+    /// (`auth.token_default_ttl_days`). Use [`Self::create_token_with_expiry`]
+    /// to request a different lifetime within the configured maximum.
     pub async fn create_token(
         &self,
         name: &str,
         scope: Role,
         owner: Option<&str>,
     ) -> Result<(ApiTokenMeta, CreateTokenResponse), CreateTokenError> {
+        self.create_token_with_expiry(name, scope, owner, None)
+            .await
+    }
+
+    /// Creates a new API token with an optional explicit lifetime in days.
+    ///
+    /// `expires_in_days` follows the operator policy:
+    ///
+    /// - `None` uses `auth.token_default_ttl_days` (the historical behavior);
+    ///   a configured default of `0` means no expiry.
+    /// - `Some(0)` means no expiry and is accepted only when
+    ///   `auth.token_max_ttl_days = 0` (no maximum).
+    /// - `Some(days)` with `days > 0` is accepted up to
+    ///   `auth.token_max_ttl_days` when a maximum is configured.
+    ///
+    /// The resulting expiry is stored in [`ApiTokenMeta::expires_at`]. Tokens
+    /// that already exist are never rewritten or shortened by this policy.
+    pub async fn create_token_with_expiry(
+        &self,
+        name: &str,
+        scope: Role,
+        owner: Option<&str>,
+        expires_in_days: Option<u64>,
+    ) -> Result<(ApiTokenMeta, CreateTokenResponse), CreateTokenError> {
+        let expiry_days = self.resolve_token_expiry_days(expires_in_days)?;
         let (mut meta, resp) = generate_token(name, scope);
         meta.generation = self.generation;
         meta.credential_epoch = match owner {
@@ -51,8 +80,8 @@ impl AuthManager {
             None => Some(0),
         };
         meta.owner = owner.map(str::to_string);
-        if self.token_default_ttl_days > 0 {
-            let ttl_secs = i64::try_from(self.token_default_ttl_days)
+        if let Some(days) = expiry_days {
+            let ttl_secs = i64::try_from(days)
                 .unwrap_or(i64::MAX / 86_400)
                 .saturating_mul(86_400);
             meta.expires_at = Some(chrono::Utc::now().timestamp().saturating_add(ttl_secs));
@@ -106,6 +135,50 @@ impl AuthManager {
         }
         self.save_tokens_async().await;
         Ok((meta, resp))
+    }
+
+    /// Configured default API-token lifetime in days (`0` = no expiry).
+    #[must_use]
+    pub fn token_default_ttl_days(&self) -> u64 {
+        self.token_default_ttl_days
+    }
+
+    /// Configured maximum API-token lifetime in days (`0` = no maximum).
+    #[must_use]
+    pub fn token_max_ttl_days(&self) -> u64 {
+        self.token_max_ttl_days
+    }
+
+    /// Resolves the requested per-token lifetime against the operator policy.
+    ///
+    /// Returns `None` when the resulting token must not expire.
+    fn resolve_token_expiry_days(
+        &self,
+        requested: Option<u64>,
+    ) -> Result<Option<u64>, CreateTokenError> {
+        match requested {
+            // Omitted: preserve the historical default (`0` = no expiry).
+            None => Ok(Some(self.token_default_ttl_days).filter(|days| *days > 0)),
+            Some(0) => {
+                if self.token_max_ttl_days == 0 {
+                    Ok(None)
+                } else {
+                    Err(CreateTokenError::NonExpiringTokenNotAllowed {
+                        max_days: self.token_max_ttl_days,
+                    })
+                }
+            }
+            Some(days) => {
+                if self.token_max_ttl_days > 0 && days > self.token_max_ttl_days {
+                    Err(CreateTokenError::ExpiryExceedsMax {
+                        requested_days: days,
+                        max_days: self.token_max_ttl_days,
+                    })
+                } else {
+                    Ok(Some(days))
+                }
+            }
+        }
     }
 
     /// Lists all active API tokens.

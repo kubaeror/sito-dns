@@ -195,6 +195,14 @@ pub enum CreateTokenError {
         "API token capacity reached and this account has no revocable tokens; revoke a token and try again"
     )]
     CapacityReached,
+    #[error(
+        "token expiry of {requested_days} days exceeds auth.token_max_ttl_days ({max_days} days); choose a shorter lifetime or set auth.token_max_ttl_days = 0 to remove the cap"
+    )]
+    ExpiryExceedsMax { requested_days: u64, max_days: u64 },
+    #[error(
+        "a non-expiring API token (expires_in_days = 0) is not allowed while auth.token_max_ttl_days is {max_days} days; omit the field or set auth.token_max_ttl_days = 0 to allow tokens without expiry"
+    )]
+    NonExpiringTokenNotAllowed { max_days: u64 },
 }
 
 /// Failure to apply a user mutation that must never leave the deployment
@@ -772,6 +780,10 @@ pub struct AuthManager {
     /// Same contract as [`Self::tokens_revision`] for sessions.
     sessions_revision: Arc<AtomicU64>,
     token_default_ttl_days: u64,
+    /// Maximum lifetime accepted for a newly created API token in days
+    /// (`0` = no maximum). Read once at startup; existing tokens are not
+    /// rewritten when the policy is lowered.
+    token_max_ttl_days: u64,
     /// Bounded per-account API rate limiter. Its limit is hot-applied from
     /// `auth.api_rate_limit_per_minute`.
     api_rate_limiter: Arc<crate::auth::rate_limit::ApiRateLimiter>,

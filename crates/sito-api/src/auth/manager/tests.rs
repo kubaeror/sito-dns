@@ -1408,6 +1408,7 @@ async fn test_token_persistence_and_expiry() {
             true,
             true,
             30, // 30-day token TTL
+            365,
         )
         .unwrap();
         let (meta, resp) = mgr
@@ -1437,6 +1438,157 @@ async fn test_token_persistence_and_expiry() {
     assert!(mgr.delete_token(&meta.id).await);
     let mgr2 = AuthManager::with_storage(&temp_dir, 24, 5).unwrap();
     assert!(mgr2.validate_token(&plaintext).is_none());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+fn expiry_days_from_now(meta: &ApiTokenMeta) -> i64 {
+    let expires_at = meta.expires_at.expect("token must carry an expiry");
+    (expires_at - chrono::Utc::now().timestamp()) / 86_400
+}
+
+#[tokio::test]
+async fn test_token_expiry_policy_default_explicit_and_zero() {
+    let mgr = AuthManager::with_config_and_storage_full(
+        None, 24, 5, true, false, 30, // default lifetime
+        90, // maximum lifetime
+    )
+    .unwrap();
+
+    // Omitted uses the configured default.
+    let (meta, _) = mgr
+        .create_token("default", Role::Viewer, Some("admin"))
+        .await
+        .expect("default token");
+    assert_eq!(meta.owner.as_deref(), Some("admin"));
+    assert_eq!(expiry_days_from_now(&meta), 30);
+
+    // An explicit shorter lifetime is honoured.
+    let (meta, _) = mgr
+        .create_token_with_expiry("short", Role::Viewer, Some("admin"), Some(7))
+        .await
+        .expect("short token");
+    assert_eq!(expiry_days_from_now(&meta), 7);
+
+    // Exactly the maximum is accepted.
+    let (meta, _) = mgr
+        .create_token_with_expiry("max", Role::Viewer, Some("admin"), Some(90))
+        .await
+        .expect("max token");
+    assert_eq!(expiry_days_from_now(&meta), 90);
+
+    // Above the maximum is rejected explicitly (400 at the API layer) and no
+    // token is stored.
+    let before = mgr.list_tokens().len();
+    let err = mgr
+        .create_token_with_expiry("too-long", Role::Viewer, Some("admin"), Some(91))
+        .await
+        .expect_err("above the maximum must be rejected");
+    assert_eq!(
+        err,
+        CreateTokenError::ExpiryExceedsMax {
+            requested_days: 91,
+            max_days: 90
+        }
+    );
+    assert_eq!(mgr.list_tokens().len(), before, "no token may be stored");
+
+    // `0` requests no expiry and is rejected while a maximum exists.
+    let err = mgr
+        .create_token_with_expiry("forever", Role::Viewer, Some("admin"), Some(0))
+        .await
+        .expect_err("no-expiry token must be rejected under a maximum");
+    assert_eq!(
+        err,
+        CreateTokenError::NonExpiringTokenNotAllowed { max_days: 90 }
+    );
+    assert_eq!(mgr.list_tokens().len(), before);
+}
+
+#[tokio::test]
+async fn test_token_expiry_policy_without_maximum_allows_zero() {
+    let mgr = AuthManager::with_config_and_storage_full(
+        None, 24, 5, true, false, 30, 0, // no maximum
+    )
+    .unwrap();
+
+    let (meta, _) = mgr
+        .create_token_with_expiry("forever", Role::Viewer, None, Some(0))
+        .await
+        .expect("max = 0 permits non-expiring tokens");
+    assert!(meta.expires_at.is_none());
+
+    // A large explicit lifetime is also accepted when no cap is configured.
+    let (meta, _) = mgr
+        .create_token_with_expiry("long", Role::Viewer, None, Some(10_000))
+        .await
+        .expect("max = 0 removes the cap");
+    assert_eq!(expiry_days_from_now(&meta), 10_000);
+}
+
+#[tokio::test]
+async fn test_lowering_token_max_ttl_preserves_existing_tokens() {
+    let temp_dir = std::env::temp_dir().join(format!("sito_tokpolicy_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    let (long_plaintext, no_expiry_plaintext) = {
+        let mgr = AuthManager::with_config_and_storage_full(
+            Some(temp_dir.join("users.toml")),
+            24,
+            5,
+            true,
+            true,
+            30,
+            365,
+        )
+        .unwrap();
+        let (meta, resp) = mgr
+            .create_token_with_expiry("long-lived", Role::Viewer, None, Some(365))
+            .await
+            .expect("token");
+        assert_eq!(expiry_days_from_now(&meta), 365);
+
+        // Simulate a token persisted by an older release with no expiry.
+        let (mut legacy_meta, legacy_resp) = mgr
+            .create_token("legacy-no-expiry", Role::Viewer, None)
+            .await
+            .expect("legacy token");
+        legacy_meta.expires_at = None;
+        lock(&mgr.tokens).insert(legacy_meta.hash.clone(), legacy_meta);
+        mgr.save_tokens_async().await;
+        (resp.token, legacy_resp.token)
+    };
+
+    // An upgrade that lowers the maximum must not rewrite, shorten, evict, or
+    // expire the already-persisted tokens.
+    let mgr = AuthManager::with_config_and_storage_full(
+        Some(temp_dir.join("users.toml")),
+        24,
+        5,
+        true,
+        true,
+        30,
+        30,
+    )
+    .unwrap();
+    let meta = mgr
+        .validate_token(&long_plaintext)
+        .expect("existing token must remain valid after the policy change");
+    assert!(
+        expiry_days_from_now(&meta) > 30,
+        "the existing expiry must not be shortened"
+    );
+    assert!(
+        mgr.validate_token(&no_expiry_plaintext).is_some(),
+        "an existing no-expiry token must remain valid after the upgrade"
+    );
+
+    // New tokens follow the new policy.
+    let (new_meta, _) = mgr
+        .create_token("new", Role::Viewer, None)
+        .await
+        .expect("new token");
+    assert_eq!(expiry_days_from_now(&new_meta), 30);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -1497,6 +1649,7 @@ fn test_session_persistence_can_be_disabled() {
         5,
         true,
         false, // session_persist disabled
+        0,
         0,
     )
     .unwrap();

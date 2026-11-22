@@ -182,6 +182,14 @@
         </select>
       </div>
     </div>
+    <div class="form-group">
+      <label class="form-label" for="token-expiry">Expires In (days)</label>
+      <input type="number" min="0" {% if token_max_ttl_days > 0 %}max="{{ token_max_ttl_days }}"{% endif %} id="token-expiry" name="expires_in_days" class="form-input" inputmode="numeric" placeholder="{% if token_default_ttl_days > 0 %}{{ token_default_ttl_days }}{% else %}no expiry{% endif %}">
+      <div class="form-help">
+        {% if token_default_ttl_days > 0 %}Leave blank to use the default {{ token_default_ttl_days }}-day lifetime.{% else %}Leave blank for a token without expiry.{% endif %}
+        {% if token_max_ttl_days > 0 %} Maximum {{ token_max_ttl_days }} days; 0 (no expiry) is not allowed.{% else %} Enter 0 for a token without expiry.{% endif %}
+      </div>
+    </div>
     {% if can_create_admin_token %}
     <div class="form-help" style="margin-bottom: 10px;">Creating an <strong>Admin</strong>-scoped token requires re-authentication. Viewer/Operator tokens do not.</div>
     <div class="grid-2">

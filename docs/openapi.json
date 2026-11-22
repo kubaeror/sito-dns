@@ -350,7 +350,7 @@
             }
           },
           "400": {
-            "description": "Invalid scope",
+            "description": "Invalid scope or token expiry policy",
             "content": {
               "application/json": {
                 "schema": {
@@ -5420,6 +5420,15 @@
           "scope"
         ],
         "properties": {
+          "expires_in_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Optional lifetime in days. Omitted/`null` uses\n`auth.token_default_ttl_days`; `0` requests a non-expiring token and is\naccepted only when `auth.token_max_ttl_days = 0`. A positive value must\nnot exceed `auth.token_max_ttl_days` when a maximum is configured.",
+            "minimum": 0
+          },
           "name": {
             "type": "string"
           },

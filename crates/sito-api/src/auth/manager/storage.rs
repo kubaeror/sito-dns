@@ -151,6 +151,7 @@ impl AuthManager {
             tokens_revision: Arc::new(AtomicU64::new(0)),
             sessions_revision: Arc::new(AtomicU64::new(0)),
             token_default_ttl_days: 0,
+            token_max_ttl_days: 0,
             api_rate_limiter: Arc::new(crate::auth::rate_limit::ApiRateLimiter::new(
                 sito_core::config::DEFAULT_API_RATE_LIMIT_PER_MINUTE,
             )),

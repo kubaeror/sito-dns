@@ -447,6 +447,7 @@ session_ttl_hours = 24
 login_rate_limit = 5
 session_persist = true          # persist sessions/tokens across restarts
 token_default_ttl_days = 90     # 0 = API tokens never expire
+token_max_ttl_days = 365        # 0 = no maximum per-token lifetime
 api_rate_limit_per_minute = 600 # 0 = no per-account API ceiling
 ```
 
@@ -467,7 +468,8 @@ api_rate_limit_per_minute = 600 # 0 = no per-account API ceiling
 | `auth.session_ttl_hours` | integer | `24` | Web session lifetime before re-authentication is required (must be ≥ 1). |
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL, but are revalidated against `users.toml` on load and on every request (account exists, role and credential epoch match); entries written before credential epochs existed are rejected once, so users re-login and API tokens are re-issued after upgrading. Corrupt stores are backed up and start empty. Stop the service before `sito reset-sessions`; the reset refuses to run against a live server unless `--force` is given. |
-| `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+| `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. An explicit `0` remains an operator opt-out even when a maximum is configured: omitted `expires_in_days` uses this value. |
+| `auth.token_max_ttl_days` | integer | `365` | Maximum lifetime an operator may assign to a newly created API token, in days; `0` disables the maximum. Accepted range is `0` or `1`–`3_650`. When non-zero, a non-zero `auth.token_default_ttl_days` must not exceed it; longer per-token `expires_in_days` values are rejected with `400 Bad Request`, and an explicit `expires_in_days = 0` (no expiry) is rejected. Existing tokens are never shortened or expired by changing this value. |
 | `auth.api_rate_limit_per_minute` | integer | `600` | Account-wide ceiling for authenticated `/api/v2` requests per minute; `0` disables it. Accepted range is `0`–`1_000_000`. A session and every API token owned by the same account share one bucket; legacy ownerless tokens are limited per token. Exceeding it returns `429` with an RFC 7807 body and `Retry-After`. Existing per-IP login/TOTP and per-endpoint stats/query-log limits still apply (the stricter limit wins). Hot-applied on `PUT /api/v2/config`; no restart needed. |
 
 `[web]` and `[auth]` are parsed into typed structs (`WebConfig`, `AuthConfig`)
@@ -766,8 +768,9 @@ change those fields locally) before expecting the master to report it synced.
 default values is equivalent to omitting `[auth]`, and legacy keys already
 stripped from replicated bundles (`admin_password_hash`, `tokens`) do not count
 as changes. Non-default `session_ttl_hours`, `login_rate_limit`,
-`session_persist` or `token_default_ttl_days` still require a restart;
-`api_rate_limit_per_minute` is the exception and is hot-applied.
+`session_persist`, `token_default_ttl_days` or `token_max_ttl_days` still
+require a restart; `api_rate_limit_per_minute` is the exception and is
+hot-applied.
 
 Cluster terms are node-persisted, not configuration keys: the master stores the
 current term inside `ha_state.toml` and only an explicit promotion (editing the
@@ -906,7 +909,7 @@ applies the hot settings and reports the restart-only fields that remain.
 |---|---|
 | `server.role`, `server.instance_name`, `server.data_dir`, `server.log_format` | Read once at process start. |
 | `web.enabled`, `web.bind`, `web.port` | The admin HTTP listener is bound at startup. |
-| `auth.session_ttl_hours`, `auth.login_rate_limit`, `auth.session_persist`, `auth.token_default_ttl_days` | Auth manager is created at startup. |
+| `auth.session_ttl_hours`, `auth.login_rate_limit`, `auth.session_persist`, `auth.token_default_ttl_days`, `auth.token_max_ttl_days` | Auth manager is created at startup. |
 | `tls.cert`, `tls.key`, `tls.sni_certs`, `dns.tls.cert`, `dns.tls.key`, `dns.tls.sni_certs`, `acme.*` | TLS/ACME setup is initialized at startup. (Certificate file *contents* are re-read by the certificate watcher; changing the configured paths needs a restart.) |
 | `ha.*` | HA replication tasks are created at startup. |
 | `integrations.mikrotik.*`, `integrations.lists.*` | Integration sync/refresh tasks are spawned at startup. |

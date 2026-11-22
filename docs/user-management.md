@@ -319,8 +319,17 @@ Create a token:
 curl -sS -X POST "$SITO/api/v2/auth/tokens" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"grafana","scope":"viewer"}'
+  -d '{"name":"grafana","scope":"viewer","expires_in_days":30}'
 ```
+
+`expires_in_days` is optional. Omitted or `null` uses
+`auth.token_default_ttl_days` (default 90 days; `0` disables the default
+expiry). A positive value must not exceed `auth.token_max_ttl_days` (default
+365 days); longer values are rejected with `400 Bad Request`. `0` requests a
+token without expiry and is accepted only when `auth.token_max_ttl_days = 0`
+(no maximum). `/ui/account` exposes the same optional field on the create-token
+form. Lowering the maximum never shortens or invalidates tokens that already
+exist.
 
 Creating a token with `"scope":"admin"` from a user session additionally
 requires `X-Reauth-Token`; Admin API tokens are exempt. The `/account` page
@@ -330,7 +339,7 @@ when enabled). Lower-scoped tokens do not require a second proof.
 The response contains `id`, `name`, `scope`, and the plaintext `token`
 (`sito_...`). Store it in a secret manager; it cannot be retrieved again.
 New tokens expire after `auth.token_default_ttl_days` (default 90 days, `0`
-disables expiry).
+disables expiry) unless the request sets a shorter `expires_in_days`.
 
 Tokens created from an Admin session or from `/account` are owned by that
 account. Tokens created with a bearer credential inherit the owner of the

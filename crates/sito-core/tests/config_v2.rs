@@ -193,6 +193,60 @@ fn test_auth_api_rate_limit_is_a_hot_applied_v2_field() {
 }
 
 #[test]
+fn test_auth_token_max_ttl_is_a_v2_field() {
+    // The key is registered in the v1→v2 map, so the real loader accepts it.
+    let explicit = Config::from_toml_str(&format!(
+        "{TEST_BASE}[auth]\ntoken_default_ttl_days = 30\ntoken_max_ttl_days = 60\n"
+    ))
+    .expect("auth.token_max_ttl_days = 60 must pass the real v2 loader");
+    let auth = explicit.get_auth_config();
+    assert_eq!(auth.token_default_ttl_days, 30);
+    assert_eq!(auth.token_max_ttl_days, 60);
+
+    // Absent means the documented default and the key is not fabricated in
+    // the raw [auth] table.
+    let default = Config::from_toml_str(TEST_BASE).expect("omitting the key stays valid");
+    assert_eq!(default.get_auth_config().token_max_ttl_days, 365);
+    assert!(
+        default
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.get("token_max_ttl_days"))
+            .is_none(),
+        "the default must not be written into the raw [auth] table"
+    );
+
+    // 0 is the documented "no maximum" opt-out and survives serialization.
+    let disabled = Config::from_toml_str(&format!("{TEST_BASE}[auth]\ntoken_max_ttl_days = 0\n"))
+        .expect("0 disables the maximum token lifetime");
+    assert_eq!(disabled.get_auth_config().token_max_ttl_days, 0);
+    let document = toml::to_string_pretty(&disabled).expect("serialize config");
+    assert!(document.contains("token_max_ttl_days = 0"));
+    Config::from_toml_str(&document).expect("the serialized opt-out re-parses");
+
+    // A default longer than the maximum fails at the real loader.
+    let inconsistent = Config::from_toml_str(&format!(
+        "{TEST_BASE}[auth]\ntoken_default_ttl_days = 400\ntoken_max_ttl_days = 365\n"
+    ))
+    .expect_err("the real loader must reject default > max");
+    assert!(
+        inconsistent
+            .to_string()
+            .contains("auth.token_default_ttl_days"),
+        "the loader error must name the offending default: {inconsistent}"
+    );
+
+    // The documented upper bound is enforced by the real loader.
+    let too_high =
+        Config::from_toml_str(&format!("{TEST_BASE}[auth]\ntoken_max_ttl_days = 3651\n"))
+            .expect_err("the real loader must reject values above the cap");
+    assert!(
+        too_high.to_string().contains("token_max_ttl_days"),
+        "the loader error must name the field: {too_high}"
+    );
+}
+
+#[test]
 fn test_duplicate_dns_bind_addresses_are_rejected() {
     expect_cross_section(
         &format!("{TEST_BASE}[dns]\nbind = [\"127.0.0.1\", \"127.0.0.1\"]\n"),

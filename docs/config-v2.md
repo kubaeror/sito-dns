@@ -108,6 +108,7 @@ values:
 | `acme.allow_bootstrap_cert` | `false` |
 | `upstream.allow_private_targets` | `false` |
 | `auth.token_default_ttl_days` | `90` |
+| `auth.token_max_ttl_days` | `365` |
 | `stats.rollup_client_names` | `false` |
 | `server.update_require_signature` | `true` |
 
