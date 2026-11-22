@@ -532,6 +532,7 @@ pub async fn get_filtering_rules(
     request_body = CustomRulesDto,
     responses(
         (status = 200, description = "Custom rules updated", body = CustomRulesDto),
+        (status = 400, description = "Configuration exceeds the HA replication bundle limit and was not applied", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails),
         (status = 500, description = "Filter configuration could not be applied or persisted", body = ProblemDetails)

@@ -546,7 +546,7 @@ mod tests {
                 &["409", "404", "500"],
             ),
             ("/api/v2/filtering/refresh", "post", &["500"]),
-            ("/api/v2/filtering/rules", "put", &["500"]),
+            ("/api/v2/filtering/rules", "put", &["400", "500"]),
             (
                 "/api/v2/integrations/lists/{category}/refresh",
                 "post",
@@ -601,14 +601,14 @@ mod tests {
         // These operations take the config-apply lock before they capture the
         // runtime generation, so `ApplyError::GenerationConflict` cannot occur.
         // They also use the locked/full apply variants, which skip the
-        // restart-only gate. Advertising 409 (or apply-validation 400) here
-        // would be inventing a status the handler can never return.
+        // restart-only gate. Advertising 409 here would be inventing a status
+        // the handler can never return.
         let unreachable: &[(&str, &str, &[&str])] = &[
             ("/api/v2/clients/{name}", "delete", &["400", "409"]),
             ("/api/v2/clients/groups/{name}", "put", &["409"]),
             ("/api/v2/filtering/lists/{id}", "delete", &["400"]),
             ("/api/v2/filtering/refresh", "post", &["400", "409"]),
-            ("/api/v2/filtering/rules", "put", &["400", "409"]),
+            ("/api/v2/filtering/rules", "put", &["409"]),
             ("/api/v2/rewrites", "post", &["409"]),
             ("/api/v2/rewrites/{id}", "put", &["409"]),
             ("/api/v2/rewrites/{id}", "delete", &["400", "409"]),
@@ -625,6 +625,17 @@ mod tests {
                 );
             }
         }
+
+        // `PUT /filtering/rules` can still return 400: the shared locked apply
+        // pipeline rejects a configuration whose HA replication bundle exceeds
+        // the push limit, even with no slaves connected. The response must
+        // carry the ProblemDetails envelope.
+        let rules_400 = &document["paths"]["/api/v2/filtering/rules"]["put"]["responses"]["400"];
+        assert_eq!(
+            rules_400["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProblemDetails",
+            "the oversized-HA-bundle 400 must document the ProblemDetails envelope"
+        );
     }
 
     /// Extracts `.route("<path>", <chain>)` paths and methods from the router
