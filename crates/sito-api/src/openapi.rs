@@ -217,14 +217,72 @@ struct BaseApiDoc;
 )]
 struct HaApiDoc;
 
+/// Rewrites documented error responses to the media type the server sends.
+///
+/// Every `body = ProblemDetails` response is generated as `application/json`,
+/// but `ProblemDetails::into_response` writes `application/problem+json`
+/// (RFC 7807). Advertising the wrong media type makes generated clients parse
+/// the error body with the success decoder.
+struct ProblemJsonErrorContent;
+
+impl Modify for ProblemJsonErrorContent {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        for item in openapi.paths.paths.values_mut() {
+            let operations = [
+                item.get.as_mut(),
+                item.put.as_mut(),
+                item.post.as_mut(),
+                item.delete.as_mut(),
+                item.patch.as_mut(),
+                item.head.as_mut(),
+                item.options.as_mut(),
+                item.trace.as_mut(),
+            ];
+            for operation in operations.into_iter().flatten() {
+                for (status, response) in &mut operation.responses.responses {
+                    if !(status.starts_with('4') || status.starts_with('5')) {
+                        continue;
+                    }
+                    let utoipa::openapi::RefOr::T(response) = response else {
+                        continue;
+                    };
+                    let Some(utoipa::openapi::RefOr::T(content)) =
+                        response.content.shift_remove("application/json")
+                    else {
+                        continue;
+                    };
+                    let is_problem_details = matches!(
+                        &content.schema,
+                        Some(utoipa::openapi::RefOr::Ref(reference))
+                            if reference.ref_location
+                                == "#/components/schemas/ProblemDetails"
+                    );
+                    let media_type = if is_problem_details {
+                        "application/problem+json"
+                    } else {
+                        "application/json"
+                    };
+                    response
+                        .content
+                        .insert(media_type.to_string(), utoipa::openapi::RefOr::T(content));
+                }
+            }
+        }
+    }
+}
+
 /// Root OpenAPI documentation specification for the sito administration API.
 pub struct ApiDoc;
 
 impl OpenApi for ApiDoc {
     fn openapi() -> utoipa::openapi::OpenApi {
-        let document = BaseApiDoc::openapi();
+        #[allow(unused_mut)]
+        let mut document = BaseApiDoc::openapi();
         #[cfg(feature = "ha")]
-        let document = document.merge_from(HaApiDoc::openapi());
+        {
+            document = document.merge_from(HaApiDoc::openapi());
+        }
+        ProblemJsonErrorContent.modify(&mut document);
         document
     }
 }
@@ -634,9 +692,68 @@ mod tests {
         // carry the ProblemDetails envelope.
         let rules_400 = &document["paths"]["/api/v2/filtering/rules"]["put"]["responses"]["400"];
         assert_eq!(
-            rules_400["content"]["application/json"]["schema"]["$ref"],
+            rules_400["content"]["application/problem+json"]["schema"]["$ref"],
             "#/components/schemas/ProblemDetails",
             "the oversized-HA-bundle 400 must document the ProblemDetails envelope"
+        );
+    }
+
+    /// Error responses are emitted as RFC 7807 `application/problem+json`;
+    /// the generated specification must advertise that media type instead of
+    /// `application/json`, while success responses stay JSON (or their
+    /// declared media type).
+    #[test]
+    fn test_openapi_error_responses_use_problem_json_content_type() {
+        let document = document();
+        let mut error_responses = 0usize;
+        for (key, operation) in operations(&document) {
+            let responses = operation["responses"].as_object().expect("responses");
+            for (status, response) in responses {
+                if !(status.starts_with('4') || status.starts_with('5')) {
+                    continue;
+                }
+                let content = response["content"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{} {} {status} has no content", key.1, key.0));
+                assert!(
+                    content.contains_key("application/problem+json"),
+                    "{} {} {status} must advertise application/problem+json, got {:?}",
+                    key.1,
+                    key.0,
+                    content.keys().collect::<Vec<_>>()
+                );
+                assert!(
+                    !content.contains_key("application/json"),
+                    "{} {} {status} must not advertise application/json for a problem",
+                    key.1,
+                    key.0
+                );
+                assert_eq!(
+                    content["application/problem+json"]["schema"]["$ref"],
+                    "#/components/schemas/ProblemDetails",
+                    "{} {} {status} must reference ProblemDetails",
+                    key.1,
+                    key.0
+                );
+                error_responses += 1;
+            }
+        }
+        assert!(
+            error_responses > 100,
+            "the audit must cover every documented error response, saw {error_responses}"
+        );
+
+        assert_eq!(
+            document["paths"]["/api/v2/status"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/StatusResponse",
+            "success responses must stay application/json"
+        );
+        assert!(
+            document["paths"]["/api/v2/config/backup"]["get"]["responses"]["200"]["content"]
+                .get("application/gzip")
+                .is_some(),
+            "the backup download must keep its declared gzip media type"
         );
     }
 
