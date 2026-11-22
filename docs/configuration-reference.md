@@ -689,7 +689,7 @@ node_id = "sito-node-a"
 backend = "witness"
 lease_ttl_secs = 30
 renew_interval_secs = 10
-# heartbeat_timeout_secs = 90      # default: max(45, 3 * ha.ping_interval_secs)
+# heartbeat_timeout_secs = 45      # default: max(45, 3 * ha.ping_interval_secs)
 require_manual_confirmation = false
 reconcile_window_secs = 10
 
@@ -704,7 +704,7 @@ token_file = "/etc/sito/witness.token"  # 0600, one shared cluster token
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `promotion.enabled` | boolean | `false` | Master gate for automatic promotion. When false, bounds are not validated and the feature is inert. |
-| `promotion.candidate` | boolean | `false` | Exactly one slave in the cluster may try to acquire the lease. Requires `server.role = "slave"` when enabled; when disabled it is inert (a `true` value on a master logs a warning). |
+| `promotion.candidate` | boolean | `false` | Exactly one slave in the cluster may try to acquire the lease. Requires `server.role = "slave"` when enabled; when disabled it is inert (the operator-facing warning for a `true` value on a master is C3b2b runtime behavior, not config validation). |
 | `promotion.cluster_id` | string | `None` | Stable cluster identifier, 1–64 characters from `[A-Za-z0-9._-]`; must match the witness. Required when enabled. |
 | `promotion.node_id` | string | `None` | Stable per-node identifier, 1–64 characters from `[A-Za-z0-9._-]`; unique per node. Required when enabled. |
 | `promotion.backend` | string | `"witness"` | Lease backend. Only `"witness"` is supported in 2.0; any other value is rejected as `unsupported_lease_backend` even when disabled. |

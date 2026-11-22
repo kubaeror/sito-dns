@@ -28,10 +28,15 @@ pub enum BundleHashError {
 /// non-hex characters, an empty value) is rejected.
 pub fn normalize_blake3_hash(input: &str) -> Result<String, BundleHashError> {
     let trimmed = input.trim();
-    let hex = trimmed
-        .strip_prefix("blake3:")
-        .or_else(|| trimmed.strip_prefix("BLAKE3:"))
-        .unwrap_or(trimmed);
+    let hex = if trimmed
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"blake3:"))
+    {
+        &trimmed[7..]
+    } else {
+        trimmed
+    };
     if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(BundleHashError::NotAHash(trimmed.to_string()));
     }
@@ -86,6 +91,10 @@ mod tests {
         );
         assert_eq!(
             normalize_blake3_hash(&format!("BLAKE3:{bare}")).unwrap(),
+            bare
+        );
+        assert_eq!(
+            normalize_blake3_hash(&format!("BlAkE3:{bare}")).unwrap(),
             bare
         );
         assert_eq!(normalize_blake3_hash(&format!("  {bare}  ")).unwrap(), bare);

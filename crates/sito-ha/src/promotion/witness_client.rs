@@ -31,6 +31,13 @@ use crate::witness::{
 /// Maximum time for one witness request (connect, TLS handshake and response).
 pub const WITNESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum accepted HTTP response (headers plus body).
+///
+/// Witness responses are small JSON records; bounding the read prevents a
+/// misbehaving/malicious server from exhausting memory. Requests are already
+/// capped server-side at 16 KiB.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+
 /// A typed witness client failure.
 ///
 /// The variants map to the ADR's stable read-only reasons where one exists.
@@ -354,7 +361,7 @@ impl WitnessClient {
     /// mismatch is an error, never silently accepted.
     pub async fn info(&self) -> Result<LeaseInfo, WitnessClientError> {
         let response = self.request("GET", "/v1/info", None).await?;
-        let body = expect_status(response, &[200])?;
+        let body = expect_status(response, &[200], &self.cluster_id)?;
         let info: LeaseInfo =
             serde_json::from_slice(&body).map_err(|error| WitnessClientError::Protocol {
                 detail: format!("failed to parse /v1/info: {error}"),
@@ -388,10 +395,14 @@ impl WitnessClient {
                             detail: format!("failed to parse /v1/lease: {error}"),
                         }
                     })?;
-                self.check_record_cluster(&record)?;
+                self.check_record(&record)?;
                 Ok(Some(record))
             }
-            status => Err(failure_from_response(status, &response.body)),
+            status => Err(failure_from_response(
+                status,
+                &response.body,
+                &self.cluster_id,
+            )),
         }
     }
 
@@ -414,12 +425,12 @@ impl WitnessClient {
         let response = self
             .request("POST", "/v1/lease/acquire", Some(&body))
             .await?;
-        let body = expect_status(response, &[200])?;
+        let body = expect_status(response, &[200], &self.cluster_id)?;
         let record: LeaseRecord =
             serde_json::from_slice(&body).map_err(|error| WitnessClientError::Protocol {
                 detail: format!("failed to parse acquired lease record: {error}"),
             })?;
-        self.check_record_cluster(&record)?;
+        self.check_record(&record)?;
         Ok(record)
     }
 
@@ -434,25 +445,17 @@ impl WitnessClient {
             detail: format!("failed to serialize renew request: {error}"),
         })?;
         let response = self.request("POST", "/v1/lease/renew", Some(&body)).await?;
-        let body = expect_status(response, &[200])?;
+        let body = expect_status(response, &[200], &self.cluster_id)?;
         let record: LeaseRecord =
             serde_json::from_slice(&body).map_err(|error| WitnessClientError::Protocol {
                 detail: format!("failed to parse renewed lease record: {error}"),
             })?;
-        self.check_record_cluster(&record)?;
+        self.check_record(&record)?;
         Ok(record)
     }
 
-    fn check_record_cluster(&self, record: &LeaseRecord) -> Result<(), WitnessClientError> {
-        if record.cluster_id != self.cluster_id {
-            return Err(WitnessClientError::ClusterMismatch {
-                detail: format!(
-                    "lease record belongs to cluster '{}', configured cluster_id is '{}'",
-                    record.cluster_id, self.cluster_id
-                ),
-            });
-        }
-        Ok(())
+    fn check_record(&self, record: &LeaseRecord) -> Result<(), WitnessClientError> {
+        validate_record(record, &self.cluster_id)
     }
 
     async fn request(
@@ -533,12 +536,18 @@ impl WitnessClient {
             })?;
 
         let mut bytes = Vec::new();
-        stream
+        let mut limited = stream.take(MAX_RESPONSE_BYTES + 1);
+        limited
             .read_to_end(&mut bytes)
             .await
             .map_err(|error| WitnessClientError::Unavailable {
                 detail: format!("failed to read {method} {path} response: {error}"),
             })?;
+        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(WitnessClientError::Protocol {
+                detail: format!("witness response exceeds the {MAX_RESPONSE_BYTES}-byte limit"),
+            });
+        }
         parse_http_response(&bytes)
     }
 }
@@ -548,12 +557,34 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
-fn expect_status(response: HttpResponse, expected: &[u16]) -> Result<Vec<u8>, WitnessClientError> {
+fn expect_status(
+    response: HttpResponse,
+    expected: &[u16],
+    cluster_id: &str,
+) -> Result<Vec<u8>, WitnessClientError> {
     if expected.contains(&response.status) {
         Ok(response.body)
     } else {
-        Err(failure_from_response(response.status, &response.body))
+        Err(failure_from_response(
+            response.status,
+            &response.body,
+            cluster_id,
+        ))
     }
+}
+
+fn validate_record(record: &LeaseRecord, cluster_id: &str) -> Result<(), WitnessClientError> {
+    record.validate_loaded(cluster_id).map_err(|error| {
+        if error.code() == "state_cluster_mismatch" {
+            WitnessClientError::ClusterMismatch {
+                detail: error.to_string(),
+            }
+        } else {
+            WitnessClientError::Protocol {
+                detail: format!("invalid witness lease record: {error}"),
+            }
+        }
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -568,7 +599,7 @@ struct ErrorBody {
     current: Option<LeaseRecord>,
 }
 
-fn failure_from_response(status: u16, body: &[u8]) -> WitnessClientError {
+fn failure_from_response(status: u16, body: &[u8], cluster_id: &str) -> WitnessClientError {
     let error_body: ErrorBody = serde_json::from_slice(body).unwrap_or_default();
     match status {
         401 => WitnessClientError::Auth {
@@ -581,11 +612,18 @@ fn failure_from_response(status: u16, body: &[u8]) -> WitnessClientError {
                 "X-Sito-Cluster is missing or does not match the witness".to_string()
             }),
         },
-        409 => WitnessClientError::Conflict {
-            reason: error_body.reason,
-            detail: error_body.detail,
-            current: error_body.current.map(Box::new),
-        },
+        409 => {
+            if let Some(ref current) = error_body.current
+                && let Err(error) = validate_record(current, cluster_id)
+            {
+                return error;
+            }
+            WitnessClientError::Conflict {
+                reason: error_body.reason,
+                detail: error_body.detail,
+                current: error_body.current.map(Box::new),
+            }
+        }
         _ => WitnessClientError::Server {
             status,
             error: error_body.error,
@@ -671,17 +709,135 @@ fn decode_chunked(mut input: &[u8]) -> Result<Vec<u8>, WitnessClientError> {
         if size == 0 {
             return Ok(output);
         }
-        if input.len() < size + 2 {
+        let Some(needed) = size.checked_add(2) else {
+            return Err(WitnessClientError::Protocol {
+                detail: "chunk size overflows the response buffer".to_string(),
+            });
+        };
+        if input.len() < needed {
             return Err(WitnessClientError::Protocol {
                 detail: "chunked response ended inside a chunk".to_string(),
             });
         }
         output.extend_from_slice(&input[..size]);
-        if &input[size..size + 2] != b"\r\n" {
+        if &input[size..needed] != b"\r\n" {
             return Err(WitnessClientError::Protocol {
                 detail: "chunk is not terminated by CRLF".to_string(),
             });
         }
-        input = &input[size + 2..];
+        input = &input[needed..];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_http_responses_are_rejected() {
+        assert!(matches!(
+            parse_http_response(b"not an HTTP response"),
+            Err(WitnessClientError::Protocol { .. })
+        ));
+        assert!(matches!(
+            parse_http_response(b"HTTP/1.1 nope OK\r\n\r\n"),
+            Err(WitnessClientError::Protocol { .. })
+        ));
+        assert!(matches!(
+            parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort"),
+            Err(WitnessClientError::Protocol { .. })
+        ));
+        // A valid empty body is accepted.
+        assert_eq!(
+            parse_http_response(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .unwrap()
+                .status,
+            204
+        );
+    }
+
+    #[test]
+    fn chunk_size_overflow_is_rejected() {
+        assert!(matches!(
+            decode_chunked(b"ffffffffffffffffffffffffffffffff\r\n"),
+            Err(WitnessClientError::Protocol { .. })
+        ));
+        assert!(matches!(
+            decode_chunked(b"10\r\nshort"),
+            Err(WitnessClientError::Protocol { .. })
+        ));
+    }
+
+    #[test]
+    fn retryability_is_limited_to_transport_and_5xx() {
+        let retryable = [
+            WitnessClientError::Unavailable {
+                detail: String::new(),
+            },
+            WitnessClientError::Server {
+                status: 503,
+                error: None,
+                reason: None,
+                detail: None,
+            },
+        ];
+        let non_retryable = [
+            WitnessClientError::Auth {
+                detail: String::new(),
+            },
+            WitnessClientError::Tls {
+                detail: String::new(),
+            },
+            WitnessClientError::ClusterMismatch {
+                detail: String::new(),
+            },
+            WitnessClientError::Server {
+                status: 400,
+                error: None,
+                reason: None,
+                detail: None,
+            },
+            WitnessClientError::Conflict {
+                reason: None,
+                detail: None,
+                current: None,
+            },
+        ];
+        for error in retryable {
+            assert!(error.is_retryable(), "{error:?}");
+        }
+        for error in non_retryable {
+            assert!(!error.is_retryable(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn record_validation_rejects_schema_and_cluster_mismatch() {
+        let mut record = LeaseRecord {
+            schema: 1,
+            cluster_id: "home-dns".to_string(),
+            holder: "node-a/boot".to_string(),
+            node_id: "node-a".to_string(),
+            term: 1,
+            revision: 1,
+            version: 0,
+            bundle_hash: "none".to_string(),
+            acquired_unix_ms: 1,
+            expires_unix_ms: 2,
+        };
+        validate_record(&record, "home-dns").expect("valid record");
+
+        record.cluster_id = "other".to_string();
+        assert!(matches!(
+            validate_record(&record, "home-dns"),
+            Err(WitnessClientError::ClusterMismatch { .. })
+        ));
+
+        record.cluster_id = "home-dns".to_string();
+        record.schema = 2;
+        assert!(matches!(
+            validate_record(&record, "home-dns"),
+            Err(WitnessClientError::Protocol { .. })
+        ));
     }
 }

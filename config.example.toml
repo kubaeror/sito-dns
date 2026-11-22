@@ -198,7 +198,7 @@ anonymize_querylog = false
 # backend = "witness"                # only supported backend in 2.0
 # lease_ttl_secs = 30                # 5..300, >= 3 * renew_interval_secs
 # renew_interval_secs = 10           # 1..(lease_ttl_secs / 3)
-# heartbeat_timeout_secs = 90        # default max(45, 3 * ping_interval_secs)
+# heartbeat_timeout_secs = 45        # default max(45, 3 * ping_interval_secs)
 # require_manual_confirmation = false
 # reconcile_window_secs = 10         # 1..60
 # [ha.promotion.witness]

@@ -396,13 +396,15 @@ impl PromotionConfig {
             });
         }
 
-        if let Some(server_name) = self.witness.server_name.as_deref()
-            && server_name.trim().is_empty()
-        {
-            return Err(HaError::Validation {
-                field: "ha.promotion.witness.server_name".to_string(),
-                reason: "witness.server_name must not be empty".to_string(),
-            });
+        if let Some(server_name) = self.witness.server_name.as_deref() {
+            rustls_pki_types::ServerName::try_from(server_name.to_string()).map_err(|error| {
+                HaError::Validation {
+                    field: "ha.promotion.witness.server_name".to_string(),
+                    reason: format!(
+                        "witness.server_name '{server_name}' is not a valid TLS server name: {error}"
+                    ),
+                }
+            })?;
         }
 
         self.witness.normalized_fingerprint()?;
@@ -996,15 +998,18 @@ token_file = "/etc/sito/witness.token"
                 .contains("witness.token_file")
         );
 
-        let mut empty_name = valid_promotion();
-        empty_name.witness.server_name = Some("  ".to_string());
-        assert!(
-            empty_name
-                .validate("slave", 15)
-                .unwrap_err()
-                .to_string()
-                .contains("server_name")
-        );
+        for server_name in ["  ", "bad name", "host:8954", "a/b"] {
+            let mut invalid_name = valid_promotion();
+            invalid_name.witness.server_name = Some(server_name.to_string());
+            assert!(
+                invalid_name
+                    .validate("slave", 15)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("server_name"),
+                "{server_name:?} must be rejected"
+            );
+        }
 
         for fingerprint in ["blake3:abc", "1234", "blake3:zz"] {
             let mut cfg = valid_promotion();
