@@ -94,4 +94,9 @@ VOLUME ["/var/lib/sito"]
 # pending; after setup completes the DNS probe must succeed.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/usr/bin/sito", "--config", "/etc/sito/config.toml", "healthcheck", "--setup-fallback"]
-ENTRYPOINT ["/usr/bin/sito", "--config", "/etc/sito/config.toml"]
+# The runtime is distroless and has no shell, so the entrypoint is the binary
+# in its hidden `--container-entrypoint` mode: it runs the explicit
+# `sito db migrate` path first when <server.data_dir>/stats.db already exists,
+# then starts the server. Set SITO_NO_MIGRATE=1 to skip the migration; the
+# server then refuses an old database (fail closed) until the migration runs.
+ENTRYPOINT ["/usr/bin/sito", "--config", "/etc/sito/config.toml", "--container-entrypoint"]

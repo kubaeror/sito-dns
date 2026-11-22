@@ -23,9 +23,10 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 >
 > Remaining release work is the rc.1 tag/publication; the 24-hour fuzz campaign
 > is explicitly deferred by the operator. The 2.0 administrative API is
-> `/api/v2` only; `/api/v1` was removed. Deferred work includes the SQLite
-> schema/PII migration (`sito db migrate`), installer/Docker auto-migration,
-> a default-deny DNS client ACL, weighted upstream balancing, a second proof
+> `/api/v2` only; `/api/v1` was removed. The SQLite schema/PII migration
+> (`sito db migrate`) and installer/Docker database upgrades are delivered;
+> config auto-migration remains deferred. Other deferred work includes a
+> default-deny DNS client ACL, weighted upstream balancing, a second proof
 > for user/token deletion, edit-time read-only HA enforcement, and the optional
 > external parental/service data. The current evidence matrix is
 > [`docs/2.0-claim-matrix.md`](docs/2.0-claim-matrix.md).

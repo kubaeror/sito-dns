@@ -6,6 +6,12 @@
 # candidate image, starts the candidate, asserts DNS + Docker health, then
 # rolls the data/config back and asserts the 1.9.5 image still serves.
 #
+# The candidate image entrypoint runs `sito db migrate` before the server when
+# the stats database exists. When the candidate has the 2.0 entrypoint this
+# script also proves SITO_NO_MIGRATE=1 leaves startup fail-closed and that the
+# default start writes the 0600 stats.db.v1.bak. Older candidate images skip
+# those two checks with a notice (their entrypoint has no migration flag).
+#
 # The images must exist locally:
 #   docker build -t sito:1.9.5 <v1.9.5-worktree>
 #   docker build -t sito:phase3 .
@@ -37,7 +43,7 @@ as_root() {
 }
 
 cleanup() {
-    docker rm -f "${OLD_NAME}" "${NEW_NAME}" >/dev/null 2>&1 || true
+    docker rm -f "${OLD_NAME}" "${NEW_NAME}" "${NEW_NAME}-nomigrate" >/dev/null 2>&1 || true
     as_root rm -rf "${TMP}"
 }
 trap cleanup EXIT
@@ -93,6 +99,21 @@ wait_for_dns() {
 
 docker image inspect "${OLD_IMAGE}" >/dev/null 2>&1 || fail "missing image ${OLD_IMAGE}"
 docker image inspect "${NEW_IMAGE}" >/dev/null 2>&1 || fail "missing image ${NEW_IMAGE}"
+
+# Static contract: both shipped Dockerfiles must select the entrypoint mode that
+# runs the explicit DB migration before the server, and document the opt-out.
+for dockerfile in Dockerfile Dockerfile.release; do
+    grep -Fq -- '--container-entrypoint' "${dockerfile}" ||
+        fail "${dockerfile}: ENTRYPOINT must run the container entrypoint migration mode"
+    grep -Fq -- 'SITO_NO_MIGRATE=1' "${dockerfile}" ||
+        fail "${dockerfile}: the SITO_NO_MIGRATE opt-out must be documented"
+done
+
+NEW_ENTRYPOINT="$(docker image inspect "${NEW_IMAGE}" --format '{{json .Config.Entrypoint}}')"
+HAS_CONTAINER_ENTRYPOINT=0
+case "${NEW_ENTRYPOINT}" in
+    *container-entrypoint*) HAS_CONTAINER_ENTRYPOINT=1 ;;
+esac
 
 mkdir -p "${TMP}/etc" "${TMP}/data"
 # The distroless image runs as uid/gid 65532. Bind-mounted test directories must
@@ -193,6 +214,52 @@ for f in ha_state.toml ha_watermark.toml; do
     fi
 done
 
+if [ "${HAS_CONTAINER_ENTRYPOINT}" = "1" ]; then
+    echo "==> candidate with SITO_NO_MIGRATE=1 must fail closed on the v1 stats DB"
+    as_root rm -f "${TMP}/data/stats.db.v1.bak"
+    nomigrate_log="${TMP}/no-migrate.log"
+    set +e
+    timeout 90 docker run --rm --name "${NEW_NAME}-nomigrate" \
+        -e SITO_NO_MIGRATE=1 \
+        -v "${TMP}/etc:/etc/sito" \
+        -v "${TMP}/data:/var/lib/sito" \
+        "${NEW_IMAGE}" >"${nomigrate_log}" 2>&1
+    nomigrate_rc=$?
+    set -e
+    [ "${nomigrate_rc}" -ne 0 ] || fail "SITO_NO_MIGRATE=1 started a server on the v1 stats DB"
+    [ "${nomigrate_rc}" -ne 124 ] || fail "SITO_NO_MIGRATE=1 did not exit; it must fail closed"
+    grep -q 'SITO_DB_AUTO_MIGRATE=1' "${nomigrate_log}" || \
+        fail "SITO_NO_MIGRATE=1 did not print the B3 fail-closed guidance"
+    grep -q 'sito db migrate' "${nomigrate_log}" || \
+        fail "SITO_NO_MIGRATE=1 did not name the explicit migration command"
+    if as_root test -e "${TMP}/data/stats.db.v1.bak"; then
+        fail "SITO_NO_MIGRATE=1 created a migration backup"
+    fi
+    echo "    no-migrate stayed fail-closed and created no backup"
+
+    echo "==> candidate with SITO_NO_MIGRATE=1 and SITO_DB_AUTO_MIGRATE=1 must fail closed"
+    conflict_log="${TMP}/no-migrate-conflict.log"
+    set +e
+    timeout 90 docker run --rm --name "${NEW_NAME}-nomigrate" \
+        -e SITO_NO_MIGRATE=1 \
+        -e SITO_DB_AUTO_MIGRATE=1 \
+        -v "${TMP}/etc:/etc/sito" \
+        -v "${TMP}/data:/var/lib/sito" \
+        "${NEW_IMAGE}" >"${conflict_log}" 2>&1
+    conflict_rc=$?
+    set -e
+    [ "${conflict_rc}" -ne 0 ] || fail "the no-migrate/auto-migrate conflict started a server"
+    [ "${conflict_rc}" -ne 124 ] || fail "the no-migrate/auto-migrate conflict did not exit"
+    grep -q 'Conflicting migration policy' "${conflict_log}" || \
+        fail "the conflicting switches did not produce an explicit policy error"
+    if as_root test -e "${TMP}/data/stats.db.v1.bak"; then
+        fail "the conflicting switches created a migration backup"
+    fi
+    echo "    conflicting switches failed closed without a backup"
+else
+    echo "notice: ${NEW_IMAGE} predates the 2.0 container entrypoint; skipping SITO_NO_MIGRATE checks" >&2
+fi
+
 echo "==> starting the candidate ${NEW_IMAGE} on the upgraded data dir"
 docker run -d --name "${NEW_NAME}" \
     -p "${HOST_PORT}:5353/udp" \
@@ -202,6 +269,15 @@ docker run -d --name "${NEW_NAME}" \
 
 wait_for_dns "${NEW_NAME}" "${HOST_PORT}"
 [ -s "${TMP}/data/users.toml" ] || fail "users.toml disappeared during the upgrade"
+
+if [ "${HAS_CONTAINER_ENTRYPOINT}" = "1" ]; then
+    as_root test -f "${TMP}/data/stats.db.v1.bak" ||
+        fail "the candidate entrypoint did not write stats.db.v1.bak"
+    db_backup_mode="$(as_root stat -c '%a' "${TMP}/data/stats.db.v1.bak")"
+    [ "${db_backup_mode}" = "600" ] ||
+        fail "stats.db.v1.bak mode is ${db_backup_mode}, expected 600"
+    echo "    candidate migrated the stats DB with a 0600 v1 backup"
+fi
 
 health="unknown"
 for _ in $(seq 1 90); do

@@ -67,6 +67,9 @@ services:
   # ---------------------------------------------------------------------------
   sito-master:
     # Pinned release image; pin the digest as well for reproducible deploys.
+    # The image entrypoint runs `sito db migrate` before the server when the
+    # stats DB needs it. Set SITO_NO_MIGRATE=1 to skip that step and keep the
+    # fail-closed startup policy for a controlled upgrade.
     image: ghcr.io/kubaeror/sito-dns:1.9.5
     container_name: sito-master
     cap_add:

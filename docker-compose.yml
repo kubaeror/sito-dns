@@ -5,6 +5,13 @@ services:
     # To run a locally built image during development, layer the build override:
     #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
     image: ghcr.io/kubaeror/sito-dns:1.9.5
+    # The image entrypoint runs the explicit `sito db migrate` path before the
+    # server when /var/lib/sito/stats.db already exists, so a 1.9.x database is
+    # backed up (0600 stats.db.v1.bak) and upgraded in place. For a controlled
+    # upgrade where you run the migration yourself, opt out explicitly:
+    #   environment:
+    #     SITO_NO_MIGRATE: "1"
+    # The server then fails closed on an un-migrated database (B3 policy).
     cap_add:
       - NET_BIND_SERVICE
     # Hardening: the container never needs to gain privileges, and the root

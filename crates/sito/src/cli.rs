@@ -115,6 +115,13 @@ pub struct Cli {
     #[arg(long)]
     pub no_setup: bool,
 
+    /// Internal image entrypoint mode: migrate the stats database before the
+    /// server starts. The distroless image has no shell, so the published
+    /// `ENTRYPOINT` selects this mode instead of running a wrapper script.
+    /// Not part of the supported host CLI.
+    #[arg(long, hide = true)]
+    pub container_entrypoint: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -2099,6 +2106,23 @@ mod tests {
             }
             other => panic!("expected db migrate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_cli_container_entrypoint_flag() {
+        let cli = Cli::try_parse_from([
+            "sito",
+            "--config",
+            "/etc/sito/config.toml",
+            "--container-entrypoint",
+        ])
+        .expect("parse container entrypoint");
+        assert!(cli.container_entrypoint);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.config, Some(PathBuf::from("/etc/sito/config.toml")));
+
+        let cli = Cli::try_parse_from(["sito"]).expect("parse bare server start");
+        assert!(!cli.container_entrypoint);
     }
 
     #[cfg(unix)]
