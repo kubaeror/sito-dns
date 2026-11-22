@@ -482,13 +482,22 @@ impl PromotionHost for RuntimePromotionHost {
 
     fn set_writable(&self, writable: bool, reason: Option<String>) {
         if let Some(coordinator) = self.state.coordinator() {
-            coordinator.set_serving(writable);
             if writable {
-                coordinator.allow_sessions();
-            } else if coordinator.is_hello_only() {
-                // Reconciliation must keep admitting/registering peers.
+                if coordinator.is_fenced() {
+                    return;
+                }
+                coordinator.set_serving(true);
                 coordinator.allow_sessions();
             } else {
+                // A terminal/read-only transition always ends hello-only and
+                // denies admissions. A fence is sticky.
+                if reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("ha_promotion_fenced"))
+                {
+                    coordinator.mark_fenced();
+                }
+                coordinator.end_hello_only();
                 coordinator.close_all_sessions();
                 coordinator.deny_sessions(
                     reason
@@ -629,12 +638,16 @@ impl PromotionHost for RuntimePromotionHost {
             }
             // The first push is the one publish allowed while the API gate is
             // still closed. It is enabled only for the duration of this call.
+            if coordinator.is_fenced() {
+                return Err("fenced: the master cannot publish".to_string());
+            }
+            // Keep serving enabled after a successful enqueue: the session task
+            // may dequeue after this method returns. Failure paths call
+            // set_writable(false), which denies and closes sessions.
             coordinator.set_serving(true);
-            let result = coordinator
+            coordinator
                 .publish_promoted_bundle(prepared.bundle)
-                .map_err(|error| error.to_string());
-            coordinator.set_serving(false);
-            result
+                .map_err(|error| error.to_string())
         })
     }
 
@@ -657,8 +670,7 @@ impl PromotionHost for RuntimePromotionHost {
         // Synchronous serving flag first: an in-flight Hello/handshake must not
         // enqueue a push after this returns, even before the listener joins.
         if let Some(coordinator) = self.state.coordinator() {
-            coordinator.set_serving(false);
-            coordinator.deny_sessions("fenced");
+            coordinator.mark_fenced();
             coordinator.close_all_sessions();
         }
         if let Some(tx) = self
@@ -764,6 +776,95 @@ mod tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(80));
         assert!(state.slave_handle.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn host_begin_hello_only_allows_admission_and_fence_is_sticky() {
+        let state = test_state("host_hello");
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let coordinator = MasterCoordinator::new(
+            "promoted".to_string(),
+            1,
+            key,
+            sito_stats::MetricsRegistry::new("2.0.0", "test"),
+        );
+        *state.coordinator.lock().unwrap() = Some(coordinator.clone());
+        let host = RuntimePromotionHost {
+            state: Arc::clone(&state),
+        };
+        host.begin_hello_only().await.unwrap();
+        assert!(!coordinator.is_serving());
+        assert!(coordinator.is_accepting_sessions());
+        assert!(coordinator.is_hello_only());
+
+        // Fencing while hello-only is active must be sticky, even if the engine
+        // (or a later transition) tries to re-enter hello-only.
+        host.stop_publishing();
+        assert!(coordinator.is_fenced());
+        host.begin_hello_only().await.unwrap();
+        assert!(!coordinator.is_accepting_sessions());
+        assert!(!coordinator.is_serving());
+        assert!(!coordinator.is_hello_only());
+    }
+
+    #[tokio::test]
+    async fn publish_first_keeps_serving_enabled_for_the_queued_first_push() {
+        use chrono::Utc;
+        use sito_ha::master::ActiveSlave;
+
+        let state = test_state("publish_first_delivery");
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        let coordinator = MasterCoordinator::new(
+            "promoted".to_string(),
+            1,
+            key.clone(),
+            sito_stats::MetricsRegistry::new("2.0.0", "test"),
+        );
+        coordinator.set_term(1);
+        *state.coordinator.lock().unwrap() = Some(coordinator.clone());
+        *state.signing_key.lock().unwrap() = Some(key);
+        let mut live = Config::default();
+        live.server.role = "slave".to_string();
+        let toml_doc = toml::to_string_pretty(&live).unwrap();
+        *state.live_config.lock().unwrap() = Some(Arc::new(ArcSwap::from_pointee(live)));
+        *state.initial_toml.lock().unwrap() = Some(toml_doc);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        coordinator.slaves.lock().unwrap().insert(
+            "slave-1".to_string(),
+            ActiveSlave {
+                instance: "slave-1".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 1,
+                last_ping: std::time::Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                have_term: 1,
+                have_version: 1,
+                have_bundle_hash: None,
+                connection_id: 1,
+            },
+        );
+        let host = RuntimePromotionHost {
+            state: Arc::clone(&state),
+        };
+        let prepared = host.prepare_bundle(1, 2).expect("bundle");
+        host.publish_first(&prepared).await.expect("first publish");
+        assert!(
+            coordinator.is_serving(),
+            "serving must stay enabled for the queued first push"
+        );
+        let delivered = rx.try_recv().expect("first push queued");
+        assert!(matches!(
+            delivered,
+            sito_ha::HaMessage::ConfigPush { version: 2, .. }
+        ));
+
+        // A terminal read-only transition closes admission/serving.
+        host.set_writable(false, Some("promotion_interrupted".to_string()));
+        assert!(!coordinator.is_serving());
+        assert!(!coordinator.is_accepting_sessions());
     }
 
     fn write_legacy_state(path: &std::path::Path, term: u64, version: u64) {

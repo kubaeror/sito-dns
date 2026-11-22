@@ -1172,6 +1172,8 @@ impl PromotionEngine {
             Ok(peers) => peers,
             Err(error) => {
                 let _ = self.host.end_hello_only().await;
+                self.host
+                    .set_writable(false, Some("candidate_hash_unknown".to_string()));
                 self.set_phase(PromotionPhase::Aborted, Some("candidate_hash_unknown"));
                 warn!(error = %error, "reconciliation report collection failed");
                 return PromotionOutcome::ReadOnly {
@@ -1194,6 +1196,8 @@ impl PromotionEngine {
             }
             Err(error) => {
                 let _ = self.host.end_hello_only().await;
+                self.host
+                    .set_writable(false, Some(error.reason_code().to_string()));
                 self.set_phase(PromotionPhase::Unavailable, Some(error.reason_code()));
                 return PromotionOutcome::ReadOnly {
                     reason: error.reason_code().to_string(),
@@ -1329,6 +1333,8 @@ impl PromotionEngine {
         }
         if let Err(error) = self.renew_published().await {
             let _ = self.host.end_hello_only().await;
+            self.host
+                .set_writable(false, Some("lease_lost".to_string()));
             warn!(error = %error, "post-publish renewal failed");
             return PromotionOutcome::ReadOnly {
                 reason: "lease_lost".to_string(),
@@ -1455,6 +1461,9 @@ impl PromotionEngine {
         }
 
         if let Err(error) = self.renew_published().await {
+            let _ = self.host.end_hello_only().await;
+            self.host
+                .set_writable(false, Some("lease_lost".to_string()));
             warn!(error = %error, "post-publish renewal failed");
             return PromotionOutcome::ReadOnly {
                 reason: "lease_lost".to_string(),

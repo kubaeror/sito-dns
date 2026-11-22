@@ -3314,6 +3314,7 @@ fn read_only_or_fenced_master_never_queues_a_push_for_an_inflight_hello() {
 
     // The handshake was admitted, but the node becomes read-only/fenced before
     // registration. It must not enqueue the already-active push.
+    coordinator.mark_fenced();
     coordinator.close_all_sessions();
     assert!(!coordinator.is_serving());
     let mut rx = session.register();

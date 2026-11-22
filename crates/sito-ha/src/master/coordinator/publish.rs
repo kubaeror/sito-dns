@@ -314,7 +314,12 @@ impl MasterCoordinator {
     /// Stops serving and drops every tracked replication session (fence path).
     pub fn close_all_sessions(&self) {
         self.set_serving(false);
-        self.deny_sessions("fenced");
+        if self.is_accepting_sessions() {
+            self.deny_sessions("read_only");
+        } else {
+            // Preserve a more specific (for example `fenced`) reason.
+            self.accepting_sessions.store(false, Ordering::SeqCst);
+        }
         let mut slaves = sito_core::sync::lock_or_recover(&self.slaves);
         slaves.clear();
         self.metrics.set_ha_slaves_connected(0);

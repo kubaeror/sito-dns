@@ -141,7 +141,9 @@ impl MasterCoordinator {
                             "Master stopped serving; dropping queued HA push"
                         );
                         session.account_drained(wire_size(&msg));
-                        continue;
+                        // Close so the slave reconnects and receives normal
+                        // push-on-Hello once the master is serving again.
+                        break;
                     }
                     session.account_drained(wire_size(&msg));
                     if send_ha_message(&mut ws_stream, &msg, "master", "configuration push").await.is_err() {

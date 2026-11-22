@@ -45,6 +45,7 @@ impl MasterCoordinator {
             require_slaves: Arc::new(AtomicBool::new(false)),
             require_all_slaves: Arc::new(AtomicBool::new(false)),
             promotion_bookkeeping: Arc::new(Mutex::new(None)),
+            fenced: Arc::new(AtomicBool::new(false)),
             accepting_sessions: Arc::new(AtomicBool::new(true)),
             session_refusal_reason: Arc::new(Mutex::new("read_only".to_string())),
             serving: Arc::new(AtomicBool::new(true)),
@@ -58,6 +59,9 @@ impl MasterCoordinator {
     /// it is cleared before a fence/read-only transition and never inferred
     /// from the API gate afterwards.
     pub fn set_serving(&self, serving: bool) {
+        if serving && self.fenced.load(Ordering::SeqCst) {
+            return;
+        }
         self.serving.store(serving, Ordering::SeqCst);
     }
 
@@ -68,8 +72,28 @@ impl MasterCoordinator {
     }
 
     /// Allows new slave Hellos without enabling configuration pushes.
+    ///
+    /// A fenced coordinator can never re-enable admission.
     pub fn allow_sessions(&self) {
+        if self.fenced.load(Ordering::SeqCst) {
+            return;
+        }
         self.accepting_sessions.store(true, Ordering::SeqCst);
+    }
+
+    /// Permanently disables admission/serving for the current process.
+    pub fn mark_fenced(&self) {
+        self.fenced.store(true, Ordering::SeqCst);
+        self.serving.store(false, Ordering::SeqCst);
+        self.hello_only.store(false, Ordering::SeqCst);
+        *sito_core::sync::lock_or_recover(&self.session_refusal_reason) = "fenced".to_string();
+        self.accepting_sessions.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether this coordinator has been fenced.
+    #[must_use]
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
     }
 
     /// Refuses new slave Hellos with a specific reason.
@@ -130,6 +154,9 @@ impl MasterCoordinator {
     /// ping/pong, but never enqueues a `ConfigPush`. This prevents a forked
     /// slave from applying a pending bundle before reconciliation completes.
     pub fn begin_hello_only(&self) {
+        if self.fenced.load(Ordering::SeqCst) {
+            return;
+        }
         self.hello_only.store(true, Ordering::SeqCst);
     }
 

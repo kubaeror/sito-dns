@@ -276,6 +276,9 @@ pub struct MasterCoordinator {
     /// write carries the published baseline so a normal configuration publish
     /// cannot silently drop it.
     promotion_bookkeeping: Arc<Mutex<Option<crate::promotion::state::PromotionBookkeeping>>>,
+    /// Sticky durable-fence state: once true, admission and push serving can
+    /// never be re-enabled until the operator clears the fence and restarts.
+    fenced: Arc<AtomicBool>,
     /// True while the master may admit new slave Hellos. Admission and
     /// configuration pushes are separate: hello-only reconciliation admits and
     /// registers peers while refusing to queue pushes.
