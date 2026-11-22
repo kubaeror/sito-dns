@@ -11,14 +11,14 @@ benchmarks, the action pin policy, and the monthly runner-minute budget.
 | Workflow | File | Triggers | Purpose |
 |---|---|---|---|
 | **CI** | `ci.yml` | `pull_request` to `main`, `push` to `main`, `merge_group`, `workflow_dispatch` (`full`) | Classifies the change set and runs `fmt`, `clippy`, `test`, the three-target `build` matrix, `ha-matrix`, `openapi`, `contrib`, `bench-build`, `fuzz-build`, `hygiene` (machete/udeps), `coverage`, and the reusable `docs-check`, `container-check`, `security-check` lanes. Publishes the single required check `ci-gate`. |
-| **Docs** | `docs.yml` | `workflow_call` from CI, `push` to `main` on docs/workflow paths, `workflow_dispatch` | Runs the configuration-reference nested/default/type/map check, the migration-guide breaking-change check, the internal Markdown link checker, and the pinned `actionlint` container for `.github/workflows/**`. |
+| **Docs** | `docs.yml` | `workflow_call` from CI, `push` to `main` on docs/workflow paths, `workflow_dispatch` | Runs the configuration-reference nested/default/type/map check, the migration-guide breaking-change check, the internal Markdown link checker, the P0/P1 test-matrix name check, and the pinned `actionlint` container for `.github/workflows/**`. |
 | **Container** | `container.yml` | `workflow_call` from CI and Weekly, `push` to `main` on container paths, `workflow_dispatch` | Validates both Compose files, builds/smoke-tests the development `Dockerfile`, and builds `Dockerfile.release` with stub binaries. |
 | **Security** | `security.yml` | `workflow_call` from CI and Weekly, `push` to `main`, `workflow_dispatch` | Runs `cargo-deny check`. |
 | **Weekly Quality** | `weekly.yml` | Sunday at 03:00 UTC (`schedule`), `workflow_dispatch` | Release-mode tests plus the reusable Container and Security workflows. Benchmarks moved to `bench.yml`. |
 | **Fuzz** | `fuzz.yml` | Nightly at 04:17 UTC (`schedule`), `workflow_dispatch` (`fuzz_seconds`, `shards`) | Builds and runs the five cargo-fuzz targets with their checked-in corpus and dictionary on GitHub-hosted `ubuntu-24.04`. Default smoke is 600 s per target; the 24-hour release checklist is `fuzz_seconds=17280` with `shards=5` (five 4.8-hour shards per target, ≈24 target-hours aggregate). Uploads corpus/artifacts on failure. |
 | **Bench** | `bench.yml` | Nightly at 05:42 UTC (`schedule`), `workflow_dispatch` (`update_baseline`) | Runs the workspace Criterion suite and fails when a benchmark is more than 10% slower than `benches/baseline.json`. `update_baseline=true` writes and uploads a replacement baseline. |
 | **HA Ownership (root)** | `ha-ownership.yml` | `workflow_dispatch`, Sunday at 06:00 UTC (`schedule`) | Runs the root-only `scripts/test-ha-ownership-root.sh` under `sudo -E` with `PATH`, `CARGO_HOME`, `RUSTUP_HOME` and a workspace target dir preserved. Manual/weekly 2.0 release evidence for the HA key-ownership handoff; never part of `ci-gate` or a pull-request lane. |
-| **Release** | `release.yml` | Push of a `v*` tag only | Verifies the tag, builds and signs the three release archives, stages a draft GitHub release, verifies the artifacts, publishes the multi-arch container image, and finally publishes the release. |
+| **Release** | `release.yml` | Push of a `v*` tag only | Verifies the tag and the release branch/checks, builds and signs the three release archives, stages a draft GitHub release, verifies the artifacts, publishes the multi-arch container image and scans every promised platform, and finally publishes the release. |
 | **Artifact E2E** | `artifact-e2e.yml` | `workflow_call` from Release, `workflow_dispatch` with a tag | Re-downloads a staged draft or published release and verifies checksums, signatures, and execution of every architecture in the release runtime image. |
 
 `release.yml` deliberately has no `workflow_dispatch`: GitHub mints the OIDC
@@ -38,7 +38,7 @@ part of the required `ci-gate` check, not separate advisory workflows.
 
 | Change | Lanes that run |
 |---|---|
-| Docs only (`docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates) | `ci.yml`: `changes`, `docs-check`, `security-check`, `ci-gate`. `docs-check` calls `docs.yml`, which runs `meta` (config-reference nested/default/type/map checks when the reference or checker changes; the migration-guide breaking-change check; and the internal link check over the repository's tracked Markdown). `security-check` calls `security.yml` (`cargo-deny`) on every PR/merge group, including docs-only changes. No Rust or Docker lanes. The `docs/openapi.json` exception below runs `openapi`. |
+| Docs only (`docs/**`, `**/*.md`, `LICENSE`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates) | `ci.yml`: `changes`, `docs-check`, `security-check`, `ci-gate`. `docs-check` calls `docs.yml`, which runs `meta` (config-reference nested/default/type/map checks when the reference or checker changes; the migration-guide breaking-change check; the internal link check over the repository's tracked Markdown; and the P0/P1 test-matrix name check). `security-check` calls `security.yml` (`cargo-deny`) on every PR/merge group, including docs-only changes. No Rust or Docker lanes. The `docs/openapi.json` exception below runs `openapi`. |
 | Code (`crates/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`, structural-size scripts, `benches/**`, `fuzz/Cargo.toml`, `fuzz/fuzz_targets/**`, `fuzz/corpus/**`, `fuzz/dictionaries/**`, `fuzz/.gitignore`, and `docs/large-functions.md`) | `ci.yml`: `changes`, `fmt`, `clippy`, `test`, `build` (x86_64, aarch64, armv7), `ha-matrix`, `bench-build`, `fuzz-build`, `hygiene`, `coverage`, `security-check`, `ci-gate`. |
 | OpenAPI spec only (`docs/openapi.json` without crate changes) | `ci.yml`: `changes`, `openapi`, `ci-gate`; `docs-check` also runs because the path is under `docs/`. |
 | API crate (`crates/sito-api/**`) | Full code lane. `openapi` is skipped because `test` already regenerates and diffs the spec. |
@@ -84,18 +84,19 @@ than relying on `actionlint`.
 
 ### Documentation checkers
 
-Three dependency-free Python checks protect the docs contract:
+Four dependency-free Python checks protect the docs contract:
 
 | Checker | What it proves | Fast regression fixtures |
 |---|---|---|
 | `scripts/check_config_reference.py --github` | Every top-level and nested (`[[tls.sni_certs]]`, `[[upstream.per_domain]]`, `[[filtering.lists]]`, `[[clients.entries]]`, `[clients.groups.<name>]`, `[[clients.groups.<name>.blocked_services]]`, `[[rewrites.entries]]`, `[integrations.lists.categories.<name>]`) config field is documented with the right type, default and required/optional status. It also checks the legacy raw-section key allowlists (`[clients]`, `[rewrites]`, `[ha]`, `[integrations]`) against `crates/sito-core/config-v1-to-v2-map.toml` and verifies every kept map path / deprecated alias target is documented. A missing doc file or malformed map **fails closed** with exit 1. `--github` prints one `::error::` line per failure. | `python3 scripts/test_check_config_reference.py` (nested key/default/type/required drift, unknown map path, alias target, corrupt map, missing doc, concise annotations). |
 | `scripts/check_migration_guide.py --github` | Every stable `BC-<n>` breaking-change ID declared in `docs/2.0-public-api-diff.md` has one row in the `docs/2.0-migration.md` breaking-change index with a concrete migration step and an affected doc/test. Duplicate IDs, placeholder steps and a missing index fail closed. | `python3 scripts/test_check_migration_guide.py` (missing ID, empty step, duplicate, missing table/diff, concise annotations). |
 | `scripts/check_markdown_links.py --github` | Every repository-local Markdown link and heading anchor resolves. External URLs are never fetched, so the check is deterministic. | — |
+| `scripts/check_test_matrix.py --github` | Every backticked named test, script and workflow in the "Named test / check" column of `docs/audit6-test-matrix.md` still resolves. A renamed test or deleted script cannot silently turn a P0/P1 security claim into prose. | `python3 scripts/test_check_test_matrix.py` (missing test, missing path, ignored identifier, annotation shape). |
 
 The `test` lane runs the configuration-reference checker and its fixtures on
 code changes; the `docs` lane runs it when the reference or checker changes and
-runs the migration and link checks on every docs change. All three are cheap
-enough to also run locally before pushing.
+runs the migration, link and test-matrix checks on every docs change. All four
+are cheap enough to also run locally before pushing.
 
 The migration checker only validates IDs that already exist in the public API
 diff. It cannot infer that a new change is breaking: when adding one, assign a
@@ -321,8 +322,8 @@ on every code change. See `crates/sito-stats/tests/prometheus_exposition.rs`.
 Before Phase 3 the scheduled `fuzz.yml` matrix was invalid and scheduled runs
 did not execute. The workflow now builds a target × shard matrix in a
 `prepare` job; the nightly smoke uses one shard, and the 24-hour checklist uses
-`shards=5` with `fuzz_seconds=17280`. The 24-hour campaign remains deferred for
-rc.1 and is not a PR gate.
+`shards=5` with `fuzz_seconds=17280`. The 24-hour campaign is a 2.0 final-tag
+checklist item started after rc.4, not a PR gate.
 
 ### PR vs nightly/release split
 
@@ -430,31 +431,47 @@ must be updated in the same change.
 ## Release pipeline
 
 Release runs only from a tag push. A tag must match the workspace version in
-`Cargo.toml` (`v2.0.0-rc.2` or a prerelease such as `v2.0.0-beta.1`); a mismatch stops
-the workflow before any asset is built. The order is deliberate:
+`Cargo.toml` (`v2.0.0` or a prerelease of it such as `v2.0.0-rc.2`); a mismatch
+stops the workflow before any asset is built. The order is deliberate:
 
 1. **`verify-tag`** — checks the tag against the workspace version.
-2. **`build-binaries`** — builds `x86_64-unknown-linux-gnu`,
+2. **`release-gate`** — checks that the tagged commit is an ancestor of the
+   required branch (`main` for 2.0, `release/1.9.x` for 1.9.x) and that the
+   commit has green `ci-gate` and `cargo-deny` check runs. It calls
+   `scripts/verify-release-gate.sh`; a missing or red required check stops the
+   workflow before any asset is built.
+3. **`build-binaries`** — builds `x86_64-unknown-linux-gnu`,
    `aarch64-unknown-linux-gnu`, and `armv7-unknown-linux-gnueabihf` with the
    `embed-ui,ha,mimalloc` features, runs `shellcheck` on the installer, packages
    each archive with `LICENSE`, `README.md`, `config.example.toml`, the
    systemd unit, and `contrib/install.sh`, and records per-archive SHA-256
    checksums.
-3. **`sbom-and-release`** — downloads the archives, produces a unified
+4. **`sbom-and-release`** — downloads the archives, produces a unified
    `SHA256SUMS`, generates an SPDX SBOM with `cargo-sbom`, signs every archive
    with cosign keyless signing, and uploads everything to a **draft** GitHub
    release. Tags containing `-` are marked as prereleases.
-4. **`artifact-e2e`** — re-downloads the staged draft (drafts require a token
+5. **`artifact-e2e`** — re-downloads the staged draft (drafts require a token
    with write access) and verifies all three architectures: per-archive
    `.sha256`, the unified `SHA256SUMS` line, the cosign signature identity, and
    execution of `--version` and `check-config` on the shipped configuration.
-5. **`docker-build-push`** — builds and pushes the multi-arch image, then
+6. **`docker-build-push`** — builds and pushes the multi-arch image, then
    verifies the digest, every generated tag, the required platforms, and the
-   SLSA provenance and SPDX SBOM attestations. A final smoke test pulls the
-   published image and runs `--version` and `check-config`.
-6. **`publish-release`** — flips the staged draft to published only after
+   SLSA provenance and SPDX SBOM attestations. It scans each promised platform
+   (`linux/amd64`, `linux/arm64`, `linux/arm/v7`) with the digest-pinned Trivy
+   image and fails on a fixed HIGH/CRITICAL finding. A final smoke test starts
+   the attested digest, requires a local rewrite to answer and the image
+   healthcheck to turn healthy, then runs `--version` and `check-config`.
+7. **`publish-release`** — flips the staged draft to published only after
    `artifact-e2e` and `docker-build-push` are green. Stable tags also move
    `latest`; prereleases stay prereleases and never move `latest`.
+
+The `release-gate` step prefers `gh api --paginate --slurp` and falls back to
+plain `--paginate` only when the installed `gh` does not know `--slurp`; auth,
+network and API errors are fatal. Both pagination shapes are pinned by
+`bash scripts/test-verify-release-gate.sh`. The rc.3 and rc.4 tags are
+prereleases and must leave `latest` on 1.9.5; only the final `v2.0.0` tag moves
+it. [`docs/release-verification.md`](release-verification.md) is the gate
+checklist and records the required evidence for every row.
 
 The GitHub release is not public until `publish-release` runs. A failure in
 `artifact-e2e` or `docker-build-push` leaves a recoverable draft instead of
@@ -594,6 +611,7 @@ Approximate runner-minutes per run (sum of billed jobs; parallel jobs count sepa
 | Container PR (`compose` + `smoke` + `release-image` stub build) | 8–11 |
 | Security-only PR (`cargo-deny`) | 1–2 |
 | Weekly run (release tests, container, security, `release-image`) | 20–28 |
+| Weekly root HA ownership lane (`ha-ownership.yml`, Sunday 06:00 UTC) | 5–10 |
 | Nightly fuzz (five targets × 600 s + build) | 45–70 |
 | Nightly bench (full Criterion suite + comparison) | 10–20 |
 | Release run (prebuilt-image pipeline) | 25–35 |
@@ -615,12 +633,12 @@ Dependency changes also match the code classifier, so a `Cargo.toml` or
 security row.
 
 Illustrative month using the midpoints of those ranges: ~10 code PRs (≈650),
-~5 docs PRs (≈15), four weekly runs (≈96), two releases (≈60), a handful of
-container/security/openapi/contrib runs (≈60), 30 nightly fuzz runs (≈1,725),
-and 30 nightly bench runs (≈450), for **≈3,050 minutes**. The midpoint sits
-inside the 2,800–3,200 expected band. These per-run figures are estimates from
-warm-cache runs, not invoice data. Replace them with `scripts/ci_usage.py`
-output after the first full month.
+~5 docs PRs (≈15), four weekly runs (≈96), four weekly root HA ownership runs
+(≈30), two releases (≈60), a handful of container/security/openapi/contrib runs
+(≈60), 30 nightly fuzz runs (≈1,725), and 30 nightly bench runs (≈450), for
+**≈3,080 minutes**. The midpoint sits inside the 2,800–3,200 expected band.
+These per-run figures are estimates from warm-cache runs, not invoice data.
+Replace them with `scripts/ci_usage.py` output after the first full month.
 
 The largest PR-side savings still come from the docs-only classifier (no Rust or
 Docker), skipping heavy jobs on `main` pushes, and cancelling superseded PR

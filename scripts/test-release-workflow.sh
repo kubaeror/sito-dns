@@ -12,6 +12,9 @@ SECURITY="${ROOT}/.github/workflows/security.yml"
 FUZZ="${ROOT}/.github/workflows/fuzz.yml"
 BENCH="${ROOT}/.github/workflows/bench.yml"
 INSTALLER="${ROOT}/contrib/install.sh"
+GATE_SCRIPT="${ROOT}/scripts/verify-release-gate.sh"
+RELEASE_DOC="${ROOT}/docs/release-verification.md"
+CI_DOC="${ROOT}/docs/ci.md"
 
 failures=0
 expect_match() {
@@ -104,6 +107,11 @@ expect_job_match "${RELEASE}" "release-gate" 'scripts/verify-release-gate\.sh' "
 expect_job_match "${RELEASE}" "release-gate" 'checks: read' "release-gate job can read check runs"
 expect_job_match "${RELEASE}" "release-gate" 'statuses: read' "release-gate job can read legacy statuses"
 expect_job_absent "${RELEASE}" "release-gate" 'continue-on-error' "release-gate cannot continue on error"
+# The gate script is the single definition of the required check set. Assert
+# the set here so a silent widening/narrowing is caught without re-testing the
+# E6 pagination behavior (that lives in test-verify-release-gate.sh).
+expect_match "${GATE_SCRIPT}" 'required = \("ci-gate", "cargo-deny"\)' "the release gate requires exactly ci-gate and cargo-deny"
+expect_match "${GATE_SCRIPT}" 'git merge-base --is-ancestor' "the release gate enforces branch ancestry"
 expect_match "${RELEASE}" 'needs: \[verify-tag, release-gate\]' "build job depends on the release gate"
 expect_absent "${RELEASE}" 'test-hooks' "release workflow never enables test hooks"
 expect_absent "${RELEASE}" '--all-features' "release workflow never builds with all features"
@@ -204,6 +212,22 @@ if [ -n "${unpinned}" ]; then
 else
     echo "ok - every third-party action is SHA-pinned"
 fi
+
+# The release checklist is the 2.0 gate record. Keep each release-blocking
+# gate named so a documentation edit cannot silently drop a lane. Detailed
+# E4/E5/E6 internals stay in their own policy tests; this only pins the
+# checklist's coverage.
+expect_match "${RELEASE_DOC}" '^## 2\.0 release gate checklist$' "the release checklist is explicitly titled for 2.0"
+expect_match "${RELEASE_DOC}" 'Scan the published image for vulnerabilities' "the checklist names the per-architecture image scan (E4)"
+expect_match "${RELEASE_DOC}" 'ha-ownership\.yml' "the checklist names the root-gated HA ownership lane (E5)"
+expect_match "${RELEASE_DOC}" 'fuzz_seconds=17280' "the checklist names the 24-hour fuzz campaign"
+expect_match "${RELEASE_DOC}" 'bench\.yml' "the checklist names the thresholded benchmark gate"
+expect_match "${RELEASE_DOC}" 'test-migration-1\.9\.5\.sh' "the checklist names the 1.9.5 migration and rollback E2E"
+expect_match "${RELEASE_DOC}" 'test-docker-upgrade\.sh' "the checklist names the Docker upgrade and rollback E2E"
+expect_match "${RELEASE_DOC}" 'latest.*stays on 1\.9\.5' "the checklist keeps latest on 1.9.5 until the final tag"
+expect_match "${RELEASE_DOC}" 'check_test_matrix\.py' "the checklist includes the docs-truth test-matrix check"
+expect_match "${CI_DOC}" 'check_test_matrix\.py' "docs/ci.md documents the test-matrix docs check"
+expect_match "${CI_DOC}" 'scans each promised platform' "docs/ci.md documents the per-architecture image scan"
 
 # The fuzz matrix shape, job timeout headroom and documented 24h recipe are
 # checked by the fuzz-specific policy test.
