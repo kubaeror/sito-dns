@@ -447,6 +447,7 @@ session_ttl_hours = 24
 login_rate_limit = 5
 session_persist = true          # persist sessions/tokens across restarts
 token_default_ttl_days = 90     # 0 = API tokens never expire
+api_rate_limit_per_minute = 600 # 0 = no per-account API ceiling
 ```
 
 | Key | Type | Default | Description |
@@ -467,6 +468,7 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 | `auth.login_rate_limit` | integer | `5` | Maximum failed login attempts allowed per minute per IP before lockout. |
 | `auth.session_persist` | boolean | `true` | Persist sessions (`sessions.toml`) and API tokens (`tokens.toml`) in `data_dir` (0600). Sessions/tokens survive restarts until their TTL, but are revalidated against `users.toml` on load and on every request (account exists, role and credential epoch match); entries written before credential epochs existed are rejected once, so users re-login and API tokens are re-issued after upgrading. Corrupt stores are backed up and start empty. Stop the service before `sito reset-sessions`; the reset refuses to run against a live server unless `--force` is given. |
 | `auth.token_default_ttl_days` | integer | `90` | Default lifetime of newly created API tokens in days; `0` means no expiry. |
+| `auth.api_rate_limit_per_minute` | integer | `600` | Account-wide ceiling for authenticated `/api/v2` requests per minute; `0` disables it. Accepted range is `0`–`1_000_000`. A session and every API token owned by the same account share one bucket; legacy ownerless tokens are limited per token. Exceeding it returns `429` with an RFC 7807 body and `Retry-After`. Existing per-IP login/TOTP and per-endpoint stats/query-log limits still apply (the stricter limit wins). Hot-applied on `PUT /api/v2/config`; no restart needed. |
 
 `[web]` and `[auth]` are parsed into typed structs (`WebConfig`, `AuthConfig`)
 with `deny_unknown_fields`; the single validator (`Config::validate_full()`)
@@ -764,7 +766,8 @@ change those fields locally) before expecting the master to report it synced.
 default values is equivalent to omitting `[auth]`, and legacy keys already
 stripped from replicated bundles (`admin_password_hash`, `tokens`) do not count
 as changes. Non-default `session_ttl_hours`, `login_rate_limit`,
-`session_persist` or `token_default_ttl_days` still require a restart.
+`session_persist` or `token_default_ttl_days` still require a restart;
+`api_rate_limit_per_minute` is the exception and is hot-applied.
 
 Cluster terms are node-persisted, not configuration keys: the master stores the
 current term inside `ha_state.toml` and only an explicit promotion (editing the
@@ -893,6 +896,7 @@ applies the hot settings and reports the restart-only fields that remain.
 | `clients.entries`, `clients.groups`, `clients.client_id_secrets`, `clients.trust_routeros_lease_names`, `clients.trust_arp`, `clients.timezone` | Client registry, per-group rule sets, schedule timezone and per-client upstream scopes rebuilt. |
 | `rewrites.auto_ptr`, `rewrites.ttl`, `rewrites.entries` | Rewrite table replaced. |
 | `privacy.anonymize_querylog` | Query-log writer updated. |
+| `auth.api_rate_limit_per_minute` | Read live by the authenticated-request extractor; the limiter's atomic is updated on apply. |
 | `stats.retention_days`, `stats.rollup_retention_days` | Re-read at each retention sweep: a bounded catch-up on startup (within 5 minutes) and every 24 h thereafter. |
 | `stats.rollup_client_names` | Applied immediately on a live config apply: existing rollups are scrubbed when switched off, and in-flight retention/merge writes consult the live policy so a captured `true` cannot re-insert names. Forward-only for raw `query_log` rows. |
 
@@ -909,7 +913,8 @@ applies the hot settings and reports the restart-only fields that remain.
 
 > [!NOTE]
 > `restart_required` is computed from the same change matrix as the table
-> above: `[server]` except `log_level`, `[auth]`, the web listener fields
+> above: `[server]` except `log_level`, `[auth]` except
+> `api_rate_limit_per_minute`, the web listener fields
 > (`enabled`/`bind`/`port`), `[tls]`, `[acme]`, `[ha]` and `[integrations]`.
 > Everything else applies live. Editing a config file also logs a warning for
 > restart-only changes (the watcher applies the rest).

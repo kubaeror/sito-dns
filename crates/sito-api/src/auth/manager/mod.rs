@@ -772,6 +772,9 @@ pub struct AuthManager {
     /// Same contract as [`Self::tokens_revision`] for sessions.
     sessions_revision: Arc<AtomicU64>,
     token_default_ttl_days: u64,
+    /// Bounded per-account API rate limiter. Its limit is hot-applied from
+    /// `auth.api_rate_limit_per_minute`.
+    api_rate_limiter: Arc<crate::auth::rate_limit::ApiRateLimiter>,
     /// Global user-secret generation; sessions/tokens must match it to be valid.
     generation: u64,
     /// Monotonic source of per-user credential epochs. Seeded from the clock
@@ -790,6 +793,7 @@ pub struct AuthManager {
 mod construction;
 mod login;
 mod prune;
+mod rate_limit;
 mod sessions;
 mod storage;
 mod tokens;

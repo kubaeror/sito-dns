@@ -366,6 +366,7 @@ mod tests {
             username: "operator".to_string(),
             role: Role::Operator,
             token_id: None,
+            owner: None,
         })
     }
 

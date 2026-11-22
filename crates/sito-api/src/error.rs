@@ -26,6 +26,12 @@ pub struct ProblemDetails {
     /// setting that is read at process start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_required: Option<Box<Vec<String>>>,
+    /// `Retry-After` seconds for a 429 response. Never serialized into the
+    /// problem body; the response builder turns it into a header. `u16` keeps
+    /// `ProblemDetails` small (the limiter windows are at most one minute).
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub retry_after_secs: Option<u16>,
 }
 
 impl ProblemDetails {
@@ -37,6 +43,7 @@ impl ProblemDetails {
             detail: detail.into(),
             instance: None,
             restart_required: None,
+            retry_after_secs: None,
         }
     }
 
@@ -71,6 +78,14 @@ impl ProblemDetails {
         Self::new(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests", detail)
     }
 
+    /// Builds a 429 that carries an explicit `Retry-After` in seconds.
+    #[must_use]
+    pub fn too_many_requests_with_retry(detail: impl Into<String>, retry_after_secs: u16) -> Self {
+        let mut problem = Self::too_many_requests(detail);
+        problem.retry_after_secs = Some(retry_after_secs);
+        problem
+    }
+
     pub fn internal_error(detail: impl Into<String>) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -84,21 +99,19 @@ impl ProblemDetails {
     /// Used by rate-limited endpoints so a polling client backs off instead of
     /// immediately retrying an expensive request.
     #[must_use]
-    pub fn into_response_with_retry_after(self) -> Response {
-        let mut response = self.into_response();
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-        response
+    pub fn into_response_with_retry_after(mut self) -> Response {
+        self.retry_after_secs = Some(1);
+        self.into_response()
     }
 }
 
 impl IntoResponse for ProblemDetails {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let retry_after = self.retry_after_secs;
         let body = serde_json::to_string(&self).unwrap_or_else(|_| "{}".to_string());
 
-        Response::builder()
+        let mut response = Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/problem+json")
             .body(axum::body::Body::from(body))
@@ -108,6 +121,12 @@ impl IntoResponse for ProblemDetails {
                     "Failed to render error response",
                 )
                     .into_response()
-            })
+            });
+        if let Some(seconds) = retry_after
+            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 }

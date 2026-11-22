@@ -1089,6 +1089,7 @@ mod tests {
             username: "admin".to_string(),
             role: Role::Admin,
             token_id: None,
+            owner: None,
         })
     }
 
@@ -1097,6 +1098,7 @@ mod tests {
             username: username.to_string(),
             role,
             token_id: None,
+            owner: None,
         })
     }
 
@@ -1157,6 +1159,7 @@ mod tests {
             username: username.to_string(),
             role: session.role,
             token_id: None,
+            owner: None,
         });
         (admin, with_reauth_token(headers, &ticket.token))
     }
@@ -1819,6 +1822,7 @@ mod tests {
                 username: "admin".to_string(),
                 role: Role::Admin,
                 token_id: None,
+                owner: None,
             }),
             State(ctx.clone()),
             ticket_headers,
@@ -2044,6 +2048,7 @@ mod tests {
             username: "ci-admin".to_string(),
             role: Role::Admin,
             token_id: Some(meta.id.clone()),
+            owner: None,
         });
 
         let updated = update_user(
@@ -2304,6 +2309,7 @@ mod tests {
             username: "ci".to_string(),
             role: Role::Admin,
             token_id: Some("tok_123".to_string()),
+            owner: None,
         });
         let err = get_totp_setup(token_user.clone(), State(ctx.clone()), HeaderMap::new())
             .await
@@ -2365,6 +2371,7 @@ mod tests {
             username: "ci".to_string(),
             role: Role::Admin,
             token_id: Some("tok_123".to_string()),
+            owner: None,
         });
         let err = reauth(
             State(ctx.clone()),
@@ -2442,6 +2449,7 @@ mod tests {
             username: "ci".to_string(),
             role: Role::Admin,
             token_id: Some("tok_123".to_string()),
+            owner: None,
         });
         let err = change_password(
             RequireViewer(token_admin.0),
@@ -2578,6 +2586,7 @@ mod tests {
             username: "ci-auth".to_string(),
             role: Role::Admin,
             token_id: Some(parent.id.clone()),
+            owner: None,
         });
 
         let resp = create_token(
@@ -2613,6 +2622,7 @@ mod tests {
             username: "ci-auth".to_string(),
             role: Role::Admin,
             token_id: Some(parent.id.clone()),
+            owner: None,
         });
         let err = create_token(
             stale_bearer,

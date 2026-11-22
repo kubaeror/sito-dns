@@ -735,6 +735,7 @@ mod no_ha_tests {
             username: "admin".to_string(),
             role: Role::Admin,
             token_id: None,
+            owner: None,
         })
     }
 

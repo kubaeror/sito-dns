@@ -51,6 +51,7 @@ pub fn get_session_user(ctx: &ServerContext, headers: &HeaderMap) -> Option<Auth
             username: session.username,
             role: session.role,
             token_id: None,
+            owner: None,
         });
     }
     None

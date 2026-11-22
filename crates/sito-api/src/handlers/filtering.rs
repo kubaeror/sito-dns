@@ -654,6 +654,7 @@ mod tests {
             username: "operator".to_string(),
             role: Role::Operator,
             token_id: None,
+            owner: None,
         })
     }
 
@@ -1037,6 +1038,7 @@ mod tests {
                 username: "viewer".to_string(),
                 role: Role::Viewer,
                 token_id: None,
+                owner: None,
             }),
             State(ctx.clone()),
         )

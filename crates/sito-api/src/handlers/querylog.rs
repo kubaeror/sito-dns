@@ -340,6 +340,7 @@ mod tests {
             username: "viewer".to_string(),
             role: Role::Viewer,
             token_id: None,
+            owner: None,
         });
         let peer = std::net::SocketAddr::from(([198, 51, 100, 250], 12_345));
         let Err(error) = get_querylog(

@@ -263,6 +263,30 @@ pub struct AuthConfig {
     /// Defaults to 90 days so credentials do not live forever by omission.
     #[serde(default = "default_token_ttl_days")]
     pub token_default_ttl_days: u64,
+    /// Maximum authenticated API requests per minute per account.
+    ///
+    /// Sessions and API tokens owned by the same account share one bucket;
+    /// legacy ownerless tokens are limited per token. `0` disables this
+    /// account-wide ceiling. Existing per-endpoint limits still apply; the
+    /// stricter limit wins. Accepted range is `0` through
+    /// [`MAX_API_RATE_LIMIT_PER_MINUTE`].
+    #[serde(default = "default_api_rate_limit_per_minute")]
+    pub api_rate_limit_per_minute: u32,
+}
+
+/// Upper bound accepted for [`AuthConfig::api_rate_limit_per_minute`].
+///
+/// Values above one million requests per minute for one account are not a real
+/// deployment; operators who want no account-wide ceiling can set `0`
+/// (disabled). Bounding the value also keeps the limiter arithmetic and the
+/// `Retry-After` conversion predictable.
+pub const MAX_API_RATE_LIMIT_PER_MINUTE: u32 = 1_000_000;
+
+/// Default per-account API rate limit (requests per minute).
+pub const DEFAULT_API_RATE_LIMIT_PER_MINUTE: u32 = 600;
+
+fn default_api_rate_limit_per_minute() -> u32 {
+    DEFAULT_API_RATE_LIMIT_PER_MINUTE
 }
 
 fn default_token_ttl_days() -> u64 {
@@ -288,6 +312,7 @@ impl Default for AuthConfig {
             login_rate_limit: default_login_rate_limit(),
             session_persist: default_session_persist(),
             token_default_ttl_days: default_token_ttl_days(),
+            api_rate_limit_per_minute: default_api_rate_limit_per_minute(),
         }
     }
 }
@@ -298,6 +323,15 @@ impl AuthConfig {
             return Err(ConfigError::validation(
                 "auth.session_ttl_hours",
                 "session_ttl_hours must be greater than 0 (sessions would expire immediately)",
+            ));
+        }
+        if self.api_rate_limit_per_minute > MAX_API_RATE_LIMIT_PER_MINUTE {
+            return Err(ConfigError::validation(
+                "auth.api_rate_limit_per_minute",
+                format!(
+                    "api_rate_limit_per_minute must be 0 (disabled) or between 1 and {MAX_API_RATE_LIMIT_PER_MINUTE} (got {})",
+                    self.api_rate_limit_per_minute
+                ),
             ));
         }
         Ok(())

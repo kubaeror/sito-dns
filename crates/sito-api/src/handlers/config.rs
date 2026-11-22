@@ -516,6 +516,7 @@ token = "ha-token"
             username: "admin".to_string(),
             role: crate::auth::token::Role::Admin,
             token_id: None,
+            owner: None,
         })
     }
 

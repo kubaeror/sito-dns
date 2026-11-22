@@ -450,6 +450,10 @@ path = "auth.token_default_ttl_days"
 status = "kept"
 
 [[field]]
+path = "auth.api_rate_limit_per_minute"
+status = "kept"
+
+[[field]]
 path = "auth.admin_password_hash"
 status = "removed"
 

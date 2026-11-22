@@ -377,6 +377,10 @@ async fn commit_staged(
         }
     }
     ctx.querylog_sender.set_anonymize(anonymize);
+    // The per-account API rate limit is deliberately hot-applied: the
+    // extractor reads this atomic on every authenticated request.
+    ctx.auth_mgr
+        .set_api_rate_limit(candidate.get_auth_config().api_rate_limit_per_minute);
     // An apply that changes filter rules or the DNSSEC policy flushes the
     // response cache inside the runtime publish; refresh the footprint gauge
     // so it cannot keep reporting reclaimed entries.
@@ -1025,8 +1029,15 @@ pub fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
     // default (`[auth]` with the default values) is equivalent to omitting the
     // section, and HA sanitization strips inert legacy keys such as
     // `admin_password_hash`/`tokens` from the replicated table.
+    // `auth.api_rate_limit_per_minute` is the exception: it is hot-applied
+    // through the live limiter, so it is excluded from the restart comparison.
+    let auth_without_live_limit = |config: &Config| {
+        let mut auth = config.get_auth_config();
+        auth.api_rate_limit_per_minute = sito_core::config::DEFAULT_API_RATE_LIMIT_PER_MINUTE;
+        auth
+    };
     mark(
-        old.get_auth_config() != new.get_auth_config(),
+        auth_without_live_limit(old) != auth_without_live_limit(new),
         "auth",
         &mut fields,
     );
@@ -1653,6 +1664,50 @@ mod tests {
         );
     }
 
+    /// D5a: `auth.api_rate_limit_per_minute` is deliberately hot-applied so an
+    /// operator can tune the account ceiling without a restart, unlike the rest
+    /// of `[auth]`.
+    #[tokio::test]
+    async fn test_api_rate_limit_change_is_hot_applied() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_api_rate_limit");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let previous = (**ctx.config.load()).clone();
+        let mut candidate = previous.clone();
+        candidate.auth =
+            Some(toml::from_str("api_rate_limit_per_minute = 10").expect("valid [auth] table"));
+
+        let report = apply_full_config(&ctx, &candidate, FilterApply::Deferred, None)
+            .await
+            .expect("a rate-limit-only auth change must apply without a restart");
+        assert!(
+            report.restart_required.is_empty(),
+            "the live rate limit must not claim restart-required: {:?}",
+            report.restart_required
+        );
+        assert_eq!(
+            ctx.auth_mgr.api_rate_limit_per_minute(),
+            10,
+            "the live limiter must pick up the applied configuration"
+        );
+
+        // Other [auth] policy changes still require a restart.
+        let mut restarting = candidate.clone();
+        restarting.auth = Some(
+            toml::from_str(
+                "api_rate_limit_per_minute = 10\nlogin_rate_limit = 7\nsession_ttl_hours = 12",
+            )
+            .expect("valid [auth] table"),
+        );
+        assert!(
+            restart_required_fields(&candidate, &restarting)
+                .iter()
+                .any(|field| field == "auth"),
+            "restart-only auth policy must still be reported"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     /// `[dns.tls]` is the effective TLS source (top-level `[tls]` is the
     /// alias). Both must be restart-required, as must legacy `[web] acme_*`
     /// keys resolved through `get_acme_config()`.
@@ -1983,6 +2038,7 @@ acme_enabled = false
                 username: "operator".to_string(),
                 role: Role::Operator,
                 token_id: None,
+                owner: None,
             })
         }
 
