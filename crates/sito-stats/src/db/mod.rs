@@ -58,6 +58,73 @@ const RETENTION_ROWS_PER_CHUNK: i64 = 5_000;
 /// Per-install salt file name under the stats data directory.
 const SALT_FILE_NAME: &str = "stats-salt";
 
+/// Schema version written by this binary into `stats_meta.schema_version`.
+///
+/// Version 1 is implicit: databases written by 1.9.x do not have the marker.
+/// Version 2 adds the persisted schema marker (plus the additive `stats_meta`
+/// table and runtime indexes). The version is deliberately **not** a sqlx
+/// migration row so a 1.9.3 binary can still open an upgraded database.
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// Schema version assumed for a database without a `schema_version` marker.
+pub const LEGACY_SCHEMA_VERSION: i64 = 1;
+
+/// How [`StatsDb::open_with_options`] treats a database that is older than
+/// [`SCHEMA_VERSION`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MigrationMode {
+    /// Upgrade an older database on open. This is the pre-2.0 behavior and the
+    /// default for [`StatsDb::open`].
+    #[default]
+    Auto,
+    /// Refuse to open an older database without changing it. The operator is
+    /// expected to run the explicit migration command first.
+    RequireCurrent,
+}
+
+/// Options controlling how a [`StatsDb`] is opened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatsOpenOptions {
+    /// Whether rollups may retain client names. Matches the existing
+    /// `rollup_client_names` setting.
+    pub rollup_client_names: bool,
+    /// Migration policy applied during open.
+    pub migration_mode: MigrationMode,
+}
+
+/// Read-only view of a database's schema version.
+///
+/// Produced by [`StatsDb::inspect_schema_version`] so callers (for example an
+/// upcoming `sito db migrate` command) can decide whether a migration is
+/// needed without opening the database read-write or running any DDL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaInspection {
+    /// Version recorded in the database (legacy databases report version 1).
+    pub found: i64,
+    /// Version supported by this binary.
+    pub supported: i64,
+}
+
+impl SchemaInspection {
+    /// Whether the database is exactly at the supported schema version.
+    #[must_use]
+    pub fn is_current(self) -> bool {
+        self.found == self.supported
+    }
+
+    /// Whether the database was written by a newer binary.
+    #[must_use]
+    pub fn is_too_new(self) -> bool {
+        self.found > self.supported
+    }
+
+    /// Whether an auto-migration would upgrade the database.
+    #[must_use]
+    pub fn needs_migration(self) -> bool {
+        self.found < self.supported
+    }
+}
+
 /// How long dashboard aggregates may be served from memory before a fresh
 /// scan is allowed. Keeps 5 s UI polling from repeatedly scanning SQLite while
 /// bounding how stale a dashboard can be.

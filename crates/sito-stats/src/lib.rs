@@ -16,8 +16,9 @@ pub mod writer;
 
 pub use anonymize::anonymize_ip;
 pub use db::{
-    ClientStats, GlobalStats, HourlyActivity, MAX_AGGREGATE_ROWS, QueryLogFilter, QueryLogPage,
-    RetentionReport, StatsDb, UpstreamStats,
+    ClientStats, GlobalStats, HourlyActivity, LEGACY_SCHEMA_VERSION, MAX_AGGREGATE_ROWS,
+    MigrationMode, QueryLogFilter, QueryLogPage, RetentionReport, SCHEMA_VERSION, SchemaInspection,
+    StatsDb, StatsOpenOptions, UpstreamStats,
 };
 pub use entry::QueryLogEntry;
 pub use error::StatsError;
@@ -2896,6 +2897,390 @@ mod tests {
             heavy.1, 27,
             "heavy hitter count must be exact across chunks: {tops:?}"
         );
+    }
+
+    /// B1 helpers: the migration set a 1.9.3 binary understands.
+    const V1_9_3_MIGRATION_VERSIONS: [i64; 4] = [
+        20_260_905_000_000,
+        20_260_906_000_000,
+        20_260_913_000_000,
+        20_260_922_000_000,
+    ];
+
+    async fn schema_migration_versions(db: &StatsDb) -> Vec<i64> {
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn raw_pool(path: &std::path::Path) -> sqlx::SqlitePool {
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap()
+    }
+
+    async fn table_names(path: &std::path::Path) -> Vec<String> {
+        let pool = raw_pool(path).await;
+        let names =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        pool.close().await;
+        names
+    }
+
+    async fn set_stored_schema_version(path: &std::path::Path, value: Option<&str>) {
+        let pool = raw_pool(path).await;
+        match value {
+            Some(value) => {
+                sqlx::query(
+                    "INSERT INTO stats_meta (key, value) VALUES ('schema_version', ?) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .bind(value)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            None => {
+                sqlx::query("DELETE FROM stats_meta WHERE key = 'schema_version'")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        pool.close().await;
+    }
+
+    /// B1: a fresh database records the supported version and keeps exactly
+    /// the four sqlx migrations visible to a 1.9.3 binary.
+    #[tokio::test]
+    async fn test_fresh_db_records_schema_version_without_new_migration() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-schema-fresh-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+
+        let db = StatsDb::open(&db_path).await.unwrap();
+        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(StatsDb::supported_schema_version(), SCHEMA_VERSION);
+        assert_eq!(db.schema_version().await.unwrap(), SCHEMA_VERSION);
+        assert!(db.is_schema_current().await.unwrap());
+
+        let stored: String =
+            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'schema_version'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored, SCHEMA_VERSION.to_string());
+        assert_eq!(
+            schema_migration_versions(&db).await,
+            V1_9_3_MIGRATION_VERSIONS.to_vec(),
+            "the schema marker must not add a sqlx migration version"
+        );
+
+        // The read-only inspector sees a current database without migrating.
+        let inspection = StatsDb::inspect_schema_version(&db_path)
+            .await
+            .unwrap()
+            .expect("existing database is inspectable");
+        assert_eq!(
+            inspection,
+            SchemaInspection {
+                found: SCHEMA_VERSION,
+                supported: SCHEMA_VERSION,
+            }
+        );
+        assert!(inspection.is_current());
+        assert!(!inspection.needs_migration());
+        assert!(!inspection.is_too_new());
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// B1: reopening a current database (in either mode) is a no-op.
+    #[tokio::test]
+    async fn test_reopen_is_idempotent() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-stats-schema-reopen-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+
+        let db = StatsDb::open(&db_path).await.unwrap();
+        sqlx::query(
+            "INSERT INTO stats_meta (key, value) VALUES ('test_sentinel', 'untouched') \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let meta_before: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM stats_meta ORDER BY key")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        let migrations_before = schema_migration_versions(&db).await;
+        drop(db);
+
+        let db = StatsDb::open(&db_path).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), SCHEMA_VERSION);
+        let meta_after: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM stats_meta ORDER BY key")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(meta_before, meta_after, "reopen must not rewrite metadata");
+        assert_eq!(schema_migration_versions(&db).await, migrations_before);
+        drop(db);
+
+        // RequireCurrent accepts a current database and also leaves it alone.
+        let db = StatsDb::open_with_options(
+            &db_path,
+            StatsOpenOptions {
+                migration_mode: MigrationMode::RequireCurrent,
+                ..StatsOpenOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), SCHEMA_VERSION);
+        let meta_after_current: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM stats_meta ORDER BY key")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(meta_before, meta_after_current);
+        drop(db);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// B1: a database written by a newer binary is refused before any DDL and
+    /// is never downgraded.
+    #[tokio::test]
+    async fn test_schema_too_new_is_refused_without_mutation() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-schema-new-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+
+        let db = StatsDb::open(&db_path).await.unwrap();
+        drop(db);
+        let too_new = SCHEMA_VERSION + 1;
+        set_stored_schema_version(&db_path, Some(&too_new.to_string())).await;
+
+        let inspection = StatsDb::inspect_schema_version(&db_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspection.found, too_new);
+        assert_eq!(inspection.supported, SCHEMA_VERSION);
+        assert!(inspection.is_too_new());
+
+        let Err(err) = StatsDb::open(&db_path).await else {
+            panic!("a newer schema must not be opened");
+        };
+        assert!(
+            matches!(
+                err,
+                StatsError::SchemaTooNew { found, supported }
+                    if found == too_new && supported == SCHEMA_VERSION
+            ),
+            "expected SchemaTooNew, got {err}"
+        );
+
+        // Refusal happened before DDL: the marker still says the future
+        // version (no silent downgrade), and the migration set is unchanged.
+        let pool = raw_pool(&db_path).await;
+        let stored: String =
+            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'schema_version'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, too_new.to_string());
+        let versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(versions, V1_9_3_MIGRATION_VERSIONS.to_vec());
+        pool.close().await;
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// B1: `RequireCurrent` refuses an additively-upgraded 1.9.x database
+    /// (no version marker) without running migrations or writing anything.
+    #[tokio::test]
+    async fn test_require_current_refuses_legacy_db_without_mutation() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-stats-schema-legacy-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+
+        let pool = create_legacy_db(&db_path).await;
+        // Model a database already touched by 1.9.x additive DDL: stats_meta
+        // exists but predates the schema_version marker.
+        sqlx::query("CREATE TABLE stats_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO stats_meta (key, value) VALUES ('rollup_pii_v2', '1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let tables_before = table_names(&db_path).await;
+
+        let Err(err) = StatsDb::open_with_options(
+            &db_path,
+            StatsOpenOptions {
+                migration_mode: MigrationMode::RequireCurrent,
+                ..StatsOpenOptions::default()
+            },
+        )
+        .await
+        else {
+            panic!("an older schema must not open in RequireCurrent mode");
+        };
+        assert!(
+            matches!(
+                err,
+                StatsError::MigrationRequired { found, supported }
+                    if found == LEGACY_SCHEMA_VERSION && supported == SCHEMA_VERSION
+            ),
+            "expected MigrationRequired, got {err}"
+        );
+
+        assert_eq!(table_names(&db_path).await, tables_before);
+        let inspection = StatsDb::inspect_schema_version(&db_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inspection.found, LEGACY_SCHEMA_VERSION);
+        assert!(inspection.needs_migration());
+
+        let pool = raw_pool(&db_path).await;
+        let marker: Option<String> =
+            sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'schema_version'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(marker.is_none(), "RequireCurrent must not write the marker");
+        let meta_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stats_meta")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(meta_rows, 1);
+        let has_index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_ql_ts_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(has_index, 0, "RequireCurrent must not run additive DDL");
+        pool.close().await;
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// B1: `Auto` still upgrades a 1.9.x database and records version 2.
+    #[tokio::test]
+    async fn test_auto_upgrades_legacy_db_and_records_version() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito-stats-schema-auto-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+
+        let pool = create_legacy_db(&db_path).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO query_log (ts, client_ip, client_name, qname, qtype, rcode, verdict, proto) \
+             VALUES (?, '10.20.0.1', NULL, 'auto-upgrade.example', 1, 0, 'allowed', 'udp')",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let db = StatsDb::open(&db_path).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            schema_migration_versions(&db).await,
+            V1_9_3_MIGRATION_VERSIONS.to_vec()
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM query_log")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "auto-upgrade must preserve existing rows");
+        let has_index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_ql_ts_id'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(has_index, 1);
+        drop(db);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// B1: a corrupt marker is refused (never guessed at), and a missing
+    /// marker is treated as legacy and upgraded rather than downgraded.
+    #[tokio::test]
+    async fn test_corrupt_or_missing_schema_version_fails_closed() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sito-stats-schema-corrupt-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("stats.db");
+
+        let db = StatsDb::open(&db_path).await.unwrap();
+        drop(db);
+
+        for bad in ["not-a-number", "-1", ""] {
+            set_stored_schema_version(&db_path, Some(bad)).await;
+            let Err(err) = StatsDb::open(&db_path).await else {
+                panic!("corrupt marker {bad:?} must not be accepted");
+            };
+            assert!(
+                matches!(&err, StatsError::InvalidSchemaVersion { value } if value == bad),
+                "expected InvalidSchemaVersion for {bad:?}, got {err}"
+            );
+
+            // The bad value is left in place; the open did not overwrite it.
+            let pool = raw_pool(&db_path).await;
+            let stored: String =
+                sqlx::query_scalar("SELECT value FROM stats_meta WHERE key = 'schema_version'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(stored, bad);
+            pool.close().await;
+        }
+
+        // A missing marker on a 1.9.x-style database means "legacy", so Auto
+        // upgrades it to the current version (no downgrade).
+        set_stored_schema_version(&db_path, None).await;
+        let db = StatsDb::open(&db_path).await.unwrap();
+        assert_eq!(db.schema_version().await.unwrap(), SCHEMA_VERSION);
+        drop(db);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }
 

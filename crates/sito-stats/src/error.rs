@@ -18,4 +18,27 @@ pub enum StatsError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The database records a schema version written by a newer binary. The
+    /// open fails before any DDL runs so an old binary cannot corrupt a
+    /// forward-migrated database.
+    #[error(
+        "Database schema version {found} is newer than the supported version {supported}; \
+         upgrade the running sito binary"
+    )]
+    SchemaTooNew { found: i64, supported: i64 },
+
+    /// The database is older than the running binary and the caller asked not
+    /// to apply migrations.
+    #[error(
+        "Database schema version {found} requires migration to {supported}; \
+         run the database migration command first"
+    )]
+    MigrationRequired { found: i64, supported: i64 },
+
+    /// The `stats_meta.schema_version` marker is present but is not a valid
+    /// version number. Treated as an error (never silently downgraded) because
+    /// guessing could run an upgrade against an unknown layout.
+    #[error("Database schema version marker is invalid: '{value}'")]
+    InvalidSchemaVersion { value: String },
 }
