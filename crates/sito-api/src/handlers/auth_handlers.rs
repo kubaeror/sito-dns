@@ -269,7 +269,8 @@ pub async fn login(
     request_body = TotpVerifyRequest,
     responses(
         (status = 200, description = "TOTP verified, session established", body = LoginResponse),
-        (status = 401, description = "Invalid or expired code", body = ProblemDetails)
+        (status = 401, description = "Invalid or expired code", body = ProblemDetails),
+        (status = 429, description = "Locked out or rate limited", body = ProblemDetails)
     ),
     tag = "Auth",
 )]
@@ -447,11 +448,12 @@ pub async fn reauth(
 #[utoipa::path(
     get,
     path = "/api/v2/auth/totp/setup",
-    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v2/auth/reauth")),
+    params(("X-Reauth-Token" = Option<String>, Header, description = "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers only; API-token callers are exempt (API tokens cannot manage TOTP and receive 403).", nullable = false)),
     responses(
         (status = 200, description = "TOTP setup credentials generated", body = TotpSetupResponse),
         (status = 401, description = "Missing, invalid, or expired re-authentication ticket", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "Failed to generate TOTP credentials", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Auth",
@@ -479,12 +481,14 @@ pub async fn get_totp_setup(
     post,
     path = "/api/v2/auth/totp/enable",
     request_body = TotpConfirmRequest,
-    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v2/auth/reauth")),
+    params(("X-Reauth-Token" = Option<String>, Header, description = "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers only; API-token callers are exempt (API tokens cannot manage TOTP and receive 403).", nullable = false)),
     responses(
         (status = 200, description = "TOTP enabled successfully", body = GenericMessageResponse),
         (status = 400, description = "Invalid code", body = ProblemDetails),
         (status = 401, description = "Missing, invalid, or expired re-authentication ticket", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 404, description = "User account not found", body = ProblemDetails),
+        (status = 500, description = "Failed to persist the user store", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Auth",
@@ -527,12 +531,14 @@ pub async fn enable_totp(
     post,
     path = "/api/v2/auth/totp/disable",
     request_body = DisableTotpRequest,
-    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v2/auth/reauth")),
+    params(("X-Reauth-Token" = Option<String>, Header, description = "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers only; API-token callers are exempt (API tokens cannot manage TOTP and receive 403).", nullable = false)),
     responses(
         (status = 200, description = "TOTP disabled successfully", body = GenericMessageResponse),
+        (status = 400, description = "Invalid TOTP verification code", body = ProblemDetails),
         (status = 401, description = "Missing, invalid, or expired re-authentication ticket", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails),
-        (status = 404, description = "User account not found", body = ProblemDetails)
+        (status = 404, description = "User account not found", body = ProblemDetails),
+        (status = 500, description = "Failed to persist the user store", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Auth",
@@ -605,7 +611,7 @@ pub async fn list_tokens(
     post,
     path = "/api/v2/auth/tokens",
     request_body = CreateTokenRequest,
-    params(("X-Reauth-Token" = String, Header, description = "Session-bound re-authentication ticket; required to mint an Admin-scoped token from a user session")),
+    params(("X-Reauth-Token" = Option<String>, Header, description = "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers minting an Admin-scoped token; API-token callers are exempt.", nullable = false)),
     responses(
         (status = 201, description = "API token created", body = CreateTokenResponse),
         (status = 400, description = "Invalid scope", body = ProblemDetails),
@@ -790,13 +796,14 @@ pub async fn list_users(
     post,
     path = "/api/v2/auth/users",
     request_body = CreateUserRequest,
-    params(("X-Reauth-Token" = String, Header, description = "Session-bound re-authentication ticket; required to create an Admin from a user session")),
+    params(("X-Reauth-Token" = Option<String>, Header, description = "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers creating an Admin user; API-token callers are exempt.", nullable = false)),
     responses(
         (status = 201, description = "User created", body = UserDto),
         (status = 400, description = "Invalid username, password or role", body = ProblemDetails),
         (status = 409, description = "Username already exists", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "Failed to persist the user store", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Auth",
@@ -850,14 +857,15 @@ pub async fn create_user(
     request_body = UpdateUserRequest,
     params(
         ("username" = String, Path, description = "Username"),
-        ("X-Reauth-Token" = String, Header, description = "Session-bound re-authentication ticket; required for session callers")
+        ("X-Reauth-Token" = Option<String>, Header, description = "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers; API-token callers are exempt.", nullable = false)
     ),
     responses(
         (status = 200, description = "User role updated", body = UserDto),
         (status = 400, description = "Invalid role or last-admin protection", body = ProblemDetails),
         (status = 404, description = "User not found", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "Failed to persist the user store", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Auth",
@@ -904,7 +912,8 @@ pub async fn update_user(
         (status = 400, description = "Last-admin protection", body = ProblemDetails),
         (status = 404, description = "User not found", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "Failed to persist the user store", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Auth",
@@ -937,12 +946,14 @@ pub async fn delete_user(
     post,
     path = "/api/v2/auth/change-password",
     request_body = ChangePasswordRequest,
-    params(("X-Reauth-Token" = String, Header, description = "Session-bound re-authentication ticket; required for an Admin overriding another account")),
+    params(("X-Reauth-Token" = Option<String>, Header, description = "Session-bound re-authentication ticket from POST /api/v2/auth/reauth. Required for cookie/session callers when an Admin overrides another account's password; API-token callers are exempt.", nullable = false)),
     responses(
         (status = 200, description = "Password changed", body = GenericMessageResponse),
         (status = 400, description = "Password policy violation", body = ProblemDetails),
         (status = 401, description = "Missing/wrong current password or second factor", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 404, description = "Target user not found", body = ProblemDetails),
+        (status = 500, description = "Failed to persist the user store", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Auth",

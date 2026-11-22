@@ -280,8 +280,8 @@ fn redirect_upstream_config() -> Response {
     path = "/api/v2/upstream/config",
     responses(
         (status = 308, description = "Permanent redirect to /api/v2/upstream", headers(("Location", description = "Canonical upstream-config path"))),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
     tag = "Upstream",
     security(("bearer_auth" = []), ("cookie_auth" = []))
@@ -297,8 +297,8 @@ pub(crate) async fn redirect_upstream_config_get(_operator: RequireOperator) -> 
     path = "/api/v2/upstream/config",
     responses(
         (status = 308, description = "Permanent redirect to /api/v2/upstream", headers(("Location", description = "Canonical upstream-config path"))),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
     tag = "Upstream",
     security(("bearer_auth" = []), ("cookie_auth" = []))

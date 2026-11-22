@@ -63,7 +63,8 @@ pub async fn get_upstream_config(
         (status = 200, description = "Updated upstream DNS configuration", body = UpstreamConfigDto),
         (status = 400, description = "Invalid configuration", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "Upstream configuration could not be applied or persisted", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Upstream",
@@ -123,6 +124,7 @@ pub async fn update_upstream_config(
     request_body = UpstreamTestRequest,
     responses(
         (status = 200, description = "Latency test results", body = UpstreamTestResponse),
+        (status = 400, description = "Too many upstream servers in one request", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Forbidden", body = ProblemDetails)
     ),

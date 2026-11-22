@@ -1,6 +1,7 @@
 //! Status endpoint handler.
 
 use crate::auth::RequireViewer;
+use crate::error::ProblemDetails;
 use crate::models::{AcmeStatus, StatusResponse};
 use crate::state::ServerContext;
 use axum::Json;
@@ -11,8 +12,8 @@ use axum::extract::State;
     path = "/api/v2/status",
     responses(
         (status = 200, description = "Server status retrieved successfully", body = StatusResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
     tag = "System",
     security(("bearer_auth" = []), ("cookie_auth" = [])),

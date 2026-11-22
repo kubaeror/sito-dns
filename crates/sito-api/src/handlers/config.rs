@@ -187,7 +187,8 @@ fn restore_placeholders(new: &mut toml::Table, current: &toml::Table) {
     responses(
         (status = 200, description = "Full configuration with masked secrets", body = ConfigResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "The configuration file could not be read", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Config",
@@ -241,11 +242,12 @@ pub async fn get_restart_required(
     path = "/api/v2/config",
     request_body = UpdateConfigRequest,
     responses(
-        (status = 200, description = "Configuration updated successfully", body = GenericMessageResponse),
+        (status = 200, description = "Configuration updated successfully", body = ConfigUpdateResponse),
         (status = 400, description = "Invalid configuration", body = ProblemDetails),
         (status = 409, description = "Configuration changes restart-only fields; nothing was persisted", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "Configuration could not be applied or persisted", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Config",
@@ -784,10 +786,11 @@ token = "ha-token"
     post,
     path = "/api/v2/config/reload",
     responses(
-        (status = 200, description = "Configuration reloaded", body = GenericMessageResponse),
+        (status = 200, description = "Configuration reloaded", body = ConfigUpdateResponse),
         (status = 400, description = "Invalid configuration on disk", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "Configuration could not be read, applied, or persisted", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Config",
@@ -983,7 +986,8 @@ pub fn extract_backup_archive(archive_bytes: &[u8]) -> anyhow::Result<(String, B
     responses(
         (status = 200, description = "Gzipped tar archive containing config and metadata", content_type = "application/gzip"),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "The backup could not be read or archived", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Config",
@@ -1084,7 +1088,8 @@ pub async fn prepare_restore(
         (status = 400, description = "Invalid or expired confirmation token", body = ProblemDetails),
         (status = 409, description = "Restored configuration changes restart-only fields; nothing was persisted", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Forbidden", body = ProblemDetails)
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "Restored configuration could not be applied or persisted", body = ProblemDetails)
     ),
     security(("bearer_auth" = []), ("cookie_auth" = [])),
     tag = "Config",

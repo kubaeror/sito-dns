@@ -132,8 +132,8 @@ fn validate_rewrite_entry(entry: &RewriteEntryConfig) -> Result<(), ProblemDetai
     path = "/api/v2/rewrites",
     responses(
         (status = 200, description = "DNS rewrites retrieved", body = Vec<RewriteDto>),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails)
     ),
     tag = "Rewrites",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -158,9 +158,10 @@ pub async fn get_rewrites(
     request_body = AddRewriteRequest,
     responses(
         (status = 201, description = "DNS rewrite created", body = RewriteDto),
-        (status = 400, description = "Bad Request"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 400, description = "Bad Request", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "Rewrite configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Rewrites",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -205,10 +206,11 @@ pub async fn add_rewrite(
     params(("id" = String, Path, description = "Stable rewrite ID")),
     responses(
         (status = 200, description = "DNS rewrite updated", body = RewriteDto),
-        (status = 400, description = "Bad Request"),
-        (status = 404, description = "Not Found"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 400, description = "Bad Request", body = ProblemDetails),
+        (status = 404, description = "Not Found", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "Rewrite configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Rewrites",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
@@ -249,9 +251,10 @@ pub async fn update_rewrite(
     params(("id" = String, Path, description = "Stable rewrite ID")),
     responses(
         (status = 200, description = "DNS rewrite deleted", body = GenericMessageResponse),
-        (status = 404, description = "Not Found"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden")
+        (status = 404, description = "Not Found", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Forbidden", body = ProblemDetails),
+        (status = 500, description = "Rewrite configuration could not be applied or persisted", body = ProblemDetails)
     ),
     tag = "Rewrites",
     security(("bearer_auth" = []), ("cookie_auth" = [])),
