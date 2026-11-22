@@ -228,6 +228,14 @@ servers = ["udp://192.168.1.1:53"]
 | `allow_private_targets` | boolean | `false` | Allow hostname-configured upstreams to resolve to private/loopback/link-local/reserved addresses. Disabled by default so a compromised or spoofed bootstrap cannot redirect an upstream into the local network or cloud metadata. Bootstrap answers are checked for IPv4-mapped, NAT64, 6to4 and Teredo embeddings of denied addresses, and a denied-only answer is not cached. IP literals in `servers` (and `per_domain.servers`) are the intentional allowlist path: an explicit literal is always accepted, because it is an operator choice rather than a bootstrap answer. This is a config-file-only key: the REST/UI upstream update preserves the current value rather than accepting it in the DTO. |
 | `per_domain` | array of tables | `[]` | Domain-specific upstream forwarder rules (e.g., routing LAN domains to internal router). |
 
+> **Outbound EDNS privacy.** Client-supplied EDNS options `COOKIE`, `NSID`,
+> `Padding`, `DAU`, `DHU` and `N3U` are always stripped before a query is
+> forwarded: they are scoped to the client-to-resolver hop and must not leak
+> upstream. The client's DO bit and the configured EDNS payload behaviour are
+> preserved, and ECS is governed solely by `upstream.ecs` (`off` strips it,
+> `forward` clamps and zeroes it). Stripping client options does not change
+> response shaping.
+
 ### `[[upstream.per_domain]]` entries
 
 | Key | Type | Default | Description |

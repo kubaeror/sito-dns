@@ -4191,6 +4191,217 @@ fn test_ecs_policy_off_strips_and_forward_clamps() {
     );
 }
 
+/// Builds a client query carrying every EDNS option that must never be
+/// forwarded upstream, plus ECS (policy-controlled) and an unknown option
+/// (which may be upstream-relevant and must survive).
+fn query_with_client_edns_options() -> Message {
+    let name = Name::from_str("edns-privacy.example.").unwrap();
+    let mut query = Message::new(29, MessageType::Query, OpCode::Query);
+    query
+        .queries
+        .push(hickory_proto::op::Query::query(name, RecordType::A));
+    let mut edns = Edns::new();
+    edns.set_max_payload(1400);
+    edns.set_dnssec_ok(true);
+    for (code, data) in [
+        (EdnsCode::Cookie, vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        (EdnsCode::NSID, vec![b'n', b's']),
+        (EdnsCode::Padding, vec![0; 16]),
+        (EdnsCode::DAU, vec![8, 13]),
+        (EdnsCode::DHU, vec![2, 4]),
+        (EdnsCode::N3U, vec![1]),
+    ] {
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(u16::from(code), data));
+    }
+    edns.options_mut()
+        .insert(EdnsOption::Subnet(ClientSubnet::new(
+            "192.0.2.55".parse().unwrap(),
+            32,
+            0,
+        )));
+    edns.options_mut()
+        .insert(EdnsOption::Unknown(65_001, vec![9]));
+    query.set_edns(edns);
+    query
+}
+
+/// D9: no client-supplied COOKIE/NSID/Padding/DAU/DHU/N3U may reach an
+/// upstream, in either ECS policy. ECS follows policy and DO is preserved.
+#[test]
+fn test_upstream_query_strips_client_only_edns_options_ecs_off() {
+    let query = query_with_client_edns_options();
+    let mut config = Config::default();
+    config.upstream.ecs = UpstreamEcs::Off;
+
+    let upstream = build_upstream_query(&query, &config, false);
+    let edns = upstream.edns.as_ref().expect("client EDNS must be kept");
+    for code in [
+        EdnsCode::Cookie,
+        EdnsCode::NSID,
+        EdnsCode::Padding,
+        EdnsCode::DAU,
+        EdnsCode::DHU,
+        EdnsCode::N3U,
+    ] {
+        assert!(
+            edns.option(code).is_none(),
+            "client-only option {code:?} must not be forwarded upstream"
+        );
+    }
+    assert!(
+        edns.option(EdnsCode::Subnet).is_none(),
+        "ECS off must not forward a subnet"
+    );
+    assert!(
+        edns.option(EdnsCode::Unknown(65_001)).is_some(),
+        "unknown options are not client-only and must be preserved"
+    );
+    assert!(
+        edns.flags().dnssec_ok,
+        "the client DO bit must be preserved"
+    );
+    assert_eq!(edns.max_payload(), 1400, "client payload must be preserved");
+}
+
+/// D9: `forward` keeps ECS (clamped/zeroed) while still stripping every
+/// client-only option and preserving DO.
+#[test]
+fn test_upstream_query_strips_client_only_edns_options_ecs_forward() {
+    let query = query_with_client_edns_options();
+    let mut config = Config::default();
+    config.upstream.ecs = UpstreamEcs::Forward;
+
+    let upstream = build_upstream_query(&query, &config, false);
+    let edns = upstream.edns.as_ref().expect("client EDNS must be kept");
+    for code in [
+        EdnsCode::Cookie,
+        EdnsCode::NSID,
+        EdnsCode::Padding,
+        EdnsCode::DAU,
+        EdnsCode::DHU,
+        EdnsCode::N3U,
+    ] {
+        assert!(
+            edns.option(code).is_none(),
+            "client-only option {code:?} must not be forwarded upstream"
+        );
+    }
+    let subnet = match edns.option(EdnsCode::Subnet) {
+        Some(EdnsOption::Subnet(subnet)) => *subnet,
+        other => panic!("expected a forwarded ECS option, got {other:?}"),
+    };
+    assert_eq!(subnet.source_prefix(), 24, "IPv4 ECS must clamp to /24");
+    assert_eq!(subnet.scope_prefix(), 0);
+    assert_eq!(subnet.addr().to_string(), "192.0.2.0");
+    assert!(
+        edns.flags().dnssec_ok,
+        "the client DO bit must be preserved"
+    );
+}
+
+/// D9: a query that arrived without EDNS must not gain an OPT record just
+/// because options were stripped.
+#[test]
+fn test_upstream_query_without_edns_stays_without_edns() {
+    let name = Name::from_str("no-edns.example.").unwrap();
+    let mut query = Message::new(30, MessageType::Query, OpCode::Query);
+    query
+        .queries
+        .push(hickory_proto::op::Query::query(name, RecordType::A));
+    let mut config = Config::default();
+    config.upstream.ecs = UpstreamEcs::Forward;
+
+    let upstream = build_upstream_query(&query, &config, false);
+    assert!(
+        upstream.edns.is_none(),
+        "a non-EDNS client query must stay non-EDNS upstream"
+    );
+}
+
+/// D9: `force_dnssec` still synthesizes a minimal OPT record with DO and the
+/// configured payload floor, but never client-only options.
+#[test]
+fn test_upstream_query_force_dnssec_adds_edns_without_client_options() {
+    let name = Name::from_str("forced.example.").unwrap();
+    let mut query = Message::new(31, MessageType::Query, OpCode::Query);
+    query
+        .queries
+        .push(hickory_proto::op::Query::query(name, RecordType::A));
+    let mut config = Config::default();
+    config.upstream.ecs = UpstreamEcs::Off;
+    config.dns.edns_udp_size = 1232;
+
+    let upstream = build_upstream_query(&query, &config, true);
+    let edns = upstream
+        .edns
+        .as_ref()
+        .expect("force_dnssec must add an OPT record");
+    assert!(edns.flags().dnssec_ok, "force_dnssec must set DO");
+    assert_eq!(edns.max_payload(), 1232);
+    assert!(
+        edns.options().options.is_empty(),
+        "a forced OPT record must carry no client options"
+    );
+}
+
+/// D9: the configured payload minimum survives stripping, both when the
+/// client already negotiated EDNS and when DO is forced onto it.
+#[test]
+fn test_upstream_query_force_dnssec_preserves_configured_payload() {
+    let query = query_with_client_edns_options();
+    let mut config = Config::default();
+    config.upstream.ecs = UpstreamEcs::Off;
+    config.dns.edns_udp_size = 4096;
+
+    let upstream = build_upstream_query(&query, &config, true);
+    let edns = upstream.edns.as_ref().expect("EDNS must be present");
+    assert_eq!(
+        edns.max_payload(),
+        4096,
+        "the configured payload minimum must be preserved after stripping"
+    );
+    for code in [
+        EdnsCode::Cookie,
+        EdnsCode::NSID,
+        EdnsCode::Padding,
+        EdnsCode::DAU,
+        EdnsCode::DHU,
+        EdnsCode::N3U,
+    ] {
+        assert!(edns.option(code).is_none());
+    }
+}
+
+/// D9 evidence: client-only EDNS options never reached the cache key, so the
+/// cache query keeps them (see `sito_cache::CacheKey::for_query`) and stripping
+/// them outbound does not need a cache-side change.
+#[test]
+fn test_cache_key_ignores_client_only_edns_options() {
+    use sito_cache::CacheKey;
+
+    let optioned = query_with_client_edns_options();
+    let mut plain = optioned.clone();
+    if let Some(edns) = plain.edns.as_mut() {
+        for code in [
+            EdnsCode::Cookie,
+            EdnsCode::NSID,
+            EdnsCode::Padding,
+            EdnsCode::DAU,
+            EdnsCode::DHU,
+            EdnsCode::N3U,
+        ] {
+            edns.options_mut().remove(code);
+        }
+    }
+
+    assert_eq!(
+        CacheKey::for_query(&optioned),
+        CacheKey::for_query(&plain),
+        "client-only EDNS options must not split or leak cache entries"
+    );
+}
+
 /// P2-25: the global/group precedence table is consistent across tiers:
 /// within a tier `Allow > Rewrite > Block`, the group overlay wins ties,
 /// and `$important` always outranks standard rules.
