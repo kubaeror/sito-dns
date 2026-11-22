@@ -103,6 +103,20 @@ exposes only the generic ready flag; read `readiness_reason` on the
 authenticated `/api/v2/ha/status` endpoint (or the logs) for the detailed
 cause.
 
+Master readiness can additionally require replication health with
+`ha.require_slaves` (at least one connected slave synced to the current
+configuration version) or `ha.require_all_slaves` (every connected slave synced;
+zero connected slaves also fails). Both default to `false`, so an upgrade keeps
+the previous behavior: a master with a healthy listener and last publish stays
+ready even with no slaves. "Synced" means the slave acknowledged the master's
+current published version and has no latched divergence; a slave ahead, behind,
+or forked does not count. When the policy is unmet, `/api/v2/ha/status` reports
+`ready: false` and a reason such as
+`HA requires at least one synced slave (0/2 connected)` or
+`HA requires all slaves synced (1/2 synced)`. These fields only gate the master
+role; slave readiness is unaffected. See the
+[configuration reference §13](configuration-reference.md#13-ha--high-availability-masterslave-replication).
+
 ### Health and status endpoint semantics (WP-1.7)
 
 `/health` is the generic, unauthenticated probe:
@@ -579,6 +593,7 @@ When a slave node fails or must be reprovisioned from bare metal:
 | Push rejected with `restart_required` | The master bundle changed a restart-only field that is not node-local (for example `server.log_format` or `[auth]`) | The slave kept its previous live configuration and file and ACKs `applied:false`. Restart the slave after setting the intended value locally, or change the shared setting only when a coordinated restart is acceptable. Node-local listener/TLS/`[web]`/MikroTik fields are preserved automatically and do not trigger this; web identity (including `enabled`) is node-local, so a slave may run with the admin listener disabled and still synchronize (the readiness healthcheck separately requires it). |
 | Slave state is `Connecting` in loop | Network unreachable, firewall blocking 8953, or mTLS handshake failed/timed out | Check `nc -zv 192.168.1.10 8953`. Check TLS certificate expiration or fingerprint mismatch in logs. `readiness_reason` carries the last connection/handshake error. |
 | `GET /api/v2/ha/status` reports `"ready": false` or the container healthcheck fails while DNS answers | The replication listener or slave worker is not operational: key/certificate unreadable by the runtime user, listener bind failure, or the slave has not reached `Synced` | Read `readiness_reason` and the service logs. Fixing certificate ownership (`chown sito:sito` or `65532:65532`, mode `0600`) and restarting restores the listener. A healthy DNS probe alone no longer marks the node healthy. |
+| Master reason is `HA requires at least one synced slave` or `HA requires all slaves synced` | `ha.require_slaves`/`ha.require_all_slaves` is enabled and a connected slave is behind the current version, latched as diverged, or (for `require_all_slaves`) there are no connected slaves | Inspect `GET /api/v2/ha/slaves` (`synced_version`, `lag`, `diverged`). Wait for the ACK, issue `POST /api/v2/ha/resync`, or resolve the divergence/staleness. If the requirement is not intended, remove the flag; both default to `false`. |
 | Log says `Failed to initialize mTLS ... Permission denied` | Private key is owned by root or another user that the service account cannot read | Regenerate with `--uid/--gid` for the runtime user, or `chown` the key files; keep keys mode `0600`. |
 | `Signature verification failed` | Bundle signature does not match master public key | Verify that the master didn't regenerate `ha_signing.key` without updating slaves. Compare `master_pubkey` from the master's `/api/v2/ha/status` with the slave config. |
 | `Incoming version <= have_version` | Out of order or replayed bundle | Normal during network blips; the master will send the latest monotonic version. After a promotion, an older-term master is rejected even with a higher version; promote the master explicitly (section 2). |

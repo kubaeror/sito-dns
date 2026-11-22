@@ -54,7 +54,8 @@ pub(super) fn init_ha(
             signing_key.clone(),
             metrics.clone(),
         )
-        .with_state_path(config.server.data_dir.join("ha_state.toml"));
+        .with_state_path(config.server.data_dir.join("ha_state.toml"))
+        .with_slave_requirements(ha_config.require_slaves, ha_config.require_all_slaves);
 
         if ha_config.replication_port == 0 {
             coordinator.mark_replication_disabled();

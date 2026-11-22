@@ -42,6 +42,8 @@ impl MasterCoordinator {
             last_publish_error: Arc::new(Mutex::new(None)),
             publish_retry_running: Arc::new(AtomicBool::new(false)),
             readiness: HaReadinessState::not_ready("master replication listener has not started"),
+            require_slaves: Arc::new(AtomicBool::new(false)),
+            require_all_slaves: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -61,7 +63,69 @@ impl MasterCoordinator {
                 "last HA configuration publish failed: {error}"
             ));
         }
+        if let Some(reason) = self.slave_requirement_violation() {
+            return HaReadiness::not_ready(reason);
+        }
         listener
+    }
+
+    /// Applies the opt-in slave readiness requirements from `[ha]`.
+    ///
+    /// `require_all` also covers the "no slaves" case, so it implies
+    /// `require_any` even when only `require_all_slaves` is set.
+    #[must_use]
+    pub fn with_slave_requirements(self, require_slaves: bool, require_all_slaves: bool) -> Self {
+        self.require_slaves.store(require_slaves, Ordering::SeqCst);
+        self.require_all_slaves
+            .store(require_all_slaves, Ordering::SeqCst);
+        self
+    }
+
+    /// Returns why `ha.require_slaves`/`ha.require_all_slaves` is unmet.
+    ///
+    /// The slave map and `current_version` are read as one snapshot: holding
+    /// the map lock while reading the version keeps a concurrent publish from
+    /// being observed halfway, so a freshly published version is not compared
+    /// against the previous version's ACK state. Lock order (slaves, then
+    /// diverged) matches `list_slaves` and `clear_divergence_for`; no await is
+    /// held while either lock is held.
+    fn slave_requirement_violation(&self) -> Option<String> {
+        let require_all = self.require_all_slaves.load(Ordering::SeqCst);
+        let require_any = self.require_slaves.load(Ordering::SeqCst);
+        if !require_any && !require_all {
+            return None;
+        }
+
+        let slaves = sito_core::sync::lock_or_recover(&self.slaves);
+        let current_version = self.current_version.load(Ordering::SeqCst);
+        let diverged = sito_core::sync::lock_or_recover(&self.diverged);
+        let connected = slaves.len();
+        // "Synced" is exactly the current published version and no latched
+        // divergence (a slave ahead, behind, or forked is not synced).
+        let synced = slaves
+            .values()
+            .filter(|slave| {
+                slave.synced_version == current_version && !diverged.contains_key(&slave.instance)
+            })
+            .count();
+        drop(diverged);
+        drop(slaves);
+
+        if require_all {
+            if synced == connected && connected > 0 {
+                None
+            } else {
+                Some(format!(
+                    "HA requires all slaves synced ({synced}/{connected} synced)"
+                ))
+            }
+        } else if synced == 0 {
+            Some(format!(
+                "HA requires at least one synced slave ({synced}/{connected} connected)"
+            ))
+        } else {
+            None
+        }
     }
 
     pub(super) fn set_publish_error(&self, error: Option<String>) {

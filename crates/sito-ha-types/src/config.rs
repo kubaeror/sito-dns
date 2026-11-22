@@ -77,6 +77,21 @@ pub struct HaConfig {
     #[serde(default)]
     pub allow_insecure_ws: bool,
 
+    /// Require at least one connected slave synced to the current configuration
+    /// version before master readiness reports ready (default: false).
+    ///
+    /// Only gates the master role; slave readiness is unaffected.
+    #[serde(default)]
+    pub require_slaves: bool,
+
+    /// Require every connected slave to be synced to the current configuration
+    /// version before master readiness reports ready (default: false).
+    ///
+    /// This is stronger than [`Self::require_slaves`]: zero connected slaves is
+    /// also not ready. Only gates the master role.
+    #[serde(default)]
+    pub require_all_slaves: bool,
+
     /// Interval in seconds for sending periodic statistics reports from slave to master (default: 30s).
     #[serde(default = "default_stats_interval_secs")]
     pub stats_interval_secs: u64,
@@ -101,6 +116,8 @@ impl Default for HaConfig {
             slave_token: None,
             allow_unpinned_tls: false,
             allow_insecure_ws: false,
+            require_slaves: false,
+            require_all_slaves: false,
             stats_interval_secs: default_stats_interval_secs(),
             ping_interval_secs: default_ping_interval_secs(),
         }
@@ -271,6 +288,42 @@ pinned_slave_fingerprints = ["blake3:11223344"]
         assert_eq!(cfg.replication_port, 8953);
         assert_eq!(cfg.master_url.as_deref(), Some("wss://127.0.0.1:8953"));
         assert_eq!(cfg.pinned_slave_fingerprints.len(), 1);
+        assert!(cfg.validate("slave").is_ok());
+    }
+
+    #[test]
+    fn test_slave_readiness_requirements_default_false_and_parse() {
+        let defaults = HaConfig::default();
+        assert!(!defaults.require_slaves);
+        assert!(!defaults.require_all_slaves);
+
+        // Absent keys preserve the pre-upgrade behavior.
+        let absent: toml::Value = toml::from_str("replication_port = 8953").unwrap();
+        let absent = HaConfig::from_toml_value(&absent).unwrap();
+        assert!(!absent.require_slaves);
+        assert!(!absent.require_all_slaves);
+
+        let explicit: toml::Value = toml::from_str(
+            "replication_port = 8953\nrequire_slaves = true\nrequire_all_slaves = true",
+        )
+        .unwrap();
+        let explicit = HaConfig::from_toml_value(&explicit).unwrap();
+        assert!(explicit.require_slaves);
+        assert!(explicit.require_all_slaves);
+    }
+
+    #[test]
+    fn test_slave_readiness_requirements_do_not_affect_slave_validation() {
+        // The fields only gate master readiness; a slave with both set must
+        // still validate (and start) normally.
+        let cfg = HaConfig {
+            master_url: Some("wss://127.0.0.1:8953".to_string()),
+            master_fingerprint: Some("blake3:abcdef0123456789".to_string()),
+            master_pubkey: Some("00".repeat(32)),
+            require_slaves: true,
+            require_all_slaves: true,
+            ..Default::default()
+        };
         assert!(cfg.validate("slave").is_ok());
     }
 

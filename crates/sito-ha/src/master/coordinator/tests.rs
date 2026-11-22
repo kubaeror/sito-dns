@@ -732,6 +732,221 @@ async fn test_master_replication_disabled_is_ready_and_explained() {
     );
 }
 
+fn install_slave(coordinator: &MasterCoordinator, instance: &str, synced_version: u64) {
+    let (tx, _rx) = mpsc::channel::<HaMessage>(1);
+    coordinator.slaves.lock().unwrap().insert(
+        instance.to_string(),
+        ActiveSlave {
+            instance: instance.to_string(),
+            remote_addr: "127.0.0.1:1000".parse().unwrap(),
+            synced_version,
+            last_ping: Instant::now(),
+            connected_at: Utc::now(),
+            last_stats: None,
+            sender: tx,
+            capabilities: vec![],
+            connection_id: 1,
+        },
+    );
+}
+
+#[test]
+fn test_no_slave_requirements_keeps_master_ready_without_slaves() {
+    let coordinator = test_coordinator();
+    coordinator.mark_replication_ready();
+    let readiness = coordinator.readiness();
+    assert!(
+        readiness.ready,
+        "the default policy must not require slaves: {readiness:?}"
+    );
+    assert!(readiness.reason.is_none());
+}
+
+#[test]
+fn test_require_slaves_without_slaves_is_not_ready() {
+    let coordinator = test_coordinator().with_slave_requirements(true, false);
+    coordinator.mark_replication_ready();
+    let readiness = coordinator.readiness();
+    assert!(!readiness.ready);
+    assert_eq!(
+        readiness.reason.as_deref(),
+        Some("HA requires at least one synced slave (0/0 connected)")
+    );
+}
+
+#[test]
+fn test_require_slaves_with_one_synced_slave_is_ready() {
+    let coordinator = test_coordinator().with_slave_requirements(true, false);
+    coordinator.mark_replication_ready();
+    install_slave(&coordinator, "slave-1", coordinator.get_current_version());
+    let readiness = coordinator.readiness();
+    assert!(readiness.ready, "one synced slave satisfies the policy");
+    assert!(readiness.reason.is_none());
+}
+
+#[test]
+fn test_require_slaves_with_only_behind_slaves_is_not_ready() {
+    let coordinator = test_coordinator().with_slave_requirements(true, false);
+    coordinator.mark_replication_ready();
+    let current = coordinator.get_current_version();
+    install_slave(&coordinator, "slave-1", current.saturating_sub(1));
+    install_slave(&coordinator, "slave-2", 0);
+    let readiness = coordinator.readiness();
+    assert!(!readiness.ready);
+    assert_eq!(
+        readiness.reason.as_deref(),
+        Some("HA requires at least one synced slave (0/2 connected)")
+    );
+}
+
+#[test]
+fn test_require_slaves_is_ready_when_any_slave_is_synced() {
+    let coordinator = test_coordinator().with_slave_requirements(true, false);
+    coordinator.mark_replication_ready();
+    let current = coordinator.get_current_version();
+    install_slave(&coordinator, "slave-1", current);
+    install_slave(&coordinator, "slave-2", current.saturating_sub(1));
+    assert!(
+        coordinator.readiness().ready,
+        "require_slaves needs one synced slave, not all of them"
+    );
+}
+
+#[test]
+fn test_require_slaves_treats_diverged_current_slave_as_unsynced() {
+    let coordinator = test_coordinator().with_slave_requirements(true, false);
+    coordinator.mark_replication_ready();
+    let current = coordinator.get_current_version();
+    install_slave(&coordinator, "slave-1", current);
+    coordinator.mark_diverged(
+        DivergenceKind::Term,
+        "slave-1",
+        current,
+        1,
+        "newer term".to_string(),
+    );
+    let readiness = coordinator.readiness();
+    assert!(
+        !readiness.ready,
+        "a latched divergence must override an equal version"
+    );
+    assert_eq!(
+        readiness.reason.as_deref(),
+        Some("HA requires at least one synced slave (0/1 connected)")
+    );
+}
+
+#[test]
+fn test_require_all_slaves_without_slaves_is_not_ready() {
+    let coordinator = test_coordinator().with_slave_requirements(false, true);
+    coordinator.mark_replication_ready();
+    let readiness = coordinator.readiness();
+    assert!(!readiness.ready);
+    assert_eq!(
+        readiness.reason.as_deref(),
+        Some("HA requires all slaves synced (0/0 synced)")
+    );
+}
+
+#[test]
+fn test_require_all_slaves_with_all_synced_is_ready() {
+    let coordinator = test_coordinator().with_slave_requirements(false, true);
+    coordinator.mark_replication_ready();
+    let current = coordinator.get_current_version();
+    install_slave(&coordinator, "slave-1", current);
+    install_slave(&coordinator, "slave-2", current);
+    let readiness = coordinator.readiness();
+    assert!(readiness.ready);
+    assert!(readiness.reason.is_none());
+}
+
+#[test]
+fn test_require_all_slaves_with_one_behind_is_not_ready() {
+    let coordinator = test_coordinator().with_slave_requirements(false, true);
+    coordinator.mark_replication_ready();
+    let current = coordinator.get_current_version();
+    install_slave(&coordinator, "slave-1", current);
+    install_slave(&coordinator, "slave-2", current.saturating_sub(1));
+    let readiness = coordinator.readiness();
+    assert!(!readiness.ready);
+    assert_eq!(
+        readiness.reason.as_deref(),
+        Some("HA requires all slaves synced (1/2 synced)")
+    );
+}
+
+#[test]
+fn test_require_all_slaves_implies_require_slaves() {
+    // Only require_all_slaves is set: with no slaves it must still fail, so
+    // the stricter flag cannot be satisfied by the laxer default.
+    let coordinator = test_coordinator().with_slave_requirements(false, true);
+    coordinator.mark_replication_ready();
+    assert!(!coordinator.readiness().ready);
+}
+
+#[test]
+fn test_slave_requirement_policy_is_shared_with_coordinator_clones() {
+    // `spawn_master_server` applies the policy to a clone; the API/health
+    // reader holds a clone made before that, so the policy must be shared.
+    let observer = test_coordinator();
+    let coordinator = observer.clone().with_slave_requirements(true, false);
+    coordinator.mark_replication_ready();
+    let readiness = observer.readiness();
+    assert!(!readiness.ready);
+    assert!(
+        readiness
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("at least one synced slave")),
+        "the clone must observe the configured policy: {readiness:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_master_server_applies_slave_requirements_from_config() {
+    let coordinator = test_coordinator();
+    let observer = coordinator.clone();
+    let port = sito_test_support::reserve_port_number().unwrap();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = spawn_master_server(
+        HaConfig {
+            replication_port: port,
+            listen_addr: "127.0.0.1".to_string(),
+            allow_insecure_ws: true,
+            slave_token: Some("tok".to_string()),
+            require_slaves: true,
+            ..Default::default()
+        },
+        coordinator,
+        shutdown_rx,
+    );
+
+    let mut readiness = observer.readiness();
+    for _ in 0..50 {
+        if readiness
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("at least one synced slave"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        readiness = observer.readiness();
+    }
+    assert!(
+        !readiness.ready,
+        "require_slaves must gate the listener-ready master: {readiness:?}"
+    );
+    assert_eq!(
+        readiness.reason.as_deref(),
+        Some("HA requires at least one synced slave (0/0 connected)")
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
 #[tokio::test]
 async fn test_broadcast_falls_back_to_async_delivery_when_queue_full() {
     let coordinator = test_coordinator();
