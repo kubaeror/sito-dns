@@ -603,16 +603,23 @@ writer lock for the whole sweep; the per-connection temp tables hold at most
 one hour of distinct domains, clients and upstreams and are cleared after each
 hour. The `keep_aggregates=true` clear uses the same bounded shape: it processes
 the oldest remaining hour in row-bounded `(ts, id)` chunks of 5,000 rows,
-commits each chunk separately, and then moves to the next hour. Memory is
-therefore bounded to roughly one chunk of distinct values and the writer lock
-is held for at most one chunk. A committed chunk already contains the rollup
-contribution of the rows it deleted, so an interrupted clear leaves a
-consistent prefix and re-running the command resumes from the oldest remaining
-row without double counting. Each chunk merges its delta into the current
-`stats_hourly` row inside the write transaction, so a concurrent rollup update
-is preserved and a retry after a partial hour keeps the top lists accumulated
-by the committed chunks; a deleted rollup row is not resurrected, and a
-zero-row chunk never creates an empty rollup. The in-process maintenance lock
+commits each chunk separately, and then moves to the next hour. The top-list
+accumulator is cumulative for the hour (the temp tables are not cleared per
+chunk), so a heavy hitter below a chunk-local top-N but in the hour's top-N is
+preserved; only the counters are per-chunk deltas. Memory is therefore bounded
+to roughly one hour of distinct values and the writer lock is held for at most
+one chunk. A committed chunk already contains the rollup contribution of the
+rows it deleted, so an interrupted clear leaves a consistent prefix and
+re-running the command resumes from the oldest remaining row without double
+counting. Each chunk re-reads the current `stats_hourly` row inside the write
+transaction, merges the pre-clear snapshot plus the run's cumulative counts,
+and adds any positive-only external top-list delta; a concurrent rollup update
+is therefore preserved, a deleted rollup row is not resurrected, and a zero-row
+chunk never creates an empty rollup. Top-list exactness across a *failed* run is
+bounded by the top-N stored at the interruption point: an entity below that
+snapshot cannot be recovered by the retry (its remaining chunks are still
+counted), while counters stay exact and an uninterrupted run matches retention.
+The in-process maintenance lock
 serializes retention and the clear, so a live API/UI clear cannot overwrite the
 retention scheduler's top lists. The CLI path takes the service lease and
 refuses a live server unless `--force`; the API/UI path necessarily runs live,

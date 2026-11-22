@@ -21,19 +21,29 @@
 //! for the next hour until the requested range is empty. Each chunk is its own
 //! `BEGIN IMMEDIATE` transaction, so the writer lock is held for at most
 //! [`RETENTION_ROWS_PER_CHUNK`] rows and the per-connection temp tables hold at
-//! most one chunk of distinct domains/clients/upstreams. Every committed chunk
-//! already contains the rollup contributions of the rows it deleted, so a
-//! crash or interruption loses only the uncommitted chunk and re-running the
-//! clear safely continues from the oldest remaining row.
+//! most one hour of distinct domains/clients/upstreams. The top-list
+//! accumulator is cumulative for the hour (not cleared per chunk), so a heavy
+//! hitter below a chunk-local top-N but in the hour's top-N is preserved; the
+//! counters themselves are added per chunk and never double count. Every
+//! committed chunk already contains the rollup contributions of the rows it
+//! deleted, so a crash or interruption loses only the uncommitted chunk and
+//! re-running the clear safely continues from the oldest remaining row.
 //!
-//! Unlike retention's cumulative snapshot, a clear chunk re-reads the current
-//! `stats_hourly` row **inside** its transaction and merges only that chunk's
-//! delta into it. This keeps counters and top lists exact across a retry after
-//! a partial hour (the stored row already has the committed chunks) and
-//! preserves an update made by a concurrent rollup writer between chunks. A
-//! zero-row chunk is ignored: it never creates or increments a rollup. If a
-//! rollup row existed at hour start but was deleted mid-run (rollup retention),
-//! later chunks delete the detailed rows without resurrecting it.
+//! A clear chunk re-reads the current `stats_hourly` row **inside** its
+//! transaction. It merges the pre-clear snapshot plus the run's cumulative temp
+//! counts, and adds any positive-only top-list delta made by another writer
+//! between chunks (normally impossible under the shared maintenance lock, but
+//! preserved defensively). A zero-row chunk is ignored: it never creates or
+//! increments a rollup. If a rollup row existed at hour start but was deleted
+//! mid-run (rollup retention), later chunks delete the detailed rows without
+//! resurrecting it.
+//!
+//! Top-list exactness has one documented bounded-summary limit across a
+//! **failed** run: the last committed chunk stores only the hour's top-N, so an
+//! entity that was below that bounded snapshot at the interruption point cannot
+//! be recovered by the retry (only its remaining chunks are counted). Totals
+//! (queries/blocked/cached) stay exact, and an uninterrupted run matches
+//! retention's cumulative top-N behavior.
 //!
 //! [`StatsDb::cleanup_retention_inner`] and this clear share an in-process
 //! maintenance lock, so a live API/UI clear cannot interleave with the
@@ -206,7 +216,7 @@ impl StatsDb {
             // cannot resurrect them.
             let existing_rollups = load_existing_rollups(&mut conn, &[hour]).await?;
             let existing_tops = existing_rollups.get(&hour).cloned().unwrap_or_default();
-            let chunk_base = ChunkRollupBase::Snapshot(existing_tops);
+            let mut chunk_base = ChunkRollupBase::Snapshot(&existing_tops);
 
             let mut lower = (hour, 0i64);
             loop {
@@ -234,7 +244,7 @@ impl StatsDb {
                     .rollup_and_delete_chunk(
                         &mut conn,
                         &RetentionChunk { hour, lower, upper },
-                        &chunk_base,
+                        &mut chunk_base,
                         done,
                         rollup_client_names,
                     )
@@ -499,6 +509,33 @@ impl StatsDb {
         rollup
     }
 
+    /// Adds external-only top-list deltas to an already merged hour rollup.
+    ///
+    /// The keep-aggregates clear rebuilds the hour's top lists from its
+    /// pre-clear snapshot plus cumulative temp counts on every chunk. If
+    /// another writer updated the live row between chunks (normally impossible
+    /// under the shared maintenance lock, but possible for an out-of-process
+    /// writer), the positive-only delta is accumulated in
+    /// [`ClearRollupState::external`] and merged here so it is not replaced.
+    fn merge_external_rollup(
+        &self,
+        mut merged: HourRollup,
+        external: &HourRollup,
+        rollup_client_names: bool,
+    ) -> HourRollup {
+        if external.domains.is_empty()
+            && external.clients.is_empty()
+            && external.upstreams.is_empty()
+        {
+            return merged;
+        }
+        let external = self.normalize_hour_rollup(external.clone(), rollup_client_names);
+        merged.domains = merge_domain_tops(merged.domains, external.domains, ROLLUP_TOP_N * 2);
+        merged.clients = merge_client_tops(merged.clients, external.clients, ROLLUP_TOP_N);
+        merged.upstreams = merge_upstream_tops(merged.upstreams, external.upstreams, ROLLUP_TOP_N);
+        merged
+    }
+
     /// Folds every row in `[start, end)` into `stats_hourly` and deletes
     /// exactly those rows, in bounded chunks.
     ///
@@ -514,11 +551,13 @@ impl StatsDb {
     /// A committed chunk has already written the rollup contributions of the
     /// rows it deleted, so an interrupted clear leaves a consistent prefix.
     /// Re-running the clear starts again at the oldest remaining hour and adds
-    /// only that run's remaining rows. Each chunk re-reads the current
-    /// `stats_hourly` row inside its own transaction and merges the chunk's
-    /// delta into it, so a concurrent rollup writer (retention) cannot have its
-    /// update replaced by a stale snapshot; counters are added and top lists
-    /// are merged, never replaced with a pre-run snapshot.
+    /// only that run's remaining rows. The top-list accumulator is cumulative
+    /// for the hour, so heavy hitters below a chunk-local top-N survive. Each
+    /// chunk re-reads the current `stats_hourly` row inside its own transaction
+    /// to preserve a concurrent update and to avoid resurrecting a deleted
+    /// row; counters are added per chunk and top lists are a merged summary.
+    /// A failed run's stored top-N is bounded, so an entity below it at the
+    /// failure point cannot be recovered by the retry (documented residual).
     pub(super) async fn rollup_and_delete_range(
         &self,
         start: i64,
@@ -576,7 +615,23 @@ impl StatsDb {
                     .bind(hour)
                     .fetch_one(&mut *conn)
                     .await?;
-            let mut allow_insert = hour_had_rollup == 0;
+
+            // Top lists are cumulative for the hour (the temp tables are not
+            // cleared per chunk), so a domain below the chunk-local top-N but
+            // in the hour's top-N is not dropped. Counters are still added per
+            // chunk, so totals do not double count.
+            Self::clear_retention_temp_hour(&mut conn, hour).await?;
+            let existing = load_existing_rollups(&mut conn, &[hour])
+                .await?
+                .get(&hour)
+                .cloned()
+                .unwrap_or_default();
+            let mut clear_state = ClearRollupState {
+                existing,
+                external: HourRollup::default(),
+                last_written: None,
+                allow_insert: hour_had_rollup == 0,
+            };
 
             let hour_upper = (hour_end, i64::MIN);
             let mut lower = (hour_start, i64::MIN);
@@ -600,26 +655,16 @@ impl StatsDb {
                 .await?;
                 let (upper, done) = boundary.map_or((hour_upper, true), |cursor| (cursor, false));
 
-                // This path merges only the chunk's own counts, so the temp
-                // tables are cleared before every chunk (they hold at most one
-                // chunk of distinct values).
-                Self::clear_retention_temp_hour(&mut conn, hour).await?;
-                let base = ChunkRollupBase::CurrentRow { allow_insert };
+                let mut base = ChunkRollupBase::CurrentRow(&mut clear_state);
                 let deleted = self
                     .rollup_and_delete_chunk(
                         &mut conn,
                         &RetentionChunk { hour, lower, upper },
-                        &base,
+                        &mut base,
                         done,
                         rollup_client_names,
                     )
                     .await?;
-                if deleted > 0 {
-                    // A row now exists (either the pre-existing one or one this
-                    // clear inserted); a later disappearance is an external
-                    // delete, not a missing first insert.
-                    allow_insert = false;
-                }
                 report.deleted_records = report.deleted_records.saturating_add(deleted);
                 report.chunks = report.chunks.saturating_add(1);
 
@@ -640,14 +685,14 @@ impl StatsDb {
     ///
     /// `base` selects how the chunk's top lists are merged:
     /// [`ChunkRollupBase::Snapshot`] for retention's cumulative sweep, and
-    /// [`ChunkRollupBase::CurrentRow`] for the keep-aggregates clear, which
-    /// re-reads the live row inside this transaction so a concurrent rollup
-    /// writer's contribution is merged rather than replaced.
+    /// [`ChunkRollupBase::CurrentRow`] for the keep-aggregates clear, which uses
+    /// the run's cumulative temp counts plus the pre-clear snapshot (and any
+    /// external top-list delta observed between chunks).
     pub(super) async fn rollup_and_delete_chunk(
         &self,
         conn: &mut SqliteConnection,
         chunk: &RetentionChunk,
-        base: &ChunkRollupBase,
+        base: &mut ChunkRollupBase<'_>,
         final_hour: bool,
         rollup_client_names: bool,
     ) -> Result<u64, StatsError> {
@@ -683,7 +728,7 @@ impl StatsDb {
 
         // A bounded clear can discover a chunk whose rows were removed by a
         // concurrent writer. Do not create or increment a rollup for zero rows.
-        if queries == 0 && matches!(base, ChunkRollupBase::CurrentRow { .. }) {
+        if queries == 0 && matches!(base, ChunkRollupBase::CurrentRow(_)) {
             drop(tx);
             return Ok(0);
         }
@@ -765,14 +810,19 @@ impl StatsDb {
 
         // Write the accumulated top lists on every chunk, not only the final
         // one. If the process dies after a non-final chunk, the top-list
-        // contributions of the deleted rows are already durable.
+        // contributions of the deleted rows are already durable. The top lists
+        // are cumulative for the hour, so a heavy hitter below a chunk-local
+        // top-N is not dropped; counters below are still per-chunk deltas.
         let tops = Self::load_temp_hour_tops(&mut tx, hour).await?;
-        let (baseline, write_rollup) = match base {
-            ChunkRollupBase::Snapshot(snapshot) => (snapshot.clone(), true),
-            ChunkRollupBase::CurrentRow { allow_insert } => {
-                // Re-read inside this transaction: a concurrent retention
-                // update committed before `BEGIN IMMEDIATE` is preserved, and
-                // no writer can interleave until this transaction ends.
+        let mut write_rollup = true;
+        let merged = match base {
+            ChunkRollupBase::Snapshot(snapshot) => {
+                self.merge_hour_rollup((*snapshot).clone(), tops, rollup_client_names)
+            }
+            ChunkRollupBase::CurrentRow(state) => {
+                // Re-read inside this transaction so a row deleted between
+                // chunks is not resurrected and an external top-list update is
+                // captured rather than overwritten.
                 let current: Option<StoredTops> = sqlx::query_as(
                     r"
                     SELECT top_domains, top_clients, top_upstreams
@@ -783,16 +833,50 @@ impl StatsDb {
                 .fetch_optional(&mut *tx)
                 .await?;
                 match current {
-                    Some(stored) => (stored, true),
-                    // The row was deleted after this clear observed it (for
-                    // example by rollup retention). Delete the detailed rows
-                    // but do not resurrect a rollup row that retention removed.
-                    None => (StoredTops::default(), *allow_insert),
+                    Some(stored) => {
+                        if let Some(last_written) = state.last_written.as_ref() {
+                            accumulate_external_delta(&mut state.external, &stored, last_written);
+                        }
+                        let base_merged = self.merge_hour_rollup(
+                            state.existing.clone(),
+                            tops,
+                            rollup_client_names,
+                        );
+                        self.merge_external_rollup(
+                            base_merged,
+                            &state.external,
+                            rollup_client_names,
+                        )
+                    }
+                    None => {
+                        if state.allow_insert {
+                            let base_merged = self.merge_hour_rollup(
+                                StoredTops::default(),
+                                tops,
+                                rollup_client_names,
+                            );
+                            self.merge_external_rollup(
+                                base_merged,
+                                &state.external,
+                                rollup_client_names,
+                            )
+                        } else {
+                            // The row was deleted after this clear observed it
+                            // (for example by rollup retention). Delete the
+                            // detailed rows but do not resurrect it.
+                            write_rollup = false;
+                            HourRollup::default()
+                        }
+                    }
                 }
             }
         };
         if write_rollup {
-            let merged = self.merge_hour_rollup(baseline, tops, rollup_client_names);
+            let encoded = (
+                encode_tops(&merged.domains),
+                encode_tops(&merged.clients),
+                encode_tops(&merged.upstreams),
+            );
             sqlx::query(
                 r"
                 INSERT INTO stats_hourly (hour, queries, blocked, cached, top_domains, top_clients, top_upstreams)
@@ -810,11 +894,15 @@ impl StatsDb {
             .bind(queries)
             .bind(blocked)
             .bind(cached)
-            .bind(encode_tops(&merged.domains))
-            .bind(encode_tops(&merged.clients))
-            .bind(encode_tops(&merged.upstreams))
+            .bind(&encoded.0)
+            .bind(&encoded.1)
+            .bind(&encoded.2)
             .execute(&mut *tx)
             .await?;
+            if let ChunkRollupBase::CurrentRow(state) = base {
+                state.last_written = Some((Some(encoded.0), Some(encoded.1), Some(encoded.2)));
+                state.allow_insert = false;
+            }
         }
 
         // Delete exactly the rows that were aggregated above (same predicate in
@@ -850,6 +938,82 @@ impl StatsDb {
             Self::clear_retention_temp_hour(conn, hour).await?;
         }
         Ok(del_res.rows_affected())
+    }
+}
+
+/// Accumulates positive-only top-list deltas between two stored snapshots.
+///
+/// Used only by the keep-aggregates clear's external-update guard. Counts that
+/// decreased are ignored: our own cumulative temp counts are authoritative for
+/// the rows this clear deletes, while an external writer can only add rows'
+/// contributions.
+fn accumulate_external_delta(
+    external: &mut HourRollup,
+    current: &StoredTops,
+    last_written: &StoredTops,
+) {
+    let previous_domains: Vec<DomainTop> = decode_tops(last_written.0.as_deref());
+    let previous: HashMap<&str, (i64, i64)> = previous_domains
+        .iter()
+        .map(|(qname, total, blocked)| (qname.as_str(), (*total, *blocked)))
+        .collect();
+    for (qname, total, blocked) in decode_tops::<DomainTop>(current.0.as_deref()) {
+        let (prev_total, prev_blocked) = previous.get(qname.as_str()).copied().unwrap_or((0, 0));
+        let total = total.saturating_sub(prev_total).max(0);
+        let blocked = blocked.saturating_sub(prev_blocked).max(0);
+        if total > 0 || blocked > 0 {
+            external.domains.push((qname, total, blocked));
+        }
+    }
+
+    let previous_clients: Vec<ClientTop> = decode_tops(last_written.1.as_deref());
+    let previous: HashMap<&str, (i64, i64, i64)> = previous_clients
+        .iter()
+        .map(|(client_ip, _, total, blocked, last_seen)| {
+            (client_ip.as_str(), (*total, *blocked, *last_seen))
+        })
+        .collect();
+    for (client_ip, client_name, total, blocked, last_seen) in
+        decode_tops::<ClientTop>(current.1.as_deref())
+    {
+        let (prev_total, prev_blocked, prev_last_seen) = previous
+            .get(client_ip.as_str())
+            .copied()
+            .unwrap_or((0, 0, 0));
+        let total = total.saturating_sub(prev_total).max(0);
+        let blocked = blocked.saturating_sub(prev_blocked).max(0);
+        let last_seen = if last_seen > prev_last_seen {
+            last_seen
+        } else {
+            0
+        };
+        if total > 0 || blocked > 0 || last_seen > 0 {
+            external
+                .clients
+                .push((client_ip, client_name, total, blocked, last_seen));
+        }
+    }
+
+    let previous_upstreams: Vec<UpstreamTop> = decode_tops(last_written.2.as_deref());
+    let previous: HashMap<&str, (i64, i64, i64)> = previous_upstreams
+        .iter()
+        .map(|(upstream, total, errors, elapsed_sum)| {
+            (upstream.as_str(), (*total, *errors, *elapsed_sum))
+        })
+        .collect();
+    for (upstream, total, errors, elapsed_sum) in decode_tops::<UpstreamTop>(current.2.as_deref()) {
+        let (prev_total, prev_errors, prev_elapsed) = previous
+            .get(upstream.as_str())
+            .copied()
+            .unwrap_or((0, 0, 0));
+        let total = total.saturating_sub(prev_total).max(0);
+        let errors = errors.saturating_sub(prev_errors).max(0);
+        let elapsed_sum = elapsed_sum.saturating_sub(prev_elapsed).max(0);
+        if total > 0 || errors > 0 || elapsed_sum > 0 {
+            external
+                .upstreams
+                .push((upstream, total, errors, elapsed_sum));
+        }
     }
 }
 
@@ -1358,8 +1522,9 @@ mod tests {
     }
 
     /// B5 fix: after a mid-hour failure the stored rollup has partial top
-    /// lists. The retry must merge the remaining chunks into that live row
-    /// (per-chunk deltas), not replace them with only the remaining rows.
+    /// lists. The retry must merge the remaining chunks' cumulative counts
+    /// into that stored row, not replace it with only the remaining rows (the
+    /// 27 → 18 regression when the heavy hitter was already in the snapshot).
     #[tokio::test]
     async fn test_keep_aggregates_clear_resume_preserves_top_lists() {
         let db = StatsDb::in_memory().await.unwrap();
@@ -1464,10 +1629,23 @@ mod tests {
         StatsDb::clear_retention_temp_hour(&mut conn, hour)
             .await
             .unwrap();
+        let existing = load_existing_rollups(&mut conn, &[hour])
+            .await
+            .unwrap()
+            .get(&hour)
+            .cloned()
+            .unwrap_or_default();
+        let mut state = ClearRollupState {
+            existing,
+            external: HourRollup::default(),
+            last_written: None,
+            allow_insert,
+        };
+        let mut base = ChunkRollupBase::CurrentRow(&mut state);
         db.rollup_and_delete_chunk(
             &mut conn,
             &RetentionChunk { hour, lower, upper },
-            &ChunkRollupBase::CurrentRow { allow_insert },
+            &mut base,
             true,
             false,
         )
@@ -1719,5 +1897,165 @@ mod tests {
 
         db.pool().close().await;
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Builds the retention fixture that hides its global heavy hitter below
+    /// every chunk-local top-100: each 5,000-row block has 100 distractors
+    /// with 10 hits and 9 hits for `heavy.example`, so the hour total (27) is
+    /// the only top-N ranking in which the heavy hitter appears.
+    fn heavy_hitter_fixture(
+        hour: i64,
+        blocks: usize,
+        distractors_per_block: usize,
+    ) -> Vec<QueryLogEntry> {
+        let mut entries = Vec::new();
+        let mut ts = hour;
+        for block in 0..blocks {
+            for i in 0..distractors_per_block {
+                for _ in 0..10 {
+                    entries.push(entry(
+                        ts,
+                        &format!("distract-{block}-{i}.example"),
+                        "allowed",
+                    ));
+                    ts += 1;
+                }
+            }
+            for _ in 0..9 {
+                entries.push(entry(ts, "heavy.example", "allowed"));
+                ts += 1;
+            }
+            let filler = RETENTION_ROWS_PER_CHUNK as usize - distractors_per_block * 10 - 9;
+            for i in 0..filler {
+                entries.push(entry(ts, &format!("filler-{block}-{i}.example"), "allowed"));
+                ts += 1;
+            }
+        }
+        entries
+    }
+
+    /// B5 re-review fix: the clear's top lists must be cumulative for the hour.
+    /// A heavy hitter below every chunk-local top-100 (9 hits vs 100
+    /// distractors with 10) must still appear with its full 27 hits.
+    #[tokio::test]
+    async fn test_keep_aggregates_clear_preserves_heavy_hitter_across_chunks() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let hour = hour_of(1_600_000_000_000);
+        let entries = heavy_hitter_fixture(hour, 3, 100);
+        assert_eq!(entries.len(), 15_000);
+        db.insert_batch(&entries).await.unwrap();
+
+        let deleted = db.delete_query_logs_keep_aggregates().await.unwrap();
+        assert_eq!(deleted, 15_000);
+        assert_eq!(hour_totals(&db, hour).await, (15_000, 0, 0));
+        let tops = hour_top_domains(&db, hour).await;
+        assert_eq!(
+            tops.iter()
+                .find(|(qname, _, _)| qname == "heavy.example")
+                .map(|(_, total, _)| *total),
+            Some(27),
+            "a multi-chunk heavy hitter must not be dropped by chunk-local top-N: {tops:?}"
+        );
+    }
+
+    /// B5 re-review fix, documented approximation: after a mid-hour failure the
+    /// stored top lists are truncated to the hour's top-N at that point. A
+    /// heavy hitter that was below that bounded snapshot (here 9 hits against
+    /// 300 distractors with 10 in the committed chunk) cannot be recovered by
+    /// the retry; only its remaining chunks are counted. Totals stay exact.
+    /// A successful (uninterrupted) run is exact (previous test).
+    #[tokio::test]
+    async fn test_keep_aggregates_clear_retry_keeps_bounded_top_n_approximation() {
+        let db = StatsDb::in_memory().await.unwrap();
+        let hour = hour_of(1_600_000_000_000);
+        let entries = heavy_hitter_fixture(hour, 3, 300);
+        assert_eq!(entries.len(), 15_000);
+        db.insert_batch(&entries).await.unwrap();
+
+        sqlx::query("CREATE TABLE clear_fail_counter (n INTEGER NOT NULL)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO clear_fail_counter (n) VALUES (0)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            r"
+            CREATE TRIGGER fail_clear_second_chunk
+            BEFORE INSERT ON stats_hourly
+            BEGIN
+                UPDATE clear_fail_counter SET n = n + 1;
+                SELECT CASE
+                    WHEN (SELECT n FROM clear_fail_counter) > 1
+                    THEN RAISE(ABORT, 'injected clear failure')
+                END;
+            END
+            ",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(db.delete_query_logs_keep_aggregates().await.is_err());
+
+        // The committed first chunk's 300 distractors (10 each) fill the
+        // bounded top-200, so its 9 heavy hits were not persisted.
+        let partial = hour_top_domains(&db, hour).await;
+        assert!(
+            partial.iter().all(|(qname, _, _)| qname != "heavy.example"),
+            "the bounded partial snapshot cannot contain the below-top-N hitter: {partial:?}"
+        );
+
+        sqlx::query("DROP TRIGGER fail_clear_second_chunk")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.delete_query_logs_keep_aggregates().await.unwrap(),
+            10_000
+        );
+        assert_eq!(hour_totals(&db, hour).await, (15_000, 0, 0));
+        let tops = hour_top_domains(&db, hour).await;
+        assert_eq!(
+            tops.iter()
+                .find(|(qname, _, _)| qname == "heavy.example")
+                .map(|(_, total, _)| *total),
+            Some(18),
+            "the retry recovers only the remaining chunks; the first 9 were below the persisted bounded snapshot: {tops:?}"
+        );
+    }
+
+    /// The external-update guard only adds positive deltas between the row we
+    /// wrote and the row we later observe; decreases are ignored because our
+    /// own cumulative temp counts are authoritative for cleared rows.
+    #[test]
+    fn test_accumulate_external_delta_is_positive_only() {
+        let last: StoredTops = (
+            Some(r#"[["a.example",5,0],["b.example",2,1]]"#.to_string()),
+            Some(r#"[["10.0.0.1",null,5,1,100]]"#.to_string()),
+            Some(r#"[["1.1.1.1:53",5,0,500]]"#.to_string()),
+        );
+        let current: StoredTops = (
+            Some(r#"[["a.example",7,1],["c.example",3,0]]"#.to_string()),
+            Some(r#"[["10.0.0.1","name",7,2,200]]"#.to_string()),
+            Some(r#"[["1.1.1.1:53",8,1,800]]"#.to_string()),
+        );
+        let mut external = HourRollup::default();
+        accumulate_external_delta(&mut external, &current, &last);
+        assert_eq!(
+            external.domains,
+            vec![
+                ("a.example".to_string(), 2, 1),
+                ("c.example".to_string(), 3, 0),
+            ]
+        );
+        assert_eq!(
+            external.clients,
+            vec![("10.0.0.1".to_string(), Some("name".to_string()), 2, 1, 200)]
+        );
+        assert_eq!(
+            external.upstreams,
+            vec![("1.1.1.1:53".to_string(), 3, 1, 300)]
+        );
     }
 }

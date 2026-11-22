@@ -183,22 +183,34 @@ fn hour_bounds(ts: i64) -> (i64, i64) {
 type StoredTops = (Option<String>, Option<String>, Option<String>);
 
 /// Where a rollup/delete chunk takes its baseline top lists from.
-enum ChunkRollupBase {
+enum ChunkRollupBase<'a> {
     /// Normal retention: merge the chunk's cumulative temp counts into this
     /// pre-sweep snapshot. Each chunk replaces the previous chunk's top lists,
     /// so writing every chunk is crash-safe without double counting.
-    Snapshot(StoredTops),
-    /// Bounded keep-aggregates clear: re-read the current `stats_hourly` row
-    /// inside the chunk transaction and merge only this chunk's counts into it.
-    /// That preserves updates made by a concurrent rollup writer between
-    /// chunks (per-chunk deltas cannot replace those contributions).
-    CurrentRow {
-        /// Whether a missing row may be inserted. `false` when the row existed
-        /// at hour start but was deleted in the meantime: the clear only
-        /// deletes detailed rows then, and does not resurrect a rollup that
-        /// rollup retention removed.
-        allow_insert: bool,
-    },
+    Snapshot(&'a StoredTops),
+    /// Bounded keep-aggregates clear: merge the run's cumulative temp counts
+    /// into the pre-clear snapshot, plus any external updates observed since
+    /// the previous chunk. `state` carries those per-hour values across chunks.
+    CurrentRow(&'a mut ClearRollupState),
+}
+
+/// Per-hour merge state for the bounded keep-aggregates clear.
+struct ClearRollupState {
+    /// Top lists stored for the hour before this run (or before the retry).
+    existing: StoredTops,
+    /// Positive-only top-list deltas made by another writer between chunks.
+    /// Under the maintenance lock this is normally empty, but preserving it
+    /// keeps an external (for example operator/retention) update from being
+    /// replaced by our pre-run snapshot.
+    external: HourRollup,
+    /// Exactly the top lists written by the previous chunk of this run, used
+    /// to derive `external` deltas.
+    last_written: Option<StoredTops>,
+    /// Whether a missing row may be inserted. `false` when the row existed at
+    /// hour start but was deleted in the meantime: the clear only deletes
+    /// detailed rows then, and does not resurrect a rollup that rollup
+    /// retention removed.
+    allow_insert: bool,
 }
 
 /// Bounded per-hour rollup payloads extracted from rows about to be pruned.

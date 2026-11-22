@@ -228,14 +228,33 @@ impl StatsDb {
 
         // The threshold is per run. A keep-aggregates clear that was interrupted
         // and resumed in several sub-threshold runs would otherwise never
-        // vacuum, so also vacuum when the completing run empties the detailed
-        // log. `EXISTS` is an index/table probe, not a count.
+        // vacuum, so also vacuum when the detailed log is empty and there are
+        // pages to reclaim. `EXISTS` is an index/table probe, not a count.
+        // Failures here are best-effort like the vacuum itself: the clear
+        // already committed, so a probe error must not turn it into a failure.
         let mut vacuum_needed = total_deleted >= VACUUM_MIN_DELETED_ROWS;
-        if keep_aggregates && !vacuum_needed && deleted > 0 {
-            let remaining: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM query_log)")
+        if keep_aggregates && !vacuum_needed {
+            match sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM query_log)")
                 .fetch_one(&self.pool)
-                .await?;
-            vacuum_needed = remaining == 0;
+                .await
+            {
+                Ok(0) => {
+                    // A zero-row retry can still need to compact free pages
+                    // left by the earlier partial run.
+                    let freelist: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+                        .fetch_one(&self.pool)
+                        .await
+                        .unwrap_or(0);
+                    vacuum_needed = deleted > 0 || freelist > 0;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "stats clear vacuum probe failed; skipping completion vacuum"
+                    );
+                }
+            }
         }
         if vacuum_needed && let Err(e) = self.vacuum().await {
             tracing::warn!(error = %e, "stats clear vacuum failed");
