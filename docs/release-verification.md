@@ -1,10 +1,12 @@
 # Release and container image verification
 
-This page describes the release gate in
-[`.github/workflows/release.yml`](../.github/workflows/release.yml) and the
-commands to verify a published release and image. Releases are triggered by
-pushing a `v*` tag; `workflow_dispatch` publishing is intentionally not
-supported.
+This page is the explicit gate checklist for the `v2.0.0` release and the
+commands to verify a published release and image. The
+[2.0 release gate checklist](#20-release-gate-checklist) names every gate, its
+workflow or lane, the required evidence, the pass condition and the release
+candidate at which it must be green; the sections after it hold the exact
+commands and expected output. Releases are triggered by pushing a `v*` tag;
+`workflow_dispatch` publishing is intentionally not supported.
 
 ## Release gate order
 
@@ -49,6 +51,54 @@ The container image is built from the already-built release binaries through
 image pipeline. Artifact E2E executes all three architectures in the pinned
 `cc-debian13` runtime with QEMU for arm64 and armv7.
 
+### Release-gate check lookup
+
+`release-gate` runs
+[`scripts/verify-release-gate.sh`](../scripts/verify-release-gate.sh) on the
+tagged commit. It requires exactly two green checks, `ci-gate` and
+`cargo-deny`, and ignores the release workflow's own in-progress jobs. Newer
+GitHub CLI releases are queried with `gh api --paginate --slurp`; when the
+installed `gh` does not know `--slurp`, the script retries once with plain
+`--paginate`. Any other error (authentication, network, API) is fatal and is
+never retried or hidden. Both pagination shapes are pinned by
+`bash scripts/test-verify-release-gate.sh`, and the release evidence is the
+green `release-gate` job plus its
+`release checks are green for <sha>: ci-gate, cargo-deny` log line.
+
+## 2.0 release gate checklist
+
+Complete every pre-tag row before creating the `v2.0.0` tag. Rows 1 and 2 are
+tag-push checks that can be pre-checked manually (tag/version and branch/check
+ancestry). Rows 9, 10 and 14 are produced only by the tagged release run, so
+they are verified after the tag push instead. "Stage" is the first release
+candidate at which the gate must be green; evidence from an earlier candidate
+carries forward only when the release manager records that no release-relevant
+change landed since. A red or missing pre-tag row blocks tagging; a red
+tag-push row leaves the release as a draft and blocks publication.
+
+| # | Gate | Workflow / command | Required evidence | Pass condition | Stage (owner) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | Tag matches the workspace version | `release.yml` → `verify-tag` | run URL, tag, `Cargo.toml` version | tag is `vX.Y.Z` or a prerelease of the workspace `X.Y.Z` | rc.3, rc.4, final (release manager) |
+| 2 | Release branch and checks | `release.yml` → `release-gate` (`scripts/verify-release-gate.sh`) | run URL, tagged SHA, `release checks are green for <sha>: ci-gate, cargo-deny` | tagged commit is an ancestor of `main`; `ci-gate` and `cargo-deny` are completed and successful; no failing legacy status | rc.3, rc.4, final (release manager) |
+| 3 | All-features and default test suites | `ci.yml` → `test` (`cargo test --workspace --all-features --locked`), `ha-matrix`; plus `cargo test --workspace --locked` on the candidate | green `ci-gate` run URL and the default-suite transcript | both suites green and the no-HA/HA matrix green | rc.3, rc.4, final (CI owner) |
+| 4 | Dependency policy after W0-DEPS | `security.yml` → `cargo-deny` (`deny.toml`) | check-run URL and `cargo deny check` summary | advisories, bans, licenses and sources pass with no unreviewed suppression | rc.3, rc.4, final (security reviewer) |
+| 5 | Docs truth | `docs.yml` → `meta` (`python3 scripts/check_test_matrix.py`) | run URL and command output | config reference, migration IDs, links and P0/P1 test-matrix names resolve; no stale 2.0 claim | rc.3, rc.4, final (docs owner) |
+| 6 | Installer E2E | `ci.yml` → `contrib` → `bash contrib/tests/test-installer.sh` | green `contrib` job log | fresh install, live upgrade, backup order and failed-health rollback pass | rc.4, final if S5 changed (ops owner) |
+| 7 | 1.9.5 → 2.0 migration and rollback | `bash scripts/test-migration-1.9.5.sh` | transcript ending `PASS: 1.9.5 data-dir migration and rollback acceptance` | v1.9.5 data dir migrates, v2 answers, users/TOTP/stats DB stay intact, rollback answers | rc.4, final if S2/S5 changed (ops owner) |
+| 8 | Docker upgrade E2E | `bash scripts/test-docker-upgrade.sh` | transcript ending `docker upgrade E2E OK (...)` | 1.9.5 container upgrades to the candidate with healthy DNS + healthcheck, then the rollback serves again | rc.4, final if S2/S5 changed (ops owner) |
+| 9 | Per-architecture image scan (E4) | `release.yml` → `docker-build-push` → `Scan the published image for vulnerabilities` | run URL, digest, one `Scanning ...` and one `No HIGH/CRITICAL unfixed vulnerabilities on ...` line per platform | all three platforms are scanned from the published digest and no fixed HIGH/CRITICAL finding remains | rc.4 image, final (security reviewer) |
+| 10 | Image signature and attestations | `docker-build-push` cosign steps; [verify the published image](#verify-the-published-image) | digest, `cosign verify` output, provenance, SPDX SBOM, tag map | signature identity `release.yml@refs/tags/*`, provenance and SBOM present, tags point at the digest | rc.4 image, final (release manager) |
+| 11 | Root-gated HA ownership (E5) | `ha-ownership.yml` | run URL, SHA, non-root uid, `running 1 test`, `test result: ok. 1 passed` | the m8 ownership test runs under root and passes exactly once | rc.4, final if HA changed (HA owner) |
+| 12 | 24-hour fuzz | `fuzz.yml` with `fuzz_seconds=17280` and `shards=5` | run URL, SHA, five targets, per-target corpus size, empty `fuzz/artifacts/` | no crash, timeout or OOM | after rc.4 → final (ops owner) |
+| 13 | Thresholded benchmark | `bench.yml` | run URL, baseline environment `github-ubuntu-24.04`, tolerance | no `REGRESSION` line above the tolerance | rc.4 → final (performance owner) |
+| 14 | Live DNS and health smoke | `docker-build-push` → `Smoke-test the published image` | log line `release image answered smoke.test; healthcheck: healthy` | the attested digest answers a local rewrite and the image healthcheck turns healthy | rc.4 image, final (release manager) |
+| 15 | Security review | `docs/phase3-security-review.md`, `docs/security-audit.md` | review signed off against the final tree with the open P0/P1 list | no open P0; every open P1 accepted with an owner and review date | final (security reviewer) |
+| 16 | `latest` still on 1.9.5 | commands in [`latest` stays on 1.9.5](#latest-stays-on-195-until-the-final-tag) | `latest` image digest and GitHub latest release tag | both equal `v1.9.5` before the final tag; only `v2.0.0` moves them | rc.3, rc.4, final-before-tag (release manager) |
+
+The E4 per-architecture scan, E5 root HA lane and E6 release-gate fallback are
+linked to their own policy tests and lanes above; this page records their
+release evidence rather than redefining their internals.
+
 ## Tag and publication rules
 
 | Tag | GitHub release | Docker tags |
@@ -59,8 +109,33 @@ image pipeline. Artifact E2E executes all three architectures in the pinned
 
 The prerelease decision is `contains(github.ref_name, '-')`. A prerelease tag
 therefore cannot publish or move `latest` or the moving `<major>.<minor>` tag,
-and cannot mark the GitHub release as a stable/latest release. `latest` stays
-on the previous stable release.
+and cannot mark the GitHub release as a stable/latest release.
+
+### `latest` stays on 1.9.5 until the final tag
+
+The rc.3 and rc.4 tags are prereleases. They may publish version-only Docker
+tags and a prerelease GitHub release, but they must not move the repository's
+`latest` image tag or latest release pointer. Before creating the final
+`v2.0.0` tag, record:
+
+```bash
+RELEASE_TAG=v1.9.5
+IMAGE="ghcr.io/kubaeror/sito-dns"
+LATEST_DIGEST="$(docker buildx imagetools inspect "${IMAGE}:latest" \
+  --format '{{.Manifest.Digest}}')"
+STABLE_DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${RELEASE_TAG#v}" \
+  --format '{{.Manifest.Digest}}')"
+printf 'latest=%s\n1.9.5=%s\n' "${LATEST_DIGEST}" "${STABLE_DIGEST}"
+gh release list --limit 100 --json tagName,isLatest \
+  --jq '.[] | select(.isLatest) | .tagName'
+```
+
+Expected before the final tag: the two digests are identical and
+`gh release list` prints `v1.9.5`. After the final `v2.0.0` tag is published,
+the same commands must show the `v2.0.0` image digest and `v2.0.0` as the
+latest release. A prerelease that moved either pointer is a release blocker and
+must be reverted before proceeding (see the prerelease checks in
+[Verify the published image](#verify-the-published-image)).
 
 ## Verify the workflow run
 
@@ -231,6 +306,91 @@ tar -xzf "${archive}"
 Expected: both checksum checks print `OK`, `cosign verify-blob` prints
 `Verified OK`, and `--version` prints the version matching the tag.
 
+## Per-architecture image scan (E4)
+
+The `docker-build-push` job scans the published digest once for each promised
+platform (`linux/amd64`, `linux/arm64`, `linux/arm/v7`) with the digest-pinned
+Trivy image and fails on a fixed HIGH/CRITICAL finding. The scan's shape and
+platform coverage are owned by E4 and pinned by
+`bash scripts/test-release-workflow.sh`; this checklist records the evidence
+from the `Scan the published image for vulnerabilities` step.
+
+Record for the rc.4 and final runs:
+
+- the run URL and the image digest;
+- one `Scanning ghcr.io/<owner>/<repo>@sha256:... for linux/<platform>` line
+  for each of `linux/amd64`, `linux/arm64` and `linux/arm/v7`;
+- the matching `No HIGH/CRITICAL unfixed vulnerabilities on linux/...` line for
+  each platform;
+- the `Verified ghcr.io/<owner>/<repo>@sha256:...` line from the preceding
+  verification step.
+
+Pass condition: the job is green and every `Scanning` and `No HIGH/CRITICAL`
+line names the same digest as the verified, signed image. A fixed finding on
+any single platform fails the release. Unfixed findings are intentionally
+ignored, as documented in the workflow.
+
+## Upgrade, installer and Docker E2E
+
+Three real upgrade paths must be green on the rc.4 candidate, and again on the
+final commit if S2 or S5 changed after rc.4. The installer and migration
+scripts are owned by E1/E2; this checklist records their evidence.
+
+1. Installer E2E, run by the `contrib` job in CI:
+
+   ```bash
+   bash contrib/tests/test-installer.sh
+   ```
+
+   Expected: a fresh install, a live upgrade over a running binary, the config
+   backup after the service stop, capability/`getcap` checks, and the
+   failed-health rollback all pass. Record the green `contrib` job URL.
+
+2. Binary migration and rollback, against a real v1.9.5 data directory:
+
+   ```bash
+   # Either provide binaries or let the script build both trees.
+   SITO_OLD_BIN=/path/to/v1.9.5/sito \
+   SITO_NEW_BIN=/path/to/2.0/sito \
+     bash scripts/test-migration-1.9.5.sh
+   ```
+
+   Expected transcript tail:
+   `PASS: 1.9.5 data-dir migration and rollback acceptance`. Record the
+   v1.9.5 version line, the migrated `/api/v2/status` version, the read-only
+   `stats.db` integrity check, and the rollback rewrite answer.
+
+3. Docker upgrade and rollback, with the previous image and candidate image
+   available locally:
+
+   ```bash
+   docker build -t sito:1.9.5 <v1.9.5-worktree>
+   docker build -t sito:phase3 .
+   OLD_IMAGE=sito:1.9.5 NEW_IMAGE=sito:phase3 \
+     bash scripts/test-docker-upgrade.sh
+   ```
+
+   Expected transcript tail:
+   `docker upgrade E2E OK (sito:1.9.5 -> sito:phase3 -> rollback)`, after the
+   candidate answered DNS and reported `healthy`, and the rollback container
+   answered again with the v1 data.
+
+A failed or missing transcript blocks the release. Record the command, commit
+SHA, date and transcript path for all three runs.
+
+## Live DNS and health smoke (E8)
+
+The `Smoke-test the published image` step in `docker-build-push` starts the
+exact attested digest with a self-contained config, queries `smoke.test`, and
+waits for the image healthcheck. It is the release-time live DNS/health gate;
+the `container.yml` compose smoke remains the pull-request mechanism and does
+not replace it.
+
+Record the run URL, image digest, and the log line
+`release image answered smoke.test; healthcheck: healthy`. Pass condition: the
+step is green, the container did not exit before answering, and the healthcheck
+is `healthy`. Repeat for the rc.4 image and the final image.
+
 ## HA certificate ownership evidence (root-gated lane)
 
 The HA key-ownership handoff is verified by
@@ -330,20 +490,53 @@ python3 scripts/check_config_reference.py --github
 python3 scripts/test_check_config_reference.py
 python3 scripts/check_migration_guide.py --github
 python3 scripts/test_check_migration_guide.py
+python3 scripts/check_test_matrix.py
+python3 scripts/test_check_test_matrix.py
 ```
 
 The configuration checker must accept every nested config struct, default,
 type and legacy raw-section map entry. The migration checker must find a
 concrete migration step for every `BC-<n>` ID in
 [`docs/2.0-public-api-diff.md`](2.0-public-api-diff.md) in
-[`docs/2.0-migration.md`](2.0-migration.md). Record the command output with the
-release checklist, alongside the fuzz and benchmark evidence.
+[`docs/2.0-migration.md`](2.0-migration.md). The test-matrix checker must
+resolve every backticked P0/P1 test, script and workflow name in
+[`docs/audit6-test-matrix.md`](audit6-test-matrix.md). Record the command
+output with the release checklist, alongside the fuzz and benchmark evidence.
+
+## Security review
+
+The final tag requires a security review of the final tree, not only the rc.2
+review recorded in
+[`docs/phase3-security-review.md`](phase3-security-review.md). Before tagging:
+
+```bash
+python3 scripts/check_test_matrix.py
+python3 scripts/test_check_test_matrix.py
+cargo deny check
+```
+
+Re-run the Phase 3 review against the final commit and record:
+
+- the reviewer, date and reviewed commit SHA;
+- the verdict for open P0 findings (none allowed) and open P1 findings (each
+  with an owner, review date and accepted rationale in the review document);
+- confirmation that every P0/P1 row in
+  [`docs/audit6-test-matrix.md`](audit6-test-matrix.md) still maps to a named
+  test or script and that the matrix checker resolves it;
+- the `cargo deny check` result, which must match the green `cargo-deny` gate
+  in row 4 of the checklist;
+- confirmation that the 2.0 claim matrix
+  ([`docs/2.0-claim-matrix.md`](2.0-claim-matrix.md)) matches the final tree,
+  including anything still deferred.
+
+An open P0, an unowned P1, or a claim that no longer matches the tree blocks the
+release.
 
 ## Post-release monitoring (first 24–72 hours)
 
-A prerelease is not finished when the workflow turns green. Watch these signals
-after publishing `v2.0.0-rc.2` and keep the previous stable binary/config
-backup ready for rollback:
+A release candidate is not finished when the workflow turns green. Watch these
+signals after publishing `v2.0.0-rc.3`, `v2.0.0-rc.4` and the final `v2.0.0`,
+and keep the previous stable binary/config backup ready for rollback:
 
 | Area | Signal | Where | Rollback trigger |
 | --- | --- | --- | --- |
