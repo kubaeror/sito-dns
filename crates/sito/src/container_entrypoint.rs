@@ -81,6 +81,18 @@ impl NoMigrate {
 /// entrypoint decision, so the process exits without binding DNS/API ports.
 pub async fn migrate_before_start(config_path: &Path) -> anyhow::Result<()> {
     if NoMigrate::from_env()?.is_enabled() {
+        // `SITO_NO_MIGRATE` must win. Fail closed on the conflicting pair rather
+        // than letting B3 auto-migrate the database the operator explicitly
+        // asked the entrypoint not to migrate.
+        if crate::db_startup::DbAutoMigrate::from_env()?.is_enabled() {
+            anyhow::bail!(
+                "Conflicting migration policy: {NO_MIGRATE_ENV} is set but \
+                 {DB_AUTO_MIGRATE_ENV}=1 asks the server to auto-migrate. Remove or set \
+                 {DB_AUTO_MIGRATE_ENV}=0 to keep the no-migrate opt-out, or unset \
+                 {NO_MIGRATE_ENV} to let the entrypoint migrate first.",
+                DB_AUTO_MIGRATE_ENV = crate::db_startup::DB_AUTO_MIGRATE_ENV
+            );
+        }
         eprintln!(
             "{NO_MIGRATE_ENV} is set: skipping the pre-start database migration. If \
              <server.data_dir>/stats.db still needs a migration, the server will refuse to start \

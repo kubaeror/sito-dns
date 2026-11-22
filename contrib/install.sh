@@ -265,13 +265,73 @@ backup_config_if_present() {
     fi
 }
 
-# Restores the configuration backup with a temp file + rename so a crash or a
-# failed write can never leave a truncated config.toml behind.
-restore_config_atomically() {
-    local dir tmp
+# Sets KEY=VALUE in the systemd environment file atomically, replacing every
+# existing assignment and preserving unrelated lines and mode 0600. Symlinks are
+# followed so an operator-managed env file is not replaced by a regular file.
+set_env_file_value() {
+    local key="$1" value="$2" file="$3" target dir tmp owner_mode
+    target="${file}"
+    if [ -L "${file}" ]; then
+        target="$(readlink -f "${file}" 2>/dev/null || true)"
+        if [ -z "${target}" ]; then
+            echo "Error: cannot resolve the symlinked environment file ${file}." >&2
+            return 1
+        fi
+    fi
+    dir="$(dirname -- "${target}")"
+    tmp="$(mktemp "${dir}/.sito-env.XXXXXX")" || return 1
+    if [ -f "${target}" ]; then
+        owner_mode="$(stat -c '%u:%g' "${target}" 2>/dev/null || true)"
+        if ! awk -v key="${key}" -v value="${value}" '
+            BEGIN { replaced = 0 }
+            $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+                print key "=" value
+                replaced = 1
+                next
+            }
+            { print }
+            END {
+                if (!replaced) {
+                    print key "=" value
+                }
+            }
+        ' "${target}" >"${tmp}"; then
+            rm -f "${tmp}"
+            return 1
+        fi
+    else
+        owner_mode=""
+        printf '%s=%s\n' "${key}" "${value}" >"${tmp}" || {
+            rm -f "${tmp}"
+            return 1
+        }
+    fi
+    chmod 0600 "${tmp}" || {
+        rm -f "${tmp}"
+        return 1
+    }
+    if [ -n "${owner_mode}" ] && [ "$(id -u)" -eq 0 ]; then
+        chown "${owner_mode}" "${tmp}" 2>/dev/null || true
+    fi
+    if command -v sync >/dev/null 2>&1; then
+        sync -- "${tmp}" 2>/dev/null || sync || true
+    fi
+    if ! mv -f -- "${tmp}" "${target}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    if command -v sync >/dev/null 2>&1; then
+        sync -- "${dir}" 2>/dev/null || sync || true
+    fi
+}
+
+# Restores the configuration from `src` with a temp file + rename so a crash or
+# a failed write can never leave a truncated config.toml behind.
+restore_config_from() {
+    local src="$1" dir tmp
     dir="$(dirname -- "${CONFIG_FILE}")"
     tmp="$(mktemp "${dir}/.sito-config-restore.XXXXXX")" || return 1
-    if ! cp -pf "${CONFIG_BACKUP}" "${tmp}"; then
+    if ! cp -pf "${src}" "${tmp}"; then
         rm -f "${tmp}"
         return 1
     fi
@@ -287,25 +347,106 @@ restore_config_atomically() {
     fi
 }
 
+restore_config_atomically() {
+    restore_config_from "${CONFIG_BACKUP}"
+}
+
+# Prints the major component of a version string ("sito 1.9.5" -> 1,
+# "v2.0.0-rc.2" -> 2). Unknown/empty versions produce no output.
+version_major_of() {
+    local version="$1" major
+    version="${version#sito }"
+    version="${version#v}"
+    version="${version%% *}"
+    version="${version%%[-+]*}"
+    major="${version%%.*}"
+    case "${major}" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "${major}"
+}
+
+is_pre_2_0_version() {
+    local major
+    major="$(version_major_of "${1:-}")" || return 1
+    [ "${major}" -lt 2 ]
+}
+
+is_2_0_or_newer_version() {
+    local major
+    major="$(version_major_of "${1:-}")" || return 1
+    [ "${major}" -ge 2 ]
+}
+
 # Restores the previous binary and configuration backup after a failed health
 # check. The restore itself is atomic so the service can be started again even
 # if the new binary is still executing.
+#
+# A pre-2.0 binary cannot read a config v2 document. On the 1.9.x -> 2.0 path
+# the operator has already migrated the config and `sito config migrate
+# --backup` left `<config>.v1.bak`; that matching document is what a pre-2.0
+# rollback must restore. If it is missing, leave the new 2.0 binary installed
+# and the service stopped with explicit recovery instructions instead of
+# starting a 1.9.x binary against a v2 file.
 rollback_install() {
+    local pre_two=0 restore_config="" backup_version="" binary_restored=0
+
+    if is_pre_2_0_version "${PREV_VERSION:-}"; then
+        pre_two=1
+    fi
+
+    if [ "${pre_two}" -eq 1 ]; then
+        if [ -f "${CONFIG_BACKUP}" ]; then
+            backup_version="$(read_config_version "${CONFIG_BACKUP}")"
+        elif [ -f "${CONFIG_FILE}" ]; then
+            backup_version="$(read_config_version "${CONFIG_FILE}")"
+        fi
+        if [ "${backup_version}" = "2" ]; then
+            if [ -f "${CONFIG_FILE}.v1.bak" ]; then
+                restore_config="${CONFIG_FILE}.v1.bak"
+            else
+                echo "Error: refusing to restart the pre-2.0 binary from ${BACKUP_BIN}." >&2
+                echo "Error: the configuration is v2 but ${CONFIG_FILE}.v1.bak is missing, and 1.9.x cannot read config v2." >&2
+                echo "Error: the 2.0 binary remains installed at ${INSTALL_BIN}; the service stays stopped." >&2
+                echo "Error: restore a v1 configuration backup (or migrate the config and stay on 2.0), then start the service." >&2
+                return 1
+            fi
+        fi
+    fi
+
     if [ -f "${BACKUP_BIN}" ]; then
         echo "Restoring previous binary from ${BACKUP_BIN}..." >&2
         if install_binary_atomic "${BACKUP_BIN}"; then
             apply_capabilities
+            binary_restored=1
         else
-            echo "Error: failed to restore ${BACKUP_BIN}." >&2
+            echo "Error: failed to restore ${BACKUP_BIN}; leaving the current binary and stopping." >&2
+            echo "Error: the service stays stopped; restore ${BACKUP_BIN} manually before starting it." >&2
+            return 1
         fi
+    else
+        echo "Error: previous binary backup ${BACKUP_BIN} is missing; leaving the service stopped." >&2
+        return 1
     fi
-    if [ -f "${CONFIG_BACKUP}" ]; then
+
+    if [ "${binary_restored}" -ne 1 ]; then
+        return 1
+    fi
+
+    if [ -n "${restore_config}" ]; then
+        echo "Restoring matching v1 configuration from ${restore_config}..." >&2
+        if ! restore_config_from "${restore_config}"; then
+            echo "Error: failed to restore ${CONFIG_FILE} from ${restore_config}; the service stays stopped." >&2
+            return 1
+        fi
+    elif [ -f "${CONFIG_BACKUP}" ]; then
         echo "Restoring previous configuration from ${CONFIG_BACKUP}..." >&2
         if ! restore_config_atomically; then
-            echo "Error: failed to restore ${CONFIG_FILE} from ${CONFIG_BACKUP}." >&2
+            echo "Error: failed to restore ${CONFIG_FILE} from ${CONFIG_BACKUP}; the service stays stopped." >&2
             return 1
         fi
     fi
+
     if have_systemctl; then
         run_systemctl restart sito || true
     fi
@@ -356,12 +497,68 @@ read_config_version() {
     ' "$1" 2>/dev/null || true
 }
 
+# Prints the existing B2 pre-migration backups for a stats database, one per
+# line. The installer only restores a backup that did not exist before its own
+# migration attempt, never an operator's older snapshot.
+snapshot_db_backups() {
+    local dir="$1" file
+    for file in "${dir%/}"/stats.db.v*.bak; do
+        [ -e "${file}" ] || continue
+        printf '%s\n' "${file}"
+    done | sort
+}
+
+# Restores exactly one newly created B2 backup over stats.db. Returns 1 when no
+# single unambiguous new backup exists, so the caller can leave the service
+# stopped instead of guessing.
+restore_new_migration_backup() {
+    local db_path="$1" before="$2" file dir tmp restored=""
+    local -a candidates=()
+    dir="$(dirname -- "${db_path}")"
+    for file in "${dir%/}"/stats.db.v*.bak; do
+        [ -e "${file}" ] || continue
+        if ! printf '%s\n' "${before}" | grep -Fxq -- "${file}"; then
+            candidates+=("${file}")
+        fi
+    done
+    if [ "${#candidates[@]}" -ne 1 ]; then
+        return 1
+    fi
+    restored="${candidates[0]}"
+    echo "Restoring pre-migration stats database from ${restored}..." >&2
+    rm -f "${db_path}-wal" "${db_path}-shm"
+    tmp="$(mktemp "${dir}/.sito-db-restore.XXXXXX")" || return 1
+    if ! cp -pf "${restored}" "${tmp}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    if command -v sync >/dev/null 2>&1; then
+        sync -- "${tmp}" 2>/dev/null || sync || true
+    fi
+    if ! mv -f -- "${tmp}" "${db_path}"; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    if command -v sync >/dev/null 2>&1; then
+        sync -- "${dir}" 2>/dev/null || sync || true
+    fi
+    echo "Restored ${db_path} from ${restored}." >&2
+}
+
 # Upgrades run the new binary's explicit migration after the old service was
 # stopped and before the replacement is started. B2 owns the backup, service
-# lease and migration lock; the installer only sequences it and rolls back the
-# binary/config if the migration fails, so a half-migrated server never starts.
+# lease and migration lock; the installer only sequences it and restores the
+# B2 backup plus the binary/config if the migration fails, so a half-migrated
+# server never starts.
 migrate_database_before_start() {
     if [ "${IS_UPGRADE}" -ne 1 ]; then
+        return 0
+    fi
+
+    # Only a 2.0+ target has `sito db migrate` and the schema-v2 policy. A 1.9.x
+    # -> 1.9.x update must remain a plain binary/config upgrade.
+    if ! is_2_0_or_newer_version "${SITO_VERSION}"; then
+        echo "Target version ${SITO_VERSION} is pre-2.0; skipping the stats database migration."
         return 0
     fi
 
@@ -377,9 +574,10 @@ migrate_database_before_start() {
     fi
 
     # `sito db migrate` needs a config v2 document to resolve server.data_dir.
-    # Config auto-migration is deferred, so refuse early with an actionable
-    # message instead of letting the new binary fail on the v1 document.
-    local data_dir db_path config_version
+    # Config auto-migration is deferred, so refuse to migrate (and keep the new
+    # 2.0 binary installed) instead of rolling back to a 1.9.x binary that
+    # cannot read the v2 document or run this recovery command.
+    local data_dir db_path config_version backups_before
     data_dir="$(read_config_data_dir "${CONFIG_FILE}")"
     db_path="${data_dir%/}/stats.db"
     if [ ! -f "${db_path}" ]; then
@@ -390,22 +588,29 @@ migrate_database_before_start() {
     config_version="$(read_config_version "${CONFIG_FILE}")"
     if [ "${config_version}" != "2" ]; then
         echo "Error: ${CONFIG_FILE} is not config v2 (config_version='${config_version}')." >&2
-        echo "Error: migrate it with the 2.0 binary before upgrading:" >&2
-        echo "Error:   sito config migrate --from v1 --to v2 --backup --config ${CONFIG_FILE}" >&2
-        echo "Error: restoring the previous binary and configuration; the new server was not started." >&2
-        if ! rollback_install; then
-            echo "Error: rollback did not complete cleanly; inspect the service manually." >&2
-        fi
+        echo "Error: the 2.0 binary is installed at ${INSTALL_BIN} and the service is stopped." >&2
+        echo "Error: migrate the configuration with that binary, then start the service:" >&2
+        echo "Error:   ${INSTALL_BIN} config migrate --from v1 --to v2 --backup --config ${CONFIG_FILE}" >&2
+        echo "Error:   ${SYSTEMCTL} start sito" >&2
+        echo "Error: or re-run this installer after the configuration is migrated." >&2
         exit 1
     fi
 
+    backups_before="$(snapshot_db_backups "${data_dir}")"
     echo "Migrating stats database ${db_path} with the new binary..."
     echo "The migration takes the service lease and a 0600 backup before writing."
     if ! "${INSTALL_BIN}" db migrate --config "${CONFIG_FILE}"; then
-        echo "Error: stats database migration failed; restoring the previous binary and configuration." >&2
-        echo "Error: the new server was not started. Inspect the migration backup next to ${db_path} if one was written." >&2
-        if ! rollback_install; then
-            echo "Error: rollback did not complete cleanly; inspect the service manually." >&2
+        echo "Error: stats database migration failed; the new server was not started." >&2
+        if restore_new_migration_backup "${db_path}" "${backups_before}"; then
+            echo "Error: restored the pre-migration database backup; rolling back the binary/config." >&2
+            if ! rollback_install; then
+                echo "Error: rollback did not complete cleanly; inspect the service manually." >&2
+            fi
+        else
+            echo "Error: no single new pre-migration backup could be identified for ${db_path}." >&2
+            echo "Error: the 2.0 binary remains installed and the service stays stopped." >&2
+            echo "Error: inspect ${db_path} and any stats.db.v*.bak, restore a consistent copy," >&2
+            echo "Error: then run '${INSTALL_BIN} db migrate --config ${CONFIG_FILE}' and start the service." >&2
         fi
         exit 1
     fi
@@ -499,6 +704,17 @@ if [ ! -e "${ENV_FILE}" ] && [ ! -L "${ENV_FILE}" ]; then
         chown sito:sito "${ENV_FILE}"
     fi
     chmod 0600 "${ENV_FILE}"
+fi
+
+# `--no-migrate` must win over a preserved B3 opt-in. Pin the B3 switch to 0 in
+# the unit environment file so a stale `SITO_DB_AUTO_MIGRATE=1` cannot silently
+# auto-migrate in the new server after the installer explicitly skipped it.
+if [ "${NO_MIGRATE}" -eq 1 ]; then
+    echo "SITO_NO_MIGRATE is set; forcing SITO_DB_AUTO_MIGRATE=0 in ${ENV_FILE}."
+    if ! set_env_file_value "SITO_DB_AUTO_MIGRATE" "0" "${ENV_FILE}"; then
+        echo "Error: failed to disable SITO_DB_AUTO_MIGRATE in ${ENV_FILE}." >&2
+        exit 1
+    fi
 fi
 
 # 5. Detect upgrade vs fresh install and backup existing binary

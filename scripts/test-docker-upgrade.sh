@@ -236,6 +236,26 @@ if [ "${HAS_CONTAINER_ENTRYPOINT}" = "1" ]; then
         fail "SITO_NO_MIGRATE=1 created a migration backup"
     fi
     echo "    no-migrate stayed fail-closed and created no backup"
+
+    echo "==> candidate with SITO_NO_MIGRATE=1 and SITO_DB_AUTO_MIGRATE=1 must fail closed"
+    conflict_log="${TMP}/no-migrate-conflict.log"
+    set +e
+    timeout 90 docker run --rm --name "${NEW_NAME}-nomigrate" \
+        -e SITO_NO_MIGRATE=1 \
+        -e SITO_DB_AUTO_MIGRATE=1 \
+        -v "${TMP}/etc:/etc/sito" \
+        -v "${TMP}/data:/var/lib/sito" \
+        "${NEW_IMAGE}" >"${conflict_log}" 2>&1
+    conflict_rc=$?
+    set -e
+    [ "${conflict_rc}" -ne 0 ] || fail "the no-migrate/auto-migrate conflict started a server"
+    [ "${conflict_rc}" -ne 124 ] || fail "the no-migrate/auto-migrate conflict did not exit"
+    grep -q 'Conflicting migration policy' "${conflict_log}" || \
+        fail "the conflicting switches did not produce an explicit policy error"
+    if as_root test -e "${TMP}/data/stats.db.v1.bak"; then
+        fail "the conflicting switches created a migration backup"
+    fi
+    echo "    conflicting switches failed closed without a backup"
 else
     echo "notice: ${NEW_IMAGE} predates the 2.0 container entrypoint; skipping SITO_NO_MIGRATE checks" >&2
 fi

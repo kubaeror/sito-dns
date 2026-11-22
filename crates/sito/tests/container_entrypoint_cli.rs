@@ -323,6 +323,42 @@ async fn test_container_entrypoint_no_migrate_leaves_fail_closed_b3_message() {
 }
 
 #[tokio::test]
+async fn test_container_entrypoint_no_migrate_rejects_conflicting_auto_migrate() {
+    let (dir, config_path) = fixture("no_migrate_conflict");
+    let db_path = dir.join("stats.db");
+    legacy_db(&db_path).await;
+    let before = std::fs::read(&db_path).unwrap();
+
+    let output = entrypoint(&config_path)
+        .env("SITO_NO_MIGRATE", "1")
+        .env("SITO_DB_AUTO_MIGRATE", "1")
+        .output()
+        .unwrap();
+    let text = output_of(&output);
+
+    assert!(
+        !output.status.success(),
+        "the conflicting no-migrate/auto-migrate pair must fail closed: {text}"
+    );
+    assert!(
+        text.contains("Conflicting migration policy")
+            && text.contains("SITO_NO_MIGRATE")
+            && text.contains("SITO_DB_AUTO_MIGRATE"),
+        "the conflict error must name both switches: {text}"
+    );
+    assert!(
+        !backup_path(&db_path, 1).exists(),
+        "the conflicting pair must not create a backup"
+    );
+    assert_eq!(
+        std::fs::read(&db_path).unwrap(),
+        before,
+        "the conflicting pair must not modify the database"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn test_container_entrypoint_failed_migration_never_starts_server() {
     let (dir, config_path) = fixture("migration_failure");
     let db_path = dir.join("stats.db");

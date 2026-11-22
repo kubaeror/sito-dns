@@ -345,9 +345,11 @@ scripts are owned by E1/E2; this checklist records their evidence.
    Expected: a fresh install, a live upgrade over a running binary, the config
    backup after the service stop, capability/`getcap` checks, the
    failed-health rollback, the default stats-DB migration before the new server
-   starts, the `--no-migrate` skip (fail-closed rollback), and the
-   migration-failure binary/config rollback all pass. Record the green
-   `contrib` job URL.
+   starts, the 1.9.x → 1.9.x skip, the `--no-migrate` skip with forced
+   `SITO_DB_AUTO_MIGRATE=0` and fail-closed rollback, partial-migration DB
+   restore, pre-2.0 binary/config pairing, the “stop without a backup”
+   recovery path, and the runnable v1-config recovery command all pass. Record
+   the green `contrib` job URL.
 
 2. Binary migration and rollback, against a real v1.9.5 data directory:
 
