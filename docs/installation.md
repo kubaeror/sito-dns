@@ -144,7 +144,7 @@ Official release archives and the container image enable
 `embed-ui,ha,mimalloc`. `ha` is opt-in for source builds; the command above
 matches the official feature set. Drop `ha` only for a deliberate no-HA build:
 it runs as a master, rejects `[ha]`/`server.role = "slave"`, answers
-`/api/v1/ha/*` with `501 ha_not_supported`, and omits `sito ha gen-certs`.
+`/api/v2/ha/*` with `501 ha_not_supported`, and omits `sito ha gen-certs`.
 
 2.0 uses config v2. A new install starts from the [safe defaults](2.0-migration.md#44-safe-defaults-vs-behavior-preserving-upgrade);
 an existing 1.9.x config must be migrated before the 2.0 binary will start:
@@ -369,7 +369,7 @@ the hardened systemd unit the unprivileged service still cannot replace the
 root-owned binary: the updater detects the systemd service environment and
 refuses in-app apply with the stop/CLI/start commands above. Docker deployments
 are refused for the same reason and must pull a new image. `GET
-/api/v1/system/update/check` and `sito update --check` remain available to
+/api/v2/system/update/check` and `sito update --check` remain available to
 preview a release.
 
 The CLI updater downloads assets with `0600` permissions, verifies the staged
@@ -639,13 +639,13 @@ dig @127.0.0.1 -p 53 doubleclick.net +short
 ```
 
 ### 5.2 Verify API and Web Panel
-The `/api/v1/*` endpoints used below require a session cookie or API token.
+The `/api/v2/*` endpoints used below require a session cookie or API token.
 Create a token in the web UI or sign in, then:
 
 ```bash
 export SITO=http://127.0.0.1:8080
 export TOKEN='sito_...'   # Viewer, Operator, or Admin API token
-curl -fsSL -H "Authorization: Bearer $TOKEN" "$SITO/api/v1/status" | jq .
+curl -fsSL -H "Authorization: Bearer $TOKEN" "$SITO/api/v2/status" | jq .
 ```
 
 For a pre-authentication liveness probe use the dedicated `/health` endpoint

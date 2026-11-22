@@ -2,7 +2,7 @@
 //!
 //! HA failures used to be logged and otherwise invisible: the master returned
 //! from `spawn_master_server` when its mTLS key was unreadable, yet
-//! `/api/v1/ha/status` still said `active` and the DNS healthcheck passed.
+//! `/api/v2/ha/status` still said `active` and the DNS healthcheck passed.
 //! The state below is updated by the replication listener/worker and read by
 //! the admin API and healthcheck so an operator sees a failed role.
 

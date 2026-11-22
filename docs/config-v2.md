@@ -45,7 +45,7 @@ rules. Every entry point reaches it:
 |---|---|
 | Startup (`sito`) | `Config::from_toml_str` → `validate_full` |
 | `sito check-config` | `Config::from_toml_str` + `validate_typed_sections` |
-| API write (`PUT /api/v1/config`) | `Config::from_toml_str` + `validate_full_config` |
+| API write (`PUT /api/v2/config`) | `Config::from_toml_str` + `validate_full_config` |
 | Backup restore | `Config::from_toml_str` + `validate_full_config` |
 | HA apply | `Config::from_toml_str` + `validate_full_config` + restart rejection |
 | File watcher / `POST /config/reload` | `Config::from_toml_str` + `validate_full_config` |
@@ -201,8 +201,8 @@ Some settings are read once at process start. An admin write that changes one
 of them returns **409 Conflict** with `restart_required` and is **not
 persisted**. Edit `config.toml` and restart, or use the installer.
 
-`GET /api/v1/config/restart-required` on the canonical `/api/v1` API
-(`/api/v2` is absent) is a read-only preview:
+`GET /api/v2/config/restart-required` on the canonical `/api/v2` API is a
+read-only preview:
 
 ```json
 {
@@ -212,7 +212,7 @@ persisted**. Edit `config.toml` and restart, or use the installer.
     "integrations"
   ],
   "message": "...",
-  "apply_endpoint": "/api/v1/config"
+  "apply_endpoint": "/api/v2/config"
 }
 ```
 
@@ -227,7 +227,7 @@ persisted**. Edit `config.toml` and restart, or use the installer.
 
 The same matrix is used by:
 
-- `PUT /api/v1/config` and backup restore (409, no persist);
+- `PUT /api/v2/config` and backup restore (409, no persist);
 - the HA slave apply path (409, ACK `applied: false`, no persist);
 - `restart_required_fields()` for the file-watcher warning and reload report;
 - the read-only preview endpoint.
@@ -269,9 +269,9 @@ schema also fails the fixture test.
 - `clients.trust_arp` is **not** added in config v2. D10 defines the trust
   table, but the optional ARP-trust knob remains unimplemented; if it lands it
   will be an optional v2 field with default `false`.
-- `/api/v2` and the API v1 compatibility facade are absent and deferred beyond
-  Phase 2. `/api/v1` is canonical, including
-  `/api/v1/config/restart-required`.
+- `/api/v1` and its compatibility facade are absent: 2.0 removed v1, and
+  `/api/v2` is the only administrative API, including
+  `/api/v2/config/restart-required`.
 - Installer/Docker config auto-migration and `--no-migrate` remain
   unimplemented and deferred. The full narrative migration guide is
   [`docs/2.0-migration.md`](2.0-migration.md).

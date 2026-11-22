@@ -467,7 +467,7 @@ pub fn ensure_no_restart_required(
     Err(ProblemDetails::conflict_with_restart(
         restart_required.clone(),
         format!(
-            "restart_required: configuration changes restart-only fields ({}); nothing was applied or persisted. Edit config.toml and restart the service (or use the installer). GET /api/v1/config/restart-required lists the matrix",
+            "restart_required: configuration changes restart-only fields ({}); nothing was applied or persisted. Edit config.toml and restart the service (or use the installer). GET /api/v2/config/restart-required lists the matrix",
             restart_required.join(", ")
         ),
     ))
@@ -692,7 +692,7 @@ pub enum ConfigFileApplyOutcome {
 /// re-reads the file. The document is suppressed only when it parses to the
 /// *current* runtime configuration (typically the HA applier's own write, a
 /// duplicate event, or an identical external save). An identical external save
-/// therefore does not force a full re-apply; use `POST /api/v1/config/reload`
+/// therefore does not force a full re-apply; use `POST /api/v2/config/reload`
 /// when an explicit reload is required. A file that differs from the runtime —
 /// including an external revert to an older document — is always applied.
 ///
@@ -1071,7 +1071,7 @@ pub fn restart_required_fields(old: &Config, new: &Config) -> Vec<String> {
 /// The complete restart-only matrix (D11), in the order reported by
 /// [`restart_required_fields`].
 ///
-/// `GET /api/v1/config/restart-required` publishes this list so the UI can
+/// `GET /api/v2/config/restart-required` publishes this list so the UI can
 /// show which edits require a process restart. Keep it in sync with the
 /// comparisons above; the parity test asserts every name is reachable.
 #[must_use]

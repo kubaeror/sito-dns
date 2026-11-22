@@ -183,7 +183,7 @@ fn restore_placeholders(new: &mut toml::Table, current: &toml::Table) {
 /// Get current full configuration with secrets masked.
 #[utoipa::path(
     get,
-    path = "/api/v1/config",
+    path = "/api/v2/config",
     responses(
         (status = 200, description = "Full configuration with masked secrets", body = ConfigResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -209,7 +209,7 @@ pub async fn get_config(
 /// List the settings that only take effect after a process restart (D11).
 #[utoipa::path(
     get,
-    path = "/api/v1/config/restart-required",
+    path = "/api/v2/config/restart-required",
     responses(
         (status = 200, description = "Restart-only configuration fields", body = RestartRequiredResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -231,14 +231,14 @@ pub async fn get_restart_required(
                   them returns 409 Conflict with `restart_required` and is not persisted; edit \
                   config.toml and restart, or use the installer"
             .to_string(),
-        apply_endpoint: "/api/v1/config".to_string(),
+        apply_endpoint: "/api/v2/config".to_string(),
     })
 }
 
 /// Update full configuration atomically after pre-commit validation.
 #[utoipa::path(
     put,
-    path = "/api/v1/config",
+    path = "/api/v2/config",
     request_body = UpdateConfigRequest,
     responses(
         (status = 200, description = "Configuration updated successfully", body = GenericMessageResponse),
@@ -782,7 +782,7 @@ token = "ha-token"
 /// Reload configuration from disk without server restart.
 #[utoipa::path(
     post,
-    path = "/api/v1/config/reload",
+    path = "/api/v2/config/reload",
     responses(
         (status = 200, description = "Configuration reloaded", body = GenericMessageResponse),
         (status = 400, description = "Invalid configuration on disk", body = ProblemDetails),
@@ -855,7 +855,7 @@ pub async fn reload_config(
 /// Download a complete configuration backup archive (.tar.gz).
 #[utoipa::path(
     get,
-    path = "/api/v1/config/backup",
+    path = "/api/v2/config/backup",
     responses(
         (status = 200, description = "Gzipped tar archive containing config and metadata", content_type = "application/gzip"),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -979,7 +979,7 @@ pub fn extract_backup_archive(archive_bytes: &[u8]) -> anyhow::Result<(String, B
 /// Download a complete configuration backup archive (.tar.gz).
 #[utoipa::path(
     get,
-    path = "/api/v1/config/backup",
+    path = "/api/v2/config/backup",
     responses(
         (status = 200, description = "Gzipped tar archive containing config and metadata", content_type = "application/gzip"),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -1020,7 +1020,7 @@ pub async fn download_backup(
 /// Upload and validate a backup archive (.tar.gz), generating a confirmation token.
 #[utoipa::path(
     post,
-    path = "/api/v1/config/restore",
+    path = "/api/v2/config/restore",
     request_body(content = String, description = "Gzipped tar archive", content_type = "application/gzip"),
     responses(
         (status = 200, description = "Backup validated and confirmation token issued", body = RestorePreparedResponse),
@@ -1077,7 +1077,7 @@ pub async fn prepare_restore(
 /// Confirm and apply configuration restoration using confirmation token.
 #[utoipa::path(
     post,
-    path = "/api/v1/config/restore/confirm",
+    path = "/api/v2/config/restore/confirm",
     request_body = RestoreConfirmRequest,
     responses(
         (status = 200, description = "Restoration completed successfully", body = GenericMessageResponse),

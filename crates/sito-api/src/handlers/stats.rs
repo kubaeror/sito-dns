@@ -141,7 +141,7 @@ pub fn parse_window_ms(window: Option<&str>) -> Result<i64, ProblemDetails> {
 
 #[utoipa::path(
     get,
-    path = "/api/v1/stats",
+    path = "/api/v2/stats",
     params(StatsQuery),
     responses(
         (status = 200, description = "Global statistics retrieved", body = GlobalStats),
@@ -173,7 +173,7 @@ pub async fn get_stats(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/stats/clients",
+    path = "/api/v2/stats/clients",
     params(StatsQuery),
     responses(
         (status = 200, description = "Per-client statistics retrieved", body = Vec<ClientStats>,
@@ -211,7 +211,7 @@ pub async fn get_client_stats(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/stats/upstreams",
+    path = "/api/v2/stats/upstreams",
     params(StatsQuery),
     responses(
         (status = 200, description = "Per-upstream statistics retrieved", body = Vec<UpstreamStats>,

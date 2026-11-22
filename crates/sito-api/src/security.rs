@@ -36,8 +36,8 @@ fn is_sensitive_path(path: &str) -> bool {
     // Every authenticated API route and UI page can carry caller-specific
     // state (sessions, tokens, query history, config, URLs), so the whole
     // surface must stay out of shared caches.
-    path.starts_with("/api/v1/")
-        || path == "/api/v1"
+    path.starts_with("/api/v2/")
+        || path == "/api/v2"
         || path.starts_with("/ui/")
         || path == "/metrics"
         || matches!(
@@ -657,21 +657,21 @@ mod tests {
     #[test]
     fn test_sensitive_paths() {
         for path in [
-            "/api/v1",
-            "/api/v1/auth/login",
-            "/api/v1/config",
-            "/api/v1/config/restart-required",
-            "/api/v1/clients",
-            "/api/v1/querylog",
-            "/api/v1/querylog/stream",
-            "/api/v1/stats",
-            "/api/v1/filtering/status",
-            "/api/v1/integrations/lists",
-            "/api/v1/upstream",
-            "/api/v1/rewrites",
-            "/api/v1/cache/flush",
-            "/api/v1/status",
-            "/api/v1/ha/status",
+            "/api/v2",
+            "/api/v2/auth/login",
+            "/api/v2/config",
+            "/api/v2/config/restart-required",
+            "/api/v2/clients",
+            "/api/v2/querylog",
+            "/api/v2/querylog/stream",
+            "/api/v2/stats",
+            "/api/v2/filtering/status",
+            "/api/v2/integrations/lists",
+            "/api/v2/upstream",
+            "/api/v2/rewrites",
+            "/api/v2/cache/flush",
+            "/api/v2/status",
+            "/api/v2/ha/status",
             "/metrics",
             "/ui/login",
             "/ui/partials/dashboard-stats",

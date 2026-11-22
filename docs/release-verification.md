@@ -308,11 +308,11 @@ backup ready for rollback:
 
 | Area | Signal | Where | Rollback trigger |
 | --- | --- | --- | --- |
-| DNS availability | Query error/SERVFAIL rate, listener readiness, `/health` 503s | Prometheus, `/api/v1/status`, `sito healthcheck` | Sustained SERVFAIL/503 growth not explained by an upstream outage |
+| DNS availability | Query error/SERVFAIL rate, listener readiness, `/health` 503s | Prometheus, `/api/v2/status`, `sito healthcheck` | Sustained SERVFAIL/503 growth not explained by an upstream outage |
 | DNSSEC | `sito_dnssec_bogus_total`, secure/insecure counts, validation fetch failures | Prometheus, query log | Bogus rate jumps on names that validated before 2.0 |
-| ACME/TLS | Certificate expiry, renewal failures, readiness reasons, all-transport reload | `/api/v1/status`, ACME logs | Certificate near expiry or a transport serving a stale pair |
-| HA | `protocol_mismatch`, divergence, lag, `queued` vs `connected_no_delivery`, slave `Synced` | `/api/v1/ha/status`, `/api/v1/ha/slaves`, metrics | A slave cannot reach `Synced` or divergence persists after a resync |
-| Filtering | Zero-yield lists, reload errors, `degraded_groups`, rule count | `/api/v1/integrations/lists`, status page, logs | A list reload empties blocking or a group loses its previous snapshot |
+| ACME/TLS | Certificate expiry, renewal failures, readiness reasons, all-transport reload | `/api/v2/status`, ACME logs | Certificate near expiry or a transport serving a stale pair |
+| HA | `protocol_mismatch`, divergence, lag, `queued` vs `connected_no_delivery`, slave `Synced` | `/api/v2/ha/status`, `/api/v2/ha/slaves`, metrics | A slave cannot reach `Synced` or divergence persists after a resync |
+| Filtering | Zero-yield lists, reload errors, `degraded_groups`, rule count | `/api/v2/integrations/lists`, status page, logs | A list reload empties blocking or a group loses its previous snapshot |
 | Runtime | 429/503 rate, cache hit ratio, upstream RTT/errors, query-log drops | Prometheus, dashboard | A sustained latency/error regression or dropped query-log batches |
 | Supply chain | Image digest/signature, archive checksums, SBOM | `docs/release-verification.md` above | A published artifact does not verify |
 

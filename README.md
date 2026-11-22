@@ -22,12 +22,12 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 > not published as stable artifacts.
 >
 > Remaining release work is the rc.1 tag/publication; the 24-hour fuzz campaign
-> is explicitly deferred by the operator. Deferred work includes `/api/v2`
-> and the API v1 compatibility facade, the SQLite schema/PII migration
-> (`sito db migrate`), installer/Docker auto-migration, a default-deny DNS
-> client ACL, weighted upstream balancing, a second proof for user/token
-> deletion, edit-time read-only HA enforcement, and the optional external
-> parental/service data. The current evidence matrix is
+> is explicitly deferred by the operator. The 2.0 administrative API is
+> `/api/v2` only; `/api/v1` was removed. Deferred work includes the SQLite
+> schema/PII migration (`sito db migrate`), installer/Docker auto-migration,
+> a default-deny DNS client ACL, weighted upstream balancing, a second proof
+> for user/token deletion, edit-time read-only HA enforcement, and the optional
+> external parental/service data. The current evidence matrix is
 > [`docs/2.0-claim-matrix.md`](docs/2.0-claim-matrix.md).
 
 ---
@@ -215,7 +215,7 @@ The command above matches the official release archives and container image,
 which are built with `embed-ui,ha,mimalloc`. HA is **opt-in** for source builds:
 omit `ha` if you intentionally want a no-HA binary. A no-HA `sito` still runs as
 a master, but rejects `[ha]` and `server.role = "slave"` and answers
-`/api/v1/ha/*` with `501 ha_not_supported`; `sito ha gen-certs` is not present.
+`/api/v2/ha/*` with `501 ha_not_supported`; `sito ha gen-certs` is not present.
 
 ### 🧙 First-Time Setup Wizard
 On a fresh installation without a configuration file, **sito** starts in **setup-pending mode** on port `8080` (DNS listener ports 53/853/443 remain closed until initial setup is confirmed).

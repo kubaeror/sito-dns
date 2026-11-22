@@ -2,14 +2,14 @@
   "openapi": "3.1.0",
   "info": {
     "title": "sito DNS Administrative API",
-    "description": "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, API-token management, and self-service TOTP enrollment are available in the web UI (/users and /account); sensitive TOTP changes require a fresh re-authentication ticket from POST /api/v1/auth/reauth. See docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
+    "description": "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, API-token management, and self-service TOTP enrollment are available in the web UI (/users and /account); sensitive TOTP changes require a fresh re-authentication ticket from POST /api/v2/auth/reauth. See docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
     "license": {
       "name": "GPL-3.0-only"
     },
     "version": "2.0.0-rc.2"
   },
   "paths": {
-    "/api/v1/auth/change-password": {
+    "/api/v2/auth/change-password": {
       "post": {
         "tags": [
           "Auth"
@@ -89,7 +89,7 @@
         ]
       }
     },
-    "/api/v1/auth/login": {
+    "/api/v2/auth/login": {
       "post": {
         "tags": [
           "Auth"
@@ -150,7 +150,7 @@
         }
       }
     },
-    "/api/v1/auth/logout": {
+    "/api/v2/auth/logout": {
       "post": {
         "tags": [
           "Auth"
@@ -171,7 +171,7 @@
         }
       }
     },
-    "/api/v1/auth/reauth": {
+    "/api/v2/auth/reauth": {
       "post": {
         "tags": [
           "Auth"
@@ -240,7 +240,7 @@
         ]
       }
     },
-    "/api/v1/auth/tokens": {
+    "/api/v2/auth/tokens": {
       "get": {
         "tags": [
           "Auth"
@@ -370,7 +370,7 @@
         ]
       }
     },
-    "/api/v1/auth/tokens/{id}": {
+    "/api/v2/auth/tokens/{id}": {
       "delete": {
         "tags": [
           "Auth"
@@ -439,19 +439,19 @@
         ]
       }
     },
-    "/api/v1/auth/totp/disable": {
+    "/api/v2/auth/totp/disable": {
       "post": {
         "tags": [
           "Auth"
         ],
         "summary": "Disable TOTP 2FA.",
-        "description": "Requires a fresh re-authentication ticket (`X-Reauth-Token`) from\n`POST /api/v1/auth/reauth`; that call proves the account password and, when\nTOTP is enabled, the current TOTP or backup code. The legacy request-body\ncredentials remain accepted for client compatibility but are superseded by\nthe re-authentication ticket.",
+        "description": "Requires a fresh re-authentication ticket (`X-Reauth-Token`) from\n`POST /api/v2/auth/reauth`; that call proves the account password and, when\nTOTP is enabled, the current TOTP or backup code. The legacy request-body\ncredentials remain accepted for client compatibility but are superseded by\nthe re-authentication ticket.",
         "operationId": "disable_totp",
         "parameters": [
           {
             "name": "X-Reauth-Token",
             "in": "header",
-            "description": "Short-lived re-authentication ticket from POST /api/v1/auth/reauth",
+            "description": "Short-lived re-authentication ticket from POST /api/v2/auth/reauth",
             "required": true,
             "schema": {
               "type": "string"
@@ -520,7 +520,7 @@
         ]
       }
     },
-    "/api/v1/auth/totp/enable": {
+    "/api/v2/auth/totp/enable": {
       "post": {
         "tags": [
           "Auth"
@@ -531,7 +531,7 @@
           {
             "name": "X-Reauth-Token",
             "in": "header",
-            "description": "Short-lived re-authentication ticket from POST /api/v1/auth/reauth",
+            "description": "Short-lived re-authentication ticket from POST /api/v2/auth/reauth",
             "required": true,
             "schema": {
               "type": "string"
@@ -600,7 +600,7 @@
         ]
       }
     },
-    "/api/v1/auth/totp/setup": {
+    "/api/v2/auth/totp/setup": {
       "get": {
         "tags": [
           "Auth"
@@ -611,7 +611,7 @@
           {
             "name": "X-Reauth-Token",
             "in": "header",
-            "description": "Short-lived re-authentication ticket from POST /api/v1/auth/reauth",
+            "description": "Short-lived re-authentication ticket from POST /api/v2/auth/reauth",
             "required": true,
             "schema": {
               "type": "string"
@@ -660,7 +660,7 @@
         ]
       }
     },
-    "/api/v1/auth/totp/verify": {
+    "/api/v2/auth/totp/verify": {
       "post": {
         "tags": [
           "Auth"
@@ -701,7 +701,7 @@
         }
       }
     },
-    "/api/v1/auth/users": {
+    "/api/v2/auth/users": {
       "get": {
         "tags": [
           "Auth"
@@ -841,7 +841,7 @@
         ]
       }
     },
-    "/api/v1/auth/users/{username}": {
+    "/api/v2/auth/users/{username}": {
       "put": {
         "tags": [
           "Auth"
@@ -1018,7 +1018,7 @@
         ]
       }
     },
-    "/api/v1/cache/flush": {
+    "/api/v2/cache/flush": {
       "post": {
         "tags": [
           "Cache"
@@ -1067,7 +1067,7 @@
         ]
       }
     },
-    "/api/v1/cache/invalidate": {
+    "/api/v2/cache/invalidate": {
       "post": {
         "tags": [
           "Cache"
@@ -1136,7 +1136,7 @@
         ]
       }
     },
-    "/api/v1/clients": {
+    "/api/v2/clients": {
       "get": {
         "tags": [
           "Clients"
@@ -1218,7 +1218,7 @@
         ]
       }
     },
-    "/api/v1/clients/groups": {
+    "/api/v2/clients/groups": {
       "get": {
         "tags": [
           "Clients"
@@ -1307,7 +1307,7 @@
         ]
       }
     },
-    "/api/v1/clients/groups/{name}": {
+    "/api/v2/clients/groups/{name}": {
       "get": {
         "tags": [
           "Clients"
@@ -1454,7 +1454,7 @@
         ]
       }
     },
-    "/api/v1/clients/unidentified": {
+    "/api/v2/clients/unidentified": {
       "get": {
         "tags": [
           "Clients"
@@ -1503,7 +1503,7 @@
         ]
       }
     },
-    "/api/v1/clients/{name}": {
+    "/api/v2/clients/{name}": {
       "get": {
         "tags": [
           "Clients"
@@ -1668,7 +1668,7 @@
         ]
       }
     },
-    "/api/v1/config": {
+    "/api/v2/config": {
       "get": {
         "tags": [
           "Config"
@@ -1794,7 +1794,7 @@
         ]
       }
     },
-    "/api/v1/config/backup": {
+    "/api/v2/config/backup": {
       "get": {
         "tags": [
           "Config"
@@ -1839,7 +1839,7 @@
         ]
       }
     },
-    "/api/v1/config/reload": {
+    "/api/v2/config/reload": {
       "post": {
         "tags": [
           "Config"
@@ -1898,7 +1898,7 @@
         ]
       }
     },
-    "/api/v1/config/restart-required": {
+    "/api/v2/config/restart-required": {
       "get": {
         "tags": [
           "Config"
@@ -1947,7 +1947,7 @@
         ]
       }
     },
-    "/api/v1/config/restore": {
+    "/api/v2/config/restore": {
       "post": {
         "tags": [
           "Config"
@@ -2017,7 +2017,7 @@
         ]
       }
     },
-    "/api/v1/config/restore/confirm": {
+    "/api/v2/config/restore/confirm": {
       "post": {
         "tags": [
           "Config"
@@ -2096,7 +2096,7 @@
         ]
       }
     },
-    "/api/v1/filtering/check": {
+    "/api/v2/filtering/check": {
       "post": {
         "tags": [
           "Filtering"
@@ -2143,7 +2143,7 @@
         ]
       }
     },
-    "/api/v1/filtering/lists": {
+    "/api/v2/filtering/lists": {
       "get": {
         "tags": [
           "Filtering"
@@ -2225,7 +2225,7 @@
         ]
       }
     },
-    "/api/v1/filtering/lists/{id}": {
+    "/api/v2/filtering/lists/{id}": {
       "put": {
         "tags": [
           "Filtering"
@@ -2331,7 +2331,7 @@
         ]
       }
     },
-    "/api/v1/filtering/refresh": {
+    "/api/v2/filtering/refresh": {
       "post": {
         "tags": [
           "Filtering"
@@ -2365,7 +2365,7 @@
         ]
       }
     },
-    "/api/v1/filtering/rules": {
+    "/api/v2/filtering/rules": {
       "get": {
         "tags": [
           "Filtering"
@@ -2441,7 +2441,7 @@
         ]
       }
     },
-    "/api/v1/filtering/status": {
+    "/api/v2/filtering/status": {
       "get": {
         "tags": [
           "Filtering"
@@ -2475,7 +2475,7 @@
         ]
       }
     },
-    "/api/v1/ha/resync": {
+    "/api/v2/ha/resync": {
       "post": {
         "tags": [
           "HA"
@@ -2544,7 +2544,7 @@
         ]
       }
     },
-    "/api/v1/ha/slaves": {
+    "/api/v2/ha/slaves": {
       "get": {
         "tags": [
           "HA"
@@ -2596,7 +2596,7 @@
         ]
       }
     },
-    "/api/v1/ha/status": {
+    "/api/v2/ha/status": {
       "get": {
         "tags": [
           "HA"
@@ -2645,7 +2645,7 @@
         ]
       }
     },
-    "/api/v1/integrations/lists": {
+    "/api/v2/integrations/lists": {
       "get": {
         "tags": [
           "Integrations"
@@ -2682,7 +2682,7 @@
         ]
       }
     },
-    "/api/v1/integrations/lists/{category}/refresh": {
+    "/api/v2/integrations/lists/{category}/refresh": {
       "post": {
         "tags": [
           "Integrations"
@@ -2736,7 +2736,7 @@
         ]
       }
     },
-    "/api/v1/querylog": {
+    "/api/v2/querylog": {
       "get": {
         "tags": [
           "QueryLog"
@@ -2939,12 +2939,12 @@
         ]
       }
     },
-    "/api/v1/querylog/clear": {
+    "/api/v2/querylog/clear": {
       "post": {
         "tags": [
           "QueryLog"
         ],
-        "summary": "POST alias for `DELETE /api/v1/querylog` (older UI clients).",
+        "summary": "POST alias for `DELETE /api/v2/querylog` (older UI clients).",
         "operationId": "clear_querylog",
         "parameters": [
           {
@@ -2985,7 +2985,7 @@
         ]
       }
     },
-    "/api/v1/querylog/stream": {
+    "/api/v2/querylog/stream": {
       "get": {
         "tags": [
           "QueryLog"
@@ -3014,7 +3014,7 @@
         ]
       }
     },
-    "/api/v1/rewrites": {
+    "/api/v2/rewrites": {
       "get": {
         "tags": [
           "Rewrites"
@@ -3096,7 +3096,7 @@
         ]
       }
     },
-    "/api/v1/rewrites/{id}": {
+    "/api/v2/rewrites/{id}": {
       "put": {
         "tags": [
           "Rewrites"
@@ -3203,7 +3203,7 @@
         ]
       }
     },
-    "/api/v1/stats": {
+    "/api/v2/stats": {
       "get": {
         "tags": [
           "Stats"
@@ -3279,7 +3279,7 @@
         ]
       }
     },
-    "/api/v1/stats/clients": {
+    "/api/v2/stats/clients": {
       "get": {
         "tags": [
           "Stats"
@@ -3366,7 +3366,7 @@
         ]
       }
     },
-    "/api/v1/stats/upstreams": {
+    "/api/v2/stats/upstreams": {
       "get": {
         "tags": [
           "Stats"
@@ -3453,7 +3453,7 @@
         ]
       }
     },
-    "/api/v1/status": {
+    "/api/v2/status": {
       "get": {
         "tags": [
           "System"
@@ -3487,7 +3487,7 @@
         ]
       }
     },
-    "/api/v1/system/update/apply": {
+    "/api/v2/system/update/apply": {
       "post": {
         "tags": [
           "System"
@@ -3563,7 +3563,7 @@
         ]
       }
     },
-    "/api/v1/system/update/check": {
+    "/api/v2/system/update/check": {
       "get": {
         "tags": [
           "System"
@@ -3625,7 +3625,7 @@
         ]
       }
     },
-    "/api/v1/upstream": {
+    "/api/v2/upstream": {
       "get": {
         "tags": [
           "Upstream"
@@ -3741,16 +3741,16 @@
         ]
       }
     },
-    "/api/v1/upstream/config": {
+    "/api/v2/upstream/config": {
       "get": {
         "tags": [
           "Upstream"
         ],
-        "summary": "Documented GET alias for `/api/v1/upstream`.",
+        "summary": "Documented GET alias for `/api/v2/upstream`.",
         "operationId": "redirect_upstream_config_get",
         "responses": {
           "308": {
-            "description": "Permanent redirect to /api/v1/upstream",
+            "description": "Permanent redirect to /api/v2/upstream",
             "headers": {
               "Location": {
                 "schema": {
@@ -3780,11 +3780,11 @@
         "tags": [
           "Upstream"
         ],
-        "summary": "Documented PUT alias for `/api/v1/upstream`.",
+        "summary": "Documented PUT alias for `/api/v2/upstream`.",
         "operationId": "redirect_upstream_config_put",
         "responses": {
           "308": {
-            "description": "Permanent redirect to /api/v1/upstream",
+            "description": "Permanent redirect to /api/v2/upstream",
             "headers": {
               "Location": {
                 "schema": {
@@ -3811,7 +3811,7 @@
         ]
       }
     },
-    "/api/v1/upstream/test": {
+    "/api/v2/upstream/test": {
       "post": {
         "tags": [
           "Upstream"
@@ -4699,7 +4699,7 @@
       },
       "HaResyncResponse": {
         "type": "object",
-        "description": "Response for `POST /api/v1/ha/resync`.",
+        "description": "Response for `POST /api/v2/ha/resync`.",
         "required": [
           "status",
           "role",
@@ -4767,7 +4767,7 @@
       },
       "HaSlaveSummary": {
         "type": "object",
-        "description": "Summary of a connected replica slave node for `GET /api/v1/ha/slaves`.",
+        "description": "Summary of a connected replica slave node for `GET /api/v2/ha/slaves`.",
         "required": [
           "instance",
           "remote_addr",
@@ -4819,7 +4819,7 @@
       },
       "HaStatusResponse": {
         "type": "object",
-        "description": "HA cluster status response for `GET /api/v1/ha/status`.",
+        "description": "HA cluster status response for `GET /api/v2/ha/status`.",
         "required": [
           "role",
           "instance_name",

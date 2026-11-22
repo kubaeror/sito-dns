@@ -1,4 +1,4 @@
-//! `/api/v1/ha/*` placeholders for builds compiled without the `ha` feature.
+//! `/api/v2/ha/*` placeholders for builds compiled without the `ha` feature.
 //!
 //! The routes stay mounted so HA is discoverable and clients get a stable
 //! answer instead of a 404, but replication is genuinely unavailable. The

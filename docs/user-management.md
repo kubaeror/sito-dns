@@ -3,7 +3,7 @@
 sito keeps its accounts in `<data_dir>/users.toml` (mode `0600`) and has no
 self-registration or e-mail-based password reset. Accounts, roles, and API
 tokens can be managed from the web panel (`/users` and `/account`) or through
-the administrative REST API under `/api/v1/auth/*`. TOTP enrollment, replacement,
+the administrative REST API under `/api/v2/auth/*`. TOTP enrollment, replacement,
 and disabling are available to every role from the Account page and the REST
 API.
 
@@ -36,7 +36,7 @@ Navigation links are role-aware: **Users** is shown only to Admins and
   re-authentication with the current password and a valid TOTP or backup code.
   The same workflows are available through the REST API (section 7).
 - The **Clients** page shows the operator-only “Discovered but unidentified”
-  table, matching `GET /api/v1/clients/unidentified`. Viewers see only the
+  table, matching `GET /api/v2/clients/unidentified`. Viewers see only the
   configured clients.
 
 All examples below use the REST API:
@@ -60,17 +60,17 @@ automatically.
    panel to loopback. When a config file already exists, `--no-setup` neither
    creates nor rotates credentials. The bootstrap account is named `admin`.
    While the first-boot setup token is active, or `admin/adminadmin` is still the
-   stored bootstrap credential, login, `/api/v1/auth/*`, API tokens and every
+   stored bootstrap credential, login, `/api/v2/auth/*`, API tokens and every
    non-wizard routes are disabled. Only `/wizard`, `/ui/wizard/*`, static assets,
    `/health` and `/status` are reachable; the wizard requires the one-time token
    printed in the server logs. The wizard is bootstrap-only and returns `403`
    after setup completes, even for an Admin session; use the authenticated
    account flow for later password changes.
-2. **Create** additional accounts with `POST /api/v1/auth/users` or the Admin
+2. **Create** additional accounts with `POST /api/v2/auth/users` or the Admin
    **Users** page at `/users`.
 3. **Operate.** Users sign in at `/login` (session cookie) or authenticate with
    an API token (`Authorization: Bearer ...`).
-4. **Delete** an account with `DELETE /api/v1/auth/users/{username}` or the
+4. **Delete** an account with `DELETE /api/v2/auth/users/{username}` or the
    **Users** page. Sessions and every API token owned by that account are
    revoked immediately. Legacy ownerless tokens are not tied to an account and
    remain Admin-managed until explicitly revoked.
@@ -128,7 +128,7 @@ immediately and revokes all existing sessions of the affected account.
 A stolen browser session must not be able to change a password, change a role,
 create an Admin account, or mint an Admin-scoped token. When the caller
 authenticates with a **user session**, those operations require a fresh,
-session-bound re-authentication ticket from `POST /api/v1/auth/reauth`
+session-bound re-authentication ticket from `POST /api/v2/auth/reauth`
 (`X-Reauth-Token`) or, in the web UI, the caller's current password plus a
 current TOTP/backup code when 2FA is enrolled. The ticket is single-use and is
 consumed atomically at authorization, before the mutation; a failed mutation burns it (fail-closed).
@@ -153,13 +153,13 @@ Requires an Admin session or an Admin-scoped API token.
 List accounts (never includes password hashes or TOTP secrets):
 
 ```bash
-curl -sS -H "Authorization: Bearer $TOKEN" "$SITO/api/v1/auth/users"
+curl -sS -H "Authorization: Bearer $TOKEN" "$SITO/api/v2/auth/users"
 ```
 
 Create an account:
 
 ```bash
-curl -sS -X POST "$SITO/api/v1/auth/users" \
+curl -sS -X POST "$SITO/api/v2/auth/users" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice","password":"CorrectHorse1","role":"operator"}'
@@ -180,7 +180,7 @@ Delete an account:
 
 ```bash
 curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" \
-  "$SITO/api/v1/auth/users/alice"
+  "$SITO/api/v2/auth/users/alice"
 ```
 
 The last remaining `admin` account cannot be deleted (or demoted); the API
@@ -203,7 +203,7 @@ Admin-managed until explicitly revoked.
 
 ```bash
 # Admin API token (exempt from the reauth ticket):
-curl -sS -X PUT "$SITO/api/v1/auth/users/alice" \
+curl -sS -X PUT "$SITO/api/v2/auth/users/alice" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"role":"viewer"}'
@@ -213,7 +213,7 @@ Every role change from a **user session** instead requires a fresh
 `X-Reauth-Token` plus the session cookie, `X-CSRF-Token` and `Origin`:
 
 ```bash
-curl -sS -X PUT "$SITO/api/v1/auth/users/alice" \
+curl -sS -X PUT "$SITO/api/v2/auth/users/alice" \
   -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
   -H "X-CSRF-Token: <csrf-token>" \
   -H "Origin: $SITO" \
@@ -268,7 +268,7 @@ Self-service (current password required; `totp_code` is also required when TOTP
 is enabled):
 
 ```bash
-curl -sS -X POST "$SITO/api/v1/auth/change-password" \
+curl -sS -X POST "$SITO/api/v2/auth/change-password" \
   -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
   -H "X-CSRF-Token: <csrf-token>" \
   -H "Origin: $SITO" \
@@ -281,7 +281,7 @@ user session **and** a fresh session-bound re-authentication ticket. Non-Admin
 callers receive `403 Forbidden`:
 
 ```bash
-curl -sS -X POST "$SITO/api/v1/auth/change-password" \
+curl -sS -X POST "$SITO/api/v2/auth/change-password" \
   -H "Cookie: sito_session=<admin-session-id>; sito_csrf=<csrf-token>" \
   -H "X-CSRF-Token: <csrf-token>" \
   -H "Origin: $SITO" \
@@ -305,7 +305,7 @@ that created it as its owner.
 List token metadata (never the hash or plaintext):
 
 ```bash
-curl -sS -H "Authorization: Bearer $TOKEN" "$SITO/api/v1/auth/tokens"
+curl -sS -H "Authorization: Bearer $TOKEN" "$SITO/api/v2/auth/tokens"
 ```
 
 The REST listing is Admin-only and returns metadata for all tokens. The
@@ -316,7 +316,7 @@ internally and is not part of the REST response schema.
 Create a token:
 
 ```bash
-curl -sS -X POST "$SITO/api/v1/auth/tokens" \
+curl -sS -X POST "$SITO/api/v2/auth/tokens" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"name":"grafana","scope":"viewer"}'
@@ -365,14 +365,14 @@ tokens, an old token can never retain privileges the account no longer has.
 Use a token as a Bearer credential:
 
 ```bash
-curl -sS -H "Authorization: Bearer sito_..." "$SITO/api/v1/status"
+curl -sS -H "Authorization: Bearer sito_..." "$SITO/api/v2/status"
 ```
 
 Revoke a token by ID:
 
 ```bash
 curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" \
-  "$SITO/api/v1/auth/tokens/<token-id>"
+  "$SITO/api/v2/auth/tokens/<token-id>"
 ```
 
 The REST revoke endpoint is Admin-only. On `/account`, a user may revoke only
@@ -414,7 +414,7 @@ required.
    required too:
 
    ```bash
-   curl -sS -X POST "$SITO/api/v1/auth/reauth" \
+   curl -sS -X POST "$SITO/api/v2/auth/reauth" \
      -H "Origin: $SITO" \
      -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
      -H "X-CSRF-Token: <csrf-token>" \
@@ -432,7 +432,7 @@ required.
      -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
      -H "X-CSRF-Token: <csrf-token>" \
      -H "X-Reauth-Token: <reauth-token>" \
-     "$SITO/api/v1/auth/totp/setup"
+     "$SITO/api/v2/auth/totp/setup"
    ```
 
    The response contains the Base32 secret, an `otpauth://` URI, a QR-code data
@@ -442,7 +442,7 @@ required.
 3. Confirm with a current code (or a backup code) and the same ticket:
 
    ```bash
-   curl -sS -X POST "$SITO/api/v1/auth/totp/enable" \
+   curl -sS -X POST "$SITO/api/v2/auth/totp/enable" \
      -H "Origin: $SITO" \
      -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
      -H "X-CSRF-Token: <csrf-token>" \
@@ -458,7 +458,7 @@ required.
 4. Subsequent logins return `202 Accepted` with `"totp_required": true` and a
    short-lived partial token. Browser clients receive it as an HttpOnly cookie;
    API clients can send `X-Sito-Token-Delivery: body` to receive it in the JSON
-   response. Finish the login with `POST /api/v1/auth/totp/verify`. Partial
+   response. Finish the login with `POST /api/v2/auth/totp/verify`. Partial
    tokens expire after 5 minutes and allow at most 5 wrong codes before the
    account is locked.
 
@@ -466,7 +466,7 @@ required.
    password + current TOTP/backup-code proof as step 1):
 
    ```bash
-   curl -sS -X POST "$SITO/api/v1/auth/totp/disable" \
+   curl -sS -X POST "$SITO/api/v2/auth/totp/disable" \
      -H "Origin: $SITO" \
      -H "Cookie: sito_session=<session-id>; sito_csrf=<csrf-token>" \
      -H "X-CSRF-Token: <csrf-token>" \
@@ -496,7 +496,7 @@ on the next start (see section 1).
 
 * Sessions are `HttpOnly` cookies valid for `auth.session_ttl_hours` (default
   24). The cookie is named `sito_session`, or `__Host-sito_session` when the
-  admin panel is served over HTTPS. `POST /api/v1/auth/logout` revokes the
+  admin panel is served over HTTPS. `POST /api/v2/auth/logout` revokes the
   current session.
 * With `auth.session_persist = true` (default), sessions and tokens survive a
   restart until their TTL. The stores are mode `0600`; corrupt stores are backed

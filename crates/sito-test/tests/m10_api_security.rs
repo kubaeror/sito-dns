@@ -133,7 +133,7 @@ async fn test_acceptance_m10_csrf_and_origin_enforcement() {
     // Log in over the API to obtain a real session + CSRF cookie pair.
     let req = Request::builder()
         .method("POST")
-        .uri("/api/v1/auth/login")
+        .uri("/api/v2/auth/login")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
             serde_json::json!({"user": "admin", "pass": TEST_ADMIN_PASSWORD}).to_string(),
@@ -195,7 +195,7 @@ async fn test_acceptance_m10_csrf_and_origin_enforcement() {
     // feature (the `/ui/*` routes are feature-gated).
     let req = Request::builder()
         .method("POST")
-        .uri("/api/v1/cache/flush")
+        .uri("/api/v2/cache/flush")
         .header(header::HOST, "localhost")
         .header(header::ORIGIN, "http://localhost")
         .header(
@@ -218,7 +218,7 @@ async fn test_acceptance_m10_csrf_and_origin_enforcement() {
         .token;
     let req = Request::builder()
         .method("POST")
-        .uri("/api/v1/cache/flush")
+        .uri("/api/v2/cache/flush")
         .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
         .body(Body::empty())
         .unwrap();
@@ -239,7 +239,7 @@ async fn test_acceptance_m10_security_headers_and_cookies() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/api/v1/auth/login")
+        .uri("/api/v2/auth/login")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
             serde_json::json!({"user": "admin", "pass": TEST_ADMIN_PASSWORD}).to_string(),
@@ -458,7 +458,7 @@ async fn test_acceptance_m10_concurrent_writes_preserve_both() {
         .unwrap();
     let req = Request::builder()
         .method("POST")
-        .uri("/api/v1/filtering/lists")
+        .uri("/api/v2/filtering/lists")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
@@ -479,7 +479,7 @@ async fn test_acceptance_m10_concurrent_writes_preserve_both() {
     let toggle = tokio::spawn(async move {
         let req = Request::builder()
             .method("PUT")
-            .uri("/api/v1/filtering/lists/Local")
+            .uri("/api/v2/filtering/lists/Local")
             .header(header::AUTHORIZATION, format!("Bearer {toggle_token}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"enabled":false}"#))
@@ -491,7 +491,7 @@ async fn test_acceptance_m10_concurrent_writes_preserve_both() {
     let add_client = tokio::spawn(async move {
         let req = Request::builder()
             .method("POST")
-            .uri("/api/v1/clients")
+            .uri("/api/v2/clients")
             .header(header::AUTHORIZATION, format!("Bearer {client_token}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
@@ -574,7 +574,7 @@ phone = "table-secret-value"
     let archive = sito_api::handlers::config::create_backup_archive(&secret_toml).unwrap();
     let req = Request::builder()
         .method("POST")
-        .uri("/api/v1/config/restore")
+        .uri("/api/v2/config/restore")
         .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
         .header(header::CONTENT_TYPE, "application/gzip")
         .body(Body::from(archive))
@@ -628,7 +628,7 @@ async fn test_acceptance_m10_ui_users_csrf_and_rbac() {
         async move {
             let req = Request::builder()
                 .method("POST")
-                .uri("/api/v1/auth/login")
+                .uri("/api/v2/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({"user": user, "pass": pass}).to_string(),

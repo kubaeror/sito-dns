@@ -105,7 +105,7 @@ impl IntoResponse for QueryLogHandlerError {
 
 #[utoipa::path(
     get,
-    path = "/api/v1/querylog",
+    path = "/api/v2/querylog",
     params(QueryLogQueryParams),
     responses(
         (status = 200, description = "Query logs retrieved with cursor pagination", body = QueryLogPage),
@@ -158,7 +158,7 @@ pub async fn get_querylog(
 
 #[utoipa::path(
     delete,
-    path = "/api/v1/querylog",
+    path = "/api/v2/querylog",
     params(ClearQueryLogParams),
     responses(
         (status = 200, description = "Query log cleared successfully", body = GenericMessageResponse),
@@ -194,10 +194,10 @@ pub async fn delete_querylog(
     .into_response())
 }
 
-/// POST alias for `DELETE /api/v1/querylog` (older UI clients).
+/// POST alias for `DELETE /api/v2/querylog` (older UI clients).
 #[utoipa::path(
     post,
-    path = "/api/v1/querylog/clear",
+    path = "/api/v2/querylog/clear",
     params(ClearQueryLogParams),
     responses(
         (status = 200, description = "Query log cleared successfully", body = GenericMessageResponse),
@@ -224,7 +224,7 @@ pub async fn clear_querylog(
 /// and may omit it. The legacy `?token=` query parameter is not accepted.
 #[utoipa::path(
     get,
-    path = "/api/v1/querylog/stream",
+    path = "/api/v2/querylog/stream",
     responses(
         (status = 101, description = "WebSocket upgrade accepted; query log entries stream as JSON text frames"),
         (status = 401, description = "Unauthorized"),

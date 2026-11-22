@@ -419,7 +419,7 @@ exception_clients = ["admin-laptop"]
 | `entries.type` | string | required | Record type: `"A"`, `"AAAA"`, `"CNAME"`, `"PTR"` or `"TXT"`. |
 | `entries.answer` | string | required | Answer value for the record. |
 | `entries.exception_clients` | array of strings | `[]` | Client names/groups/MACs that bypass the rewrite. Matching requires an authenticated identity; IP/CIDR matching still uses the query source. Names may contain spaces and apostrophes; leading/trailing whitespace is rejected, and names containing `/` are not supported (the value is treated as a CIDR attempt). |
-| `entries.id` | string | `None` | Stable rewrite identifier preserved by the admin rewrite API and returned by `/api/v1/rewrites`. The DNS rewrite loader does not use it. If it is absent, the API synthesizes `legacy-<index>`; removing an existing id changes the identifier clients see. |
+| `entries.id` | string | `None` | Stable rewrite identifier preserved by the admin rewrite API and returned by `/api/v2/rewrites`. The DNS rewrite loader does not use it. If it is absent, the API synthesizes `legacy-<index>`; removing an existing id changes the identifier clients see. |
 
 ---
 
@@ -443,7 +443,7 @@ token_default_ttl_days = 90     # 0 = API tokens never expire
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `web.enabled` | boolean | `true` | Enable the web dashboard and REST API. |
-| `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v1/`; must be ≥ 1). It may share a port with a DNS TCP listener only when the addresses cannot collide. DNS TCP `::` binds are v6-only (`IPV6_V6ONLY`), while the web `::` bind is dual-stack; a web `0.0.0.0`/specific IPv4 and a DNS `::` may share a port, but a web `::` conflicts with any IPv4/IPv6 DNS bind on that port. Against an IPv4 DNS bind, an IPv4-mapped web bind (`::ffff:a.b.c.d`) is compared as its IPv4 address (a mapped wildcard covers all IPv4); a native specific IPv6 web bind does not cover IPv4. |
+| `web.port` | integer | `8080` | Port for the Web Dashboard and REST API (`/api/v2/`; must be ≥ 1). It may share a port with a DNS TCP listener only when the addresses cannot collide. DNS TCP `::` binds are v6-only (`IPV6_V6ONLY`), while the web `::` bind is dual-stack; a web `0.0.0.0`/specific IPv4 and a DNS `::` may share a port, but a web `::` conflicts with any IPv4/IPv6 DNS bind on that port. Against an IPv4 DNS bind, an IPv4-mapped web bind (`::ffff:a.b.c.d`) is compared as its IPv4 address (a mapped wildcard covers all IPv4); a native specific IPv6 web bind does not cover IPv4. |
 | `web.bind` | string (IP address) | `"127.0.0.1"` | Bind address for the web server. The admin UI is served over plain HTTP; see the exposure warning below. Migrated v1 documents keep their previous bind unless `--adopt-safe-defaults` is used. |
 | `web.metrics_auth` | boolean | `true` | Require authentication (token or session) for `/metrics`. |
 | `web.trusted_proxies`| array of IP addresses | `[]` | Individual proxy IPs trusted to supply `X-Forwarded-For`/`X-Forwarded-Proto` (CIDR is **not** supported here). |
@@ -545,7 +545,7 @@ cannot silently delete every row while query logging is advertised as enabled.
 The one-validator pipeline rejects an unknown or removed `[stats]`/`[privacy]`
 key before any retention task starts.
 
-> Clearing the query log (`DELETE /api/v1/querylog`, `sito clear-query-log`, or
+> Clearing the query log (`DELETE /api/v2/querylog`, `sito clear-query-log`, or
 > the UI “Clear Logs” button) deletes both `query_log` and `stats_hourly` by
 > default. Pass `?keep_aggregates=true` (API) or `--keep-aggregates` (CLI) to
 > preserve rollups. Large clears are vacuumed and
@@ -603,7 +603,7 @@ P2-59).
 > `ha` feature. Official release archives and the container image include it;
 > the default source build does not. A no-HA build rejects `[ha]` and
 > `server.role = "slave"` at startup, `check-config`, API writes and restore
-> with an error naming the `ha` feature, and its `/api/v1/ha/*` routes return
+> with an error naming the `ha` feature, and its `/api/v2/ha/*` routes return
 > `501 ha_not_supported`. Build HA from source with
 > `cargo build -p sito --features ha`.
 
@@ -653,7 +653,7 @@ sessions (the per-IP permit covers the whole session, not only the handshake).
 A publish response with `ha_publish.status = "queued"` means at least one slave
 was enqueued (directly or coalesced), not delivered; inspect
 `slaves_connected`/`slaves_queued`/`slaves_coalesced` and the slave ACKs in
-`GET /api/v1/ha/slaves`. If slaves are connected but every channel is closed,
+`GET /api/v2/ha/slaves`. If slaves are connected but every channel is closed,
 nothing was queued and the status is `connected_no_delivery`. An oversized
 bundle returns `TooLarge`, is not persisted/broadcast, and is not retried:
 reduce the shared configuration. Private keys (`cert`/`key`, `ca.key`, and the
@@ -673,7 +673,7 @@ Private keys referenced by `key` are read by the unprivileged service account
 with ownership transfer (`sito ha gen-certs --uid <UID> --gid <GID>`, both
 required together) or `chown` them after copying; a key owned by another user
 fails the mTLS listener even though DNS keeps answering. Replication readiness
-is exposed as `ready` and `readiness_reason` in `GET /api/v1/ha/status`; the
+is exposed as `ready` and `readiness_reason` in `GET /api/v2/ha/status`; the
 unauthenticated `/health` endpoint reports only a generic ready flag, and the
 `healthcheck` subcommand fails when `[ha]` requires replication but the master
 listener or slave handshake is not ready. Because
@@ -708,7 +708,7 @@ start, back them up and move them aside on the master and every slave (see the
 resets the master sequence and each slave's local replay guard and requires a
 full resync; keep the v1 files for downgrade. Master publish failures are
 reported through `ha_publish` on config writes and make HA readiness false.
-`POST /api/v1/ha/resync` returns `200` when the request was accepted (including
+`POST /api/v2/ha/resync` returns `200` when the request was accepted (including
 a master with no connected slaves and no active bundle, which reports
 `slaves_notified: 0`). It returns `503` when replication is inactive, the slave
 worker is stopped, or a master has connected slaves and an active bundle but the
@@ -813,7 +813,7 @@ url = "https://lists.example.com/services.json"
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `refresh_hours` | integer | `24` | Default refresh interval in hours for categories without an override (must be ≥ 1 and at most 8760, one year). |
-| `categories` | table (map of category → source) | `{}` | Sources keyed by a bundled category id (`adult`, `gambling` or `services`, case-insensitive). Unknown ids and case-insensitive duplicates are rejected at startup and on configuration writes; empty/whitespace keys are invalid. Each entry has a required `url` (`https://`, `http://` or `file://`), an optional `refresh_hours` override and an optional `license` string for operator reference. Refreshed domain lists replace the bundled content of that category; `services` expects service JSON. Operators can force an immediate refresh (bypassing the >50% shrink guard) with `POST /api/v1/integrations/lists/{category}/refresh`; `GET /api/v1/integrations/lists` reports last refresh/attempt and the most recent error. |
+| `categories` | table (map of category → source) | `{}` | Sources keyed by a bundled category id (`adult`, `gambling` or `services`, case-insensitive). Unknown ids and case-insensitive duplicates are rejected at startup and on configuration writes; empty/whitespace keys are invalid. Each entry has a required `url` (`https://`, `http://` or `file://`), an optional `refresh_hours` override and an optional `license` string for operator reference. Refreshed domain lists replace the bundled content of that category; `services` expects service JSON. Operators can force an immediate refresh (bypassing the >50% shrink guard) with `POST /api/v2/integrations/lists/{category}/refresh`; `GET /api/v2/integrations/lists` reports last refresh/attempt and the most recent error. |
 
 ### `[integrations.lists.categories.<name>]` entries
 
@@ -832,17 +832,17 @@ flag an existing `./config.toml` is preferred, then `/etc/sito/config.toml`
 (the systemd unit and container image pass `/etc/sito/config.toml` explicitly)
 and re-applies the settings below in-process. A
 configuration that cannot be parsed or validated is rejected as a whole: the
-previous settings stay active and the error is logged. `PUT /api/v1/config`
+previous settings stay active and the error is logged. `PUT /api/v2/config`
 returns **409 Conflict** with `restart_required` and persists nothing when a
-restart-only field changes; `GET /api/v1/config/restart-required` previews the
-matrix. `POST /api/v1/config/reload` re-reads an operator-edited file, so it
+restart-only field changes; `GET /api/v2/config/restart-required` previews the
+matrix. `POST /api/v2/config/reload` re-reads an operator-edited file, so it
 applies the hot settings and reports the restart-only fields that remain.
 
 > [!NOTE]
 > The watcher compares the parsed file with the running configuration before
 > applying it. An identical external save (including a file already written by
 > the HA applier) is ignored and does **not** force a full re-apply. When an
-> explicit reload is required, use `POST /api/v1/config/reload`: it re-reads
+> explicit reload is required, use `POST /api/v2/config/reload`: it re-reads
 > the file and applies it even when the content matches the current runtime.
 >
 > On an HA master, an external edit that produces a bundle above the
@@ -916,9 +916,9 @@ they report after a change.
 | Endpoint | Auth | Contract |
 |---|---|---|
 | `GET /health` | None | `200 {"status":"ok"}` when every blocking component is ready; `503 {"status":"unavailable"}` otherwise. It exposes no component names, reason codes, setup state, paths or configuration values. During first-boot setup-pending it is unavailable until setup completes; `sito healthcheck --setup-fallback` accepts that window. |
-| `GET /api/v1/status` | Viewer or higher | Keeps `version`, `uptime_seconds`, `role`, `listeners`, `acme`; adds `ready` and `reasons[]` (`component`, stable `code`, `message`, optional `since_unix_ms`). The stats probe is bounded to 750 ms and is advisory. |
-| `GET /api/v1/ha/status` | Admin | Detailed HA `ready`, `readiness_reason`, `diverged`/`diverged_reason`, role/version and master public key. |
-| `GET /api/v1/config/restart-required` | Admin | Read-only preview of the restart-only field matrix used by the 409 response. |
+| `GET /api/v2/status` | Viewer or higher | Keeps `version`, `uptime_seconds`, `role`, `listeners`, `acme`; adds `ready` and `reasons[]` (`component`, stable `code`, `message`, optional `since_unix_ms`). The stats probe is bounded to 750 ms and is advisory. |
+| `GET /api/v2/ha/status` | Admin | Detailed HA `ready`, `readiness_reason`, `diverged`/`diverged_reason`, role/version and master public key. |
+| `GET /api/v2/config/restart-required` | Admin | Read-only preview of the restart-only field matrix used by the 409 response. |
 
 A restart-only change returns **409 Conflict** with `restart_required` and is
 not persisted; hot fields report their new state after the next config apply.
