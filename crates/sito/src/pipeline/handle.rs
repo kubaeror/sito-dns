@@ -17,6 +17,92 @@ impl QueryHandler for DnsPipeline {
         // One snapshot per query: config, clients and rewrites cannot be torn
         // apart by a concurrent hot reload.
         let runtime_snapshot = self.runtime.snapshot();
+        let acl_start = std::time::Instant::now();
+
+        // ADR-0011: source admission runs before identity resolution and every
+        // expensive stage. The decision reads only the observed peer address
+        // (`client.ip`) and the shared compiled ACL from this snapshot; it
+        // never consults DoH path/SNI, headers, MAC/ARP, RouterOS leases,
+        // secrets or groups. It must stay before the multi-question FORMERR
+        // path so denied sources cannot exercise wire-level error handling.
+        let acl = runtime_snapshot.clients.acl();
+        let decision = acl.decide(client.ip);
+        // Labels are precomputed in `AclPrefix`; both allow and deny series
+        // are emitted without a per-query allocation.
+        let matched_prefix = decision.matched.map(sito_clients::AclPrefix::label);
+        if let Some(ref metrics) = self.metrics {
+            metrics.inc_acl_decision(
+                decision.action.as_str(),
+                decision.reason.as_str(),
+                decision.family.as_str(),
+            );
+            if let Some(prefix) = matched_prefix {
+                metrics.inc_acl_matched_prefix(
+                    decision.action.as_str(),
+                    prefix,
+                    decision.family.as_str(),
+                );
+            }
+        }
+        if decision.is_denied() {
+            let deny_response = acl.deny_response();
+            if deny_response == sito_clients::AclDenyResponse::Drop
+                && let Some(ref metrics) = self.metrics
+            {
+                metrics.inc_acl_dropped(decision.family.as_str());
+            }
+            // Network metadata only: source IP, protocol, action, matched
+            // prefix. No qname, path, SNI, header, entry/group name or secret.
+            match self.acl_log.record(client.ip) {
+                acl::AclLogLevel::Info => info!(
+                    source_ip = %client.ip,
+                    proto = %client.proto,
+                    action = "deny",
+                    reason = decision.reason.as_str(),
+                    matched_prefix = matched_prefix.unwrap_or("default"),
+                    "DNS client ACL denied a query"
+                ),
+                acl::AclLogLevel::Debug => debug!(
+                    source_ip = %client.ip,
+                    proto = %client.proto,
+                    action = "deny",
+                    reason = decision.reason.as_str(),
+                    matched_prefix = matched_prefix.unwrap_or("default"),
+                    "DNS client ACL denied a query"
+                ),
+            }
+
+            if deny_response == sito_clients::AclDenyResponse::Drop {
+                // No query-log entry, no pipeline work, no response. DoH and
+                // DoH3 map `None` to HTTP 204 in the transport.
+                return None;
+            }
+
+            // Synthesized REFUSED still increments the existing query-rate
+            // series; ACL counters always increment because identity (and
+            // therefore `ignore_stats`) is not resolved for denied traffic.
+            if let Some(ref metrics) = self.metrics {
+                let qtype = query
+                    .queries
+                    .first()
+                    .map_or(0, |question| u16::from(question.query_type()));
+                metrics.inc_queries(&client.proto, qtype, "refused");
+                metrics.observe_query_duration("refused", acl_start.elapsed().as_secs_f64());
+            }
+            let mut response = Message::new(
+                query.metadata.id,
+                MessageType::Response,
+                query.metadata.op_code,
+            );
+            response.metadata.response_code = ResponseCode::Refused;
+            ResponseShaper::shape_with_payload(
+                &mut response,
+                &query,
+                runtime_snapshot.dnssec_policy.mode(),
+                runtime_snapshot.config.dns.edns_udp_size,
+            );
+            return Some(response);
+        }
 
         // Multi-question messages are not resolvable by this pipeline (and
         // are used by DoS probes to amplify work). Reject with FORMERR at the

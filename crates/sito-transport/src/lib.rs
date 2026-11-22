@@ -1762,4 +1762,133 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    /// ADR-0011: a REFUSED from the pipeline must be framed normally on TCP.
+    #[tokio::test]
+    async fn test_tcp_refused_is_framed_normally() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::Refused;
+            Some(resp)
+        });
+        let _handle = start_tcp_listener(
+            TcpConfig {
+                bind_addr: actual_addr,
+                max_connections: 10,
+                idle_timeout: Duration::from_secs(5),
+                rate_limit_per_ip: 100,
+                rate_limiter: None,
+            },
+            handler,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut query = Message::new(5001, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("tcp-refused.example.").unwrap(),
+            RecordType::A,
+        ));
+        let wire = encode_message(&query).unwrap();
+        let mut stream = TcpStream::connect(actual_addr).await.unwrap();
+        stream
+            .write_all(&(wire.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&wire).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let mut response = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+        stream.read_exact(&mut response).await.unwrap();
+        let response = decode_message(&response).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+        assert_eq!(response.metadata.id, 5001);
+
+        let _ = shutdown_tx.send(true);
+    }
+
+    /// ADR-0011: a REFUSED from the pipeline must be framed normally on DoT.
+    #[tokio::test]
+    async fn test_dot_refused_is_framed_normally() {
+        use crate::tls::generate_test_cert;
+        use rustls_pki_types::ServerName;
+        use tokio_rustls::TlsConnector;
+
+        let temp_dir = std::env::temp_dir().join(format!("sito_dot_acl_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost", "dot.example.com"]);
+        std::fs::write(&cert_file, cert_pem).unwrap();
+        std::fs::write(&key_file, key_pem).unwrap();
+
+        let server_config =
+            load_server_config(&cert_file, &key_file, &[], vec![b"dot".to_vec()]).unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::Refused;
+            Some(resp)
+        });
+        let _handle = start_dot_listener(
+            DotConfig::new(actual_addr, TlsAcceptorManager::new(server_config)),
+            handler,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in load_certificates(&cert_file).unwrap() {
+            root_store.add(cert).unwrap();
+        }
+        let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"dot".to_vec()];
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp_stream = TcpStream::connect(actual_addr).await.unwrap();
+        let server_name = ServerName::try_from("dot.example.com").unwrap().to_owned();
+        let mut tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
+
+        let mut query = Message::new(5002, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("dot-refused.example.").unwrap(),
+            RecordType::A,
+        ));
+        let wire = encode_message(&query).unwrap();
+        tls_stream
+            .write_all(&(wire.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        tls_stream.write_all(&wire).await.unwrap();
+        tls_stream.flush().await.unwrap();
+
+        let mut len_buf = [0u8; 2];
+        tls_stream.read_exact(&mut len_buf).await.unwrap();
+        let mut response = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+        tls_stream.read_exact(&mut response).await.unwrap();
+        let response = decode_message(&response).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+        assert_eq!(response.metadata.id, 5002);
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

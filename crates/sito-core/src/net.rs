@@ -5,6 +5,10 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use thiserror::Error;
 
+/// Maximum number of prefixes in each ADR-0011 `[clients.acl] allow`/`deny`
+/// list. Shared by the schema validator and the runtime ACL index.
+pub const MAX_ACL_PREFIXES: usize = 1024;
+
 /// Error returned when a CIDR block is invalid.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CidrError {

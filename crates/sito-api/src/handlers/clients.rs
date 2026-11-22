@@ -1091,6 +1091,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_client_api_save_does_not_materialize_acl_defaults() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("sito_clients_acl_{}", rand::random::<u64>()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let ctx = mock_context(&temp_dir).await;
+
+        // Saving the typed default must not add `default_policy` or
+        // `[clients.acl]` to the in-memory config or the persisted document.
+        save_clients_config(&ctx, &ClientsConfig::default())
+            .await
+            .unwrap();
+        let cfg = ctx.config.load();
+        let clients = cfg
+            .clients
+            .as_ref()
+            .and_then(toml::Value::as_table)
+            .expect("clients table");
+        assert!(!clients.contains_key("default_policy"), "{clients:?}");
+        assert!(!clients.contains_key("acl"), "{clients:?}");
+
+        let persisted: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&ctx.config_path).expect("persisted config"))
+                .unwrap();
+        let persisted_clients = persisted
+            .get("clients")
+            .and_then(toml::Value::as_table)
+            .expect("persisted clients table");
+        assert!(
+            !persisted_clients.contains_key("default_policy"),
+            "{persisted_clients:?}"
+        );
+        assert!(
+            !persisted_clients.contains_key("acl"),
+            "{persisted_clients:?}"
+        );
+
+        // An explicitly configured ACL is preserved verbatim.
+        let explicit = ClientsConfig {
+            default_policy: sito_clients::AclDefaultPolicy::Deny,
+            acl: sito_clients::ClientAclConfig {
+                allow: vec!["192.0.2.0/24".to_string()],
+                deny_response: sito_clients::AclDenyResponse::Drop,
+                ..Default::default()
+            },
+            ..ClientsConfig::default()
+        };
+        save_clients_config(&ctx, &explicit).await.unwrap();
+        let persisted: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&ctx.config_path).expect("persisted config"))
+                .unwrap();
+        let persisted_clients = persisted
+            .get("clients")
+            .and_then(toml::Value::as_table)
+            .expect("persisted clients table");
+        assert_eq!(
+            persisted_clients
+                .get("default_policy")
+                .and_then(toml::Value::as_str),
+            Some("deny")
+        );
+        let acl = persisted_clients
+            .get("acl")
+            .and_then(toml::Value::as_table)
+            .expect("acl table");
+        assert_eq!(
+            acl.get("deny_response").and_then(toml::Value::as_str),
+            Some("drop")
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_partial_update_preserves_fields_and_rejects_duplicate_rename() {
         let temp_dir =
             std::env::temp_dir().join(format!("sito_clients_partial_{}", rand::random::<u64>()));

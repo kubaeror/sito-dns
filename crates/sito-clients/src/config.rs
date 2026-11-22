@@ -7,9 +7,115 @@ use crate::safe_search::YouTubeSafeSearchMode;
 use crate::schedule::Schedule;
 use crate::timezone::ClientTimeZone;
 
+/// What happens to a DNS query whose source matches no explicit ACL rule
+/// (ADR-0011). Kept as a typed enum so an invalid value is rejected at load
+/// time instead of silently defaulting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AclDefaultPolicy {
+    /// Admit the query (compatibility default; upgrades stay allow).
+    #[default]
+    Allow,
+    /// Refuse the query (fresh-install wizard policy).
+    Deny,
+}
+
+impl AclDefaultPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// What a denied client receives (ADR-0011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AclDenyResponse {
+    /// Send a normal DNS REFUSED (RCODE 5) response.
+    #[default]
+    Refused,
+    /// Send no DNS response at all; DoH/DoH3 return HTTP 204.
+    Drop,
+}
+
+impl AclDenyResponse {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::Drop => "drop",
+        }
+    }
+}
+
+/// Typed writers (client API, UI, HA apply) must not materialize the
+/// compatibility default. Only migration and the first-boot wizard write it
+/// explicitly.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip predicate signature
+fn is_default_policy(policy: &AclDefaultPolicy) -> bool {
+    *policy == AclDefaultPolicy::Allow
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip predicate signature
+fn is_default_deny_response(response: &AclDenyResponse) -> bool {
+    *response == AclDenyResponse::Refused
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip predicate signature
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Source-address admission rules for the DNS listeners (ADR-0011).
+///
+/// This is shared configuration: it is part of the HA bundle and its decision
+/// depends only on the observed peer address, never on DoH path/SNI, MAC, ARP,
+/// RouterOS leases, headers or groups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAclConfig {
+    /// IPv4/IPv6 addresses or CIDR blocks whose sources may use the listeners.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// IPv4/IPv6 addresses or CIDR blocks that are always denied. Deny wins
+    /// over every allow rule regardless of prefix length.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+    /// Treat static IP/CIDR values in `clients.entries[].ids` as allow rules.
+    /// Off by default: an entry is identity/policy, not admission.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_entry_ids: bool,
+    /// Response for a denied source.
+    #[serde(default, skip_serializing_if = "is_default_deny_response")]
+    pub deny_response: AclDenyResponse,
+}
+
+impl ClientAclConfig {
+    /// True when no ACL key differs from its typed default. Used by typed
+    /// serialization (client API, UI, HA apply) to omit an inert table; the
+    /// same defaults are also skipped field-by-field when the table is kept.
+    #[must_use]
+    pub fn is_inert(&self) -> bool {
+        self.allow.is_empty()
+            && self.deny.is_empty()
+            && !self.allow_entry_ids
+            && self.deny_response == AclDenyResponse::Refused
+    }
+}
+
 /// Clients configuration section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ClientsConfig {
+    /// What happens when no explicit rule matches (ADR-0011). Defaults to
+    /// `"allow"` so upgrades and hand-written configs are unchanged.
+    #[serde(default, skip_serializing_if = "is_default_policy")]
+    pub default_policy: AclDefaultPolicy,
+    /// Source-address admission rules for the DNS listeners.
+    #[serde(default, skip_serializing_if = "ClientAclConfig::is_inert")]
+    pub acl: ClientAclConfig,
     /// Timezone used to evaluate group and blocked-service cron schedules
     /// (default: `"local"`, the host's system timezone).
     ///
@@ -232,6 +338,48 @@ schedule = "0 0 15-21 * * MON-FRI"
         );
         assert!(!defaults.trust_routeros_lease_names);
         assert!(!defaults.trust_arp);
+    }
+
+    #[test]
+    fn test_typed_serialization_omits_acl_defaults() {
+        // Typed writers (client API, UI, HA apply) must not materialize the
+        // compatibility defaults. Only migration/the wizard writes them.
+        let defaults = ClientsConfig::default();
+        let rendered = toml::to_string(&defaults).expect("serialize defaults");
+        assert!(!rendered.contains("default_policy"), "{rendered}");
+        assert!(!rendered.contains("[acl]"), "{rendered}");
+        assert!(!rendered.contains("allow_entry_ids"), "{rendered}");
+        assert!(!rendered.contains("deny_response"), "{rendered}");
+        assert_eq!(
+            toml::from_str::<ClientsConfig>(&rendered).unwrap(),
+            defaults
+        );
+
+        let mut with_allow = ClientsConfig::default();
+        with_allow.acl.allow = vec!["192.0.2.0/24".to_string()];
+        let rendered = toml::to_string(&with_allow).expect("serialize allow");
+        assert!(!rendered.contains("default_policy"), "{rendered}");
+        assert!(rendered.contains("192.0.2.0/24"), "{rendered}");
+        assert!(!rendered.contains("allow_entry_ids"), "{rendered}");
+        assert!(!rendered.contains("deny_response"), "{rendered}");
+        assert_eq!(
+            toml::from_str::<ClientsConfig>(&rendered).unwrap(),
+            with_allow
+        );
+
+        let explicit_deny = ClientsConfig {
+            default_policy: AclDefaultPolicy::Deny,
+            acl: ClientAclConfig {
+                allow_entry_ids: true,
+                deny_response: AclDenyResponse::Drop,
+                ..Default::default()
+            },
+            ..ClientsConfig::default()
+        };
+        let rendered = toml::to_string(&explicit_deny).expect("serialize explicit ACL");
+        assert!(rendered.contains("default_policy = \"deny\""), "{rendered}");
+        assert!(rendered.contains("allow_entry_ids = true"), "{rendered}");
+        assert!(rendered.contains("deny_response = \"drop\""), "{rendered}");
     }
 
     #[test]

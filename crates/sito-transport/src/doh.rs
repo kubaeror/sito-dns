@@ -764,6 +764,123 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// ADR-0011: the DNS ACL is decided by the observed TCP peer. DoH must
+    /// never promote `X-Forwarded-For` to a client identity, even when a
+    /// reverse proxy is configured for the admin listener elsewhere.
+    #[tokio::test]
+    async fn test_doh_ignores_x_forwarded_for_for_client_ip() {
+        use std::sync::Mutex;
+
+        let port = reserve_port_number().unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let seen: Arc<Mutex<Option<ClientContext>>> = Arc::new(Mutex::new(None));
+        let seen_handler = Arc::clone(&seen);
+        let handler = move |query: Message, client: ClientContext| {
+            let seen = Arc::clone(&seen_handler);
+            async move {
+                *seen.lock().unwrap() = Some(client);
+                let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+                resp.queries = query.queries.clone();
+                Some(resp)
+            }
+        };
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = start_doh_listener(DohConfig::new(addr, None), Arc::new(handler), shutdown_rx)
+            .await
+            .unwrap();
+
+        let wire = encode_message(&test_query(7010, "xff.example.")).unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/dns-query"))
+            .header("Content-Type", "application/dns-message")
+            .header("X-Forwarded-For", "203.0.113.250")
+            .header("Forwarded", "for=203.0.113.250")
+            .body(wire)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let observed = seen.lock().unwrap().clone().expect("handler must run");
+        assert_eq!(
+            observed.ip,
+            std::net::Ipv4Addr::LOCALHOST,
+            "DoH must use the raw TCP peer, never X-Forwarded-For"
+        );
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
+    /// ADR-0011: an ACL REFUSED is a normal DNS message over HTTP 200, and a
+    /// drop is HTTP 204 (never a 403 or an empty DNS body).
+    #[tokio::test]
+    async fn test_doh_refused_is_200_and_drop_is_204() {
+        let port = reserve_port_number().unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let name = query
+                .queries
+                .first()
+                .map(|q| q.name().to_ascii())
+                .unwrap_or_default();
+            if name.contains("drop") {
+                return None;
+            }
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = sito_proto::ResponseCode::Refused;
+            Some(resp)
+        });
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = start_doh_listener(DohConfig::new(addr, None), handler, shutdown_rx)
+            .await
+            .unwrap();
+
+        let refused_wire = encode_message(&test_query(7020, "refused.example.")).unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/dns-query"))
+            .header("Content-Type", "application/dns-message")
+            .body(refused_wire)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/dns-message")
+        );
+        let body = resp.bytes().await.unwrap();
+        let dns_resp = decode_message(&body).unwrap();
+        assert_eq!(
+            dns_resp.metadata.response_code,
+            sito_proto::ResponseCode::Refused
+        );
+        assert_eq!(dns_resp.answers.len(), 0);
+
+        let drop_wire = encode_message(&test_query(7021, "drop.example.")).unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/dns-query"))
+            .header("Content-Type", "application/dns-message")
+            .body(drop_wire)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NO_CONTENT,
+            "drop must be HTTP 204, not 403"
+        );
+        assert_eq!(resp.bytes().await.unwrap().len(), 0);
+
+        let _ = shutdown_tx.send(true);
+        handle.await.unwrap();
+    }
+
     /// Alt-Svc must only be advertised when a DoH3 port is configured; the
     /// default `DohConfig::new` advertises 443, and `alt_svc_port = None`
     /// (no DoH3 listener) must produce no header at all.

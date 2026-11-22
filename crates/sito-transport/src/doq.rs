@@ -563,6 +563,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// ADR-0011: a REFUSED from the pipeline must be framed normally on DoQ.
+    #[tokio::test]
+    async fn test_doq_refused_is_framed_normally() {
+        let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);
+        let temp_dir = std::env::temp_dir().join(format!("sito_doq_acl_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let cert_file = temp_dir.join("cert.pem");
+        let key_file = temp_dir.join("key.pem");
+        std::fs::write(&cert_file, &cert_pem).unwrap();
+        std::fs::write(&key_file, &key_pem).unwrap();
+
+        let server_config =
+            crate::tls::load_server_config(&cert_file, &key_file, &[], vec![b"doq".to_vec()])
+                .unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let port = reserve_udp_port_number().unwrap();
+        let actual_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let handler = Arc::new(|query: Message, _client: ClientContext| async move {
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.queries = query.queries.clone();
+            resp.metadata.response_code = ResponseCode::Refused;
+            Some(resp)
+        });
+        let _handle = start_doq_listener(
+            DoqConfig::new(actual_addr, Some(TlsAcceptorManager::new(server_config))),
+            handler,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert_der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
+        root_store.add(cert_der).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"doq".to_vec()];
+        let quic_client_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls)).unwrap();
+        let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint
+            .set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_client_crypto)));
+        let conn = client_endpoint
+            .connect(actual_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+
+        let mut query = Message::new(0, MessageType::Query, OpCode::Query);
+        query.queries.push(Query::query(
+            Name::from_str("doq-refused.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let wire = encode_message(&query).unwrap();
+        send.write_all(&(wire.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(&wire).await.unwrap();
+        send.finish().unwrap();
+
+        let mut len_buf = [0u8; 2];
+        recv.read_exact(&mut len_buf).await.unwrap();
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut response = vec![0u8; len];
+        recv.read_exact(&mut response).await.unwrap();
+        let response = decode_message(&response).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+
+        let _ = shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[tokio::test]
     async fn test_doq_rejects_non_zero_message_id() {
         let (cert_pem, key_pem) = generate_test_cert(&["localhost"]);

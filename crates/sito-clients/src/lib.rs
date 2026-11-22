@@ -7,6 +7,7 @@
 //! - Router configuration data (`RouterOsConfig`); the optional RouterOS DHCP
 //!   snapshot sync lives in the separate `sito-routeros` crate.
 
+pub mod acl;
 pub mod bundled;
 pub mod catalog;
 pub mod config;
@@ -21,13 +22,18 @@ pub mod schedule;
 pub mod services;
 pub mod timezone;
 
+pub use acl::{
+    AclAction, AclConfigError, AclDecision, AclFamily, AclIndex, AclPrefix, AclReason,
+    MAX_ACL_PREFIXES, canonical_source,
+};
 pub use bundled::{BundledList, BundledListError, BundledManifest};
 pub use catalog::{
     CATALOG_JSON, CATALOG_LICENSE, CATALOG_VERSION, Catalog, CatalogCategory, CatalogError,
     CatalogFilter, CatalogService, CatalogSource, FILTERS_SOURCE_URL, SERVICES_SOURCE_URL,
 };
 pub use config::{
-    BlockedServiceConfig, ClientEntryConfig, ClientGroupConfig, ClientsConfig, IntegrationsConfig,
+    AclDefaultPolicy, AclDenyResponse, BlockedServiceConfig, ClientAclConfig, ClientEntryConfig,
+    ClientGroupConfig, ClientsConfig, IntegrationsConfig,
 };
 pub use mac::{MacResolver, normalize_mac, normalize_mac_id};
 pub use parental::ParentalRegistry;

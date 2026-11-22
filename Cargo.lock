@@ -3143,6 +3143,7 @@ dependencies = [
  "notify",
  "rand 0.10.3",
  "rcgen",
+ "reqwest",
  "rustls",
  "serde_json",
  "sito-api",

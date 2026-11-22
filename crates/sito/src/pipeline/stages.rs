@@ -46,6 +46,7 @@ impl DnsPipeline {
             querylog: None,
             metrics: None,
             scoped_upstreams: Arc::new(ArcSwap::from(Arc::new(HashMap::new()))),
+            acl_log: acl::AclLogSampler::new(),
         }
     }
 
