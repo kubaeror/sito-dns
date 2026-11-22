@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+pub use crate::db_anonymize::{DbAnonymizeOptions, DbAnonymizeOutcome, run_db_anonymize};
+
 /// Conventional system-wide configuration path used by packages and the
 /// systemd unit.
 pub const SYSTEM_CONFIG_PATH: &str = "/etc/sito/config.toml";
@@ -299,6 +301,20 @@ pub enum DbCommands {
         /// own copy of the database.
         #[arg(long)]
         no_backup: bool,
+    },
+    /// Retroactively mask client IPs and remove client names from query_log
+    Anonymize {
+        /// Optional path to configuration file (defaults to the main --config)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Anonymize every query_log row. Required in 2.0: there is no
+        /// per-client or date-range selection yet.
+        #[arg(long, required = true)]
+        all: bool,
+        /// Report how many rows would change without creating or modifying
+        /// anything in the live data directory
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1712,7 +1728,7 @@ fn lease_holder(pid: Option<u32>) -> String {
 /// operator forced a reset on a live server, no exclusive lease is possible and
 /// callers must print the persisted-only warning.
 #[derive(Debug)]
-enum ResetAccess {
+pub(crate) enum ResetAccess {
     Stopped {
         _lease: crate::service_lock::ServiceLease,
     },
@@ -1733,7 +1749,7 @@ impl ResetAccess {
 /// reset; if it was held we know a server is live. `force_hint` is the
 /// command-specific consequence of using `--force`, so the refusals do not
 /// mention unrelated credentials.
-fn begin_reset(
+pub(crate) fn begin_reset(
     data_dir: &Path,
     action: &str,
     force: bool,
@@ -2106,6 +2122,67 @@ mod tests {
             }
             other => panic!("expected db migrate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_cli_db_anonymize_requires_all_and_parses_dry_run() {
+        let err = Cli::try_parse_from(["sito", "db", "anonymize"])
+            .expect_err("`db anonymize` must require --all");
+        let message = err.to_string();
+        assert!(
+            message.contains("--all"),
+            "the parse error must name the required flag: {message}"
+        );
+
+        let cli = Cli::try_parse_from([
+            "sito",
+            "db",
+            "anonymize",
+            "--all",
+            "--dry-run",
+            "--config",
+            "/tmp/config.toml",
+        ])
+        .expect("parse db anonymize");
+        match cli.command {
+            Some(Commands::Db {
+                command:
+                    DbCommands::Anonymize {
+                        config,
+                        all,
+                        dry_run,
+                    },
+            }) => {
+                assert_eq!(config, Some(PathBuf::from("/tmp/config.toml")));
+                assert!(all);
+                assert!(dry_run);
+            }
+            other => panic!("expected db anonymize, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["sito", "db", "anonymize", "--all"])
+            .expect("parse bare db anonymize --all");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Db {
+                command: DbCommands::Anonymize {
+                    all: true,
+                    dry_run: false,
+                    ..
+                },
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_run_db_anonymize_rejects_a_missing_all_flag() {
+        let (dir, config_path) = reset_admin_fixture();
+        let err = run_db_anonymize(&config_path, DbAnonymizeOptions::default())
+            .await
+            .expect_err("the function must also reject a missing --all");
+        assert!(err.to_string().contains("--all"), "got: {err}");
+        assert!(!dir.join("stats.db").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

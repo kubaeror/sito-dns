@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use sito_stats::{SchemaInspection, StatsDb};
+use sito_stats::{QueryLogAnonymizePlan, SchemaInspection, StatsDb};
 
 /// Name of the cross-process database migration lock inside `server.data_dir`.
 ///
@@ -144,51 +144,132 @@ fn create_private_directory(path: &Path) -> Result<(), anyhow::Error> {
 /// any committed `-wal` content) so refusals and the already-current no-op
 /// leave no sidecars behind.
 pub async fn inspect_db_without_writes(db_path: &Path) -> Result<SchemaInspection, anyhow::Error> {
-    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
-    let staging = parent.join(format!(
-        ".sito-db-inspect-{}-{:016x}.tmp",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    create_private_directory(&staging)?;
-
-    let copy = staging.join("stats.db");
-    let result = async {
-        std::fs::copy(db_path, &copy).map_err(|e| {
+    let copy = PrivateDbCopy::new(db_path)?;
+    StatsDb::inspect_schema_version(copy.path())
+        .await
+        .map_err(|e| {
             anyhow::anyhow!(
-                "Failed to copy '{}' for the dry-run inspection: {e}",
+                "Failed to inspect stats database '{}': {e}",
+                db_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Stats database '{}' disappeared before it could be inspected",
+                db_path.display()
+            )
+        })
+}
+
+/// Read-only dry-run view of a retroactive anonymization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnonymizeInspection {
+    pub schema: SchemaInspection,
+    /// `None` unless the copied database is at the supported schema version.
+    pub plan: Option<QueryLogAnonymizePlan>,
+}
+
+/// Inspects the schema and counts anonymization candidates on a private copy.
+///
+/// The live `stats.db` is never opened, so `--dry-run` cannot create
+/// `-wal`/`-shm` sidecars or a `stats-salt` beside it. The copy lives in a 0700
+/// staging directory under the data directory and is removed before returning.
+/// It includes committed `-wal` content, so the count reflects rows the server
+/// had already persisted before it was stopped.
+pub async fn inspect_anonymize_without_writes(
+    db_path: &Path,
+) -> Result<AnonymizeInspection, anyhow::Error> {
+    let copy = PrivateDbCopy::new(db_path)?;
+    let schema = StatsDb::inspect_schema_version(copy.path())
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to inspect stats database '{}': {e}",
+                db_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Stats database '{}' disappeared before it could be inspected",
                 db_path.display()
             )
         })?;
-        let wal = path_with_suffix(db_path, "-wal");
-        if wal.is_file() {
-            std::fs::copy(&wal, path_with_suffix(&copy, "-wal")).map_err(|e| {
+
+    let plan = if schema.is_current() {
+        Some(
+            StatsDb::inspect_anonymize_plan(copy.path())
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to count anonymization candidates in '{}': {e}",
+                        db_path.display()
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
+    Ok(AnonymizeInspection { schema, plan })
+}
+
+/// A private 0700 copy of `stats.db` and its committed WAL content.
+///
+/// Dropping the copy removes the whole staging directory, including any
+/// sidecars SQLite created while inspecting it.
+struct PrivateDbCopy {
+    staging: PathBuf,
+    copy: PathBuf,
+}
+
+impl PrivateDbCopy {
+    fn new(db_path: &Path) -> Result<Self, anyhow::Error> {
+        let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+        let staging = parent.join(format!(
+            ".sito-db-inspect-{}-{:016x}.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        create_private_directory(&staging)?;
+
+        let copy = staging.join("stats.db");
+        let result = (|| -> Result<(), anyhow::Error> {
+            std::fs::copy(db_path, &copy).map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to copy '{}' for the dry-run inspection: {e}",
-                    wal.display()
+                    db_path.display()
                 )
             })?;
+            let wal = path_with_suffix(db_path, "-wal");
+            if wal.is_file() {
+                std::fs::copy(&wal, path_with_suffix(&copy, "-wal")).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to copy '{}' for the dry-run inspection: {e}",
+                        wal.display()
+                    )
+                })?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => Ok(Self { staging, copy }),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                Err(e)
+            }
         }
-
-        StatsDb::inspect_schema_version(&copy)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to inspect stats database '{}': {e}",
-                    db_path.display()
-                )
-            })?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Stats database '{}' disappeared before it could be inspected",
-                    db_path.display()
-                )
-            })
     }
-    .await;
 
-    let _ = std::fs::remove_dir_all(&staging);
-    result
+    fn path(&self) -> &Path {
+        &self.copy
+    }
+}
+
+impl Drop for PrivateDbCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.staging);
+    }
 }
 
 /// Ownership of a data-directory file, captured before the command writes

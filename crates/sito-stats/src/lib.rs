@@ -16,9 +16,11 @@ pub mod writer;
 
 pub use anonymize::anonymize_ip;
 pub use db::{
-    ClientStats, DEFAULT_QUERYLOG_LIMIT, GlobalStats, HourlyActivity, LEGACY_SCHEMA_VERSION,
-    MAX_AGGREGATE_ROWS, MAX_QUERYLOG_LIMIT, MigrationMode, QueryLogFilter, QueryLogPage,
-    RetentionReport, SCHEMA_VERSION, SchemaInspection, StatsDb, StatsOpenOptions, UpstreamStats,
+    ANONYMIZE_QUERYLOG_CHUNK_ROWS, ClientStats, DEFAULT_QUERYLOG_LIMIT, GlobalStats,
+    HourlyActivity, LEGACY_SCHEMA_VERSION, MAX_AGGREGATE_ROWS, MAX_QUERYLOG_LIMIT, MigrationMode,
+    QueryLogAnonymizeChunk, QueryLogAnonymizePlan, QueryLogAnonymizeReport, QueryLogFilter,
+    QueryLogPage, RetentionReport, SCHEMA_VERSION, SchemaInspection, StatsDb, StatsOpenOptions,
+    UpstreamStats,
 };
 pub use entry::QueryLogEntry;
 pub use error::StatsError;

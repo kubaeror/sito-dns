@@ -247,6 +247,39 @@ fails closed. Roll back by stopping the service, restoring the `.bak` over
 A fresh 2.0 install creates a version 2 database when the server starts;
 `sito db migrate` fails clearly instead of creating an empty database.
 
+### 1.2 Retroactive anonymization (optional)
+
+Enabling `privacy.anonymize_querylog` only affects new rows. To mask raw client
+IPs and remove client names that were already stored in `query_log`, run the
+explicit command while the service is stopped:
+
+```bash
+sudo systemctl stop sito
+# Recommended: keep a pre-anonymization copy; this rewrite cannot be undone
+sudo install -d -m 0700 /var/backups/sito-pre-anonymize
+sudo tar -C /var/lib/sito -czf /var/backups/sito-pre-anonymize/var-lib-sito.tgz .
+# Inspect only: counts rows on a private copy; no live database writes
+sudo sito db anonymize --all --config /etc/sito/config.toml --dry-run
+# Mask client_ip (IPv4 /24, IPv6 /56) and set client_name = NULL
+sudo sito db anonymize --all --config /etc/sito/config.toml
+sudo systemctl start sito
+```
+
+`--all` is required in 2.0. Detailed rows, their timestamps, query names,
+verdicts and all other statistics columns are preserved; only `client_ip` is
+masked and `client_name` becomes `NULL`. `stats_hourly` rollups are not touched
+(their client identifiers are hashed separately by the rollup PII backfill).
+
+The rewrite is chunked (1,000 rows per committed transaction), crash-resumable
+and idempotent: rerunning it skips already-anonymized rows and reports
+`0 changed`, and a full run that changed rows ends with `VACUUM` plus a WAL
+truncate. It takes the same service lease and `db-migrate.lock` as
+`sito db migrate`, refuses a running server and has no `--force`. The database
+must already be at schema version 2; run `sito db migrate` first if it is not.
+There is no automatic anonymization at startup. See
+[the migration guide §6](2.0-migration.md#6-database) for the full behavior and
+rollback guidance.
+
 ---
 
 ## 2. Linux Bare-Metal Installation (systemd)
