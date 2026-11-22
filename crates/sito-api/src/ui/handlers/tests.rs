@@ -2695,6 +2695,65 @@ async fn test_clients_page_hides_unidentified_for_viewer() {
 }
 
 #[tokio::test]
+async fn test_clients_page_renders_blocked_services_picker() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_clients_group_services_page_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let mut clients = sito_clients::ClientsConfig::default();
+    clients.groups.insert(
+        "kids".to_string(),
+        clients_group_with_services(vec![sito_clients::BlockedServiceConfig {
+            service: "tiktok".to_string(),
+            schedule: Some(sito_clients::Schedule::parse("0 8 * * *").unwrap()),
+        }]),
+    );
+    seed_clients_config(&ctx, &clients);
+
+    let headers = operator_form_headers(&ctx).await;
+    let resp = clients_page(
+        State(ctx.clone()),
+        headers,
+        Query(ClientsPageQuery::default()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+
+    assert!(body.contains("Blocked services by group"), "{body}");
+    assert!(body.contains("kids"), "{body}");
+    assert!(body.contains("tiktok"), "{body}");
+    assert!(body.contains("schedule: 0 8 * * *"), "{body}");
+    assert!(
+        body.contains("action=\"/ui/clients/group-services\""),
+        "the picker form must be wired to the handler: {body}"
+    );
+    assert!(body.contains("name=\"csrf_token\" value=\""), "{body}");
+    assert!(body.contains("name=\"group\" value=\"kids\""), "{body}");
+    assert!(body.contains("name=\"selected\""), "{body}");
+    assert!(
+        body.contains("1 selected"),
+        "the group summary count must render: {body}"
+    );
+
+    // Groups sort default-first, so kids is the second picker. Its configured
+    // TikTok entry must be prechecked without client-side JavaScript.
+    let marker = "id=\"group-services-2-tiktok\"";
+    let start = body.find(marker).expect("kids tiktok checkbox");
+    let end = body[start..].find('>').expect("checkbox close") + start;
+    assert!(
+        body[start..=end].contains("checked"),
+        "configured services must be prechecked: {}",
+        &body[start..=end]
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
 async fn test_clients_page_empty_unidentified_state() {
     let temp_dir = std::env::temp_dir().join(format!(
         "sito_ui_clients_discovered_empty_{}",

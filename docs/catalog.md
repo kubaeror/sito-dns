@@ -86,6 +86,35 @@ The dialog also links to the [HostlistsRegistry](https://github.com/AdguardTeam/
 corrupt, the catalog button and dialog are omitted and the custom-URL
 **+ Add Blocklist** flow remains available as the fallback.
 
+## Blocked services by group (web UI)
+
+Operators can manage per-group blocked services on the **Clients** page. The
+**Blocked services by group** card lists every configured client group plus the
+implicit `default` group, with the number of selected services and a chip for
+each service. A service limited by a cron schedule shows that schedule next to
+its chip.
+
+**Edit services** opens a dialog for one group:
+
+- search matches a service name, catalog id or catalog group id;
+- services are grouped by their catalog group with per-group counts;
+- services already configured for the group are prechecked, and their existing
+  schedule is shown beside the name;
+- every row shows its rule count; a catalog service with no usable blocking
+  rule is disabled and marked **Unavailable** instead of being offered as a
+  silent no-op;
+- the dialog shows a live selected count and allows an empty selection, which
+  clears that group's blocked services;
+- saving submits the hidden `group` plus repeated `selected` catalog ids and
+  the CSRF token to `POST /ui/clients/group-services`. The handler validates
+  every id against the embedded catalog, keeps schedules for services that
+  stay selected, and applies the whole group in one configuration update.
+
+If the embedded catalog is missing or corrupt, the group table still renders
+the current selections and schedules, but the edit controls and dialog are
+omitted and the card explains that services cannot be edited. The catalog is
+never fetched at runtime.
+
 ## Runtime behaviour
 
 Filter-list bodies are **not** embedded. The catalog only records their

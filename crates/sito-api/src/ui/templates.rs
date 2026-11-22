@@ -77,6 +77,31 @@ pub struct ClientGroupServicesViewItem {
     pub blocked_services: Vec<BlockedServiceViewItem>,
 }
 
+impl ClientGroupServicesViewItem {
+    /// True when the group already blocks `service_id` (case-insensitive).
+    ///
+    /// Used by the picker to precheck catalog rows without exposing raw
+    /// configuration values to client-side JavaScript.
+    #[must_use]
+    pub fn blocks_service(&self, service_id: &str) -> bool {
+        self.blocked_services
+            .iter()
+            .any(|blocked| blocked.service.eq_ignore_ascii_case(service_id))
+    }
+
+    /// The configured cron schedule for `service_id`, if any.
+    ///
+    /// The picker shows this beside a selected service so an operator knows a
+    /// plain checkbox selection will keep the existing schedule.
+    #[must_use]
+    pub fn schedule_for(&self, service_id: &str) -> Option<&str> {
+        self.blocked_services
+            .iter()
+            .find(|blocked| blocked.service.eq_ignore_ascii_case(service_id))
+            .and_then(|blocked| blocked.schedule.as_deref())
+    }
+}
+
 /// One catalog service offered by the blocked-service picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogServiceViewItem {
