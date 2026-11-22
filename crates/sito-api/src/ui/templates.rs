@@ -75,31 +75,11 @@ pub struct ClientGroupServicesViewItem {
     pub is_default: bool,
     /// Configured entries in configuration order, deduplicated by service id.
     pub blocked_services: Vec<BlockedServiceViewItem>,
-}
-
-impl ClientGroupServicesViewItem {
-    /// True when the group already blocks `service_id` (case-insensitive).
-    ///
-    /// Used by the picker to precheck catalog rows without exposing raw
-    /// configuration values to client-side JavaScript.
-    #[must_use]
-    pub fn blocks_service(&self, service_id: &str) -> bool {
-        self.blocked_services
-            .iter()
-            .any(|blocked| blocked.service.eq_ignore_ascii_case(service_id))
-    }
-
-    /// The configured cron schedule for `service_id`, if any.
-    ///
-    /// The picker shows this beside a selected service so an operator knows a
-    /// plain checkbox selection will keep the existing schedule.
-    #[must_use]
-    pub fn schedule_for(&self, service_id: &str) -> Option<&str> {
-        self.blocked_services
-            .iter()
-            .find(|blocked| blocked.service.eq_ignore_ascii_case(service_id))
-            .and_then(|blocked| blocked.schedule.as_deref())
-    }
+    /// Configured entries whose ids are absent from the embedded catalog
+    /// (bundled-only or legacy ids). The picker shows these as an editable
+    /// "Other configured services" section so saving cannot drop them
+    /// silently.
+    pub unlisted_services: Vec<BlockedServiceViewItem>,
 }
 
 /// One catalog service offered by the blocked-service picker.

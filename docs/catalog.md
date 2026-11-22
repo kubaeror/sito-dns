@@ -94,21 +94,26 @@ implicit `default` group, with the number of selected services and a chip for
 each service. A service limited by a cron schedule shows that schedule next to
 its chip.
 
-**Edit services** opens a dialog for one group:
+**Edit services** opens a single shared dialog populated for the chosen group:
 
 - search matches a service name, catalog id or catalog group id;
 - services are grouped by their catalog group with per-group counts;
-- services already configured for the group are prechecked, and their existing
-  schedule is shown beside the name;
+- services already configured for the group are checked when the dialog opens
+  for that group, and the group table shows each existing schedule;
+- configured services that are missing from the embedded catalog (bundled-only
+  ids such as `ads`, `hbo`, `primevideo`, `zoom`, or a legacy custom id) appear
+  in an **Other configured services** section, checked and with their
+  schedule. Leaving one checked preserves it; unchecking removes it;
 - every row shows its rule count; a catalog service with no usable blocking
   rule is disabled and marked **Unavailable** instead of being offered as a
   silent no-op;
 - the dialog shows a live selected count and allows an empty selection, which
   clears that group's blocked services;
-- saving submits the hidden `group` plus repeated `selected` catalog ids and
-  the CSRF token to `POST /ui/clients/group-services`. The handler validates
-  every id against the embedded catalog, keeps schedules for services that
-  stay selected, and applies the whole group in one configuration update.
+- saving submits the hidden `group` plus repeated `selected` ids and the CSRF
+  token to `POST /ui/clients/group-services`. The handler requires new ids to
+  come from the embedded catalog, accepts an already-configured id that the
+  catalog cannot represent, keeps schedules for services that stay selected,
+  and applies the whole group in one configuration update.
 
 If the embedded catalog is missing or corrupt, the group table still renders
 the current selections and schedules, but the edit controls and dialog are

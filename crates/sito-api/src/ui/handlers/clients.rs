@@ -216,11 +216,19 @@ pub(crate) fn clients_service_views_from(
         b_default.cmp(&a_default).then_with(|| a.cmp(b))
     });
 
+    let catalog_lower_ids: Option<std::collections::HashSet<String>> =
+        catalog.as_ref().ok().map(|catalog| {
+            catalog
+                .services()
+                .map(|service| service.id.to_ascii_lowercase())
+                .collect()
+        });
+
     let groups = group_names
         .into_iter()
         .map(|name| {
             let mut seen = std::collections::HashSet::new();
-            let blocked_services = clients
+            let blocked_services: Vec<BlockedServiceViewItem> = clients
                 .groups
                 .get(&name)
                 .map(|group| {
@@ -228,7 +236,7 @@ pub(crate) fn clients_service_views_from(
                         .blocked_services
                         .iter()
                         .filter(|blocked| !blocked.service.trim().is_empty())
-                        .filter(|blocked| seen.insert(blocked.service.clone()))
+                        .filter(|blocked| seen.insert(blocked.service.to_ascii_lowercase()))
                         .map(|blocked| BlockedServiceViewItem {
                             service: blocked.service.clone(),
                             schedule: blocked
@@ -239,10 +247,20 @@ pub(crate) fn clients_service_views_from(
                         .collect()
                 })
                 .unwrap_or_default();
+            let unlisted_services = blocked_services
+                .iter()
+                .filter(|blocked| {
+                    catalog_lower_ids
+                        .as_ref()
+                        .is_none_or(|ids| !ids.contains(&blocked.service.to_ascii_lowercase()))
+                })
+                .cloned()
+                .collect();
             ClientGroupServicesViewItem {
                 is_default: name == "default",
                 name,
                 blocked_services,
+                unlisted_services,
             }
         })
         .collect();
@@ -365,10 +383,16 @@ pub(crate) fn parse_group_services_form(
 /// Retained services keep their configured order and existing `schedule`;
 /// removed services disappear; new services are appended in submitted order
 /// with `schedule: None`. Duplicate ids are rejected rather than silently
-/// deduplicated, and every id must exist in the embedded catalog with at least
-/// one usable blocking rule. Ids are matched case-insensitively because the
-/// service registry is case-insensitive; new entries are stored with the
-/// catalog's canonical lowercase id.
+/// deduplicated.
+///
+/// Catalog ids are canonicalized and must have at least one usable registry
+/// rule. An id that is not in the embedded catalog is accepted only when this
+/// group already configures it (for example bundled-only services such as
+/// `ads` or a legacy custom id); retaining it keeps its original spelling and
+/// schedule, and omitting it removes it. This prevents editing a group from
+/// silently dropping configured services the catalog cannot represent.
+/// Ids are matched case-insensitively because the service registry is
+/// case-insensitive.
 pub(crate) fn group_blocked_services(
     existing: &[sito_clients::BlockedServiceConfig],
     selected: &[String],
@@ -379,6 +403,11 @@ pub(crate) fn group_blocked_services(
         .services()
         .map(|service| (service.id.to_ascii_lowercase(), service.id.as_str()))
         .collect();
+    let existing_by_lower: std::collections::HashMap<String, &sito_clients::BlockedServiceConfig> =
+        existing
+            .iter()
+            .map(|blocked| (blocked.service.to_ascii_lowercase(), blocked))
+            .collect();
 
     let mut trimmed: Vec<&str> = Vec::with_capacity(selected.len());
     let mut seen_selected = std::collections::HashSet::new();
@@ -394,27 +423,26 @@ pub(crate) fn group_blocked_services(
         trimmed.push(id);
     }
 
-    // The catalog size is also a hard upper bound: selecting every catalog
-    // entry is allowed, one more is not.
-    let max = MAX_GROUP_SERVICES_SELECTION.min(catalog.services.len());
-    if trimmed.len() > max {
-        return Err(GroupServicesError::TooMany(max));
+    if trimmed.len() > MAX_GROUP_SERVICES_SELECTION {
+        return Err(GroupServicesError::TooMany(MAX_GROUP_SERVICES_SELECTION));
     }
 
     let mut selected_ids: Vec<&str> = Vec::with_capacity(trimmed.len());
     for id in trimmed {
         let lower = id.to_ascii_lowercase();
-        let Some(canonical) = by_lower.get(&lower).copied() else {
+        if let Some(canonical) = by_lower.get(&lower).copied() {
+            selected_ids.push(canonical);
+        } else if let Some(configured) = existing_by_lower.get(&lower) {
+            // Bundled-only or legacy configured service: retain its configured
+            // spelling so a catalog edit cannot silently drop it.
+            selected_ids.push(configured.service.as_str());
+        } else {
             return Err(GroupServicesError::UnknownService(id.to_string()));
-        };
-        selected_ids.push(canonical);
+        }
     }
 
     for id in &selected_ids {
-        if catalog.service_by_id(id).is_none() {
-            return Err(GroupServicesError::UnknownService((*id).to_string()));
-        }
-        if !registry.contains_service(id) {
+        if catalog.service_by_id(id).is_some() && !registry.contains_service(id) {
             return Err(GroupServicesError::UnavailableService((*id).to_string()));
         }
     }
@@ -445,11 +473,13 @@ pub(crate) fn group_blocked_services(
 
 /// Operator-only blocked-services selection for one client group.
 ///
-/// The form supplies `group` and repeated `selected` catalog service ids. The
-/// embedded catalog decides what exists; the bundled registry decides what is
-/// enforceable. Retained entries keep their schedules. Everything is applied
-/// in one configuration clone and one synchronous apply, so an invalid
-/// selection or a failed apply persists nothing.
+/// The form supplies `group` and repeated `selected` service ids. The embedded
+/// catalog decides which new ids exist; configured ids missing from the
+/// catalog (bundled-only or legacy entries) can be retained or removed
+/// explicitly. The bundled registry decides what is enforceable. Retained
+/// entries keep their schedules. Everything is applied in one configuration
+/// clone and one synchronous apply, so an invalid selection or a failed apply
+/// persists nothing.
 pub async fn clients_group_services_handler(
     State(ctx): State<ServerContext>,
     headers: HeaderMap,
