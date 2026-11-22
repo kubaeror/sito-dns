@@ -613,6 +613,47 @@ async fn cli_db_migrate_restores_ownership_of_created_files() {
 }
 
 #[tokio::test]
+async fn cli_db_migrate_refuses_when_the_migration_lock_is_held() {
+    let (dir, config_path) = fixture("migration_lock");
+    let db_path = dir.join("stats.db");
+    legacy_db(&db_path).await;
+
+    // Server startup uses the same `<data_dir>/db-migrate.lock`. Holding it
+    // here simulates a concurrent startup/migration; the CLI must fail fast
+    // instead of migrating the database at the same time.
+    let lock_path = dir.join("db-migrate.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    lock_file.lock().unwrap();
+
+    let output = migrate(&config_path, &[]);
+
+    assert!(
+        !output.status.success(),
+        "a held migration lock must refuse the CLI"
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("another DB migration is in progress"),
+        "the refusal must explain the shared migration lock: {stderr}"
+    );
+    assert!(backups(&dir).is_empty(), "a refused run must not back up");
+    assert_eq!(
+        stored_marker(&db_path).await,
+        None,
+        "a refused run must not migrate"
+    );
+
+    lock_file.unlock().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn cli_db_migrate_corrupt_marker_fails_closed() {
     let (dir, config_path) = fixture("corrupt");
     let db_path = dir.join("stats.db");

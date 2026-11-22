@@ -160,9 +160,13 @@ Do not mix a 2.0 binary with an unmigrated v1 file, and do not point an old
 covers the report, unknown-key policy, restart-only matrix and rollback.
 
 A `stats.db` written by 1.9.x is **schema version 1** until it is migrated;
-2.0 supports **schema version 2**. Migrate it explicitly while the service is
-stopped — the command holds the service lease and refuses to run against a
-live server, and there is no `--force`:
+2.0 supports **schema version 2**. A 2.0 server **fails closed by default** when
+the database needs a migration: it does not serve DNS/API and does not write the
+database. There are two supported ways to upgrade:
+
+**Option A — explicit CLI migration (recommended).** Migrate while the service
+is stopped. The command holds the service lease and a database migration lock,
+refuses to run against a live server, and has no `--force`:
 
 ```bash
 sudo systemctl stop sito
@@ -173,24 +177,37 @@ sudo sito db migrate --config /etc/sito/config.toml
 sudo systemctl start sito
 ```
 
-The command preserves the data-directory ownership even under `sudo`: every
-file it creates or changes (`stats.db`, `-wal`/`-shm`, `stats-salt`, the
-`.bak`) is restored to the owner of the existing `stats.db`, so the
-`User=sito` service can open it again. Running it as the service user
+**Option B — opt in to startup auto-migration.** Start the 2.0 binary with
+`SITO_DB_AUTO_MIGRATE=1` (or `true`). Startup then takes the same shared
+migration lock, writes the same consistent 0600 backup
+(`<server.data_dir>/stats.db.v<found>.bak`, normally
+`/var/lib/sito/stats.db.v1.bak`), migrates, verifies that the schema is current,
+and only then opens the runtime database and starts DNS/API. On any failure it
+aborts startup, reports the backup path, and never serves. `0`, `false`, empty
+or unset mean “no auto-migration”; any other value is an invalid-value startup
+error. An existing backup is never overwritten.
+
+A new install (no `stats.db`) creates the current schema normally without a
+backup, and an already-current database opens without one. A newer schema is
+refused without writes; a corrupt marker fails closed. The installer and Docker
+entrypoint plumbing for `SITO_DB_AUTO_MIGRATE` is owned by the release E1 task
+in this branch; nothing in those files changes here.
+
+The command and startup both restore the data-directory ownership even under
+`sudo`: every file created or changed (`stats.db`, `-wal`/`-shm`, `stats-salt`,
+the `.bak`) is restored to the owner of the existing `stats.db`, so the
+`User=sito` service can open it again. Running the command as the service user
 (`sudo -u sito sito db migrate ...`) also avoids the issue.
 
-The backup is `<server.data_dir>/stats.db.v<found>.bak` (normally
-`/var/lib/sito/stats.db.v1.bak`), mode `0600`, and an existing backup is never
-overwritten — move it aside first. The upgrade is forward-only: there is no
-downgrade and no `--to`/`--from`. A newer schema is refused, and a corrupt or
-unknown marker fails closed. Roll back by stopping the service, restoring the
-`.bak` over `stats.db` (remove `stats.db-wal`/`stats.db-shm` first) and
-starting it. `--no-backup` skips the snapshot but is not recommended.
+The backup is mode `0600`, and an existing backup is never overwritten — move
+it aside first. The upgrade is forward-only: there is no downgrade and no
+`--to`/`--from`. A newer schema is refused, and a corrupt or unknown marker
+fails closed. Roll back by stopping the service, restoring the `.bak` over
+`stats.db` (remove `stats.db-wal`/`stats.db-shm` first) and starting it.
+`--no-backup` skips the snapshot but is not recommended.
 
 A fresh 2.0 install creates a version 2 database when the server starts;
 `sito db migrate` fails clearly instead of creating an empty database.
-`SITO_DB_AUTO_MIGRATE` and installer/Docker auto-migration are not part of
-this line: run the command explicitly.
 
 ---
 
@@ -387,8 +404,9 @@ signature policy.
 When the update crosses the 1.9.x → 2.0 line, also migrate the configuration
 and the statistics database with the service stopped (see
 [§1.1](#11-the-20-release-candidate-line)). A 1.9.x `stats.db` remains schema
-version 1 until `sudo sito db migrate --config /etc/sito/config.toml` runs; use
-`--dry-run` first to confirm the plan and the `.v1.bak` backup path.
+version 1 until `sudo sito db migrate --config /etc/sito/config.toml` runs, or
+until the server is started with `SITO_DB_AUTO_MIGRATE=1`; use `--dry-run` first
+to confirm the plan and the `.v1.bak` backup path.
 
 `sito update` verifies the release with cosign because
 `server.update_require_signature` defaults to `true`. The installer installs a

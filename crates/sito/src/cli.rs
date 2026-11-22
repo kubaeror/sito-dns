@@ -1,11 +1,15 @@
 //! CLI arguments and subcommand execution for sito.
 
+use crate::db_maintenance::{
+    DB_MIGRATE_LOCK_FILE, OwnershipGuard, acquire_db_migration_lock, file_owner,
+    inspect_db_without_writes, migration_created_paths, restore_ownership, stats_backup_path,
+};
 use clap::{Parser, Subcommand};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 use rand::RngExt;
 use sito_core::config::Config;
-use sito_stats::{MigrationMode, SchemaInspection, StatsDb, StatsOpenOptions};
+use sito_stats::{MigrationMode, StatsDb, StatsOpenOptions};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -549,187 +553,6 @@ pub enum DbMigrateOutcome {
     },
 }
 
-/// `<stats.db>.v<found>.bak`, matching the `<config>.v1.bak` convention.
-fn stats_backup_path(db_path: &Path, found: i64) -> PathBuf {
-    path_with_suffix(db_path, &format!(".v{found}.bak"))
-}
-
-/// Appends a literal suffix to the final path component (keeps non-UTF-8 paths).
-fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
-/// Creates a 0700 staging directory so a database copy is unreadable to other
-/// local users even before its own 0600 mode is applied.
-fn create_private_directory(path: &Path) -> Result<(), anyhow::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder.create(path)?;
-    }
-    #[cfg(not(unix))]
-    std::fs::create_dir(path)?;
-    Ok(())
-}
-
-/// Inspects the schema version without touching the data directory.
-///
-/// `StatsDb::inspect_schema_version` opens the database in place; SQLite
-/// creates `-wal`/`-shm` sidecars for a WAL-mode database even through a
-/// read-only connection. `--dry-run` promises not to create those files, so it
-/// inspects a private copy (including any committed `-wal` content) instead.
-async fn inspect_db_without_writes(db_path: &Path) -> Result<SchemaInspection, anyhow::Error> {
-    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
-    let staging = parent.join(format!(
-        ".sito-db-inspect-{}-{:016x}.tmp",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    create_private_directory(&staging)?;
-
-    let copy = staging.join("stats.db");
-    let result = async {
-        std::fs::copy(db_path, &copy).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to copy '{}' for the dry-run inspection: {e}",
-                db_path.display()
-            )
-        })?;
-        let wal = path_with_suffix(db_path, "-wal");
-        if wal.is_file() {
-            std::fs::copy(&wal, path_with_suffix(&copy, "-wal")).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to copy '{}' for the dry-run inspection: {e}",
-                    wal.display()
-                )
-            })?;
-        }
-
-        StatsDb::inspect_schema_version(&copy)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to inspect stats database '{}': {e}",
-                    db_path.display()
-                )
-            })?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Stats database '{}' disappeared before it could be inspected",
-                    db_path.display()
-                )
-            })
-    }
-    .await;
-
-    let _ = std::fs::remove_dir_all(&staging);
-    result
-}
-
-/// Ownership of a data-directory file, captured before the command writes
-/// anything.
-///
-/// When `sito db migrate` is run with `sudo`, SQLite creates `-wal`/`-shm`
-/// sidecars and `stats-salt` as root. The systemd unit runs the server as the
-/// unprivileged `sito` user, which then cannot open or write those files. The
-/// owner of the existing `stats.db` (or the data directory) is therefore
-/// restored on every file the migration creates or modifies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileOwner {
-    uid: u32,
-    gid: u32,
-}
-
-fn file_owner(path: &Path) -> Option<FileOwner> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path).ok().map(|meta| FileOwner {
-            uid: meta.uid(),
-            gid: meta.gid(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
-}
-
-/// Restores `owner` on every existing path in `paths`.
-///
-/// Missing paths are skipped: not every candidate (for example `-shm`) exists
-/// after a clean close. Files that already carry the expected owner are left
-/// untouched, so a non-root invocation never attempts a privileged `chown`.
-fn restore_ownership(paths: &[PathBuf], owner: Option<FileOwner>) -> Result<(), anyhow::Error> {
-    let Some(owner) = owner else {
-        return Ok(());
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        for path in paths {
-            let Ok(meta) = std::fs::symlink_metadata(path) else {
-                continue;
-            };
-            if !meta.file_type().is_file() {
-                continue;
-            }
-            if meta.uid() == owner.uid && meta.gid() == owner.gid {
-                continue;
-            }
-            std::os::unix::fs::chown(path, Some(owner.uid), Some(owner.gid)).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to restore ownership of '{}' to {}:{}: {e}. Run this command as the \
-                     service user, or fix the ownership manually.",
-                    path.display(),
-                    owner.uid,
-                    owner.gid
-                )
-            })?;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = paths;
-    }
-    Ok(())
-}
-
-/// Every path the migration can create or modify under `server.data_dir`.
-fn migration_created_paths(
-    db_path: &Path,
-    data_dir: &Path,
-    backup_path: Option<&Path>,
-) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for suffix in ["", "-wal", "-shm", "-journal"] {
-        paths.push(path_with_suffix(db_path, suffix));
-    }
-    // `load_or_create_salt` creates `<data_dir>/stats-salt` during the open.
-    paths.push(data_dir.join("stats-salt"));
-    if let Some(backup) = backup_path {
-        paths.push(backup.to_path_buf());
-    }
-    paths
-}
-
-/// Restores ownership on drop as a backstop for panics/early returns.
-struct OwnershipGuard {
-    paths: Vec<PathBuf>,
-    owner: Option<FileOwner>,
-}
-
-impl Drop for OwnershipGuard {
-    fn drop(&mut self) {
-        let _ = restore_ownership(&self.paths, self.owner);
-    }
-}
-
 /// Executes the `db migrate` subcommand (B2).
 ///
 /// Explicit and forward-only: the database is inspected read-only, a newer
@@ -781,6 +604,13 @@ pub async fn run_db_migrate(
         &[data_dir.join(crate::service_lock::SERVICE_LOCK_FILE)],
         owner,
     )?;
+
+    // Server startup uses the same cross-process lock. Holding it through
+    // inspection, backup and migration prevents two processes from migrating
+    // the same data directory at once even if their service leases are in
+    // different containers/namespaces.
+    let _migration_lock = acquire_db_migration_lock(data_dir)?;
+    restore_ownership(&[data_dir.join(DB_MIGRATE_LOCK_FILE)], owner)?;
 
     // Inspect a private copy for every path, not just `--dry-run`:
     // `StatsDb::inspect_schema_version` opens the database in place and SQLite
@@ -869,10 +699,7 @@ pub async fn run_db_migrate(
     };
 
     let owned_paths = migration_created_paths(&db_path, data_dir, backup_path.as_deref());
-    let _owner_guard = OwnershipGuard {
-        paths: owned_paths.clone(),
-        owner,
-    };
+    let _owner_guard = OwnershipGuard::new(owned_paths.clone(), owner);
 
     let open_result = StatsDb::open_with_options(
         &db_path,
