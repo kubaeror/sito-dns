@@ -36,7 +36,7 @@ Replace the installer-generated default `config.toml` flow with a web-based firs
 - Add a routing middleware/layer: while `setup_pending == true`:
   - Allow: `/wizard`, `/ui/wizard/complete`, `/static/*` (logo, css, js), health endpoint if present.
   - Everything else UI: HTTP 302 redirect to `/wizard`.
-  - Everything `/api/v1/*`: HTTP 503 with body `Setup not completed`.
+  - Everything `/api/v2/*` except `/api/v2/auth/*` (403) and the allowed routes: HTTP 503 with body `Setup not completed`.
   - `/login`: redirect to `/wizard` too (no accounts exist yet in meaningful state).
 - Keep the existing `is_first_run()` / admin-session wizard gating intact for post-setup access (admins can re-open `/wizard` to change admin credentials — current behavior).
 
@@ -51,7 +51,7 @@ Single page, grouped sections (steps), all fields pre-filled with current defaul
 6. **Web panel & stats** — `web.bind`, `web.port`, `stats.retention_days`.
 
 Handler changes:
-- Extend `WizardCompleteForm` with `Option<String>` fields (all optional) and build a full `Config` from the form; per-section: missing → `Config::default()` values. Reuse/extend the section-mapping helpers already used by `POST /api/v1/config` (`crates/sito-api/src/handlers/config.rs`) where possible to avoid duplicating validation logic.
+- Extend `WizardCompleteForm` with `Option<String>` fields (all optional) and build a full `Config` from the form; per-section: missing → `Config::default()` values. Reuse/extend the section-mapping helpers already used by `POST /api/v2/config` (`crates/sito-api/src/handlers/config.rs`) where possible to avoid duplicating validation logic.
 - Persist via the existing atomic config writer (`config_writer.rs`) — includes `Config::validate()` for free.
 - Hot-reload as today: `ctx.config.store(...)`, `ctx.filter.reload_with_config(...)`, `ctx.upstream.reload(...)`, `crate::publish_bundle(&ctx)`.
 - **Start DNS listeners after setup, in-process** (preferred): thread a start handle from the bootstrap-mode path in `run_server_full` (`crates/sito/src/lib.rs`) through `ServerContext` so wizard completion can build and bind the DNS pipeline without a process restart. **Fallback** (if the pipeline structurally requires restart): after saving, show a UI banner + log message instructing `systemctl restart sito`, and flip `setup_pending` to `false` so the next boot starts normally.
@@ -75,7 +75,7 @@ Handler changes:
 - Update `docs/installation.md`, `README.md` (installer + first-run flow sections), `CHANGELOG.md`: no default passwords, wizard-driven first run, `--no-setup` flag for headless.
 - Tests:
   - `crates/sito-api/src/ui/handlers.rs` unit tests: new form fields, empty-field → default mapping, port validation.
-  - `crates/sito-test/tests/m6_acceptance.rs`: in setup-pending mode all UI routes redirect to `/wizard`, `/api/v1/*` returns 503, DNS ports not bound until setup completes.
+  - `crates/sito-test/tests/m6_acceptance.rs`: in setup-pending mode all UI routes redirect to `/wizard`, `/api/v2/*` returns 503, DNS ports not bound until setup completes.
   - `crates/sito-test/tests/m9_acceptance.rs`: update installer assertions (no generated config file).
   - CLI test for `--no-setup` flag parsing/behavior.
 

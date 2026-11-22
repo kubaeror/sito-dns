@@ -119,9 +119,11 @@ impl ProblemDetails {
 /// Handler errors already return `application/problem+json`, but errors
 /// produced by Axum before a handler runs (malformed JSON, an invalid query or
 /// path parameter, `415 Unsupported Media Type`, `413 Payload Too Large`,
-/// `405 Method Not Allowed`) use a plain-text or empty body. Those statuses are
-/// documented as `ProblemDetails` on v2 operations, so a client that parses one
-/// 400 cannot be handed a different body for another 400.
+/// `405 Method Not Allowed`, `426 Upgrade Required`) use a plain-text or empty
+/// body. Operations already document a `ProblemDetails` body for `400` (and
+/// `415` on some routes), so a client that parses one 400 must not receive a
+/// different body for another 400. The full framework-status inventory lives in
+/// `docs/2.0-api-errors.md`; it is not repeated on every OpenAPI operation.
 ///
 /// Deliberate exceptions stay untouched:
 /// - the unknown-path fallback (`404`) is documented as `application/json`;
