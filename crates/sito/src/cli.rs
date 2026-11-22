@@ -46,7 +46,9 @@ fn resolve_config_path_from(explicit: Option<&Path>, local: &Path, system: &Path
 /// knowing the persisted signature policy.
 ///
 /// An existing `/etc/sito/config.toml` is preferred over `./config.toml`
-/// because updates are usually run as root from an arbitrary cwd.
+/// because updates are usually run as root from an arbitrary cwd. If both
+/// exist the choice is ambiguous and `--config` is required, so the CLI cannot
+/// lock a different data directory than the server.
 pub fn resolve_update_config_path(explicit: Option<&Path>) -> Result<PathBuf, anyhow::Error> {
     resolve_update_config_path_from(
         explicit,
@@ -66,6 +68,18 @@ fn resolve_update_config_path_from(
     // A system configuration wins over a relative file for updates: the
     // operator may run the command from any cwd after stopping the service,
     // and a stray ./config.toml must not silently change the signature policy.
+    //
+    // When both exist the choice is ambiguous, and choosing either one could
+    // make the CLI lock a different data directory than a server started with
+    // an explicit --config. Require the operator to pass the same --config
+    // instead of guessing.
+    if system.is_file() && local.is_file() {
+        return Err(anyhow::anyhow!(
+            "Refusing to update: both '{}' and '{}' exist, so the configuration (and its update lock data_dir) is ambiguous. Pass 'sito update --config <path>' with the same configuration the server runs with.",
+            system.display(),
+            local.display()
+        ));
+    }
     if system.is_file() {
         return Ok(system.to_path_buf());
     }
@@ -1126,8 +1140,20 @@ fn update_signature_policy(config_path: &Path) -> Result<bool, anyhow::Error> {
 }
 
 /// Returns the configured data directory that owns the shared update lock.
+///
+/// The path must be absolute: a relative `server.data_dir` is resolved against
+/// each process's working directory, so the CLI and the server would lock
+/// different files. Refusing is safer than silently diverging.
 fn update_data_dir(config_path: &Path) -> Result<PathBuf, anyhow::Error> {
-    Ok(load_update_config(config_path)?.server.data_dir)
+    let data_dir = load_update_config(config_path)?.server.data_dir;
+    if !data_dir.is_absolute() {
+        return Err(anyhow::anyhow!(
+            "Refusing to update: server.data_dir '{}' in '{}' is relative, so the cross-process update lock would depend on the current working directory. Set an absolute server.data_dir.",
+            data_dir.display(),
+            config_path.display()
+        ));
+    }
+    Ok(data_dir)
 }
 
 /// Refuses to start an update when the persisted policy requires signatures
@@ -1168,6 +1194,21 @@ pub async fn run_update(
     repo: Option<&str>,
     config_path: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
+    // Report Docker/systemd restrictions before resolving the config or taking
+    // the shared lock: those environments may not be able to write the server's
+    // data directory, and the operator needs the actionable notice rather than
+    // a lock permission error. `--check` deliberately still runs below because
+    // it is read-only and remains available for these deployments.
+    let environment = sito_api::updater::update_environment();
+    if environment.in_app_update_disabled && !check {
+        println!("Current version : v{}", env!("CARGO_PKG_VERSION"));
+        println!("\nIn-app binary updates are disabled in this environment.");
+        if let Some(instructions) = &environment.instructions {
+            println!("{instructions}");
+        }
+        return Ok(());
+    }
+
     // Resolve the configuration first: the data directory it names owns the
     // cross-process update lock shared with a running server/API. Failing
     // closed here also means `--check` can never race a server apply.
@@ -1824,15 +1865,21 @@ mod tests {
             local
         );
 
-        // The system config wins when both exist, so a stray ./config.toml
-        // cannot change the signature policy of a system install.
+        // Both configs present is ambiguous: the CLI cannot know which one a
+        // server was started with, so refuse instead of locking a different
+        // data directory.
         std::fs::write(&system, "config_version = 2\n").unwrap();
-        assert_eq!(
-            resolve_update_config_path_from(None, &local, &system).unwrap(),
-            system
+        let err = resolve_update_config_path_from(None, &local, &system)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous"), "unexpected error: {err}");
+        assert!(err.contains("--config"), "unexpected error: {err}");
+        assert!(
+            err.contains("same configuration"),
+            "unexpected error: {err}"
         );
 
-        // --config still overrides the system config.
+        // --config still overrides the ambiguous pair.
         assert_eq!(
             resolve_update_config_path_from(Some(&explicit), &local, &system).unwrap(),
             explicit
@@ -1928,26 +1975,37 @@ mod tests {
         let dir = temp_config_dir("update_lock_path");
         let data_dir = dir.join("state");
         let cfg = dir.join("config.toml");
+        let data_dir_toml = data_dir.to_string_lossy().replace('\\', "\\\\");
         std::fs::write(
             &cfg,
-            format!(
-                "config_version = 2\n[server]\ndata_dir = \"{}\"\n",
-                data_dir.display()
-            ),
+            format!("config_version = 2\n[server]\ndata_dir = \"{data_dir_toml}\"\n"),
         )
         .unwrap();
 
-        // The CLI and the server both read server.data_dir from the same
-        // validated configuration, so this is the lock path they share.
+        // Server-side resolution uses Config::from_toml_str on the same file.
+        let server_config = Config::from_toml_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         let resolved = update_data_dir(&cfg).unwrap();
         assert_eq!(resolved, data_dir);
+        assert_eq!(resolved, server_config.server.data_dir);
         assert_eq!(
             sito_api::updater::update_lock_path(&resolved),
-            data_dir.join(sito_api::updater::UPDATE_LOCK_FILE)
+            sito_api::updater::update_lock_path(&server_config.server.data_dir),
+            "CLI and server must derive the same lock path from the same config"
         );
 
         // A missing/invalid config must not guess a different lock directory.
         assert!(update_data_dir(&dir.join("missing.toml")).is_err());
+
+        // A relative data_dir is cwd-sensitive and must be refused rather than
+        // silently locking a different file in the CLI process.
+        let relative_cfg = dir.join("relative.toml");
+        std::fs::write(
+            &relative_cfg,
+            "config_version = 2\n[server]\ndata_dir = \"relative-state\"\n",
+        )
+        .unwrap();
+        let err = update_data_dir(&relative_cfg).unwrap_err().to_string();
+        assert!(err.contains("absolute"), "unexpected error: {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

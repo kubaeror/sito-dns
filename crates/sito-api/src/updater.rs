@@ -250,6 +250,35 @@ fn is_running_under_systemd() -> bool {
     )
 }
 
+/// Environment restrictions that decide whether in-app replacement is allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateEnvironment {
+    /// True when the process runs inside a Docker/OCI container.
+    pub is_docker: bool,
+    /// True when the process was started by a systemd unit.
+    pub is_systemd: bool,
+    /// True when this process cannot replace its own binary.
+    pub in_app_update_disabled: bool,
+    /// Operator guidance for the detected environment.
+    pub instructions: Option<String>,
+}
+
+/// Detects the update environment without performing any network or disk work.
+///
+/// CLI callers use this before acquiring the update lock so a Docker or
+/// systemd-hosted process reports the actionable notice instead of a
+/// permission error from a data directory it cannot use.
+pub fn update_environment() -> UpdateEnvironment {
+    let is_docker = is_running_in_docker();
+    let is_systemd = is_running_under_systemd();
+    UpdateEnvironment {
+        is_docker,
+        is_systemd,
+        in_app_update_disabled: is_docker || is_systemd,
+        instructions: update_instructions(is_docker, is_systemd),
+    }
+}
+
 /// Operator guidance for environments that cannot replace their own binary.
 fn update_instructions(is_docker: bool, is_systemd: bool) -> Option<String> {
     if is_docker {
@@ -347,11 +376,10 @@ async fn check_for_update_locked(repo: Option<&str>) -> Result<UpdateInfo, Updat
     let client = updater_http_client(Duration::from_secs(10))?;
 
     let response = client.get(&url).send().await?;
+    let environment = update_environment();
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // No releases published yet
-        let is_docker = is_running_in_docker();
-        let is_systemd = is_running_under_systemd();
         return Ok(UpdateInfo {
             current_version: current_version.clone(),
             latest_version: current_version,
@@ -359,10 +387,10 @@ async fn check_for_update_locked(repo: Option<&str>) -> Result<UpdateInfo, Updat
             release_url: format!("https://github.com/{repo_name}"),
             release_notes: "No releases found on GitHub.".to_string(),
             published_at: None,
-            is_docker,
-            is_systemd,
-            in_app_update_disabled: is_docker || is_systemd,
-            instructions: update_instructions(is_docker, is_systemd),
+            is_docker: environment.is_docker,
+            is_systemd: environment.is_systemd,
+            in_app_update_disabled: environment.in_app_update_disabled,
+            instructions: environment.instructions,
             version_comparison_unknown: false,
         });
     }
@@ -388,8 +416,6 @@ async fn check_for_update_locked(repo: Option<&str>) -> Result<UpdateInfo, Updat
 
     let published_at = release["published_at"].as_str().map(ToString::to_string);
 
-    let is_docker = is_running_in_docker();
-    let is_systemd = is_running_under_systemd();
     let version_comparison_unknown = !versions_comparable(&latest_version, &current_version);
     if version_comparison_unknown {
         tracing::warn!(
@@ -407,10 +433,10 @@ async fn check_for_update_locked(repo: Option<&str>) -> Result<UpdateInfo, Updat
         release_url,
         release_notes,
         published_at,
-        is_docker,
-        is_systemd,
-        in_app_update_disabled: is_docker || is_systemd,
-        instructions: update_instructions(is_docker, is_systemd),
+        is_docker: environment.is_docker,
+        is_systemd: environment.is_systemd,
+        in_app_update_disabled: environment.in_app_update_disabled,
+        instructions: environment.instructions,
         version_comparison_unknown,
     })
 }
@@ -711,10 +737,24 @@ impl Drop for TempFileGuard {
     }
 }
 
+/// Downloads an allowlisted updater asset with a size cap.
+async fn download_capped(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    cap: u64,
+) -> Result<(), UpdateError> {
+    ensure_allowed_download_url(url, "Download")?;
+    download_capped_raw(client, url, dest, cap).await
+}
+
 /// Streams a download into `dest`, aborting as soon as the response exceeds
 /// `cap` bytes. A declared `Content-Length` above the cap is rejected before
 /// the file is created; chunked responses are covered by the running total.
-async fn download_capped(
+///
+/// This variant does not validate the initial URL so loopback test servers can
+/// exercise the redirect policy; production callers use [`download_capped`].
+async fn download_capped_raw(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
@@ -1330,6 +1370,9 @@ impl UpdateLock {
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
+            // Refuse a symlink planted at the lock path; the lock is a plain
+            // file owned by the data directory's owner.
+            options.custom_flags(libc::O_NOFOLLOW);
         }
         let file = options.open(&path)?;
 
@@ -1338,9 +1381,11 @@ impl UpdateLock {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            }
+
+            // A root CLI run must leave a lock the unprivileged server can
+            // open. Match the data directory's owner before narrowing the mode.
+            normalize_lock_ownership(&file, data_dir)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
 
         // Drop any stale content from an earlier writer: the path must never
@@ -1357,6 +1402,45 @@ impl Drop for UpdateLock {
         // returns. The path is deliberately left in place for the next owner.
         debug!(path = %self.path.display(), "Releasing cross-process update lock");
     }
+}
+
+/// Makes a lock file created by a privileged CLI usable by the data
+/// directory's owner.
+///
+/// The documented update flow is `sudo sito update` while the service runs as
+/// an unprivileged user. Without this, the root-created 0600 lock would later
+/// be unopenable by the server and every API/UI update check would fail. Only
+/// a root process changes ownership; an unprivileged caller already owns the
+/// file it can create, so it is left untouched.
+#[cfg(unix)]
+fn normalize_lock_ownership(file: &File, data_dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+
+    let dir_meta = std::fs::metadata(data_dir)?;
+    let file_meta = file.metadata()?;
+    if file_meta.uid() == dir_meta.uid() && file_meta.gid() == dir_meta.gid() {
+        return Ok(());
+    }
+
+    // SAFETY: `file` owns a valid descriptor and the ids come from a directory
+    // metadata lookup.
+    let rc = unsafe {
+        libc::fchown(
+            file.as_raw_fd(),
+            dir_meta.uid() as libc::uid_t,
+            dir_meta.gid() as libc::gid_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Attempts a non-blocking exclusive lock on `file`.
@@ -1403,17 +1487,21 @@ fn try_acquire_update_lock() -> Result<tokio::sync::MutexGuard<'static, ()>, Upd
 
 /// Serializes an update operation across threads (the in-process mutex) and
 /// across processes (the `flock` lease in `data_dir`).
+///
+/// `_process` is declared first so the file lock is released before the
+/// in-process mutex; a competing thread cannot observe a free mutex while the
+/// kernel lock is still held.
 struct UpdateOperationGuard {
-    _threads: tokio::sync::MutexGuard<'static, ()>,
     _process: UpdateLock,
+    _threads: tokio::sync::MutexGuard<'static, ()>,
 }
 
 fn try_acquire_update_operation(data_dir: &Path) -> Result<UpdateOperationGuard, UpdateError> {
     let threads = try_acquire_update_lock()?;
     let process = UpdateLock::acquire(data_dir)?;
     Ok(UpdateOperationGuard {
-        _threads: threads,
         _process: process,
+        _threads: threads,
     })
 }
 
@@ -1450,13 +1538,14 @@ pub async fn apply_update(
     require_signature: bool,
     data_dir: &Path,
 ) -> Result<String, UpdateError> {
-    if is_running_in_docker() {
+    let environment = update_environment();
+    if environment.is_docker {
         return Err(UpdateError::DockerEnvironment(
             "In-app binary update is disabled inside Docker. Use container image management."
                 .to_string(),
         ));
     }
-    if is_running_under_systemd() {
+    if environment.is_systemd {
         return Err(UpdateError::SystemdEnvironment(
             "In-app binary update is disabled for a systemd service. Stop the service and run \
              'sudo sito update', then start it again."
@@ -1728,6 +1817,94 @@ mod tests {
         assert!(path.is_file(), "the lock file must not be deleted");
         let reacquired = UpdateLock::acquire(&dir).expect("lock must be reusable");
         drop(reacquired);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_lock_creates_missing_parent_directory() {
+        let dir = test_scratch_dir("update-lock-parent");
+        let nested = dir.join("nested").join("data");
+        assert!(!nested.exists());
+
+        let lock = UpdateLock::acquire(&nested).expect("missing parents must be created");
+        assert!(nested.is_dir());
+        assert!(update_lock_path(&nested).is_file());
+        drop(lock);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Root CI runs `sudo sito update` against a data dir owned by the
+    /// unprivileged service user. The lock it leaves behind must be openable by
+    /// that user, otherwise the server's update API breaks after one CLI run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_update_lock_is_owned_like_data_dir_and_openable_by_owner() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::process::CommandExt;
+
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("not running as root; skipped cross-user update lock test");
+            return;
+        }
+
+        let dir = test_scratch_dir("update-lock-owner");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let service_uid = 65_534_u32;
+        let service_gid = 65_534_u32;
+        let c_path = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        let rc = unsafe {
+            libc::chown(
+                c_path.as_ptr(),
+                service_uid as libc::uid_t,
+                service_gid as libc::gid_t,
+            )
+        };
+        if rc != 0 {
+            eprintln!(
+                "could not chown test data dir; skipped cross-user update lock test: {}",
+                std::io::Error::last_os_error()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // Root CLI acquires and releases the lock (the update command exits).
+        let lock = UpdateLock::acquire(&dir).unwrap();
+        let path = update_lock_path(&dir);
+        let file_meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            file_meta.uid(),
+            service_uid,
+            "lock owner must match data dir"
+        );
+        assert_eq!(
+            file_meta.gid(),
+            service_gid,
+            "lock group must match data dir"
+        );
+        assert_eq!(file_meta.permissions().mode() & 0o777, 0o600);
+        drop(lock);
+
+        // The unprivileged server/user must be able to open the remaining file.
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec 3<>\"$1\"")
+            .arg("sh")
+            .arg(&path)
+            .uid(service_uid)
+            .gid(service_gid)
+            .status()
+            .expect("spawn unprivileged opener");
+        assert!(
+            status.success(),
+            "the configured data-dir owner must be able to open the update lock"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2227,21 +2404,58 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         .into_bytes()
     }
 
+    fn error_chain_contains(err: &dyn std::error::Error, needle: &str) -> bool {
+        let mut current = Some(err);
+        while let Some(error) = current {
+            if error.to_string().contains(needle) {
+                return true;
+            }
+            current = error.source();
+        }
+        false
+    }
+
     #[tokio::test]
-    async fn test_download_rejects_disallowed_redirect_before_writing_bytes() {
-        let response = http_redirect_response("https://evil.example/asset");
+    async fn test_download_redirect_policy_blocks_before_contacting_target() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        // A default reqwest client would follow this HTTP redirect and contact
+        // the second listener. The updater policy must reject it first.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        let contacted = Arc::new(AtomicBool::new(false));
+        let contacted_probe = Arc::clone(&contacted);
+        let probe = tokio::spawn(async move {
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(300), listener.accept()).await
+            {
+                contacted_probe.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let response = http_redirect_response(&format!("http://{target_addr}/asset"));
         let (url, server) = serve_http_once(response).await;
 
-        let dir = test_scratch_dir("redirect");
+        let dir = test_scratch_dir("redirect-contact");
         let dest = dir.join("archive.tar.gz");
         let client = updater_http_client(Duration::from_secs(5)).unwrap();
 
-        let err = download_capped(&client, &url, &dest, MAX_UPDATE_ARCHIVE_BYTES)
+        let err = download_capped_raw(&client, &url, &dest, MAX_UPDATE_ARCHIVE_BYTES)
             .await
             .unwrap_err();
         server.await.unwrap();
+        probe.await.unwrap();
 
-        assert!(matches!(err, UpdateError::Network(_)), "got {err:?}");
+        assert!(
+            error_chain_contains(&err, "non-HTTPS"),
+            "the policy rejection must be visible in the error chain: {err:?}"
+        );
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "the redirect target must never be contacted"
+        );
         assert!(
             !dest.exists(),
             "a rejected redirect must not create or write the destination"
@@ -2251,6 +2465,28 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
             0,
             "no download residue after a rejected redirect"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_download_redirect_policy_rejects_cross_host_target() {
+        let response = http_redirect_response("https://evil.example/asset");
+        let (url, server) = serve_http_once(response).await;
+
+        let dir = test_scratch_dir("redirect-host");
+        let dest = dir.join("archive.tar.gz");
+        let client = updater_http_client(Duration::from_secs(5)).unwrap();
+
+        let err = download_capped_raw(&client, &url, &dest, MAX_UPDATE_ARCHIVE_BYTES)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(
+            error_chain_contains(&err, "non-allowlisted host"),
+            "the policy host rejection must be visible in the error chain: {err:?}"
+        );
+        assert!(!dest.exists(), "rejected redirect must not create dest");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2267,7 +2503,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         let dest = dir.join("archive.tar.gz");
         let client = reqwest::Client::new();
 
-        let err = download_capped(&client, &url, &dest, cap)
+        let err = download_capped_raw(&client, &url, &dest, cap)
             .await
             .unwrap_err();
         server.await.unwrap();
@@ -2298,7 +2534,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         let dest = dir.join("archive.tar.gz");
         let client = reqwest::Client::new();
 
-        let err = download_capped(&client, &url, &dest, cap)
+        let err = download_capped_raw(&client, &url, &dest, cap)
             .await
             .unwrap_err();
         server.await.unwrap();
@@ -2319,7 +2555,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  sito-v1.2.0-aa
         let dest = dir.join("sito-v1.9.0-x86_64-unknown-linux-gnu.tar.gz");
         let client = reqwest::Client::new();
 
-        download_capped(&client, &url, &dest, MAX_UPDATE_ARCHIVE_BYTES)
+        download_capped_raw(&client, &url, &dest, MAX_UPDATE_ARCHIVE_BYTES)
             .await
             .unwrap();
         server.await.unwrap();
