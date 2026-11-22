@@ -108,9 +108,9 @@ mod tests {
     fn test_openapi_omits_ha_paths_without_feature() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).expect("valid OpenAPI JSON");
         for path in [
-            "/api/v1/ha/status",
-            "/api/v1/ha/slaves",
-            "/api/v1/ha/resync",
+            "/api/v2/ha/status",
+            "/api/v2/ha/slaves",
+            "/api/v2/ha/resync",
         ] {
             assert!(
                 openapi["paths"].get(path).is_none(),
@@ -118,7 +118,7 @@ mod tests {
             );
         }
         assert!(
-            openapi["paths"].get("/api/v1/status").is_some(),
+            openapi["paths"].get("/api/v2/status").is_some(),
             "non-HA paths must remain documented"
         );
     }
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn test_openapi_documents_total_count_header() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).expect("valid OpenAPI JSON");
-        for path in ["/api/v1/stats/clients", "/api/v1/stats/upstreams"] {
+        for path in ["/api/v2/stats/clients", "/api/v2/stats/upstreams"] {
             let headers = &openapi["paths"][path]["get"]["responses"]["200"]["headers"];
             assert_eq!(
                 headers["X-Total-Count"]["description"],

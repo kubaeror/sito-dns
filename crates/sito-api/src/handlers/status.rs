@@ -8,7 +8,7 @@ use axum::extract::State;
 
 #[utoipa::path(
     get,
-    path = "/api/v1/status",
+    path = "/api/v2/status",
     responses(
         (status = 200, description = "Server status retrieved successfully", body = StatusResponse),
         (status = 401, description = "Unauthorized"),

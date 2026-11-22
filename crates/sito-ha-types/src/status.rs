@@ -30,7 +30,7 @@ impl std::fmt::Display for SlaveState {
     }
 }
 
-/// Summary of a connected slave exposed via `/api/v1/ha/slaves` REST API.
+/// Summary of a connected slave exposed via `/api/v2/ha/slaves` REST API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaveSummary {
     pub instance: String,

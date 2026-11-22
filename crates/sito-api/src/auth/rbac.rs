@@ -175,7 +175,7 @@ mod tests {
             .await
             .expect("token");
         let req = Request::builder()
-            .uri(format!("/api/v1/querylog?token={}", resp.token))
+            .uri(format!("/api/v2/querylog?token={}", resp.token))
             .body(())
             .unwrap();
         let (parts, ()) = req.into_parts();
@@ -194,7 +194,7 @@ mod tests {
             .expect("token");
 
         let req = Request::builder()
-            .uri(format!("/api/v1/querylog/stream?token={}", resp.token))
+            .uri(format!("/api/v2/querylog/stream?token={}", resp.token))
             .header(UPGRADE, "websocket")
             .header(CONNECTION, "Upgrade")
             .body(())
@@ -213,7 +213,7 @@ mod tests {
             .expect("token");
 
         let req = Request::builder()
-            .uri("/api/v1/querylog/stream")
+            .uri("/api/v2/querylog/stream")
             .header(UPGRADE, "websocket")
             .header(CONNECTION, "Upgrade")
             .header(AUTHORIZATION, format!("Bearer {}", resp.token))

@@ -77,7 +77,7 @@ fn resync_slave(
 /// Get HA cluster status.
 #[utoipa::path(
     get,
-    path = "/api/v1/ha/status",
+    path = "/api/v2/ha/status",
     responses(
         (status = 200, description = "HA cluster status", body = HaStatusResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -166,7 +166,7 @@ pub async fn get_ha_status(
 /// List connected HA replica secondary nodes.
 #[utoipa::path(
     get,
-    path = "/api/v1/ha/slaves",
+    path = "/api/v2/ha/slaves",
     responses(
         (status = 200, description = "List connected replica slaves", body = Vec<HaSlaveSummary>),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -194,7 +194,7 @@ pub async fn get_ha_slaves(
 /// Trigger manual HA resynchronization.
 #[utoipa::path(
     post,
-    path = "/api/v1/ha/resync",
+    path = "/api/v2/ha/resync",
     responses(
         (status = 200, description = "Triggered HA synchronization", body = HaResyncResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),

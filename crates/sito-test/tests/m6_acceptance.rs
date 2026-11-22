@@ -242,7 +242,7 @@ async fn test_embedded_ui_api_route_not_found_returns_problem_details() {
     let app = create_router(ctx);
 
     let req = Request::builder()
-        .uri("/api/v1/nonexistent-endpoint")
+        .uri("/api/v2/nonexistent-endpoint")
         .body(Body::empty())
         .unwrap();
 
@@ -380,10 +380,10 @@ async fn test_setup_pending_route_gating_and_wizard_flow() {
 
     // 2. API v1 endpoints return 503 Service Unavailable with "Setup not completed"
     for path in [
-        "/api/v1/status",
-        "/api/v1/config",
-        "/api/v1/clients",
-        "/api/v1/rewrites",
+        "/api/v2/status",
+        "/api/v2/config",
+        "/api/v2/clients",
+        "/api/v2/rewrites",
     ] {
         let req = Request::builder().uri(path).body(Body::empty()).unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -448,7 +448,7 @@ async fn test_setup_pending_route_gating_and_wizard_flow() {
 
     // 7. API v1 endpoints no longer return 503
     let req = Request::builder()
-        .uri("/api/v1/status")
+        .uri("/api/v2/status")
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -483,7 +483,7 @@ async fn test_csrf_cookie_enforced_for_session_mutations() {
 
     let login = Request::builder()
         .method("POST")
-        .uri("/api/v1/auth/login")
+        .uri("/api/v2/auth/login")
         .header(header::HOST, "localhost")
         .header(header::ORIGIN, "http://localhost")
         .header(header::CONTENT_TYPE, "application/json")
@@ -501,7 +501,7 @@ async fn test_csrf_cookie_enforced_for_session_mutations() {
     // request succeeded.)
     let missing_csrf = Request::builder()
         .method("POST")
-        .uri("/api/v1/cache/flush")
+        .uri("/api/v2/cache/flush")
         .header(header::HOST, "localhost")
         .header(header::ORIGIN, "http://localhost")
         .header(header::COOKIE, format!("sito_session={session}"))
@@ -514,7 +514,7 @@ async fn test_csrf_cookie_enforced_for_session_mutations() {
     // Cookie + matching header token: accepted.
     let valid = Request::builder()
         .method("POST")
-        .uri("/api/v1/cache/flush")
+        .uri("/api/v2/cache/flush")
         .header(header::HOST, "localhost")
         .header(header::ORIGIN, "http://localhost")
         .header(
@@ -591,7 +591,7 @@ async fn test_setup_pending_with_existing_users_requires_admin() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/v1/auth/login")
+                .uri("/api/v2/auth/login")
                 .header(header::HOST, "localhost")
                 .header(header::ORIGIN, "http://localhost")
                 .header(header::CONTENT_TYPE, "application/json")
@@ -633,7 +633,7 @@ async fn test_default_admin_with_existing_config_is_gated_by_setup_token() {
             app.oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/auth/login")
+                    .uri("/api/v2/auth/login")
                     .header(header::HOST, "localhost")
                     .header(header::ORIGIN, "http://localhost")
                     .header(header::CONTENT_TYPE, "application/json")
@@ -663,7 +663,7 @@ async fn test_default_admin_with_existing_config_is_gated_by_setup_token() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/v1/status")
+                .uri("/api/v2/status")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -775,7 +775,7 @@ async fn test_custom_admin_restart_does_not_reengage_setup_gate() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/v1/auth/login")
+                .uri("/api/v2/auth/login")
                 .header(header::HOST, "localhost")
                 .header(header::ORIGIN, "http://localhost")
                 .header(header::CONTENT_TYPE, "application/json")
@@ -813,7 +813,7 @@ async fn test_custom_admin_restart_does_not_reengage_setup_gate() {
     let resp = app
         .oneshot(
             Request::builder()
-                .uri("/api/v1/status")
+                .uri("/api/v2/status")
                 .header(header::COOKIE, format!("sito_session={session}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -1047,7 +1047,7 @@ async fn test_reset_admin_custom_password_restores_login() {
             app.oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/auth/login")
+                    .uri("/api/v2/auth/login")
                     .header(header::HOST, "localhost")
                     .header(header::ORIGIN, "http://localhost")
                     .header(header::CONTENT_TYPE, "application/json")
@@ -1081,13 +1081,13 @@ async fn test_sensitive_responses_have_no_store_and_vary_cookie() {
     // integrations, upstream, rewrites, cache and status routes) and /metrics
     // must be uncacheable. Methods differ where the route only supports POST.
     for (method, path) in [
-        ("GET", "/api/v1/clients"),
-        ("GET", "/api/v1/filtering/lists"),
-        ("GET", "/api/v1/integrations/lists"),
-        ("GET", "/api/v1/upstream"),
-        ("GET", "/api/v1/rewrites"),
-        ("POST", "/api/v1/cache/flush"),
-        ("GET", "/api/v1/status"),
+        ("GET", "/api/v2/clients"),
+        ("GET", "/api/v2/filtering/lists"),
+        ("GET", "/api/v2/integrations/lists"),
+        ("GET", "/api/v2/upstream"),
+        ("GET", "/api/v2/rewrites"),
+        ("POST", "/api/v2/cache/flush"),
+        ("GET", "/api/v2/status"),
         ("GET", "/metrics"),
     ] {
         let resp = app

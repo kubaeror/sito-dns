@@ -628,10 +628,10 @@ async fn test_m8_slave_read_only_enforcement() {
         create_test_context("slave", None, Some(slave_tracker), None).await;
     let app = create_router(ctx);
 
-    // Mutating request POST /api/v1/filtering/rules must be blocked with 409 Conflict
+    // Mutating request POST /api/v2/filtering/rules must be blocked with 409 Conflict
     let req = Request::builder()
         .method(Method::POST)
-        .uri("/api/v1/filtering/rules")
+        .uri("/api/v2/filtering/rules")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"["||blocked.com^"]"#))
         .unwrap();
@@ -653,19 +653,19 @@ async fn test_m8_slave_read_only_enforcement() {
     let body_str = String::from_utf8_lossy(&body_bytes);
     assert!(body_str.contains("Read-Only") || body_str.contains("disabled on HA replica slaves"));
 
-    // Mutating request DELETE /api/v1/rewrites/1 must also be blocked
+    // Mutating request DELETE /api/v2/rewrites/1 must also be blocked
     let req_del = Request::builder()
         .method(Method::DELETE)
-        .uri("/api/v1/rewrites/1")
+        .uri("/api/v2/rewrites/1")
         .body(Body::empty())
         .unwrap();
     let resp_del = app.clone().oneshot(req_del).await.unwrap();
     assert_eq!(resp_del.status(), StatusCode::CONFLICT);
 
-    // Non-mutating request GET /api/v1/status must succeed (200 OK)
+    // Non-mutating request GET /api/v2/status must succeed (200 OK)
     let req_get = Request::builder()
         .method(Method::GET)
-        .uri("/api/v1/status")
+        .uri("/api/v2/status")
         .header(header::AUTHORIZATION, format!("Bearer {_token}"))
         .body(Body::empty())
         .unwrap();
@@ -688,9 +688,9 @@ async fn test_m8_ha_rest_api_endpoints() {
         create_test_context("master", Some(coordinator.clone()), None, None).await;
     let master_app = create_router(master_ctx);
 
-    // 1. GET /api/v1/ha/status on master
+    // 1. GET /api/v2/ha/status on master
     let req = Request::builder()
-        .uri("/api/v1/ha/status")
+        .uri("/api/v2/ha/status")
         .header(header::AUTHORIZATION, format!("Bearer {master_token}"))
         .body(Body::empty())
         .unwrap();
@@ -704,19 +704,19 @@ async fn test_m8_ha_rest_api_endpoints() {
     assert_eq!(v["instance_name"], "master-test");
     assert_eq!(v["version"], 3);
 
-    // 2. GET /api/v1/ha/slaves on master
+    // 2. GET /api/v2/ha/slaves on master
     let req_slaves = Request::builder()
-        .uri("/api/v1/ha/slaves")
+        .uri("/api/v2/ha/slaves")
         .header(header::AUTHORIZATION, format!("Bearer {master_token}"))
         .body(Body::empty())
         .unwrap();
     let resp_slaves = master_app.clone().oneshot(req_slaves).await.unwrap();
     assert_eq!(resp_slaves.status(), StatusCode::OK);
 
-    // 3. POST /api/v1/ha/resync on master
+    // 3. POST /api/v2/ha/resync on master
     let req_resync = Request::builder()
         .method(Method::POST)
-        .uri("/api/v1/ha/resync")
+        .uri("/api/v2/ha/resync")
         .header(header::AUTHORIZATION, format!("Bearer {master_token}"))
         .body(Body::empty())
         .unwrap();
@@ -742,7 +742,7 @@ async fn test_m8_ha_rest_api_endpoints() {
     let slave_app = create_router(slave_ctx);
 
     let req_slave_status = Request::builder()
-        .uri("/api/v1/ha/status")
+        .uri("/api/v2/ha/status")
         .header(header::AUTHORIZATION, format!("Bearer {slave_token}"))
         .body(Body::empty())
         .unwrap();
@@ -756,10 +756,10 @@ async fn test_m8_ha_rest_api_endpoints() {
     assert_eq!(s_v["state"], "synced");
     assert_eq!(s_v["version"], 3);
 
-    // 5. POST /api/v1/ha/resync on slave (exempted from read-only)
+    // 5. POST /api/v2/ha/resync on slave (exempted from read-only)
     let req_slave_resync = Request::builder()
         .method(Method::POST)
-        .uri("/api/v1/ha/resync")
+        .uri("/api/v2/ha/resync")
         .header(header::AUTHORIZATION, format!("Bearer {slave_token}"))
         .body(Body::empty())
         .unwrap();
@@ -793,7 +793,7 @@ async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
     assert_eq!(health, serde_json::json!({ "status": "ok" }));
 
     coordinator.mark_replication_failed("master mTLS initialization failed: Permission denied");
-    let status = get_json(&master_app, "/api/v1/ha/status", Some(&master_token)).await;
+    let status = get_json(&master_app, "/api/v2/ha/status", Some(&master_token)).await;
     assert_eq!(
         status["ready"], false,
         "failed listener must not look active"
@@ -810,7 +810,7 @@ async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
     assert_eq!(health, serde_json::json!({ "status": "unavailable" }));
     // `/health` is unauthenticated and generic: it must not leak the detailed
     // reason (certificate path, OS error, internal master URL, TOML/validation
-    // text) that remains available on the authenticated `/api/v1/ha/status`.
+    // text) that remains available on the authenticated `/api/v2/ha/status`.
     let public_body = health.to_string();
     assert!(
         !public_body.contains('/'),
@@ -839,7 +839,7 @@ async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
     slave_ctx.config.store(Arc::new(slave_cfg));
     let slave_app = create_router(slave_ctx);
 
-    let status = get_json(&slave_app, "/api/v1/ha/status", Some(&slave_token)).await;
+    let status = get_json(&slave_app, "/api/v2/ha/status", Some(&slave_token)).await;
     assert_eq!(status["ready"], false);
     assert!(
         status["readiness_reason"]
@@ -863,7 +863,7 @@ async fn test_m8_ha_readiness_is_visible_in_health_and_status() {
     );
 
     tracker.mark_synced_with_term(1, 0);
-    let status = get_json(&slave_app, "/api/v1/ha/status", Some(&slave_token)).await;
+    let status = get_json(&slave_app, "/api/v2/ha/status", Some(&slave_token)).await;
     assert_eq!(status["ready"], true);
     assert!(status["readiness_reason"].is_null());
     let health = get_json(&slave_app, "/health", None).await;
@@ -896,7 +896,7 @@ async fn test_m8_ha_disabled_reason_is_exposed_in_status() {
 
     // Replication is deliberately off, so the node is ready, but the reason
     // must not be lost: operators need to see why there is no listener.
-    let status = get_json(&master_app, "/api/v1/ha/status", Some(&master_token)).await;
+    let status = get_json(&master_app, "/api/v2/ha/status", Some(&master_token)).await;
     assert_eq!(status["ready"], true);
     assert!(
         status["readiness_reason"]
@@ -1161,7 +1161,7 @@ async fn test_m8_ha_runtime_child_probe() {
                 serde_json::json!({ "status": "ok" }),
                 "public /health must flip to ready after chown: {health}"
             );
-            let status = get_json(&app, "/api/v1/ha/status", Some(&token)).await;
+            let status = get_json(&app, "/api/v2/ha/status", Some(&token)).await;
             assert_eq!(status["ready"], true);
 
             let _ = shutdown_tx.send(true);
@@ -2159,10 +2159,10 @@ async fn test_m8_master_api_mutation_publishes_bundle() {
 
     assert_eq!(coordinator.get_current_version(), 1);
 
-    // Perform mutating request: POST /api/v1/rewrites
+    // Perform mutating request: POST /api/v2/rewrites
     let req = Request::builder()
         .method(Method::POST)
-        .uri("/api/v1/rewrites")
+        .uri("/api/v2/rewrites")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(

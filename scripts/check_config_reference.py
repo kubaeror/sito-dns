@@ -176,7 +176,7 @@ MAP_ONLY_DOC_KEYS: dict[int, dict[str, str]] = {
     10: {
         "entries.id": (
             "Stable rewrite identifier: the admin rewrite API preserves it and "
-            "returns it from /api/v1/rewrites; the DNS rewrite loader ignores it."
+            "returns it from /api/v2/rewrites; the DNS rewrite loader ignores it."
         ),
     },
 }

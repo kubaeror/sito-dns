@@ -235,7 +235,7 @@ fn group_to_dto(name: &str, group: &ClientGroupConfig) -> ClientGroupDto {
 
 #[utoipa::path(
     get,
-    path = "/api/v1/clients",
+    path = "/api/v2/clients",
     responses(
         (status = 200, description = "Clients list retrieved", body = Vec<ClientDto>),
         (status = 401, description = "Unauthorized"),
@@ -259,7 +259,7 @@ pub async fn get_clients(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/clients/unidentified",
+    path = "/api/v2/clients/unidentified",
     params(UnidentifiedClientsQuery),
     responses(
         (status = 200, description = "Discovered but unconfigured clients, newest first", body = UnidentifiedClientsResponse),
@@ -302,7 +302,7 @@ pub async fn get_unidentified_clients(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/clients",
+    path = "/api/v2/clients",
     request_body = ClientDto,
     responses(
         (status = 201, description = "Client created", body = ClientDto),
@@ -362,7 +362,7 @@ pub async fn create_client(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/clients/{name}",
+    path = "/api/v2/clients/{name}",
     params(("name" = String, Path, description = "Client name"), ClientRevealQuery),
     responses(
         (status = 200, description = "Client details retrieved (shared secret replaced by a marker unless ?reveal=1)", body = ClientDto),
@@ -411,7 +411,7 @@ pub async fn get_client_by_name(
 
 #[utoipa::path(
     put,
-    path = "/api/v1/clients/{name}",
+    path = "/api/v2/clients/{name}",
     request_body = UpdateClientRequest,
     params(("name" = String, Path, description = "Client name")),
     responses(
@@ -507,7 +507,7 @@ pub async fn update_client(
 
 #[utoipa::path(
     delete,
-    path = "/api/v1/clients/{name}",
+    path = "/api/v2/clients/{name}",
     params(("name" = String, Path, description = "Client name")),
     responses(
         (status = 200, description = "Client deleted", body = GenericMessageResponse),
@@ -542,7 +542,7 @@ pub async fn delete_client(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/clients/groups",
+    path = "/api/v2/clients/groups",
     responses(
         (status = 200, description = "Client groups retrieved", body = Vec<ClientGroupDto>),
         (status = 401, description = "Unauthorized"),
@@ -580,7 +580,7 @@ pub async fn get_client_groups(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/clients/groups/{name}",
+    path = "/api/v2/clients/groups/{name}",
     params(("name" = String, Path, description = "Group name")),
     responses(
         (status = 200, description = "Client group retrieved", body = ClientGroupDto),
@@ -621,7 +621,7 @@ pub async fn get_client_group_by_name(
 
 #[utoipa::path(
     put,
-    path = "/api/v1/clients/groups/{name}",
+    path = "/api/v2/clients/groups/{name}",
     request_body = UpdateClientGroupRequest,
     params(("name" = String, Path, description = "Group name")),
     responses(
@@ -692,7 +692,7 @@ pub async fn update_client_group(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/clients/groups",
+    path = "/api/v2/clients/groups",
     request_body = ClientGroupDto,
     responses(
         (status = 201, description = "Client group added", body = ClientGroupDto),
@@ -747,7 +747,7 @@ pub async fn add_client_group(
 
 #[utoipa::path(
     delete,
-    path = "/api/v1/clients/groups/{name}",
+    path = "/api/v2/clients/groups/{name}",
     params(("name" = String, Path, description = "Group name")),
     responses(
         (status = 200, description = "Client group deleted", body = crate::models::GenericMessageResponse),
@@ -1013,7 +1013,7 @@ mod tests {
             .expect("token");
 
         let request = axum::http::Request::builder()
-            .uri("/api/v1/clients/unidentified")
+            .uri("/api/v2/clients/unidentified")
             .header(
                 axum::http::header::AUTHORIZATION,
                 format!("Bearer {}", token.token),
@@ -1035,7 +1035,7 @@ mod tests {
             .await
             .expect("token");
         let request = axum::http::Request::builder()
-            .uri("/api/v1/clients/unidentified")
+            .uri("/api/v2/clients/unidentified")
             .header(
                 axum::http::header::AUTHORIZATION,
                 format!("Bearer {}", token.token),

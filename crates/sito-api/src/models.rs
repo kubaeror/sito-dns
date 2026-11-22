@@ -621,7 +621,7 @@ pub struct ChangePasswordRequest {
     pub new_password: String,
 }
 
-/// HA cluster status response for `GET /api/v1/ha/status`.
+/// HA cluster status response for `GET /api/v2/ha/status`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HaStatusResponse {
     pub role: String,
@@ -668,7 +668,7 @@ pub struct HaSlaveStatsSummary {
     pub upstreams_count: usize,
 }
 
-/// Summary of a connected replica slave node for `GET /api/v1/ha/slaves`.
+/// Summary of a connected replica slave node for `GET /api/v2/ha/slaves`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HaSlaveSummary {
     pub instance: String,
@@ -705,7 +705,7 @@ impl From<sito_ha_types::SlaveSummary> for HaSlaveSummary {
     }
 }
 
-/// Response for `POST /api/v1/ha/resync`.
+/// Response for `POST /api/v2/ha/resync`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HaResyncResponse {
     pub status: String,

@@ -129,7 +129,7 @@ fn validate_rewrite_entry(entry: &RewriteEntryConfig) -> Result<(), ProblemDetai
 
 #[utoipa::path(
     get,
-    path = "/api/v1/rewrites",
+    path = "/api/v2/rewrites",
     responses(
         (status = 200, description = "DNS rewrites retrieved", body = Vec<RewriteDto>),
         (status = 401, description = "Unauthorized"),
@@ -154,7 +154,7 @@ pub async fn get_rewrites(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/rewrites",
+    path = "/api/v2/rewrites",
     request_body = AddRewriteRequest,
     responses(
         (status = 201, description = "DNS rewrite created", body = RewriteDto),
@@ -200,7 +200,7 @@ pub async fn add_rewrite(
 
 #[utoipa::path(
     put,
-    path = "/api/v1/rewrites/{id}",
+    path = "/api/v2/rewrites/{id}",
     request_body = AddRewriteRequest,
     params(("id" = String, Path, description = "Stable rewrite ID")),
     responses(
@@ -245,7 +245,7 @@ pub async fn update_rewrite(
 
 #[utoipa::path(
     delete,
-    path = "/api/v1/rewrites/{id}",
+    path = "/api/v2/rewrites/{id}",
     params(("id" = String, Path, description = "Stable rewrite ID")),
     responses(
         (status = 200, description = "DNS rewrite deleted", body = GenericMessageResponse),

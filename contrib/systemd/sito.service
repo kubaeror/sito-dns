@@ -19,7 +19,7 @@ EnvironmentFile=-/etc/sito/sito.env
 #   sudo chown -R sito:sito /etc/sito/certs
 #   sudo chmod 0600 /etc/sito/certs/*.key
 # Keys owned by root make the replication listener fail at startup while DNS
-# health still passes; GET /api/v1/ha/status then reports ready = false.
+# health still passes; GET /api/v2/ha/status then reports ready = false.
 # The service runs unprivileged with ProtectSystem=strict, so in-app updates
 # cannot replace the binary in /usr/local/bin. Updates must be applied as root
 # while the service is stopped: sudo systemctl stop sito && sudo sito update

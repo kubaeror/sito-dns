@@ -31,7 +31,7 @@ pub struct ApplyUpdateResponse {
 /// Check for software updates via GitHub Releases.
 #[utoipa::path(
     get,
-    path = "/api/v1/system/update/check",
+    path = "/api/v2/system/update/check",
     tag = "System",
     params(CheckUpdateQuery),
     responses(
@@ -66,7 +66,7 @@ pub async fn check_update(
 /// Download and apply software update.
 #[utoipa::path(
     post,
-    path = "/api/v1/system/update/apply",
+    path = "/api/v2/system/update/apply",
     tag = "System",
     request_body(content = Option<ApplyUpdatePayload>, description = "Optional update configuration"),
     responses(

@@ -66,7 +66,7 @@ fn require_reauth_token(
         .filter(|token| !token.is_empty())
         .ok_or_else(|| {
             ProblemDetails::unauthorized(
-                "Re-authentication required: provide a fresh X-Reauth-Token from POST /api/v1/auth/reauth",
+                "Re-authentication required: provide a fresh X-Reauth-Token from POST /api/v2/auth/reauth",
             )
         })?;
     let session_id = current_session_id(ctx, headers).ok_or_else(|| {
@@ -96,7 +96,7 @@ fn check_reauth_token(
         .filter(|token| !token.is_empty())
         .ok_or_else(|| {
             ProblemDetails::unauthorized(
-                "Re-authentication required: provide a fresh X-Reauth-Token from POST /api/v1/auth/reauth",
+                "Re-authentication required: provide a fresh X-Reauth-Token from POST /api/v2/auth/reauth",
             )
         })?;
     let session_id = current_session_id(ctx, headers).ok_or_else(|| {
@@ -183,7 +183,7 @@ fn append_session_cookies(response: &mut Response, session: &Session, secure: bo
 /// User login endpoint.
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/login",
+    path = "/api/v2/auth/login",
     request_body = LoginRequest,
     responses(
         (status = 200, description = "Login successful", body = LoginResponse),
@@ -265,7 +265,7 @@ pub async fn login(
 /// Second login phase: verify TOTP code.
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/totp/verify",
+    path = "/api/v2/auth/totp/verify",
     request_body = TotpVerifyRequest,
     responses(
         (status = 200, description = "TOTP verified, session established", body = LoginResponse),
@@ -342,7 +342,7 @@ pub async fn verify_totp(
 /// Logout endpoint invalidating current session cookie.
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/logout",
+    path = "/api/v2/auth/logout",
     responses(
         (status = 200, description = "Logged out successfully", body = GenericMessageResponse)
     ),
@@ -380,7 +380,7 @@ pub async fn logout(
 /// sensitive operation (TOTP enrollment/change).
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/reauth",
+    path = "/api/v2/auth/reauth",
     request_body = ReauthRequest,
     responses(
         (status = 200, description = "Re-authentication accepted", body = ReauthResponse),
@@ -446,8 +446,8 @@ pub async fn reauth(
 /// Initiate TOTP 2FA setup.
 #[utoipa::path(
     get,
-    path = "/api/v1/auth/totp/setup",
-    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v1/auth/reauth")),
+    path = "/api/v2/auth/totp/setup",
+    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v2/auth/reauth")),
     responses(
         (status = 200, description = "TOTP setup credentials generated", body = TotpSetupResponse),
         (status = 401, description = "Missing, invalid, or expired re-authentication ticket", body = ProblemDetails),
@@ -477,9 +477,9 @@ pub async fn get_totp_setup(
 /// Enable TOTP 2FA by verifying setup code.
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/totp/enable",
+    path = "/api/v2/auth/totp/enable",
     request_body = TotpConfirmRequest,
-    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v1/auth/reauth")),
+    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v2/auth/reauth")),
     responses(
         (status = 200, description = "TOTP enabled successfully", body = GenericMessageResponse),
         (status = 400, description = "Invalid code", body = ProblemDetails),
@@ -519,15 +519,15 @@ pub async fn enable_totp(
 /// Disable TOTP 2FA.
 ///
 /// Requires a fresh re-authentication ticket (`X-Reauth-Token`) from
-/// `POST /api/v1/auth/reauth`; that call proves the account password and, when
+/// `POST /api/v2/auth/reauth`; that call proves the account password and, when
 /// TOTP is enabled, the current TOTP or backup code. The legacy request-body
 /// credentials remain accepted for client compatibility but are superseded by
 /// the re-authentication ticket.
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/totp/disable",
+    path = "/api/v2/auth/totp/disable",
     request_body = DisableTotpRequest,
-    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v1/auth/reauth")),
+    params(("X-Reauth-Token" = String, Header, description = "Short-lived re-authentication ticket from POST /api/v2/auth/reauth")),
     responses(
         (status = 200, description = "TOTP disabled successfully", body = GenericMessageResponse),
         (status = 401, description = "Missing, invalid, or expired re-authentication ticket", body = ProblemDetails),
@@ -578,7 +578,7 @@ fn session_username(user: &crate::auth::rbac::AuthUser) -> Result<&str, ProblemD
 /// List all API tokens.
 #[utoipa::path(
     get,
-    path = "/api/v1/auth/tokens",
+    path = "/api/v2/auth/tokens",
     responses(
         (status = 200, description = "List of API tokens (hashes are never returned)", body = Vec<ApiTokenDto>),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -603,7 +603,7 @@ pub async fn list_tokens(
 /// Create a new API token.
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/tokens",
+    path = "/api/v2/auth/tokens",
     request_body = CreateTokenRequest,
     params(("X-Reauth-Token" = String, Header, description = "Session-bound re-authentication ticket; required to mint an Admin-scoped token from a user session")),
     responses(
@@ -668,7 +668,7 @@ pub async fn create_token(
 /// Revoke an API token by ID.
 #[utoipa::path(
     delete,
-    path = "/api/v1/auth/tokens/{id}",
+    path = "/api/v2/auth/tokens/{id}",
     responses(
         (status = 200, description = "Token revoked", body = GenericMessageResponse),
         (status = 404, description = "Token not found", body = ProblemDetails),
@@ -769,7 +769,7 @@ pub(crate) fn user_mutation_problem(
 /// List local user accounts.
 #[utoipa::path(
     get,
-    path = "/api/v1/auth/users",
+    path = "/api/v2/auth/users",
     responses(
         (status = 200, description = "User accounts", body = Vec<UserDto>),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -788,7 +788,7 @@ pub async fn list_users(
 /// Create a local user account.
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/users",
+    path = "/api/v2/auth/users",
     request_body = CreateUserRequest,
     params(("X-Reauth-Token" = String, Header, description = "Session-bound re-authentication ticket; required to create an Admin from a user session")),
     responses(
@@ -846,7 +846,7 @@ pub async fn create_user(
 /// Update a user's role.
 #[utoipa::path(
     put,
-    path = "/api/v1/auth/users/{username}",
+    path = "/api/v2/auth/users/{username}",
     request_body = UpdateUserRequest,
     params(
         ("username" = String, Path, description = "Username"),
@@ -897,7 +897,7 @@ pub async fn update_user(
 /// Delete a local user account.
 #[utoipa::path(
     delete,
-    path = "/api/v1/auth/users/{username}",
+    path = "/api/v2/auth/users/{username}",
     params(("username" = String, Path, description = "Username")),
     responses(
         (status = 200, description = "User deleted", body = GenericMessageResponse),
@@ -935,7 +935,7 @@ pub async fn delete_user(
 /// account must present a fresh session-bound re-authentication ticket.
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/change-password",
+    path = "/api/v2/auth/change-password",
     request_body = ChangePasswordRequest,
     params(("X-Reauth-Token" = String, Header, description = "Session-bound re-authentication ticket; required for an Admin overriding another account")),
     responses(

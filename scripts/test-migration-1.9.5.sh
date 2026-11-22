@@ -6,7 +6,7 @@
 #      local A rewrite on a high DNS port;
 #   2. a copy is migrated with `sito config migrate --from v1 --to v2 --backup`;
 #   3. the new binary starts on the migrated copy: the rewrite still answers,
-#      `/api/v1/status` responds, the stats DB is readable and users/TOTP files
+#      `/api/v2/status` responds, the stats DB is readable and users/TOTP files
 #      are unchanged;
 #   4. rollback restores the pre-upgrade data copy and `.v1.bak`, and the
 #      v1.9.5 binary starts and answers again.
@@ -261,7 +261,7 @@ step "asserted v2 document, 0600 .v1.bak, check-config"
 log "Start 2.0 on the migrated copy"
 # The acceptance config disables the admin listener for the v1 run. Derive a
 # runtime copy of the exact migrated v2 document that only enables the
-# loopback admin listener needed for /api/v1/status.
+# loopback admin listener needed for /api/v2/status.
 RUNTIME_CONFIG="$MIGRATED/config.runtime.toml"
 python3 - "$MIGRATED_CONFIG" "$RUNTIME_CONFIG" "$MIGRATED_DATA" <<'PY'
 import sys
@@ -295,20 +295,20 @@ for _ in $(seq 1 80); do
   fi
   sleep 0.25
 done
-step "curl -c <jar> -d '{\"user\":\"admin\",...}' http://127.0.0.1:$WEB_PORT/api/v1/auth/login"
+step "curl -c <jar> -d '{\"user\":\"admin\",...}' http://127.0.0.1:$WEB_PORT/api/v2/auth/login"
 curl -fsS -c "$COOKIE_JAR" -H 'Content-Type: application/json' \
   -d "{\"user\":\"admin\",\"pass\":\"$ADMIN_PASSWORD\"}" \
-  "http://127.0.0.1:$WEB_PORT/api/v1/auth/login" >/dev/null
-STATUS_JSON="$(curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:$WEB_PORT/api/v1/status")"
+  "http://127.0.0.1:$WEB_PORT/api/v2/auth/login" >/dev/null
+STATUS_JSON="$(curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:$WEB_PORT/api/v2/status")"
 python3 - "$STATUS_JSON" <<'PY'
 import json
 import sys
 
 body = json.loads(sys.argv[1])
 assert "version" in body, body
-print(f"  /api/v1/status OK: version={body['version']} role={body.get('role')}")
+print(f"  /api/v2/status OK: version={body['version']} role={body.get('role')}")
 PY
-step "asserted /api/v1/status requires a session and returns the status document"
+step "asserted /api/v2/status requires a session and returns the status document"
 stop_server "2.0"
 
 log "Post-upgrade assertions"

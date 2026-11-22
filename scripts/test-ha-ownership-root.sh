@@ -3,7 +3,7 @@
 #
 # Generates root-owned 0600 certificates, proves uid/gid 65532 cannot read the
 # private key, chowns the files to the runtime identity, and verifies that the
-# real mTLS listener plus /health and /api/v1/ha/status flip to ready.
+# real mTLS listener plus /health and /api/v2/ha/status flip to ready.
 #
 # The test itself skips when not root; this wrapper refuses to run
 # unprivileged so a CI mistake cannot be mistaken for a passing ownership test.

@@ -649,7 +649,7 @@ async fn probe_readiness(
             }
         }
         Ok((503, _)) => Err(anyhow::anyhow!(
-            "Healthcheck failed: the server reports it is not ready (see /api/v1/status or the server logs for the reason)"
+            "Healthcheck failed: the server reports it is not ready (see /api/v2/status or the server logs for the reason)"
         )),
         Ok((other, _)) => Err(anyhow::anyhow!(
             "cannot verify readiness: {web_addr}/health returned HTTP {other}"
@@ -664,11 +664,11 @@ async fn probe_readiness(
 /// Reports whether the admin API is in first-boot setup-pending mode.
 ///
 /// `/health` is generic and no longer carries a `setup_pending` field. While
-/// setup is pending, the setup-gating middleware short-circuits `/api/v1/*`
+/// setup is pending, the setup-gating middleware short-circuits `/api/v2/*`
 /// with `503 Setup not completed`; once an admin account exists the normal auth
 /// layer answers instead (typically `401`).
 async fn probe_setup_pending(web_addr: SocketAddr, timeout_ms: u64) -> Result<bool, anyhow::Error> {
-    match http_get(web_addr, "/api/v1/status", timeout_ms).await {
+    match http_get(web_addr, "/api/v2/status", timeout_ms).await {
         Ok((503, body)) if body.contains("Setup not completed") => Ok(true),
         Ok(_) => Ok(false),
         Err(e) => Err(e),
@@ -2184,7 +2184,7 @@ mod tests {
     async fn test_healthcheck_without_fallback_rejects_reachable_web_only() {
         let (dns_addr, _silent) = spawn_silent_udp().await;
         let web_addr =
-            spawn_http_router(vec![("/api/v1/status", 503, "Setup not completed")]).await;
+            spawn_http_router(vec![("/api/v2/status", 503, "Setup not completed")]).await;
         let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, false, false)
             .await
             .expect_err("web reachability must not mask a broken DNS listener by default");
@@ -2319,7 +2319,7 @@ mod tests {
         // 200 must not be mistaken for a pending wizard.
         let web_addr = spawn_http_router(vec![
             ("/health", 200, r#"{"status":"ok"}"#),
-            ("/api/v1/status", 401, "Unauthorized"),
+            ("/api/v2/status", 401, "Unauthorized"),
         ])
         .await;
         let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
@@ -2335,7 +2335,7 @@ mod tests {
     async fn test_healthcheck_setup_fallback_accepts_503_middleware_signal() {
         let (dns_addr, _silent) = spawn_silent_udp().await;
         let web_addr =
-            spawn_http_router(vec![("/api/v1/status", 503, "Setup not completed")]).await;
+            spawn_http_router(vec![("/api/v2/status", 503, "Setup not completed")]).await;
         run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
             .await
             .expect("503 setup-pending signal must satisfy the setup fallback");
@@ -2344,7 +2344,7 @@ mod tests {
     #[tokio::test]
     async fn test_healthcheck_setup_fallback_rejects_completed_setup() {
         let (dns_addr, _silent) = spawn_silent_udp().await;
-        let web_addr = spawn_http_router(vec![("/api/v1/status", 401, "Unauthorized")]).await;
+        let web_addr = spawn_http_router(vec![("/api/v2/status", 401, "Unauthorized")]).await;
         let err = run_healthcheck_or_web(Some(dns_addr), web_addr, 200, true, false)
             .await
             .expect_err("completed setup must not mask a broken DNS listener");

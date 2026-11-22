@@ -124,25 +124,25 @@ async fn test_acceptance_m5_openapi_contract() {
     );
 
     let expected_paths = [
-        "/api/v1/status",
-        "/api/v1/stats",
-        "/api/v1/stats/clients",
-        "/api/v1/stats/upstreams",
-        "/api/v1/querylog",
-        "/api/v1/filtering/lists",
-        "/api/v1/filtering/rules",
-        "/api/v1/filtering/check",
-        "/api/v1/clients",
-        "/api/v1/rewrites",
-        "/api/v1/upstream",
-        "/api/v1/upstream/test",
-        "/api/v1/cache/flush",
-        "/api/v1/auth/login",
-        "/api/v1/config",
-        "/api/v1/config/reload",
-        "/api/v1/config/backup",
-        "/api/v1/config/restore",
-        "/api/v1/config/restore/confirm",
+        "/api/v2/status",
+        "/api/v2/stats",
+        "/api/v2/stats/clients",
+        "/api/v2/stats/upstreams",
+        "/api/v2/querylog",
+        "/api/v2/filtering/lists",
+        "/api/v2/filtering/rules",
+        "/api/v2/filtering/check",
+        "/api/v2/clients",
+        "/api/v2/rewrites",
+        "/api/v2/upstream",
+        "/api/v2/upstream/test",
+        "/api/v2/cache/flush",
+        "/api/v2/auth/login",
+        "/api/v2/config",
+        "/api/v2/config/reload",
+        "/api/v2/config/backup",
+        "/api/v2/config/restore",
+        "/api/v2/config/restore/confirm",
     ];
 
     for path in expected_paths {
@@ -154,7 +154,7 @@ async fn test_acceptance_m5_openapi_contract() {
 
     // HA paths are only documented when this build can serve them; a no-HA
     // build keeps the routes mounted as 501 stubs without advertising them.
-    for path in ["/api/v1/ha/status", "/api/v1/ha/resync"] {
+    for path in ["/api/v2/ha/status", "/api/v2/ha/resync"] {
         if cfg!(feature = "ha") {
             assert!(
                 openapi.paths.paths.contains_key(path),
@@ -236,24 +236,24 @@ async fn test_acceptance_m5_rbac_matrix() {
     let app = sito_api::create_router(ctx);
 
     // 1. Unauthenticated requests to protected endpoints -> 401 with RFC 7807 problem+json
-    let (status, body) = call_route(app.clone(), "GET", "/api/v1/status", None, "").await;
+    let (status, body) = call_route(app.clone(), "GET", "/api/v2/status", None, "").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(body.contains("Authentication required"));
 
     // 2. Viewer role
-    // Viewer: allowed GET /api/v1/status
-    let (status, _) = call_route(app.clone(), "GET", "/api/v1/status", Some(&view_tok), "").await;
+    // Viewer: allowed GET /api/v2/status
+    let (status, _) = call_route(app.clone(), "GET", "/api/v2/status", Some(&view_tok), "").await;
     assert_eq!(status, StatusCode::OK);
 
-    // Viewer: allowed GET /api/v1/stats
-    let (status, _) = call_route(app.clone(), "GET", "/api/v1/stats", Some(&view_tok), "").await;
+    // Viewer: allowed GET /api/v2/stats
+    let (status, _) = call_route(app.clone(), "GET", "/api/v2/stats", Some(&view_tok), "").await;
     assert_eq!(status, StatusCode::OK);
 
-    // Viewer: allowed GET /api/v1/querylog
+    // Viewer: allowed GET /api/v2/querylog
     let (status, _) = call_route(
         app.clone(),
         "GET",
-        "/api/v1/querylog?limit=10",
+        "/api/v2/querylog?limit=10",
         Some(&view_tok),
         "",
     )
@@ -264,7 +264,7 @@ async fn test_acceptance_m5_rbac_matrix() {
     let (status, body) = call_route(
         app.clone(),
         "POST",
-        "/api/v1/cache/flush",
+        "/api/v2/cache/flush",
         Some(&view_tok),
         "",
     )
@@ -276,7 +276,7 @@ async fn test_acceptance_m5_rbac_matrix() {
     let (status, _) = call_route(
         app.clone(),
         "POST",
-        "/api/v1/config/reload",
+        "/api/v2/config/reload",
         Some(&view_tok),
         "",
     )
@@ -284,15 +284,15 @@ async fn test_acceptance_m5_rbac_matrix() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // 3. Operator role
-    // Operator: allowed GET /api/v1/status
-    let (status, _) = call_route(app.clone(), "GET", "/api/v1/status", Some(&oper_tok), "").await;
+    // Operator: allowed GET /api/v2/status
+    let (status, _) = call_route(app.clone(), "GET", "/api/v2/status", Some(&oper_tok), "").await;
     assert_eq!(status, StatusCode::OK);
 
-    // Operator: allowed POST /api/v1/cache/flush
+    // Operator: allowed POST /api/v2/cache/flush
     let (status, _) = call_route(
         app.clone(),
         "POST",
-        "/api/v1/cache/flush",
+        "/api/v2/cache/flush",
         Some(&oper_tok),
         "",
     )
@@ -303,7 +303,7 @@ async fn test_acceptance_m5_rbac_matrix() {
     let (status, _) = call_route(
         app.clone(),
         "POST",
-        "/api/v1/config/reload",
+        "/api/v2/config/reload",
         Some(&oper_tok),
         "",
     )
@@ -313,7 +313,7 @@ async fn test_acceptance_m5_rbac_matrix() {
     let (status, _) = call_route(
         app.clone(),
         "GET",
-        "/api/v1/config/backup",
+        "/api/v2/config/backup",
         Some(&oper_tok),
         "",
     )
@@ -321,37 +321,37 @@ async fn test_acceptance_m5_rbac_matrix() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // 4. Admin role
-    // Admin: allowed GET /api/v1/status
-    let (status, _) = call_route(app.clone(), "GET", "/api/v1/status", Some(&admin_tok), "").await;
+    // Admin: allowed GET /api/v2/status
+    let (status, _) = call_route(app.clone(), "GET", "/api/v2/status", Some(&admin_tok), "").await;
     assert_eq!(status, StatusCode::OK);
 
-    // Admin: allowed POST /api/v1/cache/flush
+    // Admin: allowed POST /api/v2/cache/flush
     let (status, _) = call_route(
         app.clone(),
         "POST",
-        "/api/v1/cache/flush",
+        "/api/v2/cache/flush",
         Some(&admin_tok),
         "",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Admin: allowed POST /api/v1/config/reload
+    // Admin: allowed POST /api/v2/config/reload
     let (status, _) = call_route(
         app.clone(),
         "POST",
-        "/api/v1/config/reload",
+        "/api/v2/config/reload",
         Some(&admin_tok),
         "",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Admin: allowed GET /api/v1/config/backup
+    // Admin: allowed GET /api/v2/config/backup
     let (status, _) = call_route(
         app.clone(),
         "GET",
-        "/api/v1/config/backup",
+        "/api/v2/config/backup",
         Some(&admin_tok),
         "",
     )
@@ -362,7 +362,7 @@ async fn test_acceptance_m5_rbac_matrix() {
     let (status, body) = call_route(
         app.clone(),
         "GET",
-        "/api/v1/ha/status",
+        "/api/v2/ha/status",
         Some(&admin_tok),
         "",
     )
@@ -470,7 +470,7 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
 
     // Filter by domain
     let (status, json) =
-        get_json(app.clone(), "/api/v1/querylog?domain=track.me", &admin_tok).await;
+        get_json(app.clone(), "/api/v2/querylog?domain=track.me", &admin_tok).await;
     assert_eq!(status, StatusCode::OK);
     let entries = json["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
@@ -480,7 +480,7 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     // Filter by client
     let (status, json) = get_json(
         app.clone(),
-        "/api/v1/querylog?client=192.168.1.10",
+        "/api/v2/querylog?client=192.168.1.10",
         &admin_tok,
     )
     .await;
@@ -489,13 +489,13 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     assert_eq!(entries.len(), 2);
 
     // Filter by status (verdict)
-    let (status, json) = get_json(app.clone(), "/api/v1/querylog?status=blocked", &admin_tok).await;
+    let (status, json) = get_json(app.clone(), "/api/v2/querylog?status=blocked", &admin_tok).await;
     assert_eq!(status, StatusCode::OK);
     let entries = json["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
 
     // Cursor pagination: page size 1
-    let (status, json_page1) = get_json(app.clone(), "/api/v1/querylog?limit=1", &admin_tok).await;
+    let (status, json_page1) = get_json(app.clone(), "/api/v2/querylog?limit=1", &admin_tok).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json_page1["entries"].as_array().unwrap().len(), 1);
     assert!(json_page1["next_cursor"].is_string());
@@ -504,7 +504,7 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     // Fetch page 2 using cursor
     let (status, json_page2) = get_json(
         app.clone(),
-        &format!("/api/v1/querylog?limit=1&cursor={cursor}"),
+        &format!("/api/v2/querylog?limit=1&cursor={cursor}"),
         &admin_tok,
     )
     .await;
@@ -516,10 +516,10 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
         "Pagination cursor must return sequential non-overlapping items"
     );
 
-    // Clear logs via DELETE /api/v1/querylog
+    // Clear logs via DELETE /api/v2/querylog
     let req = Request::builder()
         .method("DELETE")
-        .uri("/api/v1/querylog")
+        .uri("/api/v2/querylog")
         .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
         .body(Body::empty())
         .unwrap();
@@ -527,14 +527,14 @@ async fn test_acceptance_m5_querylog_filters_and_pagination() {
     assert_eq!(res.status(), StatusCode::OK);
 
     let (status, json_cleared) =
-        get_json(app.clone(), "/api/v1/querylog?limit=10", &admin_tok).await;
+        get_json(app.clone(), "/api/v2/querylog?limit=10", &admin_tok).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json_cleared["entries"].as_array().unwrap().len(), 0);
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
-/// 4. Acceptance test: WebSocket Live-tail (`/api/v1/querylog/stream`)
+/// 4. Acceptance test: WebSocket Live-tail (`/api/v2/querylog/stream`)
 #[tokio::test]
 async fn test_acceptance_m5_websocket_livetail() {
     let temp_dir = std::env::temp_dir().join(format!("sito_m5_ws_{}", rand::random::<u64>()));
@@ -559,7 +559,7 @@ async fn test_acceptance_m5_websocket_livetail() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let ws_url = format!("ws://{addr}/api/v1/querylog/stream");
+    let ws_url = format!("ws://{addr}/api/v2/querylog/stream");
     let mut ws_request = ws_url.into_client_request().expect("valid WebSocket URL");
     ws_request.headers_mut().insert(
         header::ORIGIN,
@@ -642,7 +642,7 @@ async fn test_acceptance_m5_querylog_stream_rejects_query_token() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let ws_url = format!("ws://{addr}/api/v1/querylog/stream?token={view_tok}");
+    let ws_url = format!("ws://{addr}/api/v2/querylog/stream?token={view_tok}");
     let mut ws_request = ws_url.into_client_request().expect("valid WebSocket URL");
     ws_request.headers_mut().insert(
         header::ORIGIN,
@@ -814,9 +814,9 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
         .token;
     let app = sito_api::create_router(ctx.clone());
 
-    // GET /api/v1/config/backup -> download tar.gz
+    // GET /api/v2/config/backup -> download tar.gz
     let req = Request::builder()
-        .uri("/api/v1/config/backup")
+        .uri("/api/v2/config/backup")
         .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
         .body(Body::empty())
         .unwrap();
@@ -839,10 +839,10 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
         "backup archive must contain a TOML config"
     );
 
-    // POST /api/v1/config/restore -> prepare restore and get confirmation token
+    // POST /api/v2/config/restore -> prepare restore and get confirmation token
     let req = Request::builder()
         .method("POST")
-        .uri("/api/v1/config/restore")
+        .uri("/api/v2/config/restore")
         .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
         .header(header::CONTENT_TYPE, "application/gzip")
         .body(Body::from(archive_bytes))
@@ -860,13 +860,13 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
         "restore preparation must return a confirmation token"
     );
 
-    // POST /api/v1/config/restore/confirm with confirmation token
+    // POST /api/v2/config/restore/confirm with confirmation token
     let confirm_body = serde_json::json!({
         "confirmation_token": confirmation_token
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/api/v1/config/restore/confirm")
+        .uri("/api/v2/config/restore/confirm")
         .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(&confirm_body).unwrap()))
@@ -880,7 +880,7 @@ async fn test_acceptance_m5_api_backup_and_token_restore() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri("/api/v1/config/restore/confirm")
+        .uri("/api/v2/config/restore/confirm")
         .header(header::AUTHORIZATION, format!("Bearer {admin_tok}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(&bad_confirm_body).unwrap()))

@@ -178,7 +178,7 @@ impl Modify for SecurityAddon {
     info(
         title = "sito DNS Administrative API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, API-token management, and self-service TOTP enrollment are available in the web UI (/users and /account); sensitive TOTP changes require a fresh re-authentication ticket from POST /api/v1/auth/reauth. See docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
+        description = "Administrative REST API and OpenAPI 3.1 specification for the sito DNS server. Account, role, API-token management, and self-service TOTP enrollment are available in the web UI (/users and /account); sensitive TOTP changes require a fresh re-authentication ticket from POST /api/v2/auth/reauth. See docs/user-management.md (https://github.com/kubaeror/sito-dns/blob/main/docs/user-management.md).",
         license(name = "GPL-3.0-only")
     )
 )]
@@ -263,9 +263,9 @@ mod tests {
         assert_eq!(schemes["cookie_auth"]["name"], "sito_session");
 
         let public: BTreeSet<(String, String)> = [
-            ("/api/v1/auth/login", "post"),
-            ("/api/v1/auth/totp/verify", "post"),
-            ("/api/v1/auth/logout", "post"),
+            ("/api/v2/auth/login", "post"),
+            ("/api/v2/auth/totp/verify", "post"),
+            ("/api/v2/auth/logout", "post"),
         ]
         .into_iter()
         .map(|(path, method)| (path.to_string(), method.to_string()))
@@ -360,7 +360,7 @@ mod tests {
             let route = &rest[..quote];
             let path = match route {
                 "/health" | "/metrics" => continue,
-                _ => format!("/api/v1{route}"),
+                _ => format!("/api/v2{route}"),
             };
             let methods = routes.entry(path).or_default();
             for method in HTTP_METHODS {
@@ -388,7 +388,7 @@ mod tests {
         // A no-HA build intentionally omits the HA operations from the spec
         // while keeping the routes mounted as 501 stubs.
         #[cfg(not(feature = "ha"))]
-        routed.retain(|path, _| !path.starts_with("/api/v1/ha/"));
+        routed.retain(|path, _| !path.starts_with("/api/v2/ha/"));
 
         assert_eq!(
             documented.keys().collect::<Vec<_>>(),

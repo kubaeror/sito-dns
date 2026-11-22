@@ -12,7 +12,7 @@ use crate::state::ServerContext;
 /// Flush entire DNS response cache.
 #[utoipa::path(
     post,
-    path = "/api/v1/cache/flush",
+    path = "/api/v2/cache/flush",
     responses(
         (status = 200, description = "Cache flushed successfully", body = GenericMessageResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -35,7 +35,7 @@ pub async fn flush_cache(
 /// Invalidate cache entries matching a domain.
 #[utoipa::path(
     post,
-    path = "/api/v1/cache/invalidate",
+    path = "/api/v2/cache/invalidate",
     params(InvalidateCacheQuery),
     responses(
         (status = 200, description = "Cache entries invalidated", body = GenericMessageResponse),

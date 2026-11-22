@@ -101,7 +101,7 @@ cargo test --workspace --all-features --locked
 
 # HA certificate ownership (root-gated; skipped in unprivileged runs)
 # Generates root-owned keys, proves uid 65532 cannot read them, chowns, then
-# starts the real mTLS listener and checks /health + /api/v1/ha/status.
+# starts the real mTLS listener and checks /health + /api/v2/ha/status.
 sudo scripts/test-ha-ownership-root.sh
 
 # License and dependency checks

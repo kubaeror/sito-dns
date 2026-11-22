@@ -90,7 +90,7 @@ async fn filter_list_dto(ctx: &ServerContext, list: &FilterListConfig) -> Filter
 
 #[utoipa::path(
     get,
-    path = "/api/v1/filtering/status",
+    path = "/api/v2/filtering/status",
     responses(
         (status = 200, description = "Filter engine lifecycle and per-list health", body = FilterStatusDto),
         (status = 401, description = "Unauthorized"),
@@ -127,7 +127,7 @@ pub async fn get_filtering_status(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/filtering/lists",
+    path = "/api/v2/filtering/lists",
     responses(
         (status = 200, description = "Subscription lists retrieved with real rule counts", body = Vec<FilterListDto>),
         (status = 401, description = "Unauthorized"),
@@ -150,7 +150,7 @@ pub async fn get_filter_lists(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/integrations/lists",
+    path = "/api/v2/integrations/lists",
     responses(
         (status = 200, description = "Runtime state of every curated parental/service category", body = Vec<IntegrationListStatusDto>),
         (status = 401, description = "Unauthorized"),
@@ -175,7 +175,7 @@ pub async fn get_integration_lists(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/integrations/lists/{category}/refresh",
+    path = "/api/v2/integrations/lists/{category}/refresh",
     params(("category" = String, Path, description = "Curated category id (case-insensitive)")),
     responses(
         (status = 200, description = "Category force-refreshed; the >50% shrink guard is bypassed", body = IntegrationListStatusDto),
@@ -283,7 +283,7 @@ pub async fn refresh_integration_list(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/filtering/lists",
+    path = "/api/v2/filtering/lists",
     request_body = AddFilterListRequest,
     responses(
         (status = 201, description = "Filter list added", body = FilterListDto),
@@ -333,7 +333,7 @@ pub async fn add_filter_list(
 
 #[utoipa::path(
     put,
-    path = "/api/v1/filtering/lists/{id}",
+    path = "/api/v2/filtering/lists/{id}",
     request_body = UpdateFilterListRequest,
     params(("id" = usize, Path, description = "Filter list index ID")),
     responses(
@@ -407,7 +407,7 @@ pub async fn update_filter_list(
 
 #[utoipa::path(
     delete,
-    path = "/api/v1/filtering/lists/{id}",
+    path = "/api/v2/filtering/lists/{id}",
     params(("id" = usize, Path, description = "Filter list index ID")),
     responses(
         (status = 200, description = "Filter list deleted", body = GenericMessageResponse),
@@ -447,7 +447,7 @@ pub async fn delete_filter_list(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/filtering/refresh",
+    path = "/api/v2/filtering/refresh",
     responses(
         (status = 200, description = "Filter lists refreshed", body = GenericMessageResponse),
         (status = 401, description = "Unauthorized"),
@@ -498,7 +498,7 @@ pub async fn refresh_filtering(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/filtering/rules",
+    path = "/api/v2/filtering/rules",
     responses(
         (status = 200, description = "Custom rules retrieved", body = CustomRulesDto),
         (status = 401, description = "Unauthorized"),
@@ -519,7 +519,7 @@ pub async fn get_filtering_rules(
 
 #[utoipa::path(
     put,
-    path = "/api/v1/filtering/rules",
+    path = "/api/v2/filtering/rules",
     request_body = CustomRulesDto,
     responses(
         (status = 200, description = "Custom rules updated", body = CustomRulesDto),
@@ -547,7 +547,7 @@ pub async fn set_filtering_rules(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/filtering/check",
+    path = "/api/v2/filtering/check",
     request_body = FilterCheckRequest,
     responses(
         (status = 200, description = "Filtering check result simulated", body = FilterCheckResponse),
@@ -869,7 +869,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/integrations/lists")
+                    .uri("/api/v2/integrations/lists")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -883,7 +883,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/integrations/lists/adult/refresh")
+                    .uri("/api/v2/integrations/lists/adult/refresh")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -895,7 +895,7 @@ mod tests {
             let response = app
                 .oneshot(
                     Request::builder()
-                        .uri("/api/v1/integrations/lists")
+                        .uri("/api/v2/integrations/lists")
                         .header(header::AUTHORIZATION, format!("Bearer {token}"))
                         .body(Body::empty())
                         .unwrap(),
@@ -921,7 +921,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/integrations/lists/Adult/refresh")
+                    .uri("/api/v2/integrations/lists/Adult/refresh")
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -944,7 +944,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/integrations/lists/unknown/refresh")
+                    .uri("/api/v2/integrations/lists/unknown/refresh")
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -959,7 +959,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/integrations/lists/gambling/refresh")
+                    .uri("/api/v2/integrations/lists/gambling/refresh")
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -980,7 +980,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/integrations/lists/services/refresh")
+                    .uri("/api/v2/integrations/lists/services/refresh")
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),

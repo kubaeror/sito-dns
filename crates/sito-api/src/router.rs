@@ -45,8 +45,8 @@ pub async fn slave_read_only_middleware(
 
     if is_slave && is_mutating {
         let path = request.uri().path();
-        let is_allowed = path.starts_with("/api/v1/auth")
-            || path == "/api/v1/ha/resync"
+        let is_allowed = path.starts_with("/api/v2/auth")
+            || path == "/api/v2/ha/resync"
             || path == "/ha/resync"
             || path == "/ui/login"
             || path == "/ui/logout"
@@ -105,8 +105,8 @@ fn setup_token_from_request(request: &Request) -> Option<String> {
 /// sufficient privileges or the one-time setup token. During that window:
 /// - Allows: `/wizard`, `/ui/wizard/*`, `/static/*`, `/assets/*`, `/health`,
 ///   `/status` and the setup-token-protected endpoints.
-/// - Returns 403 for `/api/v1/auth/*` (login and credential management).
-/// - Returns 503 for the remaining `/api/v1/*` routes.
+/// - Returns 403 for `/api/v2/auth/*` (login and credential management).
+/// - Returns 503 for the remaining `/api/v2/*` routes.
 /// - Redirects all other UI routes to `/wizard` (or `/login` once user
 ///   accounts exist and no setup token is required).
 ///
@@ -206,7 +206,7 @@ pub async fn setup_pending_middleware(
     let login_allowed = !first_run && !token_required && !default_admin_active;
 
     let login_path = path == "/login" || path == "/ui/login";
-    let auth_api = path.starts_with("/api/v1/auth");
+    let auth_api = path.starts_with("/api/v2/auth");
     if path.starts_with("/wizard")
         || path.starts_with("/ui/wizard")
         || path.starts_with("/static/")
@@ -229,7 +229,7 @@ pub async fn setup_pending_middleware(
         .into_response();
     }
 
-    if path.starts_with("/api/v1/") || path == "/api/v1" {
+    if path.starts_with("/api/v2/") || path == "/api/v2" {
         return (StatusCode::SERVICE_UNAVAILABLE, "Setup not completed").into_response();
     }
 
@@ -265,21 +265,21 @@ async fn not_found_handler() -> impl IntoResponse {
     )
 }
 
-/// Legacy alias for `GET|PUT /api/v1/upstream`; kept as a permanent redirect.
+/// Legacy alias for `GET|PUT /api/v2/upstream`; kept as a permanent redirect.
 fn redirect_upstream_config() -> Response {
     (
         StatusCode::PERMANENT_REDIRECT,
-        [(axum::http::header::LOCATION, "/api/v1/upstream")],
+        [(axum::http::header::LOCATION, "/api/v2/upstream")],
     )
         .into_response()
 }
 
-/// Documented GET alias for `/api/v1/upstream`.
+/// Documented GET alias for `/api/v2/upstream`.
 #[utoipa::path(
     get,
-    path = "/api/v1/upstream/config",
+    path = "/api/v2/upstream/config",
     responses(
-        (status = 308, description = "Permanent redirect to /api/v1/upstream", headers(("Location", description = "Canonical upstream-config path"))),
+        (status = 308, description = "Permanent redirect to /api/v2/upstream", headers(("Location", description = "Canonical upstream-config path"))),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
@@ -291,12 +291,12 @@ pub(crate) async fn redirect_upstream_config_get(_operator: RequireOperator) -> 
     redirect_upstream_config()
 }
 
-/// Documented PUT alias for `/api/v1/upstream`.
+/// Documented PUT alias for `/api/v2/upstream`.
 #[utoipa::path(
     put,
-    path = "/api/v1/upstream/config",
+    path = "/api/v2/upstream/config",
     responses(
-        (status = 308, description = "Permanent redirect to /api/v1/upstream", headers(("Location", description = "Canonical upstream-config path"))),
+        (status = 308, description = "Permanent redirect to /api/v2/upstream", headers(("Location", description = "Canonical upstream-config path"))),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden")
     ),
@@ -324,7 +324,7 @@ pub fn create_router_with_hooks(
 }
 
 fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHooks) -> Router {
-    let api_v1 = Router::new()
+    let api_v2 = Router::new()
         // System status
         .route("/status", get(status::get_status))
         // Stats
@@ -464,7 +464,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
     // to enable client generation and documentation discovery. Restrict via reverse proxy if needed.
     #[cfg(feature = "embed-ui")]
     let app = Router::new()
-        .nest("/api/v1", api_v1)
+        .nest("/api/v2", api_v2)
         .route("/metrics", get(metrics::get_metrics))
         .route("/health", get(health_handler))
         .merge(SwaggerUi::new("/api/docs").url("/api/docs/openapi.json", ApiDoc::openapi()))
@@ -483,7 +483,7 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
 
     #[cfg(not(feature = "embed-ui"))]
     let app = Router::new()
-        .nest("/api/v1", api_v1)
+        .nest("/api/v2", api_v2)
         .route("/metrics", get(metrics::get_metrics))
         .route("/health", get(health_handler))
         .merge(SwaggerUi::new("/api/docs").url("/api/docs/openapi.json", ApiDoc::openapi()))
@@ -587,7 +587,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/upstream/config")
+                    .uri("/api/v2/upstream/config")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -598,7 +598,7 @@ mod tests {
         let authenticated = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/upstream/config")
+                    .uri("/api/v2/upstream/config")
                     .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -611,16 +611,18 @@ mod tests {
                 .headers()
                 .get(axum::http::header::LOCATION)
                 .unwrap(),
-            "/api/v1/upstream"
+            "/api/v2/upstream"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    /// WP-3.2: `/api/v1` is the only mounted API. `/api/v2` is absent (404)
-    /// and `/api/v1/status` keeps its canonical authentication behavior.
+    /// 2.0 mounts `/api/v2` as the only administrative API. `/api/v1` was
+    /// removed and returns 404 with no alias or redirect; `/api/v2/status`
+    /// keeps the canonical authentication behavior, and the OpenAPI document
+    /// advertises only v2 paths.
     #[tokio::test]
-    async fn test_api_surface_has_no_v2_and_keeps_v1_status_canonical() {
+    async fn test_api_surface_uses_only_v2_and_removes_v1() {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
@@ -641,7 +643,7 @@ mod tests {
             .token;
         let app = create_router(ctx);
 
-        for path in ["/api/v2", "/api/v2/status", "/api/v2/stats"] {
+        for path in ["/api/v1", "/api/v1/status", "/api/v1/stats"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -664,7 +666,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/status")
+                    .uri("/api/v2/status")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -675,7 +677,7 @@ mod tests {
         let authenticated = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/status")
+                    .uri("/api/v2/status")
                     .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -686,9 +688,14 @@ mod tests {
 
         let openapi = serde_json::to_value(ApiDoc::openapi()).expect("valid OpenAPI JSON");
         let paths = openapi["paths"].as_object().expect("paths object");
+        assert!(!paths.is_empty(), "the OpenAPI document must document v2");
         assert!(
-            paths.keys().all(|path| !path.starts_with("/api/v2")),
-            "the OpenAPI document must not advertise an API v2"
+            paths.keys().all(|path| path.starts_with("/api/v2")),
+            "every OpenAPI path must be under /api/v2"
+        );
+        assert!(
+            paths.keys().all(|path| !path.starts_with("/api/v1")),
+            "the OpenAPI document must not advertise the removed API v1"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -715,7 +722,7 @@ mod tests {
     }
 }
 
-/// A build without `sito-ha` still mounts `/api/v1/ha/*` for discoverability,
+/// A build without `sito-ha` still mounts `/api/v2/ha/*` for discoverability,
 /// but every handler reports the stable `501 ha_not_supported` response behind
 /// the same admin authorization as a feature-enabled build.
 #[cfg(all(test, not(feature = "ha")))]

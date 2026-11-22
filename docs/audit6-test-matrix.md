@@ -482,7 +482,7 @@ WebSocket Origin, accurate updater version/systemd/lock/rollback/signature
 behavior, Viewer URL redaction, and backup/get-config truth. Public API notes
 are in §26 of
 [`docs/2.0-public-api-diff.md`](2.0-public-api-diff.md#26-api-hardening-openapi-config-apply-updater-wp-211).
-This section describes `/api/v1`; `/api/v2` is absent and deferred.
+This section describes `/api/v2`; `/api/v1` was removed and returns 404.
 
 | Finding / acceptance | Named test / check | Focused command |
 |---|---|---|
@@ -615,15 +615,15 @@ attested release image to the release workflow before publication.
 
 WP-3.2 is acceptance evidence, not a new feature. SQLite is compatibility-only:
 the 2.0 tree keeps the existing additive `stats_meta`/index startup pass and
-adds no schema migration command or `SITO_DB_AUTO_MIGRATE` switch. `/api/v1` is
-canonical; `/api/v2` and an API v1 facade stay absent. 1.9.5 is the latest
+adds no schema migration command or `SITO_DB_AUTO_MIGRATE` switch. `/api/v2` is
+canonical; `/api/v1` and an API v1 facade are absent. 1.9.5 is the latest
 1.9.x data-directory test; 1.9.3 is covered by an exact-schema fixture.
 
 | Acceptance criterion | Named test / check | Focused command |
 |---|---|---|
 | A real 1.9.5 data dir answers a local rewrite, migrates config v1 -> v2 with a 0600 backup, runs 2.0 on the same migrated stats DB, and rolls back to 1.9.5 | `scripts/test-migration-1.9.5.sh` | `bash scripts/test-migration-1.9.5.sh` |
 | The exact four `v1.9.3` migration files still produce a readable database with no new sqlx version after the current `StatsDb` opens it | `test_exact_v1_9_3_schema_stays_readable_after_additive_upgrade` | `cargo test -p sito-stats exact_v1_9_3` |
-| `/api/v2` is absent (404) and `/api/v1/status` keeps its canonical 401/200 auth behavior; OpenAPI advertises no v2 | `test_api_surface_has_no_v2_and_keeps_v1_status_canonical` | `cargo test -p sito-api test_api_surface_has_no_v2` |
+| `/api/v1` is absent (404) and `/api/v2/status` keeps its canonical 401/200 auth behavior; every OpenAPI path is under `/api/v2` | `test_api_surface_uses_only_v2_and_removes_v1` | `cargo test -p sito-api test_api_surface_uses_only_v2` |
 | HA protocol v2 rejects v1 peers, bundles, state and watermarks | `scripts/test-ha-v1-compat.sh`; `test_master_rejects_v1_slave_and_keeps_listening`, `test_slave_rejects_v1_master_and_accepts_next_valid_push`, `test_restore_preserves_term_and_rejects_v1_state`, `test_v1_bundle_is_rejected_by_protocol_v2`, `test_v1_watermark_is_rejected_by_protocol_v2` | `bash scripts/test-ha-v1-compat.sh` |
 
 HA remains a coordinated cluster upgrade; there is no two-node v1/v2 E2E

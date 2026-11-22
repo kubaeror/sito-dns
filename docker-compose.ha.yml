@@ -49,7 +49,7 @@
 # ready (mTLS/key permissions, listener bind, initial slave handshake), so a
 # healthy DNS probe can no longer mask a broken HA node. Check
 # `docker inspect --format '{{json .State.Health}}' sito-master` and
-# GET /api/v1/ha/status (`ready` / `readiness_reason`) for the cause.
+# GET /api/v2/ha/status (`ready` / `readiness_reason`) for the cause.
 #
 # DHCP CONFIGURATION (MikroTik RouterOS Option 6):
 # Configure RouterOS DHCP server to hand out both redundant DNS IPs:

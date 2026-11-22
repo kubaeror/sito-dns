@@ -12,7 +12,7 @@ This runbook provides step-by-step operational procedures for managing, maintain
 - **Admission limits**: the replication listener accepts at most 64 concurrent slave sessions and at most 8 concurrent sessions per source IP; a 10 s timeout bounds TLS/WebSocket handshakes and one WebSocket write. A NAT deployment with more than eight simultaneous HA peers from one address must be split across source addresses.
 - **Continuous Resolution**: Slaves serve DNS queries continuously without downtime. If an invalid or unparsable configuration bundle is received, the slave performs an automatic rollback to its last known good snapshot and enters a `Degraded` state.
 - **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master.
-- **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master stores the latest report per slave and exposes it through `GET /api/v1/ha/slaves`; replica counters are **not** merged into the master's own Prometheus registry. Scrape each replica's `/metrics` endpoint separately (labels such as `sito_ha_config_version{instance="..."}` identify the node).
+- **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master stores the latest report per slave and exposes it through `GET /api/v2/ha/slaves`; replica counters are **not** merged into the master's own Prometheus registry. Scrape each replica's `/metrics` endpoint separately (labels such as `sito_ha_config_version{instance="..."}` identify the node).
 
 ### Build prerequisites and the optional HA module
 
@@ -37,8 +37,8 @@ A no-HA binary still runs as a **master**, but it is fail-closed:
 | Surface | No-HA behavior |
 |---|---|
 | Startup, `sito check-config`, API config writes, restore | Rejects `[ha]` and `server.role = "slave"` with an error naming the missing feature. |
-| `GET /api/v1/ha/status`, `GET /api/v1/ha/slaves`, `POST /api/v1/ha/resync` | Return **501** with `ha_not_supported`; normal admin authentication still applies. |
-| `/health`, `/api/v1/status` | HA is not part of the node's role and never gates readiness. |
+| `GET /api/v2/ha/status`, `GET /api/v2/ha/slaves`, `POST /api/v2/ha/resync` | Return **501** with `ha_not_supported`; normal admin authentication still applies. |
+| `/health`, `/api/v2/status` | HA is not part of the node's role and never gates readiness. |
 | `[ha]` in `config.toml` | Not usable. Rebuild with `ha` or remove the section. |
 
 This only affects source builds that omit the feature. A cluster running the
@@ -89,7 +89,7 @@ either DNS IP.
 
 A key that the runtime cannot read fails closed: the master listener logs
 `Failed to initialize mTLS for master HA replication server: ... Permission
-denied`, `GET /api/v1/ha/status` reports `ready: false` with a
+denied`, `GET /api/v2/ha/status` reports `ready: false` with a
 `readiness_reason`, and the `healthcheck` subcommand fails even though DNS
 still answers. The same visibility applies to a failed listener bind, a slave
 that cannot complete the handshake, and a slave that has not reached `Synced`.
@@ -100,7 +100,7 @@ independent of replication: HA preserves each node's node-local `[web]`
 identity, so a slave that disables the listener can still converge to `Synced`
 while the healthcheck reports not ready. The unauthenticated `/health` endpoint
 exposes only the generic ready flag; read `readiness_reason` on the
-authenticated `/api/v1/ha/status` endpoint (or the logs) for the detailed
+authenticated `/api/v2/ha/status` endpoint (or the logs) for the detailed
 cause.
 
 ### Health and status endpoint semantics (WP-1.7)
@@ -116,7 +116,7 @@ It deliberately exposes no component names, reason codes, filesystem paths,
 certificate text or configuration values. The container healthcheck and
 `GET /health` consumers must rely on the status code.
 
-`GET /api/v1/status` (Viewer or higher) is the detailed admin view. It keeps
+`GET /api/v2/status` (Viewer or higher) is the detailed admin view. It keeps
 `version`, `uptime_seconds`, `role`, `listeners` and `acme`, and adds:
 
 - `ready` — the same aggregate verdict `/health` uses.
@@ -223,7 +223,7 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
 
 3. **Carry over the master identity and the version sequence**:
    A promoted slave is already at some configuration version `N` (visible as
-   `version` in `GET /api/v1/ha/status`). Two artifacts decide whether the new
+   `version` in `GET /api/v2/ha/status`). Two artifacts decide whether the new
    master can keep replicating to the remaining slaves:
 
    - **Signing key** (`data_dir/ha_signing.key`): bundles are signed with this
@@ -278,19 +278,19 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
 
    To obtain the master public key for the slave configs:
    ```bash
-   # All /api/v1/ha/* endpoints require an Admin token or session.
+   # All /api/v2/ha/* endpoints require an Admin token or session.
    export TOKEN='sito_...'   # Admin API token
    curl -s -H "Authorization: Bearer $TOKEN" \
-     http://192.168.1.10:8080/api/v1/ha/status | jq -r .master_pubkey
+     http://192.168.1.10:8080/api/v2/ha/status | jq -r .master_pubkey
 
    # Without it: the promoted master prints the same value in its status once running.
    ```
    Never let an unpromoted master start below or beside a newer term: it marks
-   itself in `GET /api/v1/ha/status` with `"diverged": true` plus a
+   itself in `GET /api/v2/ha/status` with `"diverged": true` plus a
    `diverged_reason` and stops replicating, rather than republishing its stale
    bundle over newer configuration. Divergence is sticky per slave: it is not
    cleared by another slave's success and **not** cleared by
-   `POST /api/v1/ha/resync` (a resync only re-pushes the current bundle). It
+   `POST /api/v2/ha/resync` (a resync only re-pushes the current bundle). It
    clears only when that specific slave acknowledges the master's current
    term/version, or when the slave disconnects. A same-version payload fork is
    likewise cleared only by that slave accepting the current bundle after a
@@ -331,7 +331,7 @@ In the event of a catastrophic or permanent failure of the master node, a slave 
    Query the local status endpoint with an authenticated token or session:
    ```bash
    curl -s -H "Authorization: Bearer $TOKEN" \
-     http://localhost:8080/api/v1/ha/status | jq .
+     http://localhost:8080/api/v2/ha/status | jq .
    ```
    Expected response (master):
    ```json
@@ -557,7 +557,7 @@ When a slave node fails or must be reprovisioned from bare metal:
    Check the slave status endpoint with an authenticated token or session:
    ```bash
    curl -s -H "Authorization: Bearer $TOKEN" \
-     http://localhost:8080/api/v1/ha/status | jq .
+     http://localhost:8080/api/v2/ha/status | jq .
    ```
    The slave will transition through `Connecting` -> `HelloSent` -> `Applying` -> `Synced` (or `HelloSent` -> `Synced` when it is already at the master's version) in under 2 seconds once the restart-only fields from step 3 match the master. If the first push is rejected with `restart_required`, align `server.log_format` and the `[auth]` policy with the master and restart the slave; the master keeps reporting it unsynced until then. Verify that custom rules, rewrites, and client lists match the master. `Degraded` is only cleared by a successful apply or an early ACK for the already-running version.
 
@@ -575,48 +575,48 @@ When a slave node fails or must be reprovisioned from bare metal:
 
 | Symptom | Probable Cause | Action |
 |---|---|---|
-| Slave state is `Degraded` | Configuration apply failed, corrupted bundle, or an unresolvable `${SECRET:...}` placeholder | Check the service journal (`journalctl -u sito`) for `apply_config_push` errors. The slave keeps its last good snapshot and reports `Degraded`; fix the configuration on the master and re-push. The reason is exposed as `degraded_reason` in `GET /api/v1/ha/status`. |
+| Slave state is `Degraded` | Configuration apply failed, corrupted bundle, or an unresolvable `${SECRET:...}` placeholder | Check the service journal (`journalctl -u sito`) for `apply_config_push` errors. The slave keeps its last good snapshot and reports `Degraded`; fix the configuration on the master and re-push. The reason is exposed as `degraded_reason` in `GET /api/v2/ha/status`. |
 | Push rejected with `restart_required` | The master bundle changed a restart-only field that is not node-local (for example `server.log_format` or `[auth]`) | The slave kept its previous live configuration and file and ACKs `applied:false`. Restart the slave after setting the intended value locally, or change the shared setting only when a coordinated restart is acceptable. Node-local listener/TLS/`[web]`/MikroTik fields are preserved automatically and do not trigger this; web identity (including `enabled`) is node-local, so a slave may run with the admin listener disabled and still synchronize (the readiness healthcheck separately requires it). |
 | Slave state is `Connecting` in loop | Network unreachable, firewall blocking 8953, or mTLS handshake failed/timed out | Check `nc -zv 192.168.1.10 8953`. Check TLS certificate expiration or fingerprint mismatch in logs. `readiness_reason` carries the last connection/handshake error. |
-| `GET /api/v1/ha/status` reports `"ready": false` or the container healthcheck fails while DNS answers | The replication listener or slave worker is not operational: key/certificate unreadable by the runtime user, listener bind failure, or the slave has not reached `Synced` | Read `readiness_reason` and the service logs. Fixing certificate ownership (`chown sito:sito` or `65532:65532`, mode `0600`) and restarting restores the listener. A healthy DNS probe alone no longer marks the node healthy. |
+| `GET /api/v2/ha/status` reports `"ready": false` or the container healthcheck fails while DNS answers | The replication listener or slave worker is not operational: key/certificate unreadable by the runtime user, listener bind failure, or the slave has not reached `Synced` | Read `readiness_reason` and the service logs. Fixing certificate ownership (`chown sito:sito` or `65532:65532`, mode `0600`) and restarting restores the listener. A healthy DNS probe alone no longer marks the node healthy. |
 | Log says `Failed to initialize mTLS ... Permission denied` | Private key is owned by root or another user that the service account cannot read | Regenerate with `--uid/--gid` for the runtime user, or `chown` the key files; keep keys mode `0600`. |
-| `Signature verification failed` | Bundle signature does not match master public key | Verify that the master didn't regenerate `ha_signing.key` without updating slaves. Compare `master_pubkey` from the master's `/api/v1/ha/status` with the slave config. |
+| `Signature verification failed` | Bundle signature does not match master public key | Verify that the master didn't regenerate `ha_signing.key` without updating slaves. Compare `master_pubkey` from the master's `/api/v2/ha/status` with the slave config. |
 | `Incoming version <= have_version` | Out of order or replayed bundle | Normal during network blips; the master will send the latest monotonic version. After a promotion, an older-term master is rejected even with a higher version; promote the master explicitly (section 2). |
-| Master reports `"diverged": true` | A slave is ahead in the same term, reports a newer term (stale/partitioned master, lost/corrupt `ha_state.toml`, or forked master), or reported a same-version payload fork | Read `diverged_reason`. Divergence is **sticky per slave**: it is not cleared by another slave applying the current version, nor by `POST /api/v1/ha/resync`. It clears when that specific slave acknowledges the master's current term/version or disconnects. A same-version fork marks that slave unsynced and visible but does **not** stop publishing to healthy replicas. Isolate the stale master, resolve the fork, restore its state file or perform the explicit promotion in section 2 (raise both `term` and `version`), then restart it. |
+| Master reports `"diverged": true` | A slave is ahead in the same term, reports a newer term (stale/partitioned master, lost/corrupt `ha_state.toml`, or forked master), or reported a same-version payload fork | Read `diverged_reason`. Divergence is **sticky per slave**: it is not cleared by another slave applying the current version, nor by `POST /api/v2/ha/resync`. It clears when that specific slave acknowledges the master's current term/version or disconnects. A same-version fork marks that slave unsynced and visible but does **not** stop publishing to healthy replicas. Isolate the stale master, resolve the fork, restore its state file or perform the explicit promotion in section 2 (raise both `term` and `version`), then restart it. |
 | Slave stays `Synced` but its master is gone / stale config | The TCP session is blackholed (no frames, no close) | The slave now treats any frame as liveness proof and requires one within `3 × ping_interval_secs` (default 45 s). On timeout it leaves `Synced`, sets `readiness_reason`, and `/health` reports not ready while DNS keeps serving the last applied configuration. Check the network path/port 8953 and the master process. |
 | Slave reports `"Degraded"` with `Local configuration drift` | A shared field in `config.toml` was edited or reverted locally after the last applied bundle | The persisted `ha_watermark.toml` stores the digest of the shared projection of the applied document. Wait for the master to push the current bundle (the slave forces a full apply even for the same version) or issue a resync. If the master is unreachable the node stays degraded and `/health` false until it reconnects. |
 | Slave reports a same-version payload fork | The master and slave hold different signed content for the same term and version (split brain) | The slave persists a fork latch in `ha_watermark.toml`, degrades, and rejects all same-term pushes; the master records divergence and stops showing the slave as synced. Do not retry the same version. Isolate the forked master and perform an explicit promotion with a strictly higher `term` **and** `version` (section 2); the promoted bundle clears the latch. |
-| Master `/health` stays false after an external `config.toml` edit, log says the HA bundle exceeds the replication limit | The file watcher rolled the live configuration back, but the oversized external file is left on disk; publication re-reads it on every attempt | Correct or replace `config.toml` with a document under the replication limit (or restore the previous file). Until then each republish/retry re-reads the oversized document and `/health` cannot recover. The `PUT /api/v1/config` path rolls the persisted document back and is not affected. |
+| Master `/health` stays false after an external `config.toml` edit, log says the HA bundle exceeds the replication limit | The file watcher rolled the live configuration back, but the oversized external file is left on disk; publication re-reads it on every attempt | Correct or replace `config.toml` with a document under the replication limit (or restore the previous file). Until then each republish/retry re-reads the oversized document and `/health` cannot recover. The `PUT /api/v2/config` path rolls the persisted document back and is not affected. |
 | API returns `409 Conflict` | Mutation attempted directly on a slave node | Perform configuration edits on the master node indicated in the `X-Dnsd-Master` header. |
-| `POST /api/v1/ha/resync` returns `503` | HA replication is inactive on the node, the slave worker stopped, or (master) a push could not be queued for any of the connected slaves | Check the node's role and `GET /api/v1/ha/status`. A `429` means a resync is already queued; retry shortly. With no connected slaves and no active bundle the master still returns `200` with `slaves_notified: 0`. |
+| `POST /api/v2/ha/resync` returns `503` | HA replication is inactive on the node, the slave worker stopped, or (master) a push could not be queued for any of the connected slaves | Check the node's role and `GET /api/v2/ha/status`. A `429` means a resync is already queued; retry shortly. With no connected slaves and no active bundle the master still returns `200` with `slaves_notified: 0`. |
 
 ### Diagnostic Commands
 
-The `/api/v1/*` endpoints used below require authentication. Export an Admin API
+The `/api/v2/*` endpoints used below require authentication. Export an Admin API
 token (or use a session cookie) before running these examples:
 
 ```bash
-export TOKEN='sito_...'   # Admin token: all /api/v1/ha/* endpoints require Admin
+export TOKEN='sito_...'   # Admin token: all /api/v2/ha/* endpoints require Admin
 ```
 
 1. **Check HA status on Master**:
    ```bash
    curl -s -H "Authorization: Bearer $TOKEN" \
-     http://192.168.1.10:8080/api/v1/ha/status | jq .
+     http://192.168.1.10:8080/api/v2/ha/status | jq .
    curl -s -H "Authorization: Bearer $TOKEN" \
-     http://192.168.1.10:8080/api/v1/ha/slaves | jq .
+     http://192.168.1.10:8080/api/v2/ha/slaves | jq .
    ```
 2. **Check HA status on Slave**:
    ```bash
    curl -s -H "Authorization: Bearer $TOKEN" \
-     http://192.168.1.11:8080/api/v1/ha/status | jq .
+     http://192.168.1.11:8080/api/v2/ha/status | jq .
    ```
    `/ha/status` fields:
    - Common: `role`, `instance_name`, `version`, `state`.
    - Master only: `slaves_connected`, `diverged`/`diverged_reason`,
      `master_pubkey` (hex; slaves must list it as `master_pubkey`).
    - Slave only: `master_url`, `last_synced_at`, `degraded_reason`.
-   Connected replicas are listed separately by `GET /api/v1/ha/slaves`:
+   Connected replicas are listed separately by `GET /api/v2/ha/slaves`:
    `instance`, `remote_addr`, `synced_version`, `lag`, `diverged`,
    `last_ping_secs_ago`, `connected_at`, `last_stats` (with `window_s` — the
    measured interval since the previous report — and window-scoped `queries`,
@@ -626,11 +626,11 @@ export TOKEN='sito_...'   # Admin token: all /api/v1/ha/* endpoints require Admi
    ```bash
    # From the master (Admin token required):
    curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-     http://192.168.1.10:8080/api/v1/ha/resync | jq .
+     http://192.168.1.10:8080/api/v2/ha/resync | jq .
 
    # Or from a slave:
    curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-     http://192.168.1.11:8080/api/v1/ha/resync | jq .
+     http://192.168.1.11:8080/api/v2/ha/resync | jq .
    ```
    A master response includes the queueing result:
    ```json
@@ -748,12 +748,12 @@ backups described in the [migration guide](2.0-migration.md#8-ha).
    start slaves only after the master is v2. Watch each slave reach `Synced`
    with the master's current term/version after the full apply.
 6. **Verify convergence.** Read `ready`, `readiness_reason` and
-   `diverged_reason` from `GET /api/v1/ha/status`, and per-slave
-   `synced_version`/`lag` from `GET /api/v1/ha/slaves`. `/health` stays generic;
+   `diverged_reason` from `GET /api/v2/ha/status`, and per-slave
+   `synced_version`/`lag` from `GET /api/v2/ha/slaves`. `/health` stays generic;
    a `protocol_mismatch` reason means a node still runs v1.
 7. **Publish/verify the current bundle.** Because the master sequence and the
    slave replay guards were reset, confirm the active bundle was republished
-   (or trigger `POST /api/v1/ha/resync`) and that every slave's applied version
+   (or trigger `POST /api/v2/ha/resync`) and that every slave's applied version
    matches the master.
 
 The rolling order above intentionally accepts a short replication gap. For a
@@ -771,7 +771,7 @@ them, which loses the replay guard). To return to 1.9.x:
    `ha_watermark.toml` and the certificate/key material on every node.
 3. Start the old binary on the master, then the slaves.
 4. Verify `Synced` and that no `protocol_mismatch` remains in
-   `GET /api/v1/ha/status`.
+   `GET /api/v2/ha/status`.
 
 If the v2 state/watermark cannot be restored, the only safe recovery is a full
 resync from a master whose state you trust, after an explicit version/term
@@ -780,11 +780,11 @@ not a supported downgrade.
 
 ### 7.4 Publish status, limits and trust policy
 
-- `POST /api/v1/config`/reload responses report `ha_publish.status = "queued"`
+- `POST /api/v2/config`/reload responses report `ha_publish.status = "queued"`
   when at least one slave was enqueued (directly or coalesced). This is **not**
   delivery proof: `slaves_connected`, `slaves_queued` and `slaves_coalesced` are
   separate counts, and delivery is confirmed by the slave ACK shown in
-  `GET /api/v1/ha/slaves`. `no_slaves` means no slave is connected. When
+  `GET /api/v2/ha/slaves`. `no_slaves` means no slave is connected. When
   slaves are connected but every channel is closed, nothing was queued and the
   status is `connected_no_delivery` (never `no_slaves` and never `queued`).
 - `TooLarge` is a configuration error, not a transport error. The envelope is
