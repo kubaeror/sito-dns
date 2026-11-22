@@ -5,14 +5,16 @@
 #   1. a real v1.9.5 binary creates a v1 data dir + stats.db and answers a
 #      local A rewrite on a high DNS port;
 #   2. a copy is migrated with `sito config migrate --from v1 --to v2 --backup`;
-#   3. the new binary starts on the migrated copy: the rewrite still answers,
+#   3. the copied stats database is migrated with `sito db migrate --config`,
+#      which writes a 0600 `stats.db.v1.bak` before upgrading the schema;
+#   4. the new binary starts on the migrated copy: the rewrite still answers,
 #      `/api/v2/status` responds, the stats DB is readable and users/TOTP files
 #      are unchanged;
-#   4. rollback restores the pre-upgrade data copy and `.v1.bak`, and the
+#   5. rollback restores the pre-upgrade data copy and `.v1.bak`, and the
 #      v1.9.5 binary starts and answers again.
 #
-# SQLite is compatibility-only in 2.0: this script never runs a schema
-# migration command. The current binary opens the 1.9.5 `stats.db` additively.
+# The 2.0 server deliberately fails closed on a schema v1 database, so the
+# explicit migration is part of the documented upgrade precondition.
 #
 # Binaries: set SITO_OLD_BIN / SITO_NEW_BIN to skip the builds. Otherwise the
 # script builds v1.9.5 from /tmp/opencode/sito-1.9.5 and this worktree with
@@ -165,7 +167,6 @@ PY
 
 wait_for_dns() {
   local pid="$1" logfile="$2" label="$3"
-  local i
   for _ in $(seq 1 120); do
     if ! kill -0 "$pid" 2>/dev/null; then
       printf '\n%s exited before answering:\n' "$label" >&2
@@ -245,7 +246,7 @@ MIGRATED_CONFIG="$MIGRATED/config.toml"
 MIGRATED_DATA="$MIGRATED/data"
 step "cp -a $DATA/. $MIGRATED/data && cp -a $CONFIG $MIGRATED_CONFIG"
 
-log "Migrate the copied config (SQLite is untouched)"
+log "Migrate the copied config (the stats DB is migrated separately)"
 step "$NEW_BIN config migrate --config $MIGRATED_CONFIG --from v1 --to v2 --backup"
 "$NEW_BIN" config migrate --config "$MIGRATED_CONFIG" --from v1 --to v2 --backup
 grep -qx 'config_version = 2' "$MIGRATED_CONFIG" || fail "migrated config is not v2"
@@ -284,6 +285,37 @@ open(target, "w", encoding="utf-8").write("\n".join(out) + "\n")
 PY
 step "$NEW_BIN --config $RUNTIME_CONFIG check-config"
 "$NEW_BIN" --config "$RUNTIME_CONFIG" check-config
+
+log "Migrate the copied stats database with the current binary"
+# The copied config still names the original data_dir; use the derived runtime
+# config so the migration and the server both target $MIGRATED_DATA.
+step "$NEW_BIN db migrate --config $RUNTIME_CONFIG"
+"$NEW_BIN" db migrate --config "$RUNTIME_CONFIG"
+DB_BACKUP="$MIGRATED_DATA/stats.db.v1.bak"
+[[ -f "$DB_BACKUP" ]] || fail "missing stats database backup $DB_BACKUP"
+DB_BACKUP_MODE="$(stat -c '%a' "$DB_BACKUP")"
+[[ "$DB_BACKUP_MODE" == "600" ]] || fail "stats backup mode is $DB_BACKUP_MODE, expected 600"
+python3 - "$MIGRATED_DATA/stats.db" "$DB_BACKUP" <<'PY'
+import sqlite3
+import sys
+
+live, backup = sys.argv[1:]
+for path, expected in ((live, "2"), (backup, None)):
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        marker = con.execute(
+            "SELECT value FROM stats_meta WHERE key = 'schema_version'"
+        ).fetchall()
+    finally:
+        con.close()
+    if expected is None:
+        assert marker == [], (path, marker)
+    else:
+        assert marker == [(expected,)], (path, marker)
+PY
+step "asserted schema v2 database, unmarked v1 backup, and 0600 backup mode"
+
 start_v2 "$RUNTIME_CONFIG" "$WORK/new.log" "2.0"
 dns_rewrite_answers || fail "2.0 did not answer the rewrite after migration"
 step "2.0 answered migration.test A 192.0.2.53 on 127.0.0.1:$DNS_PORT"
