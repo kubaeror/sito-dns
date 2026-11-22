@@ -290,7 +290,7 @@ mod tests {
             .await
             .unwrap();
         let upstream_log = logs
-            .entries
+            .items
             .iter()
             .find(|e| e.qname == "example.com")
             .expect("should find example.com query log");
@@ -792,7 +792,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                !logs.entries.is_empty(),
+                !logs.items.is_empty(),
                 "Query log batch should be flushed on graceful shutdown"
             );
         }

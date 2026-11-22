@@ -124,6 +124,37 @@ mod tests {
     }
 
     #[test]
+    fn test_openapi_querylog_cursor_contract() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).expect("valid OpenAPI JSON");
+        let params = openapi["paths"]["/api/v2/querylog"]["get"]["parameters"]
+            .as_array()
+            .expect("querylog parameters");
+        let names: Vec<&str> = params
+            .iter()
+            .filter_map(|param| param["name"].as_str())
+            .collect();
+        assert!(names.contains(&"cursor"), "cursor must stay documented");
+        assert!(names.contains(&"limit"), "limit must stay documented");
+        assert!(
+            !names.contains(&"include_total"),
+            "include_total must be removed from the query-log API: {names:?}"
+        );
+
+        assert!(
+            openapi["paths"]["/api/v2/querylog"]["get"]["responses"]["400"].is_object(),
+            "a rejected cursor must be documented as a 400"
+        );
+
+        let properties = &openapi["components"]["schemas"]["QueryLogPage"]["properties"];
+        assert!(properties.get("items").is_some());
+        assert!(properties.get("next_cursor").is_some());
+        assert!(
+            properties.get("entries").is_none() && properties.get("total_count").is_none(),
+            "the old page shape must not be documented"
+        );
+    }
+
+    #[test]
     fn test_openapi_documents_total_count_header() {
         let openapi = serde_json::to_value(ApiDoc::openapi()).expect("valid OpenAPI JSON");
         for path in ["/api/v2/stats/clients", "/api/v2/stats/upstreams"] {

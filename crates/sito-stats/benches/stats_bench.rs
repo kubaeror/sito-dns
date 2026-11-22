@@ -52,7 +52,6 @@ fn bench_query_log(c: &mut Criterion) {
     let batch = sample_entries(100, 1_700_000_000_000);
     let page_filter = QueryLogFilter {
         limit: Some(50),
-        include_total: Some(false),
         ..Default::default()
     };
     let filtered = QueryLogFilter {
@@ -60,7 +59,6 @@ fn bench_query_log(c: &mut Criterion) {
         from: Some(1_700_000_000_000),
         to: Some(1_700_000_000_500),
         limit: Some(50),
-        include_total: Some(true),
         ..Default::default()
     };
 
@@ -80,7 +78,7 @@ fn bench_query_log(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
-    group.bench_function("page_50_without_total", |b| {
+    group.bench_function("page_50", |b| {
         b.iter(|| {
             let page = rt
                 .block_on(read_db.query_logs(black_box(&page_filter)))
@@ -88,7 +86,7 @@ fn bench_query_log(c: &mut Criterion) {
             black_box(page);
         });
     });
-    group.bench_function("page_50_filtered_with_total", |b| {
+    group.bench_function("page_50_filtered", |b| {
         b.iter(|| {
             let page = rt
                 .block_on(read_db.query_logs(black_box(&filtered)))

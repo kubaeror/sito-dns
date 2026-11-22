@@ -3612,18 +3612,19 @@
           {
             "name": "cursor",
             "in": "query",
+            "description": "Opaque cursor from the previous response's `next_cursor`.\n\nBound to the other filter parameters: reusing it with a different\nfilter set returns `400 Bad Request`.",
             "required": false,
             "schema": {
               "type": [
-                "integer",
+                "string",
                 "null"
-              ],
-              "format": "int64"
+              ]
             }
           },
           {
             "name": "limit",
             "in": "query",
+            "description": "Page size, clamped to `1..=500`. Defaults to `50`.",
             "required": false,
             "schema": {
               "type": [
@@ -3631,18 +3632,6 @@
                 "null"
               ],
               "minimum": 0
-            }
-          },
-          {
-            "name": "include_total",
-            "in": "query",
-            "description": "Defaults to `true` for API compatibility. The live UI refresh passes\n`false` so the 3 s poll does not run a whole-table `COUNT(*)`.",
-            "required": false,
-            "schema": {
-              "type": [
-                "boolean",
-                "null"
-              ]
             }
           }
         ],
@@ -3653,6 +3642,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/QueryLogPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or filter-mismatched cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             }
@@ -6289,10 +6288,10 @@
           },
           "cursor": {
             "type": [
-              "integer",
+              "string",
               "null"
             ],
-            "format": "int64"
+            "description": "Opaque cursor from the previous page's [`QueryLogPage::next_cursor`].\n\nThe string is bound to the other filter fields: replaying it with a\ndifferent filter set is rejected with [`StatsError::InvalidCursor`].\nIts wire format is internal and may change between releases."
           },
           "domain": {
             "type": [
@@ -6307,18 +6306,12 @@
             ],
             "format": "int64"
           },
-          "include_total": {
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "description": "Whether to run the `COUNT(*)` used for `total_count`. Defaults to\n`true` for API compatibility; the live UI refresh sets it to `false`\nso the 3 s poll does not scan the filtered table."
-          },
           "limit": {
             "type": [
               "integer",
               "null"
             ],
+            "description": "Page size. Clamped to `1..=`[`MAX_QUERYLOG_LIMIT`]; defaults to\n[`DEFAULT_QUERYLOG_LIMIT`]. Not part of the cursor's filter binding.",
             "minimum": 0
           },
           "qtype": {
@@ -6346,29 +6339,24 @@
       },
       "QueryLogPage": {
         "type": "object",
-        "description": "Paginated page of query logs.",
+        "description": "Paginated page of query logs, newest first.",
         "required": [
-          "entries"
+          "items"
         ],
         "properties": {
-          "entries": {
+          "items": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/QueryLogEntry"
-            }
+            },
+            "description": "Rows for this page, ordered by `(ts, id)` descending."
           },
           "next_cursor": {
             "type": [
               "string",
               "null"
-            ]
-          },
-          "total_count": {
-            "type": [
-              "integer",
-              "null"
             ],
-            "format": "int64"
+            "description": "Cursor for the next page, or `None` when this is the last page."
           }
         }
       },
