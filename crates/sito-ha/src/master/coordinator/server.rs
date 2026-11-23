@@ -55,12 +55,51 @@ pub fn spawn_master_server(
                 }
             }
         } else {
+            // A partial cert/key pair is a configuration error, not an
+            // invitation to fall back to plaintext.
+            if ha_config.cert.is_some() != ha_config.key.is_some() {
+                coordinator.mark_replication_failed(
+                    "master replication refused: cert and key must be configured together",
+                );
+                error!(
+                    "Master HA replication has only one of cert/key configured. Refusing to start instead of falling back to plaintext."
+                );
+                return;
+            }
             if !ha_config.allow_insecure_ws {
                 coordinator.mark_replication_failed(
                     "master replication refused to serve plaintext without allow_insecure_ws",
                 );
                 error!(
                     "Master HA replication requires TLS (cert and key configured) unless allow_insecure_ws is true. Refusing to serve plaintext replication."
+                );
+                return;
+            }
+            // The shared token is the only peer authentication over plaintext
+            // and a promoted master must not serve anonymously.
+            let has_token = ha_config
+                .slave_token
+                .as_ref()
+                .is_some_and(|token| !token.trim().is_empty());
+            if !has_token {
+                coordinator.mark_replication_failed(
+                    "master replication refused plaintext without a non-empty slave_token",
+                );
+                error!(
+                    "Master HA replication has no slave_token; plaintext replication would admit unauthenticated slaves. Refusing to serve plaintext."
+                );
+                return;
+            }
+            // A pin or CA is only enforceable inside the TLS handshake. If
+            // either is configured, serving plaintext would silently drop the
+            // control, so refuse instead of downgrading. Configuration
+            // validation rejects this too; this is the runtime guard.
+            if !ha_config.pinned_slave_fingerprints.is_empty() || ha_config.ca.is_some() {
+                coordinator.mark_replication_failed(
+                    "master replication refused plaintext while pin/CA material is configured",
+                );
+                error!(
+                    "Master HA replication has pinned_slave_fingerprints or ca configured without a TLS cert/key. Refusing to serve plaintext and silently ignore them."
                 );
                 return;
             }

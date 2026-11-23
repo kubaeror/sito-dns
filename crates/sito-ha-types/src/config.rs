@@ -465,6 +465,13 @@ pub struct HaConfig {
     pub allow_unpinned_tls: bool,
 
     /// Allow unencrypted plaintext WebSocket connections (ws://; insecure; default: false).
+    ///
+    /// This is an explicit opt-in with no silent fallback: a master without
+    /// `cert`/`key` refuses to serve and a slave refuses a `ws://`
+    /// `master_url` unless this is `true`. Plaintext requires a non-empty
+    /// `slave_token` and is rejected when TLS-only material
+    /// (`pinned_slave_fingerprints`, `ca`, `master_fingerprint`) is also
+    /// configured, because none of it can be enforced without TLS.
     #[serde(default)]
     pub allow_insecure_ws: bool,
 
@@ -591,6 +598,23 @@ impl HaConfig {
                             reason: "Master replication requires TLS certificate and key unless allow_insecure_ws = true".to_string(),
                         });
                     }
+                    // Certificate pins and a verification CA only exist in the
+                    // TLS handshake. Accepting plaintext while either is
+                    // configured would silently stop enforcing a control the
+                    // operator asked for, so the combination is rejected
+                    // instead of downgraded.
+                    if has_pins {
+                        return Err(HaError::Validation {
+                            field: "pinned_slave_fingerprints".to_string(),
+                            reason: "pinned_slave_fingerprints cannot be enforced over plaintext replication; configure cert/key or remove the pins".to_string(),
+                        });
+                    }
+                    if has_ca {
+                        return Err(HaError::Validation {
+                            field: "ca".to_string(),
+                            reason: "ha.ca requires TLS (cert/key); it cannot be used with plaintext (allow_insecure_ws) replication".to_string(),
+                        });
+                    }
                     // Certificate pins cannot be enforced without TLS, so
                     // plaintext replication must use a pre-shared token.
                     if !has_token {
@@ -606,6 +630,14 @@ impl HaConfig {
                 return Err(HaError::Validation {
                     field: "replication_port".to_string(),
                     reason: "Replication port must be greater than 0".to_string(),
+                });
+            }
+            let has_cert = self.cert.is_some();
+            let has_key = self.key.is_some();
+            if has_cert != has_key {
+                return Err(HaError::Validation {
+                    field: if has_cert { "key" } else { "cert" }.to_string(),
+                    reason: "Both cert and key must be provided together".to_string(),
                 });
             }
             if self.master_pubkey.is_none() {
@@ -632,6 +664,34 @@ impl HaConfig {
                         reason: "Plaintext ws:// replication is rejected by default. Use wss:// or explicitly set allow_insecure_ws = true".to_string(),
                     });
                 }
+                if url.starts_with("ws://") {
+                    // Without TLS the shared token is the only peer
+                    // authentication, and the master requires one. A tokenless
+                    // slave would connect anonymously and, after promotion,
+                    // become an unauthenticated plaintext master.
+                    let has_token = self
+                        .slave_token
+                        .as_ref()
+                        .is_some_and(|token| !token.trim().is_empty());
+                    if !has_token {
+                        return Err(HaError::Validation {
+                            field: "slave_token".to_string(),
+                            reason: "Plaintext ws:// replication requires a non-empty slave_token on the slave as well; it is the only peer authentication without TLS".to_string(),
+                        });
+                    }
+                }
+                if url.starts_with("ws://") && self.master_fingerprint.is_some() {
+                    return Err(HaError::Validation {
+                        field: "master_fingerprint".to_string(),
+                        reason: "master_fingerprint cannot be enforced over plaintext ws:// replication; use wss:// or remove the pin".to_string(),
+                    });
+                }
+                if url.starts_with("ws://") && self.ca.is_some() {
+                    return Err(HaError::Validation {
+                        field: "ca".to_string(),
+                        reason: "ha.ca cannot be used with plaintext ws:// replication; use wss:// or remove ca".to_string(),
+                    });
+                }
                 if url.starts_with("wss://")
                     && self.master_fingerprint.is_none()
                     && self.ca.is_none()
@@ -648,6 +708,99 @@ impl HaConfig {
         self.promotion.validate(role, self.ping_interval_secs)?;
 
         Ok(())
+    }
+
+    /// Returns operator-facing warnings for the explicit insecure plaintext
+    /// WebSocket opt-in (`ha.allow_insecure_ws = true`).
+    ///
+    /// The policy itself is enforced by [`Self::validate`] and again by the
+    /// master listener and slave session code; these warnings exist so
+    /// `check-config` and startup can report a risk that is valid but
+    /// easy to miss. They never contain secrets.
+    ///
+    /// A node only "uses" plaintext when its replication path would actually
+    /// omit TLS: a master whose listener has no certificate/key pair, or a
+    /// slave whose `master_url` is `ws://`. On every other node the flag is
+    /// inert (TLS is used) and the warning says so, because a leftover
+    /// opt-in must not look like a downgrade the operator is relying on.
+    #[must_use]
+    pub fn insecure_ws_warnings(&self, role: &str) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if !self.allow_insecure_ws {
+            return warnings;
+        }
+
+        let plaintext_active = match role {
+            "master" => self.replication_port > 0 && !(self.cert.is_some() && self.key.is_some()),
+            "slave" => self
+                .master_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("ws://")),
+            _ => false,
+        };
+
+        if plaintext_active {
+            warnings.push(
+                "ha.allow_insecure_ws = true: HA replication is running over plaintext ws:// \
+                 with no TLS. Configuration bundles, client definitions and the slave token \
+                 are visible on the wire. Use wss:// unless both nodes are on a trusted, \
+                 private or loopback link, and never across an untrusted network."
+                    .to_string(),
+            );
+            if role == "slave" && self.master_fingerprint.is_some() {
+                warnings.push(
+                    "ha.master_fingerprint is ignored over plaintext ws://; remove the pin or \
+                     switch master_url to wss://"
+                        .to_string(),
+                );
+            }
+            if role == "slave" && self.cert.is_some() && self.key.is_some() {
+                warnings.push(
+                    "ha.cert/ha.key are ignored for plaintext ws:// replication (client \
+                     certificates are only used for wss://); remove them or switch to wss://"
+                        .to_string(),
+                );
+            }
+            if self.allow_unpinned_tls {
+                warnings.push(
+                    "ha.allow_unpinned_tls has no effect while replication is plaintext; \
+                     remove the flag or switch to wss://"
+                        .to_string(),
+                );
+            }
+            if self.promotion.enabled {
+                warnings.push(
+                    "ha.promotion.enabled = true reuses this replication transport: a promoted \
+                     master inherits ha.allow_insecure_ws = true and will serve plaintext too"
+                        .to_string(),
+                );
+            }
+        } else {
+            // The flag is inert for this node's current transport, but a
+            // candidate with no server certificate/key still becomes a
+            // plaintext master on promotion.
+            let promotion_plaintext_risk = role == "slave"
+                && self.promotion.enabled
+                && !(self.cert.is_some() && self.key.is_some());
+            if promotion_plaintext_risk {
+                warnings.push(
+                    "ha.allow_insecure_ws = true is inert while this node replicates over \
+                     wss://, but ha.promotion.enabled = true: if it is promoted without a \
+                     server certificate/key the new master will serve plaintext. Configure \
+                     cert/key or remove the opt-in"
+                        .to_string(),
+                );
+            } else {
+                warnings.push(
+                    "ha.allow_insecure_ws = true is inert on this node because its replication \
+                     path uses TLS (or has no master listener); remove it unless it is a \
+                     deliberate leftover from a plaintext deployment"
+                        .to_string(),
+                );
+            }
+        }
+
+        warnings
     }
 }
 
@@ -799,6 +952,209 @@ pinned_slave_fingerprints = ["blake3:11223344"]
             ..Default::default()
         };
         assert!(disabled_cfg.validate("master").is_ok());
+    }
+
+    #[test]
+    fn test_plaintext_master_rejects_tls_only_material() {
+        let base = HaConfig {
+            allow_insecure_ws: true,
+            slave_token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        assert!(base.validate("master").is_ok());
+
+        // Pins are enforced only inside the TLS handshake; a plaintext
+        // listener must not silently stop enforcing them.
+        let pinned = HaConfig {
+            pinned_slave_fingerprints: vec!["blake3:abc123".to_string()],
+            ..base.clone()
+        };
+        let err = pinned
+            .validate("master")
+            .expect_err("pins with plaintext must be rejected");
+        assert!(err.to_string().contains("pinned_slave_fingerprints"));
+
+        // The same applies to a verification CA.
+        let with_ca = HaConfig {
+            ca: Some(PathBuf::from("/etc/sito/ca.crt")),
+            ..base
+        };
+        let err = with_ca
+            .validate("master")
+            .expect_err("ca with plaintext must be rejected");
+        assert!(err.to_string().contains("ca"));
+    }
+
+    #[test]
+    fn test_plaintext_slave_rejects_pin_or_ca() {
+        let base = HaConfig {
+            master_url: Some("ws://127.0.0.1:8953".to_string()),
+            master_pubkey: Some("00".repeat(32)),
+            allow_insecure_ws: true,
+            slave_token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        assert!(base.validate("slave").is_ok());
+
+        let pinned = HaConfig {
+            master_fingerprint: Some("blake3:abcdef0123456789".to_string()),
+            ..base.clone()
+        };
+        let err = pinned
+            .validate("slave")
+            .expect_err("a pin cannot be enforced over ws://");
+        assert!(err.to_string().contains("master_fingerprint"));
+
+        let with_ca = HaConfig {
+            ca: Some(PathBuf::from("/etc/sito/ca.crt")),
+            ..base
+        };
+        let err = with_ca
+            .validate("slave")
+            .expect_err("a CA cannot be used over ws://");
+        assert!(err.to_string().contains("ca"));
+    }
+
+    #[test]
+    fn test_plaintext_slave_requires_a_token() {
+        let base = HaConfig {
+            master_url: Some("ws://127.0.0.1:8953".to_string()),
+            master_pubkey: Some("00".repeat(32)),
+            allow_insecure_ws: true,
+            ..Default::default()
+        };
+        let err = base
+            .validate("slave")
+            .expect_err("a tokenless plaintext slave must be rejected");
+        assert!(
+            err.to_string().contains("slave_token"),
+            "the error must name slave_token: {err}"
+        );
+
+        // Whitespace is not a token.
+        let blank = HaConfig {
+            slave_token: Some("   ".to_string()),
+            ..base.clone()
+        };
+        assert!(blank.validate("slave").is_err());
+
+        let token = HaConfig {
+            slave_token: Some("secret".to_string()),
+            ..base
+        };
+        assert!(token.validate("slave").is_ok());
+    }
+
+    #[test]
+    fn test_partial_client_cert_pair_is_rejected_on_a_slave() {
+        let base = HaConfig {
+            master_url: Some("ws://127.0.0.1:8953".to_string()),
+            master_pubkey: Some("00".repeat(32)),
+            allow_insecure_ws: true,
+            slave_token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let cert_only = HaConfig {
+            cert: Some(PathBuf::from("/etc/sito/slave.crt")),
+            ..base.clone()
+        };
+        let err = cert_only
+            .validate("slave")
+            .expect_err("cert without key must be rejected");
+        assert!(err.to_string().contains("key"), "{err}");
+
+        let key_only = HaConfig {
+            key: Some(PathBuf::from("/etc/sito/slave.key")),
+            ..base
+        };
+        let err = key_only
+            .validate("slave")
+            .expect_err("key without cert must be rejected");
+        assert!(err.to_string().contains("cert"), "{err}");
+    }
+
+    #[test]
+    fn test_insecure_ws_warnings_report_active_and_inert_flag() {
+        // Default is quiet.
+        let warnings = HaConfig::default().insecure_ws_warnings("master");
+        assert_eq!(warnings, Vec::<String>::new());
+
+        // An explicit plaintext master warns about the wire exposure.
+        let plaintext_master = HaConfig {
+            allow_insecure_ws: true,
+            slave_token: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let warnings = plaintext_master.insecure_ws_warnings("master");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("plaintext ws://"), "{warnings:?}");
+
+        // With TLS material configured, the listener serves TLS: the flag is
+        // inert and the warning says so instead of claiming a downgrade.
+        let tls_master = HaConfig {
+            cert: Some(PathBuf::from("/etc/sito/master.crt")),
+            key: Some(PathBuf::from("/etc/sito/master.key")),
+            pinned_slave_fingerprints: vec!["blake3:abc123".to_string()],
+            ..plaintext_master.clone()
+        };
+        let warnings = tls_master.insecure_ws_warnings("master");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("inert"), "{warnings:?}");
+
+        // A plaintext slave with promotion enabled warns that the promoted
+        // master inherits the same policy.
+        let plaintext_slave = HaConfig {
+            master_url: Some("ws://127.0.0.1:8953".to_string()),
+            master_pubkey: Some("00".repeat(32)),
+            promotion: PromotionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..plaintext_master.clone()
+        };
+        let warnings = plaintext_slave.insecure_ws_warnings("slave");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|warning| warning.contains("promoted")),
+            "{warnings:?}"
+        );
+
+        // Client certificates are inert over plaintext and must be reported.
+        let slave_with_certs = HaConfig {
+            cert: Some(PathBuf::from("/etc/sito/slave.crt")),
+            key: Some(PathBuf::from("/etc/sito/slave.key")),
+            ..plaintext_slave.clone()
+        };
+        let warnings = slave_with_certs.insecure_ws_warnings("slave");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("ha.cert/ha.key are ignored")),
+            "{warnings:?}"
+        );
+
+        // A wss:// slave with promotion enabled warns that promotion would
+        // serve plaintext even though the flag is inert for its current role.
+        let wss_promotion = HaConfig {
+            master_url: Some("wss://127.0.0.1:8953".to_string()),
+            master_fingerprint: Some("blake3:abcdef0123456789".to_string()),
+            master_pubkey: Some("00".repeat(32)),
+            promotion: PromotionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..plaintext_master.clone()
+        };
+        let warnings = wss_promotion.insecure_ws_warnings("slave");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("promoted without a server certificate/key"),
+            "{warnings:?}"
+        );
+
+        // The warning text must never echo a token.
+        let rendered = warnings.join("\n");
+        assert!(!rendered.contains("secret"), "{rendered}");
     }
 
     fn valid_promotion() -> PromotionConfig {

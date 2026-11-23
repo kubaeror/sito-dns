@@ -499,6 +499,11 @@ mod tests {
         assert!(cfg.validate("slave").is_err());
 
         cfg.allow_insecure_ws = true;
+        assert!(
+            cfg.validate("slave").is_err(),
+            "plaintext without a token must stay rejected"
+        );
+        cfg.slave_token = Some("secret".to_string());
         assert!(cfg.validate("slave").is_ok());
     }
 

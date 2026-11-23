@@ -62,6 +62,12 @@ pub(super) fn init_ha(
         .validate(&config.server.role)
         .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
 
+    // `allow_insecure_ws` is an explicit opt-in, never implicit. Surface the
+    // risk (or an inert leftover flag) at startup as well as in check-config.
+    for warning in ha_config.insecure_ws_warnings(&config.server.role) {
+        tracing::warn!("{warning}");
+    }
+
     let write_gate = Arc::new(sito_api::state::HaWriteGate::new());
     let promoted_master = Arc::new(Mutex::new(None));
     if ha_config.promotion.enabled {

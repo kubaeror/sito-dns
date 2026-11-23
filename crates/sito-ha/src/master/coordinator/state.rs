@@ -217,6 +217,17 @@ impl MasterCoordinator {
         listener
     }
 
+    /// Readiness of the replication listener alone.
+    ///
+    /// Unlike [`Self::readiness`], this ignores publish failures, slave
+    /// requirements and ACL capability, so a promotion can tell whether the
+    /// listener task actually started (and did not refuse its TLS/plaintext
+    /// configuration) without conflating that with cluster quorum settings.
+    #[must_use]
+    pub fn listener_readiness(&self) -> HaReadiness {
+        self.readiness.snapshot()
+    }
+
     /// Applies the effective DNS client ACL policy to readiness checks.
     ///
     /// Only `default_policy = "deny"` needs every connected slave to be
