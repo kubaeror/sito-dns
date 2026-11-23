@@ -45,6 +45,11 @@ pub use sito_ha_types::status::{PublishOutcome, ResyncOutcome};
 /// individual slave's ACK.
 pub const MAX_PUBLISH_HISTORY: usize = 64;
 
+/// Maximum late-ahead peer reports retained for the promotion engine before
+/// the oldest is dropped. Reports are consumed on every renewal-loop tick; the
+/// bound only protects against a burst of reconnecting ahead peers.
+pub const MAX_LATE_PEER_REPORTS: usize = 64;
+
 /// Maximum bytes queued for one slave before the master falls back to
 /// coalesced delivery (4 MiB, i.e. four maximum-size 1 MiB messages).
 ///
@@ -146,6 +151,11 @@ pub const MAX_PEER_VERSION_LEAD: u64 = 1_000_000;
 #[cfg(test)]
 type StateWriteHook = Arc<dyn Fn(u64) + Send + Sync>;
 
+/// Test-only hook invoked after the active bundle is installed and before the
+/// first broadcast.
+#[cfg(test)]
+type BeforeBroadcastHook = Box<dyn Fn() + Send + Sync>;
+
 /// Severity of a recorded divergence. Ordered so a fork outranks a term
 /// mismatch, which outranks a same-term version gap; `mark_diverged` never
 /// downgrades an existing higher-severity record.
@@ -244,6 +254,14 @@ pub struct MasterCoordinator {
     /// Test-only hook called by the asynchronous state writer.
     #[cfg(test)]
     state_write_hook: Arc<Mutex<Option<StateWriteHook>>>,
+    /// Test-only failure injection: fail the state write after this many
+    /// successful writes. `None` never fails.
+    #[cfg(test)]
+    state_write_fail_after: Arc<Mutex<Option<usize>>>,
+    /// Test-only hook invoked after the active bundle is installed and before
+    /// the first broadcast. Lets a test observe the persist/enqueue window.
+    #[cfg(test)]
+    before_broadcast_hook: Arc<Mutex<Option<BeforeBroadcastHook>>>,
     /// Divergence records per currently connected slave. They are sticky: only
     /// that slave's applied ACK for the current term/version or a disconnect
     /// removes them, never an unrelated version advance or a global resync.
@@ -297,6 +315,17 @@ pub struct MasterCoordinator {
     /// accept TLS/WebSocket and Hello, answer ping/pong, but send no
     /// `ConfigPush` and do not install the active bundle.
     hello_only: Arc<AtomicBool>,
+    /// Set once the reconciliation window has ended. Peer Hellos observed
+    /// afterwards that report a term/version above this master are late ahead
+    /// peers; they are handed to the promotion engine to latch.
+    reconcile_complete: Arc<AtomicBool>,
+    /// Peer reports observed after the reconcile window and not yet consumed by
+    /// the promotion engine.
+    late_peer_reports: Arc<Mutex<Vec<crate::promotion::reconcile::PeerReport>>>,
+    /// Instances latched as late ahead/diverged peers. The latch is sticky for
+    /// the process lifetime: no push is queued for a latched slave and it is
+    /// never overwritten. The operator resolves the fork manually.
+    latched_slaves: Arc<Mutex<HashSet<String>>>,
 }
 
 mod message;

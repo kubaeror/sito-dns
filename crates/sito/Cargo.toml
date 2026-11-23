@@ -47,7 +47,9 @@ reqwest = { workspace = true, features = ["http2"] }
 # exposing them in a normal build.
 sito-cache = { workspace = true, features = ["test-hooks"] }
 sito-test-support.workspace = true
+futures-util.workspace = true
 rcgen.workspace = true
+tokio-tungstenite.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 time.workspace = true
 

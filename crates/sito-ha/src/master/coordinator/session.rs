@@ -145,6 +145,17 @@ impl MasterCoordinator {
                         // push-on-Hello once the master is serving again.
                         break;
                     }
+                    if self.is_late_peer_latched(&session.state.slave_instance) {
+                        // A push queued before the peer was latched must not be
+                        // delivered. Close the session: a latched late-ahead
+                        // peer is never overwritten.
+                        session.account_drained(wire_size(&msg));
+                        debug!(
+                            instance = %session.state.slave_instance,
+                            "Dropping queued HA push: slave is latched as a late ahead peer"
+                        );
+                        break;
+                    }
                     session.account_drained(wire_size(&msg));
                     if send_ha_message(&mut ws_stream, &msg, "master", "configuration push").await.is_err() {
                         break;

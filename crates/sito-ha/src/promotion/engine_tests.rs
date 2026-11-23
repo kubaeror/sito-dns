@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sito_ha_types::bundle::{AppliedWatermark, ConfigBundle};
 use sito_ha_types::config::{PromotionConfig, WitnessClientConfig};
@@ -12,7 +13,7 @@ use sito_ha_types::status::PublicationState;
 use super::clock::{ManualMonotonicClock, ManualTimers, MonotonicClock};
 use super::engine::{
     ConfiguredRole, EffectiveRole, Eligibility, LeaseBackend, PreparedBundle, PromotionEngine,
-    PromotionHost, PromotionOutcome, PromotionPhase,
+    PromotionHost, PromotionOutcome, PromotionPhase, PublishDeadline,
 };
 use super::reconcile::PeerReport;
 use super::state::{HaStateStore, LoadedState, PersistedMasterState, PublicationBaseline};
@@ -206,6 +207,10 @@ impl LeaseBackend for RecordingBackend {
         &self,
         request: RenewRequest,
     ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        self.log(format!(
+            "renew_req:{}:{}",
+            request.version, request.bundle_hash
+        ));
         let inner = Arc::clone(&self.inner);
         let events = clone_events(&self.events);
         Box::pin(async move {
@@ -224,10 +229,18 @@ impl LeaseBackend for RecordingBackend {
 struct ConflictBackend {
     inner: Arc<WitnessClient>,
     conflict: Mutex<Option<LeaseRecord>>,
+    fail_info: AtomicBool,
 }
 
 impl LeaseBackend for ConflictBackend {
     fn info(&self) -> super::clock::BoxFuture<'_, Result<LeaseInfo, WitnessClientError>> {
+        if self.fail_info.load(Ordering::SeqCst) {
+            return Box::pin(async {
+                Err(WitnessClientError::Unavailable {
+                    detail: "injected witness info failure".to_string(),
+                })
+            });
+        }
         let inner = Arc::clone(&self.inner);
         Box::pin(async move { inner.info().await })
     }
@@ -321,13 +334,15 @@ struct TestHost {
     fail_prepare: AtomicBool,
     fail_publish: AtomicBool,
     pushed: Mutex<Option<PreparedBundle>>,
-    adopted: Mutex<Option<PreparedBundle>>,
     publish_during_hello_only: AtomicBool,
     published_baseline: Mutex<Option<PublicationBaseline>>,
     latched: Mutex<Vec<String>>,
+    late_reports: Mutex<Vec<PeerReport>>,
     fail_renew_on_reports: Mutex<Option<Arc<AtomicBool>>>,
     fail_renew_on_hello_end: Mutex<Option<Arc<AtomicBool>>>,
     admissions_denied: AtomicBool,
+    clock: Mutex<Option<Arc<ManualMonotonicClock>>>,
+    slow_publish_millis: Mutex<Option<u64>>,
 }
 
 impl TestHost {
@@ -346,14 +361,24 @@ impl TestHost {
             fail_prepare: AtomicBool::new(false),
             fail_publish: AtomicBool::new(false),
             pushed: Mutex::new(None),
-            adopted: Mutex::new(None),
             publish_during_hello_only: AtomicBool::new(false),
             published_baseline: Mutex::new(None),
             latched: Mutex::new(Vec::new()),
+            late_reports: Mutex::new(Vec::new()),
             fail_renew_on_reports: Mutex::new(None),
             fail_renew_on_hello_end: Mutex::new(None),
             admissions_denied: AtomicBool::new(false),
+            clock: Mutex::new(None),
+            slow_publish_millis: Mutex::new(None),
         }
+    }
+
+    fn set_clock(&self, clock: Arc<ManualMonotonicClock>) {
+        *self.clock.lock().unwrap() = Some(clock);
+    }
+
+    fn set_slow_publish_millis(&self, millis: u64) {
+        *self.slow_publish_millis.lock().unwrap() = Some(millis);
     }
 
     fn fail_renew_on_reports(&self, flag: Arc<AtomicBool>) {
@@ -395,7 +420,27 @@ impl PromotionHost for TestHost {
     }
 
     fn current_published_baseline(&self) -> Option<PublicationBaseline> {
-        self.published_baseline.lock().unwrap().clone()
+        if let Some(baseline) = self.published_baseline.lock().unwrap().clone() {
+            return Some(baseline);
+        }
+        // Mirror the production host: renewal uses the durable published
+        // baseline from `ha_state.toml`, never an in-memory pre-commit value.
+        let loaded = HaStateStore::new(self.state_path.clone()).load().ok()?;
+        match loaded {
+            LoadedState::Present {
+                bookkeeping: Some(bookkeeping),
+                ..
+            } => Some(bookkeeping.baseline()),
+            _ => None,
+        }
+    }
+
+    fn signing_key_pubkey(&self) -> Option<String> {
+        Some(self.key.public_key_hex())
+    }
+
+    fn take_late_peer_reports(&self) -> Vec<PeerReport> {
+        std::mem::take(&mut *self.late_reports.lock().unwrap())
     }
 
     fn hash_bundle(&self, bundle: &ConfigBundle) -> Result<String, String> {
@@ -403,9 +448,9 @@ impl PromotionHost for TestHost {
         push_payload_hash(&push).map_err(|error| error.to_string())
     }
 
-    fn latch_peer(&self, instance: &str, reason: &str) {
-        self.log(format!("latch:{instance}:{reason}"));
-        self.latched.lock().unwrap().push(instance.to_string());
+    fn latch_peer(&self, report: &PeerReport, reason: &str) {
+        self.log(format!("latch:{}:{reason}", report.instance));
+        self.latched.lock().unwrap().push(report.instance.clone());
     }
 
     fn eligibility(&self) -> Eligibility {
@@ -460,15 +505,29 @@ impl PromotionHost for TestHost {
         Box::pin(async move { Ok(reports) })
     }
 
-    fn publish_first(
-        &self,
-        prepared: &PreparedBundle,
-    ) -> super::clock::BoxFuture<'_, Result<String, String>> {
+    fn publish_first<'a>(
+        &'a self,
+        prepared: &'a PreparedBundle,
+        deadline: &'a PublishDeadline,
+    ) -> super::clock::BoxFuture<'a, Result<String, String>> {
         if self.hello_only.load(Ordering::SeqCst) {
             self.publish_during_hello_only.store(true, Ordering::SeqCst);
         }
         if self.fail_publish.load(Ordering::SeqCst) {
             return Box::pin(async { Err("injected publish failure".to_string()) });
+        }
+        // Model a slow durable pre-publish write: the host advances the clock
+        // and must refuse to push when the deadline handle is no longer safe.
+        if let Some(delay) = *self.slow_publish_millis.lock().unwrap() {
+            if let Some(clock) = self.clock.lock().unwrap().clone() {
+                clock.advance_boot(delay);
+            }
+            if !deadline.is_safe() {
+                self.log("publish_deadline_passed");
+                return Box::pin(async {
+                    Err("self-fence deadline passed before the push".to_string())
+                });
+            }
         }
         self.log(format!(
             "publish:{}:{}",
@@ -490,15 +549,6 @@ impl PromotionHost for TestHost {
         *self.pushed.lock().unwrap() = Some(prepared.clone());
         let hash = prepared.hash.clone();
         Box::pin(async move { Ok(hash) })
-    }
-
-    fn adopt_published(
-        &self,
-        prepared: &PreparedBundle,
-    ) -> super::clock::BoxFuture<'_, Result<(), String>> {
-        self.log(format!("adopt:{}", prepared.bundle.version));
-        *self.adopted.lock().unwrap() = Some(prepared.clone());
-        Box::pin(async { Ok(()) })
     }
 
     fn stop_publishing(&self) {
@@ -566,9 +616,11 @@ impl Harness {
         let data_dir = fixture.dir.join(format!("data-{node_id}"));
         let events = Arc::new(Mutex::new(Vec::new()));
         let host = Arc::new(TestHost::new(&data_dir, Arc::clone(&events)));
+        let clock = Arc::new(ManualMonotonicClock::new(1_000, START_MS));
+        host.set_clock(Arc::clone(&clock));
         Self {
             fixture,
-            clock: Arc::new(ManualMonotonicClock::new(1_000, START_MS)),
+            clock,
             events,
             host,
         }
@@ -1395,10 +1447,35 @@ async fn published_state_write_failure_does_not_renew_and_restart_recovers() {
     engine.boot().unwrap();
     let outcome = engine.start_master().await;
     assert_eq!(outcome, PromotionOutcome::Master);
+    assert!(!engine.snapshot().fenced, "recovery must not self-fence");
     let events = harness.events();
     assert!(
-        events.iter().any(|e| e == "adopt:1"),
-        "the proven publish is adopted, not re-pushed: {events:?}"
+        events.iter().any(|e| e == "prepare:2"),
+        "the proven baseline 1 is published above as 2: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e == &format!("renew_req:1:{}", prepared.hash)),
+        "the recovery renewal uses the proven published baseline, not a skipped version: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e.starts_with("publish:2:")),
+        "a new-term publish is still required above the proven baseline: {events:?}"
+    );
+    let loaded = HaStateStore::new(harness.data_dir("node-a").join("ha_state.toml"))
+        .load()
+        .unwrap();
+    let LoadedState::Present { bookkeeping, state } = loaded else {
+        panic!("state");
+    };
+    let bookkeeping = bookkeeping.unwrap();
+    assert_eq!(bookkeeping.publication_state, PublicationState::Published);
+    assert_eq!(bookkeeping.published_version, 2);
+    assert_eq!(state.bundle.version, 2);
+    assert!(
+        state.signing_key_pubkey.is_some(),
+        "the promoted state records the signing key"
     );
     let record = harness
         .fixture
@@ -1666,11 +1743,57 @@ async fn late_ahead_peer_is_reported_to_the_runtime_latch() {
 }
 
 #[tokio::test]
+async fn renewal_conflict_without_the_witness_clock_fences() {
+    let harness = Harness::new("renew_conflict_no_clock", "node-a").await;
+    let conflict_backend = Arc::new(ConflictBackend {
+        inner: Arc::new(harness.fixture.client("node-a")),
+        conflict: Mutex::new(None),
+        fail_info: AtomicBool::new(false),
+    });
+    let clock: Arc<dyn MonotonicClock> = harness.clock.clone();
+    let host: Arc<dyn PromotionHost> = harness.host.clone();
+    let engine = PromotionEngine::with_runtime(
+        harness.fixture.config("node-a"),
+        ConfiguredRole::Master,
+        harness.data_dir("node-a"),
+        conflict_backend.clone(),
+        host,
+        clock,
+        Arc::new(ManualTimers::new(Arc::clone(&harness.clock))),
+    )
+    .unwrap();
+    assert_eq!(engine.start_master().await, PromotionOutcome::Master);
+    // Every subsequent info call fails, and the renewal returns a conflict
+    // with a current record that cannot be classified without the witness
+    // clock.
+    conflict_backend.fail_info.store(true, Ordering::SeqCst);
+    *conflict_backend.conflict.lock().unwrap() = Some(LeaseRecord {
+        schema: 1,
+        cluster_id: CLUSTER.to_string(),
+        holder: "node-a/other-boot".to_string(),
+        node_id: "node-a".to_string(),
+        term: 1,
+        revision: 2,
+        version: 1,
+        bundle_hash: hash(0xab),
+        acquired_unix_ms: 1,
+        expires_unix_ms: i64::MAX,
+    });
+    assert!(engine.renew_once().await.is_err());
+    assert!(engine.snapshot().fenced, "uncertain lease time must fence");
+    assert_eq!(
+        engine.fence_store().load().unwrap().unwrap().reason,
+        "lease_lost"
+    );
+}
+
+#[tokio::test]
 async fn engine_level_renewal_409_fences_immediately() {
     let harness = Harness::new("renew_409", "node-a").await;
     let conflict_backend = Arc::new(ConflictBackend {
         inner: Arc::new(harness.fixture.client("node-a")),
         conflict: Mutex::new(None),
+        fail_info: AtomicBool::new(false),
     });
     let config = harness.fixture.config("node-a");
     let clock: Arc<dyn MonotonicClock> = harness.clock.clone();
@@ -1767,4 +1890,473 @@ async fn transport_renewal_failure_before_first_push_denies_admission() {
     );
     assert!(harness.host.admissions_denied.load(Ordering::SeqCst));
     assert!(harness.event_index("publish:").is_none());
+}
+
+/// A backend whose renew call advances the monotonic clock past the deadline
+/// and then returns a syntactically valid ACK. The engine must reject the ACK
+/// and fence instead of extending the lease.
+struct SlowAckBackend {
+    inner: Arc<WitnessClient>,
+    clock: Arc<ManualMonotonicClock>,
+    advance_millis: u64,
+}
+
+impl LeaseBackend for SlowAckBackend {
+    fn info(&self) -> super::clock::BoxFuture<'_, Result<LeaseInfo, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.info().await })
+    }
+
+    fn lease(
+        &self,
+    ) -> super::clock::BoxFuture<'_, Result<Option<LeaseRecord>, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.lease().await })
+    }
+
+    fn acquire(
+        &self,
+        request: AcquireRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.acquire(&request).await })
+    }
+
+    fn renew(
+        &self,
+        request: RenewRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        let clock = Arc::clone(&self.clock);
+        let advance = self.advance_millis;
+        Box::pin(async move {
+            clock.advance_boot(advance);
+            Ok(LeaseRecord {
+                schema: 1,
+                cluster_id: CLUSTER.to_string(),
+                holder: request.holder,
+                node_id: "node-a".to_string(),
+                term: request.term,
+                revision: request.expected_revision + 1,
+                version: request.version,
+                bundle_hash: request.bundle_hash,
+                acquired_unix_ms: 1,
+                expires_unix_ms: i64::MAX,
+            })
+        })
+    }
+}
+
+/// A backend whose renew call blocks longer than the remaining self-fence
+/// budget. The engine must time out, close the gate and fence.
+struct SlowSleepBackend {
+    inner: Arc<WitnessClient>,
+    sleep: Duration,
+    slow: Arc<AtomicBool>,
+}
+
+impl LeaseBackend for SlowSleepBackend {
+    fn info(&self) -> super::clock::BoxFuture<'_, Result<LeaseInfo, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.info().await })
+    }
+
+    fn lease(
+        &self,
+    ) -> super::clock::BoxFuture<'_, Result<Option<LeaseRecord>, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.lease().await })
+    }
+
+    fn acquire(
+        &self,
+        request: AcquireRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.acquire(&request).await })
+    }
+
+    fn renew(
+        &self,
+        request: RenewRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        if !self.slow.load(Ordering::SeqCst) {
+            let inner = Arc::clone(&self.inner);
+            return Box::pin(async move { inner.renew(&request).await });
+        }
+        let sleep = self.sleep;
+        Box::pin(async move {
+            tokio::time::sleep(sleep).await;
+            Err(WitnessClientError::Unavailable {
+                detail: "slow renewal".to_string(),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn retried_first_publish_quiesce_never_sends_the_pending_version() {
+    let harness = Harness::new("retry_pending", "node-a").await;
+    harness.host.fail_publish.store(true, Ordering::SeqCst);
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    assert!(matches!(
+        engine.start_master().await,
+        PromotionOutcome::ReadOnly { .. }
+    ));
+    let loaded = HaStateStore::new(harness.data_dir("node-a").join("ha_state.toml"))
+        .load()
+        .unwrap();
+    let LoadedState::Present { state, bookkeeping } = loaded else {
+        panic!("state");
+    };
+    assert_eq!(state.bundle.version, 1);
+    let pending_hash = bookkeeping.unwrap().pending_hash.unwrap();
+
+    // Expire the witness grant and retry. The staged pending version 1 must
+    // never be announced as the renewal baseline: only the published 0/none.
+    harness.fixture.clock.advance(5_000);
+    harness.clock.advance_boot(5_000);
+    harness.host.fail_publish.store(false, Ordering::SeqCst);
+    let retry_start = harness.events().len();
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    harness.clock.set_boot(1_000);
+    let outcome = engine.start_master().await;
+    assert_eq!(outcome, PromotionOutcome::Master, "{:?}", harness.events());
+    let events = harness.events();
+    let publish = events[retry_start..]
+        .iter()
+        .position(|event| event.starts_with("publish:1:"))
+        .map(|index| retry_start + index)
+        .expect("retry publishes version 1");
+    let renewals = events[retry_start..publish]
+        .iter()
+        .filter(|event| event.starts_with("renew_req:"))
+        .collect::<Vec<_>>();
+    assert!(
+        !renewals.is_empty(),
+        "quiesce/reconciliation must renew: {events:?}"
+    );
+    assert!(
+        renewals
+            .iter()
+            .all(|event| event.starts_with("renew_req:0:")),
+        "quiesce/reconciliation must renew with the published baseline only: {renewals:?}"
+    );
+    assert!(
+        events[..publish]
+            .iter()
+            .all(|event| !event.starts_with("renew_req:1:")),
+        "the pending version 1 ({pending_hash}) must never be sent to the witness"
+    );
+    let record = harness
+        .fixture
+        .client("node-a")
+        .lease()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.term, 2);
+    assert_eq!(record.version, 1);
+}
+
+#[tokio::test]
+async fn renewal_uses_the_durable_published_baseline_only() {
+    let harness = Harness::new("second_persist", "node-a").await;
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    assert_eq!(engine.start_master().await, PromotionOutcome::Master);
+    // The host reads only the durable published baseline. A normal publish
+    // advances the coordinator's in-memory bookkeeping before its second
+    // durable write; that uncommitted value must never reach the witness. The
+    // coordinator-level failed-second-persist test covers the write failure;
+    // here the renewal must use the durable 1, never an in-memory 2.
+    *harness.host.published_baseline.lock().unwrap() = None;
+    let loaded = HaStateStore::new(harness.data_dir("node-a").join("ha_state.toml"))
+        .load()
+        .unwrap();
+    let LoadedState::Present { bookkeeping, .. } = loaded else {
+        panic!("state");
+    };
+    let published = bookkeeping.unwrap();
+    assert_eq!(published.published_version, 1);
+    engine.renew_once().await.unwrap();
+    let events = harness.events();
+    assert!(
+        events.iter().any(|event| event.starts_with("renew_req:1:")),
+        "the durable published baseline is renewed: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn already_published_recovery_renews_with_the_proven_baseline_and_publishes_above_it() {
+    let harness = Harness::new("already_published", "node-a").await;
+    let baseline = hash(0xab);
+    let pending = hash(0xcd);
+    seed_witness_record(&harness.fixture, "node-a", 3, 7, &baseline).await;
+    seed_state(
+        &harness.data_dir("node-a"),
+        3,
+        8,
+        PublicationState::Publishing,
+        (7, &baseline),
+        Some(&pending),
+        (8, &pending),
+    );
+    harness.host.set_reports(vec![PeerReport {
+        instance: "proof-slave".to_string(),
+        have_term: 3,
+        have_version: 8,
+        have_bundle_hash: Some(pending.clone()),
+    }]);
+    harness.clock.set_boot(1_000);
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    engine.boot().unwrap();
+    let outcome = engine.start_master().await;
+    assert_eq!(outcome, PromotionOutcome::Master, "{:?}", harness.events());
+    assert!(
+        !engine.snapshot().fenced,
+        "the proven publish must not self-fence: {:?}",
+        harness.events()
+    );
+    let events = harness.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event == &format!("renew_req:8:{pending}")),
+        "the proven baseline 8/{pending} is renewed before publishing above it: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| event.starts_with("publish:9:")),
+        "the new term publishes strictly above the proven baseline: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| event.starts_with("renew_req:9:")),
+        "the post-publish renewal advances to 9: {events:?}"
+    );
+    let loaded = HaStateStore::new(harness.data_dir("node-a").join("ha_state.toml"))
+        .load()
+        .unwrap();
+    let LoadedState::Present { state, bookkeeping } = loaded else {
+        panic!("state");
+    };
+    assert_eq!(state.bundle.version, 9);
+    let bookkeeping = bookkeeping.unwrap();
+    assert_eq!(bookkeeping.publication_state, PublicationState::Published);
+    assert_eq!(bookkeeping.published_version, 9);
+    assert!(
+        state.signing_key_pubkey.is_some(),
+        "the promoted state records the signing key"
+    );
+    let record = harness
+        .fixture
+        .client("node-a")
+        .lease()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.term, 4);
+    assert_eq!(record.version, 9);
+}
+
+#[tokio::test]
+async fn slow_ack_after_the_deadline_fences_without_publishing() {
+    let harness = Harness::new("slow_ack", "node-a").await;
+    let backend = Arc::new(SlowAckBackend {
+        inner: Arc::new(harness.fixture.client("node-a")),
+        clock: Arc::clone(&harness.clock),
+        advance_millis: 10_000,
+    });
+    let clock: Arc<dyn MonotonicClock> = harness.clock.clone();
+    let host: Arc<dyn PromotionHost> = harness.host.clone();
+    let engine = PromotionEngine::with_runtime(
+        harness.fixture.config("node-a"),
+        ConfiguredRole::Master,
+        harness.data_dir("node-a"),
+        backend,
+        host,
+        clock,
+        Arc::new(ManualTimers::new(Arc::clone(&harness.clock))),
+    )
+    .unwrap();
+    let outcome = engine.start_master().await;
+    assert_eq!(outcome, PromotionOutcome::Fenced);
+    assert!(engine.snapshot().fenced);
+    assert_eq!(
+        engine.fence_store().load().unwrap().unwrap().reason,
+        "lease_lost"
+    );
+    assert!(
+        harness.event_index("publish:").is_none(),
+        "no publish may happen after the deadline: {:?}",
+        harness.events()
+    );
+    assert!(
+        harness.host.admissions_denied.load(Ordering::SeqCst),
+        "the gate must close on the slow ACK"
+    );
+}
+
+#[tokio::test]
+async fn slow_renewal_times_out_before_the_deadline_and_closes_the_gate() {
+    let harness = Harness::new("slow_timeout", "node-a").await;
+    let slow = Arc::new(AtomicBool::new(false));
+    let backend = Arc::new(SlowSleepBackend {
+        inner: Arc::new(harness.fixture.client("node-a")),
+        sleep: Duration::from_millis(800),
+        slow: Arc::clone(&slow),
+    });
+    let clock: Arc<dyn MonotonicClock> = harness.clock.clone();
+    let host: Arc<dyn PromotionHost> = harness.host.clone();
+    let engine = PromotionEngine::with_runtime(
+        harness.fixture.config("node-a"),
+        ConfiguredRole::Master,
+        harness.data_dir("node-a"),
+        backend,
+        host,
+        clock,
+        Arc::new(ManualTimers::new(Arc::clone(&harness.clock))),
+    )
+    .unwrap();
+    assert_eq!(engine.start_master().await, PromotionOutcome::Master);
+    let deadline = engine.self_fence_deadline_millis().expect("deadline");
+    let now = harness.clock.boot_millis().unwrap();
+    assert!(deadline > now);
+    // Leave ~120 ms of self-fence budget; the renewal sleeps far longer.
+    harness.clock.advance_boot(deadline - now - 120);
+    slow.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let result = engine.renew_once().await;
+    assert!(result.is_err(), "the slow renewal must fence");
+    assert!(engine.snapshot().fenced);
+    assert_eq!(
+        engine.fence_store().load().unwrap().unwrap().reason,
+        "lease_lost"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(700),
+        "the bounded call must return before the witness timeout"
+    );
+    assert!(
+        harness.host.admissions_denied.load(Ordering::SeqCst),
+        "the API gate must close when the bounded renewal times out"
+    );
+}
+
+#[tokio::test]
+async fn boot_clock_unavailable_at_the_reconcile_window_fences() {
+    let harness = Harness::new("reconcile_clock", "node-a").await;
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    // Quiesce completes normally, then the boot clock disappears exactly at
+    // the reconcile window's start read. This isolates the reconcile fail-closed
+    // path from the quiesce/renewal clock checks.
+    let clock = Arc::clone(&harness.clock);
+    engine.set_quiesce_complete_hook(Arc::new(move || {
+        clock.set_boot_unavailable(true);
+    }));
+    let outcome = engine.start_master().await;
+    assert_eq!(outcome, PromotionOutcome::Fenced);
+    assert!(engine.snapshot().fenced);
+    assert_eq!(
+        engine.fence_store().load().unwrap().unwrap().reason,
+        "clock_step"
+    );
+    assert!(
+        harness.event_index("publish:").is_none(),
+        "an unavailable boot clock must never skip the reconcile window and publish: {:?}",
+        harness.events()
+    );
+}
+
+#[tokio::test]
+async fn expired_own_grant_reacquires_term_plus_one() {
+    let harness = Harness::new("expired_own", "node-b").await;
+    let baseline = hash(0xab);
+    seed_witness_record(&harness.fixture, "node-a", 1, 7, &baseline).await;
+    *harness.host.watermark.lock().unwrap() = Some(watermarked(1, 7, &baseline));
+    let engine = harness.engine("node-b", ConfiguredRole::Slave);
+    engine.boot().unwrap();
+    // Seed an own-holder record through the witness (the engine's holder is a
+    // fresh boot id) and let it expire.
+    let client = harness.fixture.client("node-b");
+    let record = client
+        .acquire(&AcquireRequest {
+            holder: engine.holder().to_string(),
+            node_id: "node-b".to_string(),
+            expected_term: Some(1),
+            expected_revision: Some(client.lease().await.unwrap().unwrap().revision),
+            term: 2,
+            version: 7,
+            bundle_hash: baseline.clone(),
+            ttl_secs: 5,
+        })
+        .await
+        .unwrap();
+    assert_eq!(record.holder, engine.holder());
+    harness.fixture.clock.advance(5_000);
+    let outcome = engine.candidate_attempt(false).await;
+    assert_eq!(outcome, PromotionOutcome::Master, "{:?}", harness.events());
+    let record = harness
+        .fixture
+        .client("node-b")
+        .lease()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.term, 3,
+        "an expired own grant is re-acquired, not renewed"
+    );
+    assert_eq!(record.version, 8);
+}
+
+#[tokio::test]
+async fn late_peer_reports_are_consumed_and_latched_by_the_engine() {
+    let harness = Harness::new("late_consume", "node-a").await;
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    assert_eq!(engine.start_master().await, PromotionOutcome::Master);
+    harness.host.late_reports.lock().unwrap().push(PeerReport {
+        instance: "late-late".to_string(),
+        have_term: 9,
+        have_version: 99,
+        have_bundle_hash: Some(hash(0xaa)),
+    });
+    assert_eq!(engine.process_late_peer_reports(), 1);
+    assert_eq!(engine.latched_peers(), vec!["late-late".to_string()]);
+    assert_eq!(
+        harness.host.latched.lock().unwrap().as_slice(),
+        ["late-late".to_string()]
+    );
+    assert_eq!(
+        engine.process_late_peer_reports(),
+        0,
+        "the queue is drained"
+    );
+}
+
+#[tokio::test]
+async fn slow_first_publish_crossing_the_deadline_fences_and_publishes_nothing() {
+    let harness = Harness::new("slow_first_publish", "node-a").await;
+    // The host models a durable pre-publish write that consumes the whole
+    // self-fence budget before the push.
+    harness.host.set_slow_publish_millis(10_000);
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    let outcome = engine.start_master().await;
+    assert_eq!(outcome, PromotionOutcome::Fenced);
+    assert!(engine.snapshot().fenced);
+    assert_eq!(
+        engine.fence_store().load().unwrap().unwrap().reason,
+        "lease_lost"
+    );
+    assert!(
+        harness.event_index("publish:").is_none(),
+        "nothing may be pushed after the deadline: {:?}",
+        harness.events()
+    );
+    assert!(
+        harness
+            .events()
+            .iter()
+            .any(|event| event == "publish_deadline_passed"),
+        "the host must reject the push when the deadline handle is unsafe: {:?}",
+        harness.events()
+    );
+    assert!(!harness.host.writable.load(Ordering::SeqCst));
 }
