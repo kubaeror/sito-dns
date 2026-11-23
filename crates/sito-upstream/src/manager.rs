@@ -29,14 +29,29 @@ pub type PerDomainRule = (Vec<String>, Vec<NamedUpstream>);
 /// The manager records each attempt separately so the pipeline can emit
 /// per-attempt RTT/error metrics. The successful attempt's `rtt` measures only
 /// that attempt, not the time already spent on failed candidates.
+///
+/// A parallel race also reports candidates that were still in flight when
+/// another candidate won or the overall deadline fired. Those attempts are
+/// marked `cancelled`: they did not produce a response, they did not fail, so
+/// [`Self::is_success`] is `false` and [`Self::error_kind`] is `None`, and
+/// their `rtt` is the time they ran before cancellation, not a usable
+/// round-trip sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamAttempt {
     /// Configured upstream name (the label used by metrics and health).
     pub name: String,
     /// Time spent on this attempt alone.
     pub rtt: Duration,
-    /// `None` on success; the candidate's error otherwise.
+    /// `None` on success and on cancellation; the candidate's error otherwise.
+    ///
+    /// Do not use `error.is_none()` to detect success: a cancelled attempt also
+    /// has `error: None`. Use [`Self::is_success`] or the `cancelled` field.
     pub error: Option<UpstreamError>,
+    /// `true` when the candidate was dropped before it could answer because
+    /// another parallel candidate won or the overall deadline fired.
+    ///
+    /// Cancellation is not a health failure and produces no RTT sample.
+    pub cancelled: bool,
 }
 
 impl UpstreamAttempt {
@@ -45,6 +60,7 @@ impl UpstreamAttempt {
             name,
             rtt,
             error: None,
+            cancelled: false,
         }
     }
 
@@ -53,19 +69,86 @@ impl UpstreamAttempt {
             name,
             rtt,
             error: Some(error),
+            cancelled: false,
+        }
+    }
+
+    /// An attempt that was still in flight when the race ended without it.
+    fn cancelled(name: String, rtt: Duration) -> Self {
+        Self {
+            name,
+            rtt,
+            error: None,
+            cancelled: true,
         }
     }
 
     /// Whether the candidate produced a usable response.
+    ///
+    /// A cancelled candidate never did, so this is `false` for it.
     #[must_use]
     pub fn is_success(&self) -> bool {
-        self.error.is_none()
+        !self.cancelled && self.error.is_none()
     }
 
     /// Stable, low-cardinality error kind for metrics labels.
+    ///
+    /// A cancellation is not a failure, so this is `None` for it.
     #[must_use]
     pub fn error_kind(&self) -> Option<&'static str> {
+        if self.cancelled {
+            return None;
+        }
         self.error.as_ref().map(UpstreamError::kind)
+    }
+}
+
+/// Drop guard that records a cancelled attempt for one parallel candidate.
+///
+/// The future owning the guard disarms it after it has recorded its real
+/// success/failure attempt. If the future is dropped first (another candidate
+/// won, or the overall deadline fired) the guard appends a cancelled attempt.
+/// It only takes the existing `std::sync::Mutex`, never a Tokio lock, so it is
+/// safe to run from `Drop`.
+struct CancelledAttemptGuard {
+    log: Arc<std::sync::Mutex<Vec<UpstreamAttempt>>>,
+    name: String,
+    started: Instant,
+    armed: bool,
+}
+
+impl CancelledAttemptGuard {
+    fn new(log: Arc<std::sync::Mutex<Vec<UpstreamAttempt>>>, name: String) -> Self {
+        Self {
+            log,
+            name,
+            started: Instant::now(),
+            armed: true,
+        }
+    }
+
+    /// Time elapsed since the candidate was launched.
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// The candidate recorded its own outcome; do not report a cancellation.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelledAttemptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut log) = self.log.lock() {
+            log.push(UpstreamAttempt::cancelled(
+                self.name.clone(),
+                self.started.elapsed(),
+            ));
+        }
     }
 }
 
@@ -1228,8 +1311,9 @@ impl UpstreamManager {
                     let m = msg.clone();
                     let name = entry.name.clone();
                     let attempt_log = Arc::clone(&parallel_attempts);
+                    let mut guard =
+                        CancelledAttemptGuard::new(Arc::clone(&parallel_attempts), name.clone());
                     futs.push(Box::pin(async move {
-                        let started = Instant::now();
                         let result = match resolve_with_edns_fallback(u.as_ref(), &m).await {
                             Ok(resp) if !is_retryable_response(&resp) => {
                                 h.write().await.record_success();
@@ -1255,7 +1339,7 @@ impl UpstreamManager {
                                 })
                             }
                         };
-                        let rtt = started.elapsed();
+                        let rtt = guard.elapsed();
                         let attempt = match &result {
                             Ok(_) => UpstreamAttempt::success(name, rtt),
                             Err(error) => UpstreamAttempt::failure(name, rtt, error.error.clone()),
@@ -1263,21 +1347,38 @@ impl UpstreamManager {
                         if let Ok(mut log) = attempt_log.lock() {
                             log.push(attempt);
                         }
+                        // The real outcome is logged; if this future is still
+                        // dropped afterwards it must not also log a cancellation.
+                        guard.disarm();
                         result
                     }));
                 }
                 // All attempts already run concurrently, so the whole race gets
                 // the full timeout; the deadline only bounds implementations
                 // that ignore their own timeout.
-                let result = timeout(timeout_duration, futures_util::future::select_ok(futs)).await;
+                let mut race = Box::pin(timeout(
+                    timeout_duration,
+                    futures_util::future::select_ok(futs),
+                ));
+                let raced = race.as_mut().await;
+                // Drop the race first: on the timeout path this drops every
+                // still-pending candidate, which runs its cancellation guard.
+                drop(race);
+                let result = match raced {
+                    Ok(Ok((response, rest))) => {
+                        // `select_ok` returns the losing futures. Dropping them
+                        // runs their cancellation guards before the attempt log
+                        // is collected below.
+                        drop(rest);
+                        Ok(response)
+                    }
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(UpstreamQueryError::unattributed(UpstreamError::Timeout)),
+                };
                 if let Ok(mut log) = parallel_attempts.lock() {
                     attempts.append(&mut log);
                 }
-                match result {
-                    Ok(Ok((resp, _))) => Ok(resp),
-                    Ok(Err(error)) => Err(error),
-                    Err(_) => Err(UpstreamQueryError::unattributed(UpstreamError::Timeout)),
-                }
+                result
             }
             UpstreamStrategy::LoadBalance => {
                 let weights: Vec<u32> = candidates.iter().map(|entry| entry.weight).collect();
@@ -2038,6 +2139,192 @@ mod tests {
             resp.answers[0].data,
             RData::A(A(std::net::Ipv4Addr::new(1, 1, 1, 1)))
         );
+    }
+
+    /// G2: every candidate launched by a parallel race is reported. The fast
+    /// winner is a success; the slower candidate is still in flight when the
+    /// race ends, so it is reported as cancelled — not as a success and not as
+    /// a failure.
+    #[tokio::test]
+    async fn test_parallel_reports_cancelled_losers() {
+        let calls_fast = Arc::new(AtomicU32::new(0));
+        let calls_slow = Arc::new(AtomicU32::new(0));
+
+        let manager = UpstreamManager::with_upstreams(
+            vec![
+                (
+                    "slow".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::from_secs(2),
+                        result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+                        call_count: Arc::clone(&calls_slow),
+                    }),
+                ),
+                (
+                    "fast".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::from_millis(10),
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::clone(&calls_fast),
+                    }),
+                ),
+            ],
+            UpstreamStrategy::Parallel,
+            Duration::from_secs(5),
+        );
+
+        let (response, upstream, attempts) = manager
+            .resolve_with_attempts(&test_query())
+            .await
+            .expect("the fast candidate must win the race");
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(upstream, "fast");
+        assert_eq!(calls_fast.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_slow.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            attempts.len(),
+            2,
+            "both launched candidates must be reported: {attempts:?}"
+        );
+
+        let winner = attempts
+            .iter()
+            .find(|attempt| attempt.name == "fast")
+            .expect("winner attempt present");
+        assert!(winner.is_success());
+        assert!(!winner.cancelled);
+        assert_eq!(winner.error_kind(), None);
+
+        let loser = attempts
+            .iter()
+            .find(|attempt| attempt.name == "slow")
+            .expect("cancelled loser attempt present");
+        assert!(loser.cancelled, "the slow loser must be cancelled");
+        assert!(!loser.is_success(), "a cancelled attempt is not a success");
+        assert_eq!(
+            loser.error_kind(),
+            None,
+            "a cancellation must not be reported as a failure kind"
+        );
+        assert!(
+            loser.rtt >= Duration::from_millis(5),
+            "the cancelled attempt reports the time it ran: {:?}",
+            loser.rtt
+        );
+        assert!(
+            loser.rtt < Duration::from_secs(2),
+            "cancellation happens before the slow upstream answers: {:?}",
+            loser.rtt
+        );
+    }
+
+    /// G2: when the overall parallel deadline fires, every in-flight candidate
+    /// is reported as cancelled and the final error is an unattributed timeout.
+    #[tokio::test]
+    async fn test_parallel_timeout_reports_cancelled_attempts_and_final_timeout() {
+        let calls_a = Arc::new(AtomicU32::new(0));
+        let calls_b = Arc::new(AtomicU32::new(0));
+
+        let manager = UpstreamManager::with_upstreams(
+            vec![
+                (
+                    "slow-a".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::from_millis(500),
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::clone(&calls_a),
+                    }),
+                ),
+                (
+                    "slow-b".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::from_millis(500),
+                        result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+                        call_count: Arc::clone(&calls_b),
+                    }),
+                ),
+            ],
+            UpstreamStrategy::Parallel,
+            Duration::from_millis(60),
+        );
+
+        let error = manager
+            .resolve_with_attempts(&test_query())
+            .await
+            .expect_err("the overall parallel deadline must fire");
+        assert_eq!(error.kind(), "timeout");
+        assert_eq!(
+            error.upstream, None,
+            "an overall timeout cannot be attributed to one candidate"
+        );
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            error.attempts.len(),
+            2,
+            "every timed-out candidate must be reported: {:?}",
+            error.attempts
+        );
+        for attempt in &error.attempts {
+            assert!(attempt.cancelled, "{} must be cancelled", attempt.name);
+            assert!(!attempt.is_success());
+            assert_eq!(attempt.error_kind(), None);
+        }
+    }
+
+    /// G2: a fully failed race is not a cancellation. Each candidate failed on
+    /// its own before the deadline, so each attempt carries its error kind.
+    #[tokio::test]
+    async fn test_parallel_all_failures_are_not_cancelled() {
+        let manager = UpstreamManager::with_upstreams(
+            vec![
+                (
+                    "fail-a".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: false,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::new(AtomicU32::new(0)),
+                    }),
+                ),
+                (
+                    "fail-b".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: false,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+                        call_count: Arc::new(AtomicU32::new(0)),
+                    }),
+                ),
+            ],
+            UpstreamStrategy::Parallel,
+            Duration::from_secs(1),
+        );
+
+        let error = manager
+            .resolve_with_attempts(&test_query())
+            .await
+            .expect_err("both candidates fail");
+        assert_eq!(error.kind(), "timeout");
+        assert_eq!(
+            error.attempts.len(),
+            2,
+            "both failures must be reported: {:?}",
+            error.attempts
+        );
+        for attempt in &error.attempts {
+            assert!(
+                !attempt.cancelled,
+                "{} failed, it was not cancelled",
+                attempt.name
+            );
+            assert!(!attempt.is_success());
+            assert_eq!(attempt.error_kind(), Some("timeout"));
+        }
     }
 
     #[tokio::test]

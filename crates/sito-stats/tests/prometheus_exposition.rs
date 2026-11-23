@@ -18,6 +18,7 @@ fn populated_registry() -> MetricsRegistry {
     registry.observe_query_duration("allowed", 0.000_250);
     registry.observe_upstream_rtt("tls://dns.example", 0.012);
     registry.inc_upstream_errors("tls://dns.example", "timeout");
+    registry.inc_upstream_cancelled("tls://dns.example");
     registry.set_upstream_health("tls://dns.example", 1.0);
     registry.inc_cache_hits();
     registry.inc_cache_misses();

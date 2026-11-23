@@ -349,6 +349,8 @@ pub struct MetricsRegistry {
     upstream_rtt: Arc<HistogramMap>,
     /// (upstream id, kind id) -> error count
     upstream_errors: Arc<CounterMap<(u32, u32)>>,
+    /// upstream id -> cancelled-attempt count
+    upstream_cancelled: Arc<CounterMap<u32>>,
     /// upstream id -> health gauge (f64 bits)
     upstream_health: Arc<RwLock<HashMap<u32, AtomicU64>>>,
     cache_hits: Arc<AtomicU64>,
@@ -440,6 +442,7 @@ impl MetricsRegistry {
             query_duration: Arc::new(RwLock::new(HashMap::new())),
             upstream_rtt: Arc::new(RwLock::new(HashMap::new())),
             upstream_errors: Arc::new(RwLock::new(HashMap::new())),
+            upstream_cancelled: Arc::new(RwLock::new(HashMap::new())),
             upstream_health: Arc::new(RwLock::new(HashMap::new())),
             cache_hits: Arc::new(AtomicU64::new(0)),
             cache_misses: Arc::new(AtomicU64::new(0)),
@@ -514,8 +517,23 @@ impl MetricsRegistry {
         increment_counter(&self.upstream_errors, (upstream_id, kind_id));
     }
 
+    /// Counts one cancelled upstream attempt.
+    ///
+    /// A parallel race drops candidates that are still in flight once another
+    /// candidate wins or the overall deadline fires. Those attempts are
+    /// observable here, but they are **not** failures: they get no RTT sample
+    /// and do not change [`Self::set_upstream_health`]. The single `upstream`
+    /// label is the configured name and passes through the registry's shared
+    /// bounded label interner (4,096 distinct values, then `__other__`), so
+    /// unbounded input cannot grow this family without limit.
+    pub fn inc_upstream_cancelled(&self, upstream: &str) {
+        let upstream_id = self.labels.intern(upstream);
+        increment_counter(&self.upstream_cancelled, upstream_id);
+    }
+
     /// Removes every per-upstream series for `upstream`: the health gauge, the
-    /// RTT histogram, all error-kind counters and the DNSSEC bogus counter.
+    /// RTT histogram, all error-kind counters, the cancelled-attempt counter
+    /// and the DNSSEC bogus counter.
     ///
     /// Called after a config apply/publish for upstream names that no longer
     /// exist, so removed servers cannot leave stale labels in the exposition
@@ -531,6 +549,7 @@ impl MetricsRegistry {
 
         sito_core::sync::write_or_recover(&self.upstream_health).remove(&upstream_id);
         sito_core::sync::write_or_recover(&self.upstream_rtt).remove(&upstream_id);
+        sito_core::sync::write_or_recover(&self.upstream_cancelled).remove(&upstream_id);
         sito_core::sync::write_or_recover(&self.upstream_errors)
             .retain(|(label, _kind), _| *label != upstream_id);
     }
@@ -1275,7 +1294,34 @@ impl MetricsRegistry {
             }
         }
 
-        // 5. sito_upstream_health
+        // 5. sito_upstream_cancelled_total
+        out.push_str(
+            "# HELP sito_upstream_cancelled_total Upstream parallel attempts cancelled before answering\n",
+        );
+        out.push_str("# TYPE sito_upstream_cancelled_total counter\n");
+        {
+            let map = sito_core::sync::read_or_recover(&self.upstream_cancelled);
+            if map.is_empty() {
+                out.push_str("sito_upstream_cancelled_total{upstream=\"default\"} 0\n");
+            } else {
+                let mut entries: Vec<(Arc<str>, u64)> = map
+                    .iter()
+                    .map(|(&upstream, count)| {
+                        (self.labels.label(upstream), count.load(Ordering::Relaxed))
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+                for (upstream, count) in entries {
+                    let _ = writeln!(
+                        out,
+                        "sito_upstream_cancelled_total{{upstream=\"{}\"}} {count}",
+                        escape_label_value(&upstream)
+                    );
+                }
+            }
+        }
+
+        // 6. sito_upstream_health
         out.push_str("# HELP sito_upstream_health Upstream resolver health status (1 = healthy, 0 = degraded/down)\n");
         out.push_str("# TYPE sito_upstream_health gauge\n");
         {
@@ -1306,7 +1352,7 @@ impl MetricsRegistry {
 
     /// Cache hit/miss, DNSSEC key-cache, and stale-serve families.
     fn render_cache_family(&self, out: &mut String) {
-        // 6. sito_cache_hits_total & misses
+        // 7. sito_cache_hits_total & misses
         out.push_str("# HELP sito_cache_hits_total Total DNS cache hits\n");
         out.push_str("# TYPE sito_cache_hits_total counter\n");
         let _ = writeln!(
@@ -1323,7 +1369,7 @@ impl MetricsRegistry {
             self.cache_misses.load(Ordering::Relaxed)
         );
 
-        // 7. sito_dnssec_key_cache_* and sito_cache_size_bytes
+        // 8. sito_dnssec_key_cache_* and sito_cache_size_bytes
         out.push_str("# HELP sito_dnssec_key_cache_hits_total DNSSEC validated-key cache hits\n");
         out.push_str("# TYPE sito_dnssec_key_cache_hits_total counter\n");
         let _ = writeln!(
@@ -1348,7 +1394,7 @@ impl MetricsRegistry {
             self.cache_size_bytes.load(Ordering::Relaxed)
         );
 
-        // 8. sito_cache_stale_served_total
+        // 9. sito_cache_stale_served_total
         out.push_str("# HELP sito_cache_stale_served_total Total stale cache answers served\n");
         out.push_str("# TYPE sito_cache_stale_served_total counter\n");
         let _ = writeln!(
@@ -1360,7 +1406,7 @@ impl MetricsRegistry {
 
     /// Filter rule and compile-duration families.
     fn render_filter_family(&self, out: &mut String) {
-        // 9. sito_filter_rules
+        // 10. sito_filter_rules
         out.push_str("# HELP sito_filter_rules Number of active filter rules per list\n");
         out.push_str("# TYPE sito_filter_rules gauge\n");
         let _ = writeln!(
@@ -1422,7 +1468,7 @@ impl MetricsRegistry {
             self.filter_unavailable.load(Ordering::Relaxed)
         );
 
-        // 10. sito_filter_compile_seconds
+        // 11. sito_filter_compile_seconds
         out.push_str(
             "# HELP sito_filter_compile_seconds Compilation duration for filter rule trie\n",
         );
@@ -1463,7 +1509,7 @@ impl MetricsRegistry {
             );
         }
 
-        // 11. sito_dnssec_bogus_total
+        // 12. sito_dnssec_bogus_total
         out.push_str("# HELP sito_dnssec_bogus_total Total DNSSEC bogus responses detected\n");
         out.push_str("# TYPE sito_dnssec_bogus_total counter\n");
         {
@@ -1497,7 +1543,7 @@ impl MetricsRegistry {
             self.dnssec_fetch_deadline_failures.load(Ordering::Relaxed)
         );
 
-        // 12. sito_clients_identified_total
+        // 13. sito_clients_identified_total
         out.push_str("# HELP sito_clients_identified_total Total clients successfully identified by method\n");
         out.push_str("# TYPE sito_clients_identified_total counter\n");
         {
@@ -1522,7 +1568,7 @@ impl MetricsRegistry {
             }
         }
 
-        // 13. sito_doh_bypass_blocked_total
+        // 14. sito_doh_bypass_blocked_total
         out.push_str(
             "# HELP sito_doh_bypass_blocked_total Total encrypted DNS bypass attempts blocked\n",
         );
@@ -1536,7 +1582,7 @@ impl MetricsRegistry {
 
     /// HA, querylog, and stats-retention families.
     fn render_ha_retention_family(&self, out: &mut String) {
-        // 14. sito_ha_slaves_connected
+        // 15. sito_ha_slaves_connected
         out.push_str(
             "# HELP sito_ha_slaves_connected Number of HA replica slaves currently connected\n",
         );
@@ -1547,7 +1593,7 @@ impl MetricsRegistry {
             self.ha_slaves_connected.load(Ordering::Relaxed)
         );
 
-        // 15. sito_ha_config_version
+        // 16. sito_ha_config_version
         out.push_str("# HELP sito_ha_config_version Configuration version of HA node instances\n");
         out.push_str("# TYPE sito_ha_config_version gauge\n");
         {
@@ -1565,7 +1611,7 @@ impl MetricsRegistry {
             }
         }
 
-        // 16. sito_ha_diverged
+        // 17. sito_ha_diverged
         out.push_str(
             "# HELP sito_ha_diverged Whether the master observed a version-continuity divergence with a slave (1 = diverged)\n",
         );
@@ -1582,7 +1628,7 @@ impl MetricsRegistry {
             }
         }
 
-        // 17. sito_ha_startup_noop_total
+        // 18. sito_ha_startup_noop_total
         out.push_str(
             "# HELP sito_ha_startup_noop_total HA startup paths that left replication inactive\n",
         );
@@ -1618,7 +1664,7 @@ impl MetricsRegistry {
             }
         }
 
-        // 18. sito_querylog_dropped_total
+        // 19. sito_querylog_dropped_total
         out.push_str("# HELP sito_querylog_dropped_total Total query log entries dropped due to buffer overflow\n");
         out.push_str("# TYPE sito_querylog_dropped_total counter\n");
         let _ = writeln!(
@@ -1627,7 +1673,7 @@ impl MetricsRegistry {
             self.querylog_dropped.load(Ordering::Relaxed)
         );
 
-        // 19. Stats retention / rollup cleanup
+        // 20. Stats retention / rollup cleanup
         out.push_str("# HELP sito_stats_retention_last_success_seconds Unix timestamp of the last successful stats retention sweep\n");
         out.push_str("# TYPE sito_stats_retention_last_success_seconds gauge\n");
         let _ = writeln!(
@@ -1688,7 +1734,7 @@ impl MetricsRegistry {
 
     /// Build metadata.
     fn render_build_info(&self, out: &mut String) {
-        // 20. sito_build_info
+        // 21. sito_build_info
         out.push_str("# HELP sito_build_info Build and version metadata\n");
         out.push_str("# TYPE sito_build_info gauge\n");
         let _ = writeln!(
@@ -1941,6 +1987,7 @@ mod tests {
         reg.observe_query_duration("allowed", 0.0012);
         reg.observe_upstream_rtt("tls://dns.quad9.net", 0.015);
         reg.inc_upstream_errors("tls://dns.quad9.net", "timeout");
+        reg.inc_upstream_cancelled("tls://dns.quad9.net");
         reg.set_upstream_health("tls://dns.quad9.net", 1.0);
         reg.inc_cache_hits();
         reg.inc_cache_misses();
@@ -1960,11 +2007,13 @@ mod tests {
 
         let rendered = reg.render_prometheus();
 
-        // Verify all 18 metrics from Table 14.2 are present
+        // Verify the Table 14.2 families (plus the parallel-cancelled counter)
+        // are present.
         assert!(rendered.contains("sito_queries_total"));
         assert!(rendered.contains("sito_query_duration_seconds"));
         assert!(rendered.contains("sito_upstream_rtt_seconds"));
         assert!(rendered.contains("sito_upstream_errors_total"));
+        assert!(rendered.contains("sito_upstream_cancelled_total"));
         assert!(rendered.contains("sito_upstream_health"));
         assert!(rendered.contains("sito_cache_hits_total"));
         assert!(rendered.contains("sito_cache_misses_total"));
@@ -2003,6 +2052,7 @@ mod tests {
         reg.observe_query_duration("blocked", 0.35);
         reg.observe_upstream_rtt("tls://dns.quad9.net", 0.015);
         reg.inc_upstream_errors("tls://dns.quad9.net", "timeout");
+        reg.inc_upstream_cancelled("tls://dns.quad9.net");
         reg.set_upstream_health("tls://dns.quad9.net", 1.0);
         reg.inc_cache_hits();
         reg.inc_cache_misses();
@@ -2107,6 +2157,9 @@ sito_upstream_rtt_seconds_count{upstream="tls://dns.quad9.net"} 1
 # HELP sito_upstream_errors_total Total errors encountered per upstream
 # TYPE sito_upstream_errors_total counter
 sito_upstream_errors_total{upstream="tls://dns.quad9.net",kind="timeout"} 1
+# HELP sito_upstream_cancelled_total Upstream parallel attempts cancelled before answering
+# TYPE sito_upstream_cancelled_total counter
+sito_upstream_cancelled_total{upstream="tls://dns.quad9.net"} 1
 # HELP sito_upstream_health Upstream resolver health status (1 = healthy, 0 = degraded/down)
 # TYPE sito_upstream_health gauge
 sito_upstream_health{upstream="tls://dns.quad9.net"} 1
@@ -2425,6 +2478,7 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         for name in ["removed.example", "kept.example"] {
             reg.observe_upstream_rtt(name, 0.010);
             reg.inc_upstream_errors(name, "timeout");
+            reg.inc_upstream_cancelled(name);
             reg.set_upstream_health(name, 0.0);
         }
 
@@ -2444,6 +2498,7 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         for family in [
             "sito_upstream_health{upstream=\"kept.example\"}",
             "sito_upstream_errors_total{upstream=\"kept.example\",kind=\"timeout\"}",
+            "sito_upstream_cancelled_total{upstream=\"kept.example\"}",
             "sito_upstream_rtt_seconds_count{upstream=\"kept.example\"}",
         ] {
             assert!(

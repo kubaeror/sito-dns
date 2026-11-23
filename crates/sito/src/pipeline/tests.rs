@@ -2088,6 +2088,12 @@ async fn test_pipeline_records_per_attempt_upstream_metrics() {
             )),
             "each attempt must contribute its own RTT sample: {rendered}"
         );
+        assert!(
+            !rendered.contains(&format!(
+                "sito_upstream_cancelled_total{{upstream=\"{name}\"}}"
+            )),
+            "a failover failure is not a cancellation: {rendered}"
+        );
     }
     assert!(
         !rendered.contains(r#"upstream="all""#),
@@ -2095,6 +2101,243 @@ async fn test_pipeline_records_per_attempt_upstream_metrics() {
     );
 
     drop(blackhole);
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// G2: a parallel loser cancelled by the winner increments only
+/// `sito_upstream_cancelled_total`. It contributes no RTT sample, no error
+/// series and no health update, because it never answered and never failed.
+#[tokio::test]
+async fn test_pipeline_records_cancelled_metric_without_health_or_rtt() {
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.dnssec.validate = false;
+
+    let (live_addr, _live_calls) = spawn_mock_upstream(None).await;
+    // Bound but never read/answered: this candidate is still in flight when
+    // the live candidate wins the race.
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let blackhole_addr = blackhole.local_addr().unwrap();
+    config.upstream.strategy = sito_core::config::UpstreamStrategy::Parallel;
+    config.upstream.servers = vec![blackhole_addr.to_string(), live_addr.to_string()];
+    config.upstream.timeout_ms = 500;
+
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .expect("two IP-literal upstreams must build"),
+    );
+    let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let resp = pipeline
+        .handle(rewrite_query("cancelled.example.", RecordType::A), client)
+        .await
+        .unwrap();
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+
+    let loser = blackhole_addr.to_string();
+    let winner = live_addr.to_string();
+    let rendered = metrics.render_prometheus();
+    assert!(
+        rendered.contains(&format!(
+            "sito_upstream_cancelled_total{{upstream=\"{loser}\"}} 1"
+        )),
+        "the cancelled loser must increment only the cancelled counter: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&format!(
+            "sito_upstream_cancelled_total{{upstream=\"{winner}\"}}"
+        )),
+        "the winner was not cancelled: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&format!(
+            "sito_upstream_rtt_seconds_count{{upstream=\"{loser}\"}}"
+        )),
+        "a cancelled attempt has no usable RTT sample: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&format!("sito_upstream_health{{upstream=\"{loser}\"}}")),
+        "a cancelled attempt must not change health: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&format!("sito_upstream_errors_total{{upstream=\"{loser}\"")),
+        "a cancellation is not an error: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!(
+            "sito_upstream_rtt_seconds_count{{upstream=\"{winner}\"}} 1"
+        )),
+        "the winner still reports its RTT sample: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("sito_upstream_health{{upstream=\"{winner}\"}} 1")),
+        "the winner still reports healthy: {rendered}"
+    );
+
+    drop(blackhole);
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// An upstream that never answers, used by the parallel-timeout pipeline test.
+struct HangingUpstream;
+
+#[async_trait::async_trait]
+impl sito_upstream::Upstream for HangingUpstream {
+    async fn resolve(&self, _msg: &Message) -> Result<Message, sito_core::error::UpstreamError> {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        Err(sito_core::error::UpstreamError::Timeout)
+    }
+}
+
+/// G2: an overall parallel timeout reports every in-flight candidate as
+/// cancelled and still records the final timeout error exactly once, under the
+/// constant `unattributed` label, with no health or RTT series.
+#[tokio::test]
+async fn test_pipeline_parallel_timeout_counts_cancelled_and_final_timeout_once() {
+    use sito_core::config::UpstreamStrategy;
+    use sito_upstream::UpstreamManager;
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.dnssec.validate = false;
+
+    let manager = UpstreamManager::with_upstreams(
+        vec![
+            ("hang-a".to_string(), std::sync::Arc::new(HangingUpstream)),
+            ("hang-b".to_string(), std::sync::Arc::new(HangingUpstream)),
+        ],
+        UpstreamStrategy::Parallel,
+        std::time::Duration::from_millis(60),
+    );
+    let (pipeline, temp_dir) = build_test_pipeline(config, std::sync::Arc::new(manager)).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let resp = pipeline
+        .handle(rewrite_query("timeout.example.", RecordType::A), client)
+        .await
+        .unwrap();
+    assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+
+    let rendered = metrics.render_prometheus();
+    for name in ["hang-a", "hang-b"] {
+        assert!(
+            rendered.contains(&format!(
+                "sito_upstream_cancelled_total{{upstream=\"{name}\"}} 1"
+            )),
+            "every timed-out candidate must be counted as cancelled: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!(
+                "sito_upstream_rtt_seconds_count{{upstream=\"{name}\"}}"
+            )),
+            "a cancelled candidate has no RTT sample: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("sito_upstream_health{{upstream=\"{name}\"}}")),
+            "a cancelled candidate must not change health: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("sito_upstream_errors_total{{upstream=\"{name}\"")),
+            "a cancellation is not an error: {rendered}"
+        );
+    }
+    let timeout_samples = |rendered: &str| -> Vec<u64> {
+        rendered
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix(
+                    "sito_upstream_errors_total{upstream=\"unattributed\",kind=\"timeout\"} ",
+                )
+                .map(|value| value.parse().expect("counter value must be numeric"))
+            })
+            .collect()
+    };
+    assert_eq!(
+        timeout_samples(&rendered),
+        vec![1],
+        "the overall timeout must be counted exactly once: {rendered}"
+    );
+
+    // Positive control: the assertion above reads the sample value, so a
+    // second count must be observable as `2` instead of still matching a
+    // prefix of the same single line.
+    metrics.inc_upstream_errors("unattributed", "timeout");
+    assert_eq!(
+        timeout_samples(&metrics.render_prometheus()),
+        vec![2],
+        "the final-timeout assertion must detect a double count"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// G2: a fully failed parallel race is not a cancellation. Every candidate
+/// fails on its own, so each attempt is an ordinary error and
+/// `sito_upstream_cancelled_total` stays empty (default zero sample only).
+#[tokio::test]
+async fn test_pipeline_parallel_all_failures_are_errors_without_cancellation() {
+    use sito_core::config::UpstreamStrategy;
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.dnssec.validate = false;
+
+    let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (first_addr, _first_calls) = spawn_mock_upstream(Some(std::sync::Arc::clone(&fail))).await;
+    let (second_addr, _second_calls) =
+        spawn_mock_upstream(Some(std::sync::Arc::clone(&fail))).await;
+    config.upstream.strategy = UpstreamStrategy::Parallel;
+    config.upstream.servers = vec![first_addr.to_string(), second_addr.to_string()];
+    config.upstream.timeout_ms = 500;
+
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .expect("two IP-literal upstreams must build"),
+    );
+    let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let resp = pipeline
+        .handle(rewrite_query("all-fail.example.", RecordType::A), client)
+        .await
+        .unwrap();
+    assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+
+    let rendered = metrics.render_prometheus();
+    for addr in [first_addr, second_addr] {
+        let name = addr.to_string();
+        assert!(
+            rendered.contains(&format!(
+                "sito_upstream_errors_total{{upstream=\"{name}\",kind=\"bad_response\"}} 1"
+            )),
+            "each failed candidate must be an ordinary error: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("sito_upstream_health{{upstream=\"{name}\"}} 0")),
+            "each failed candidate is unhealthy: {rendered}"
+        );
+    }
+    let cancelled: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with("sito_upstream_cancelled_total{"))
+        .collect();
+    assert_eq!(
+        cancelled,
+        vec!["sito_upstream_cancelled_total{upstream=\"default\"} 0"],
+        "a fully failed race must not report any cancellation: {rendered}"
+    );
+
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 

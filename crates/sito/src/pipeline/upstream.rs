@@ -223,30 +223,51 @@ fn record_resolution_metrics(
 
 /// Records a failed resolution: per attempt when available, otherwise the
 /// attributed final error (or the constant `unattributed` label).
+///
+/// The final error is always counted exactly once. It only duplicates a
+/// per-attempt entry when the attempt list already contains the same
+/// attributed failure (the normal failover/all-failed path); an unattributed
+/// final error (e.g. a parallel race whose overall deadline fired) is recorded
+/// in addition to the cancelled attempts, because none of those attempts
+/// carries the final failure.
 fn record_failure_metrics(
     metrics: &sito_stats::MetricsRegistry,
     error: &sito_upstream::UpstreamQueryError,
 ) {
-    if error.attempts.is_empty() {
-        let label = error.upstream.as_deref().unwrap_or("unattributed");
-        metrics.inc_upstream_errors(label, error.kind());
-        if error.upstream.is_some() {
-            metrics.set_upstream_health(label, 0.0);
-        }
-    } else {
-        for attempt in &error.attempts {
-            record_upstream_attempt(metrics, attempt);
-        }
+    for attempt in &error.attempts {
+        record_upstream_attempt(metrics, attempt);
+    }
+
+    let final_kind = error.kind();
+    let already_recorded = error.upstream.as_deref().is_some_and(|name| {
+        error.attempts.iter().any(|attempt| {
+            !attempt.cancelled && attempt.name == name && attempt.error_kind() == Some(final_kind)
+        })
+    });
+    if already_recorded {
+        return;
+    }
+
+    let label = error.upstream.as_deref().unwrap_or("unattributed");
+    metrics.inc_upstream_errors(label, final_kind);
+    if error.upstream.is_some() {
+        metrics.set_upstream_health(label, 0.0);
     }
 }
 
 /// Emits one candidate attempt: its own RTT, error kind (if any) and health.
 ///
-/// Failed-attempt time is therefore never included in the winner's RTT.
+/// Failed-attempt time is therefore never included in the winner's RTT. A
+/// cancelled attempt only increments the cancelled counter: it has no usable
+/// RTT and is not evidence that the upstream is unhealthy.
 fn record_upstream_attempt(
     metrics: &sito_stats::MetricsRegistry,
     attempt: &sito_upstream::UpstreamAttempt,
 ) {
+    if attempt.cancelled {
+        metrics.inc_upstream_cancelled(&attempt.name);
+        return;
+    }
     metrics.observe_upstream_rtt(&attempt.name, attempt.rtt.as_secs_f64());
     match attempt.error_kind() {
         Some(kind) => {
