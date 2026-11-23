@@ -13,7 +13,7 @@ use sito_ha_types::status::PublicationState;
 use super::clock::{ManualMonotonicClock, ManualTimers, MonotonicClock};
 use super::engine::{
     ConfiguredRole, EffectiveRole, Eligibility, LeaseBackend, PreparedBundle, PromotionEngine,
-    PromotionHost, PromotionOutcome, PromotionPhase,
+    PromotionHost, PromotionOutcome, PromotionPhase, PublishDeadline,
 };
 use super::reconcile::PeerReport;
 use super::state::{HaStateStore, LoadedState, PersistedMasterState, PublicationBaseline};
@@ -229,10 +229,18 @@ impl LeaseBackend for RecordingBackend {
 struct ConflictBackend {
     inner: Arc<WitnessClient>,
     conflict: Mutex<Option<LeaseRecord>>,
+    fail_info: AtomicBool,
 }
 
 impl LeaseBackend for ConflictBackend {
     fn info(&self) -> super::clock::BoxFuture<'_, Result<LeaseInfo, WitnessClientError>> {
+        if self.fail_info.load(Ordering::SeqCst) {
+            return Box::pin(async {
+                Err(WitnessClientError::Unavailable {
+                    detail: "injected witness info failure".to_string(),
+                })
+            });
+        }
         let inner = Arc::clone(&self.inner);
         Box::pin(async move { inner.info().await })
     }
@@ -333,6 +341,8 @@ struct TestHost {
     fail_renew_on_reports: Mutex<Option<Arc<AtomicBool>>>,
     fail_renew_on_hello_end: Mutex<Option<Arc<AtomicBool>>>,
     admissions_denied: AtomicBool,
+    clock: Mutex<Option<Arc<ManualMonotonicClock>>>,
+    slow_publish_millis: Mutex<Option<u64>>,
 }
 
 impl TestHost {
@@ -358,7 +368,17 @@ impl TestHost {
             fail_renew_on_reports: Mutex::new(None),
             fail_renew_on_hello_end: Mutex::new(None),
             admissions_denied: AtomicBool::new(false),
+            clock: Mutex::new(None),
+            slow_publish_millis: Mutex::new(None),
         }
+    }
+
+    fn set_clock(&self, clock: Arc<ManualMonotonicClock>) {
+        *self.clock.lock().unwrap() = Some(clock);
+    }
+
+    fn set_slow_publish_millis(&self, millis: u64) {
+        *self.slow_publish_millis.lock().unwrap() = Some(millis);
     }
 
     fn fail_renew_on_reports(&self, flag: Arc<AtomicBool>) {
@@ -485,15 +505,29 @@ impl PromotionHost for TestHost {
         Box::pin(async move { Ok(reports) })
     }
 
-    fn publish_first(
-        &self,
-        prepared: &PreparedBundle,
-    ) -> super::clock::BoxFuture<'_, Result<String, String>> {
+    fn publish_first<'a>(
+        &'a self,
+        prepared: &'a PreparedBundle,
+        deadline: &'a PublishDeadline,
+    ) -> super::clock::BoxFuture<'a, Result<String, String>> {
         if self.hello_only.load(Ordering::SeqCst) {
             self.publish_during_hello_only.store(true, Ordering::SeqCst);
         }
         if self.fail_publish.load(Ordering::SeqCst) {
             return Box::pin(async { Err("injected publish failure".to_string()) });
+        }
+        // Model a slow durable pre-publish write: the host advances the clock
+        // and must refuse to push when the deadline handle is no longer safe.
+        if let Some(delay) = *self.slow_publish_millis.lock().unwrap() {
+            if let Some(clock) = self.clock.lock().unwrap().clone() {
+                clock.advance_boot(delay);
+            }
+            if !deadline.is_safe() {
+                self.log("publish_deadline_passed");
+                return Box::pin(async {
+                    Err("self-fence deadline passed before the push".to_string())
+                });
+            }
         }
         self.log(format!(
             "publish:{}:{}",
@@ -582,9 +616,11 @@ impl Harness {
         let data_dir = fixture.dir.join(format!("data-{node_id}"));
         let events = Arc::new(Mutex::new(Vec::new()));
         let host = Arc::new(TestHost::new(&data_dir, Arc::clone(&events)));
+        let clock = Arc::new(ManualMonotonicClock::new(1_000, START_MS));
+        host.set_clock(Arc::clone(&clock));
         Self {
             fixture,
-            clock: Arc::new(ManualMonotonicClock::new(1_000, START_MS)),
+            clock,
             events,
             host,
         }
@@ -1707,11 +1743,57 @@ async fn late_ahead_peer_is_reported_to_the_runtime_latch() {
 }
 
 #[tokio::test]
+async fn renewal_conflict_without_the_witness_clock_fences() {
+    let harness = Harness::new("renew_conflict_no_clock", "node-a").await;
+    let conflict_backend = Arc::new(ConflictBackend {
+        inner: Arc::new(harness.fixture.client("node-a")),
+        conflict: Mutex::new(None),
+        fail_info: AtomicBool::new(false),
+    });
+    let clock: Arc<dyn MonotonicClock> = harness.clock.clone();
+    let host: Arc<dyn PromotionHost> = harness.host.clone();
+    let engine = PromotionEngine::with_runtime(
+        harness.fixture.config("node-a"),
+        ConfiguredRole::Master,
+        harness.data_dir("node-a"),
+        conflict_backend.clone(),
+        host,
+        clock,
+        Arc::new(ManualTimers::new(Arc::clone(&harness.clock))),
+    )
+    .unwrap();
+    assert_eq!(engine.start_master().await, PromotionOutcome::Master);
+    // Every subsequent info call fails, and the renewal returns a conflict
+    // with a current record that cannot be classified without the witness
+    // clock.
+    conflict_backend.fail_info.store(true, Ordering::SeqCst);
+    *conflict_backend.conflict.lock().unwrap() = Some(LeaseRecord {
+        schema: 1,
+        cluster_id: CLUSTER.to_string(),
+        holder: "node-a/other-boot".to_string(),
+        node_id: "node-a".to_string(),
+        term: 1,
+        revision: 2,
+        version: 1,
+        bundle_hash: hash(0xab),
+        acquired_unix_ms: 1,
+        expires_unix_ms: i64::MAX,
+    });
+    assert!(engine.renew_once().await.is_err());
+    assert!(engine.snapshot().fenced, "uncertain lease time must fence");
+    assert_eq!(
+        engine.fence_store().load().unwrap().unwrap().reason,
+        "lease_lost"
+    );
+}
+
+#[tokio::test]
 async fn engine_level_renewal_409_fences_immediately() {
     let harness = Harness::new("renew_409", "node-a").await;
     let conflict_backend = Arc::new(ConflictBackend {
         inner: Arc::new(harness.fixture.client("node-a")),
         conflict: Mutex::new(None),
+        fail_info: AtomicBool::new(false),
     });
     let config = harness.fixture.config("node-a");
     let clock: Arc<dyn MonotonicClock> = harness.clock.clone();
@@ -1911,29 +1993,6 @@ impl LeaseBackend for SlowSleepBackend {
     }
 }
 
-/// Timers that make the boot clock unavailable after a configured number of
-/// sleeps, modelling `CLOCK_BOOTTIME` failing mid-promotion.
-struct FlipTimers {
-    clock: Arc<ManualMonotonicClock>,
-    sleeps: std::sync::atomic::AtomicUsize,
-    flip_after: usize,
-}
-
-impl super::clock::PromotionTimers for FlipTimers {
-    fn sleep(&self, duration: Duration) -> super::clock::BoxFuture<'static, ()> {
-        let clock = Arc::clone(&self.clock);
-        let count = self.sleeps.fetch_add(1, Ordering::SeqCst) + 1;
-        let flip = count >= self.flip_after;
-        Box::pin(async move {
-            clock.advance_boot(duration.as_millis().try_into().unwrap_or(u64::MAX));
-            if flip {
-                clock.set_boot_unavailable(true);
-            }
-            tokio::task::yield_now().await;
-        })
-    }
-}
-
 #[tokio::test]
 async fn retried_first_publish_quiesce_never_sends_the_pending_version() {
     let harness = Harness::new("retry_pending", "node-a").await;
@@ -1985,8 +2044,8 @@ async fn retried_first_publish_quiesce_never_sends_the_pending_version() {
     assert!(
         events[..publish]
             .iter()
-            .all(|event| !event.contains(&format!(":renew_req:1:{pending_hash}"))),
-        "the pending version must never be sent to the witness"
+            .all(|event| !event.starts_with("renew_req:1:")),
+        "the pending version 1 ({pending_hash}) must never be sent to the witness"
     );
     let record = harness
         .fixture
@@ -2182,28 +2241,16 @@ async fn slow_renewal_times_out_before_the_deadline_and_closes_the_gate() {
 }
 
 #[tokio::test]
-async fn boot_clock_unavailable_during_reconciliation_fences() {
+async fn boot_clock_unavailable_at_the_reconcile_window_fences() {
     let harness = Harness::new("reconcile_clock", "node-a").await;
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    // Quiesce completes normally, then the boot clock disappears exactly at
+    // the reconcile window's start read. This isolates the reconcile fail-closed
+    // path from the quiesce/renewal clock checks.
     let clock = Arc::clone(&harness.clock);
-    let timers = Arc::new(FlipTimers {
-        clock: Arc::clone(&clock),
-        sleeps: std::sync::atomic::AtomicUsize::new(0),
-        flip_after: 6,
-    });
-    let backend = Arc::new(RecordingBackend {
-        inner: Arc::new(harness.fixture.client("node-a")),
-        events: Arc::clone(&harness.events),
-    });
-    let engine = PromotionEngine::with_runtime(
-        harness.fixture.config("node-a"),
-        ConfiguredRole::Master,
-        harness.data_dir("node-a"),
-        backend,
-        Arc::clone(&harness.host) as Arc<dyn PromotionHost>,
-        clock as Arc<dyn MonotonicClock>,
-        timers,
-    )
-    .unwrap();
+    engine.set_quiesce_complete_hook(Arc::new(move || {
+        clock.set_boot_unavailable(true);
+    }));
     let outcome = engine.start_master().await;
     assert_eq!(outcome, PromotionOutcome::Fenced);
     assert!(engine.snapshot().fenced);
@@ -2282,4 +2329,34 @@ async fn late_peer_reports_are_consumed_and_latched_by_the_engine() {
         0,
         "the queue is drained"
     );
+}
+
+#[tokio::test]
+async fn slow_first_publish_crossing_the_deadline_fences_and_publishes_nothing() {
+    let harness = Harness::new("slow_first_publish", "node-a").await;
+    // The host models a durable pre-publish write that consumes the whole
+    // self-fence budget before the push.
+    harness.host.set_slow_publish_millis(10_000);
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    let outcome = engine.start_master().await;
+    assert_eq!(outcome, PromotionOutcome::Fenced);
+    assert!(engine.snapshot().fenced);
+    assert_eq!(
+        engine.fence_store().load().unwrap().unwrap().reason,
+        "lease_lost"
+    );
+    assert!(
+        harness.event_index("publish:").is_none(),
+        "nothing may be pushed after the deadline: {:?}",
+        harness.events()
+    );
+    assert!(
+        harness
+            .events()
+            .iter()
+            .any(|event| event == "publish_deadline_passed"),
+        "the host must reject the push when the deadline handle is unsafe: {:?}",
+        harness.events()
+    );
+    assert!(!harness.host.writable.load(Ordering::SeqCst));
 }

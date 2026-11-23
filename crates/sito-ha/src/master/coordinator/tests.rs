@@ -3319,6 +3319,90 @@ fn normal_publish_preserves_promotion_published_baseline() {
 }
 
 #[tokio::test]
+async fn durable_published_baseline_advances_only_after_broadcast() {
+    use crate::promotion::state::{PromotionBookkeeping, PublicationBaseline};
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_coord_persist_broadcast_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let path = dir.join("ha_state.toml");
+    let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+    let coordinator = MasterCoordinator::new(
+        "test-master".to_string(),
+        1,
+        key,
+        sito_stats::MetricsRegistry::new("test", "test"),
+    )
+    .with_state_path(path.clone());
+    let baseline = "ab".repeat(32);
+    coordinator.set_promotion_bookkeeping(Some(PromotionBookkeeping::published(
+        PublicationBaseline::new(1, &baseline).unwrap(),
+    )));
+    let (tx, mut rx) = mpsc::channel::<HaMessage>(8);
+    coordinator.slaves.lock().unwrap().insert(
+        "slave-1".to_string(),
+        ActiveSlave {
+            instance: "slave-1".to_string(),
+            remote_addr: "127.0.0.1:1000".parse().unwrap(),
+            synced_version: 1,
+            last_ping: Instant::now(),
+            connected_at: Utc::now(),
+            last_stats: None,
+            sender: tx,
+            capabilities: vec![],
+            have_term: 0,
+            have_version: 1,
+            have_bundle_hash: Some(baseline.clone()),
+            connection_id: 1,
+        },
+    );
+    // Observe the state file between the pre-publish write and the broadcast.
+    let window = Arc::new(Mutex::new(None));
+    let window_hook = Arc::clone(&window);
+    let path_for_hook = path.clone();
+    coordinator.set_before_broadcast_hook(Box::new(move || {
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path_for_hook).unwrap()).unwrap();
+        *window_hook.lock().unwrap() = Some((
+            value["published_version"].as_u64().unwrap(),
+            value["publication_state"].as_str().unwrap().to_string(),
+        ));
+    }));
+
+    assert_eq!(
+        coordinator
+            .update_bundle_async(test_bundle(2))
+            .await
+            .unwrap(),
+        2
+    );
+    let (version, state) = window
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("hook ran inside the publish");
+    assert_eq!(
+        version, 1,
+        "the durable published baseline must not advance before the broadcast"
+    );
+    assert_eq!(state, "publishing");
+
+    // After the enqueue the durable baseline advances with the push.
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(value["published_version"], 2);
+    assert_eq!(value["publication_state"], "published");
+    assert!(
+        matches!(rx.try_recv(), Ok(HaMessage::ConfigPush { version: 2, .. })),
+        "the slave must be enqueued the new version"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn failed_second_persist_does_not_advance_the_durable_baseline() {
     use crate::promotion::state::{PromotionBookkeeping, PublicationBaseline};
 
@@ -3553,9 +3637,7 @@ fn hello_only_with_pushes_disabled_still_admits_and_reports_peers() {
 }
 
 #[test]
-fn late_ahead_hello_is_reported_latched_and_never_pushed() {
-    use crate::promotion::PeerReport;
-
+fn late_ahead_hello_is_latched_synchronously_and_never_pushed() {
     let coordinator = test_coordinator();
     coordinator.update_bundle(test_bundle(2)).unwrap();
     // A normal promotion runs hello-only through the reconcile window and then
@@ -3576,28 +3658,26 @@ fn late_ahead_hello_is_reported_latched_and_never_pushed() {
     };
     let session = SessionMachine::admit(&coordinator, "127.0.0.1:2000".parse().unwrap(), hello)
         .expect("authenticated v2 peer is admitted");
+    // Admission latches synchronously: registration (and therefore the active
+    // push on Hello) sees the latch and queues nothing.
+    assert!(coordinator.is_late_peer_latched("late-ahead"));
+    assert!(coordinator.is_diverged(), "the latched peer is diverged");
     let mut rx = session.register();
-    // The report is queued for the promotion engine; registration itself does
-    // not latch (the engine owns the lateness decision and the divergence).
-    assert!(matches!(
-        rx.try_recv(),
-        Ok(HaMessage::ConfigPush { version: 2, .. })
-    ));
+    assert!(
+        rx.try_recv().is_err(),
+        "a late ahead peer must not receive the active push at registration"
+    );
     let reports = coordinator.take_late_peer_reports();
     let report = reports
         .iter()
         .find(|report| report.instance == "late-ahead")
-        .expect("late ahead hello must be reported");
+        .expect("late ahead hello must be reported to the promotion engine");
     assert_eq!(report.have_version, 3);
     assert_eq!(report.have_term, 0);
     assert_eq!(
         report.have_bundle_hash.as_deref(),
         Some("ef".repeat(32).as_str())
     );
-
-    coordinator.latch_late_peer(report, "late ahead of the master");
-    assert!(coordinator.is_late_peer_latched("late-ahead"));
-    assert!(coordinator.is_diverged(), "the latched peer is diverged");
 
     // A broadcast must not queue anything for the latched peer.
     let push = coordinator
@@ -3656,7 +3736,68 @@ fn late_ahead_hello_is_reported_latched_and_never_pushed() {
         matches!(rx.try_recv(), Ok(HaMessage::ConfigPush { version: 2, .. })),
         "a healthy peer keeps receiving pushes"
     );
-    let _: Option<&PeerReport> = None;
+}
+
+#[tokio::test]
+async fn coalesced_delivery_does_not_reach_a_late_latched_peer() {
+    use crate::promotion::PeerReport;
+
+    let coordinator = test_coordinator();
+    coordinator.update_bundle(test_bundle(2)).unwrap();
+    // The reconcile window has ended; a peer that connects now and reports
+    // ahead is a late peer.
+    coordinator.end_hello_only();
+    let (tx, mut rx) = mpsc::channel::<HaMessage>(8);
+    coordinator.slaves.lock().unwrap().insert(
+        "late-coalesced".to_string(),
+        ActiveSlave {
+            instance: "late-coalesced".to_string(),
+            remote_addr: "127.0.0.1:2500".parse().unwrap(),
+            synced_version: 0,
+            last_ping: Instant::now(),
+            connected_at: Utc::now(),
+            last_stats: None,
+            sender: tx.clone(),
+            capabilities: vec![],
+            have_term: 0,
+            have_version: 3,
+            have_bundle_hash: Some("ef".repeat(32)),
+            connection_id: 1,
+        },
+    );
+    coordinator
+        .queued_bytes
+        .lock()
+        .unwrap()
+        .insert(("late-coalesced".to_string(), 1), 0);
+    let push = coordinator
+        .active_push
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("active push");
+    coordinator.schedule_coalesced_delivery("late-coalesced", 1, &tx, &push);
+    // Latch before the spawned task is first polled.
+    coordinator.latch_late_peer(
+        &PeerReport {
+            instance: "late-coalesced".to_string(),
+            have_term: 0,
+            have_version: 3,
+            have_bundle_hash: Some("ef".repeat(32)),
+        },
+        "late ahead of the master",
+    );
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        coordinator.pending_fallbacks.lock().unwrap().is_empty(),
+        "the coalesced task must finish without delivering"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a coalesced task scheduled before the latch must not deliver after it"
+    );
 }
 
 #[test]

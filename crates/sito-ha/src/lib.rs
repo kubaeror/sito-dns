@@ -39,7 +39,7 @@ pub use master::{
 pub use promotion::{
     ConfiguredRole, EffectiveRole, Eligibility, FenceMarker, FenceReason, FenceStore, HaStateStore,
     LeaseBackend, LoadedState, PromotionBookkeeping, PromotionEngine, PromotionHost,
-    PromotionOutcome, PromotionPhase, PromotionSnapshot, PublicationBaseline,
+    PromotionOutcome, PromotionPhase, PromotionSnapshot, PublicationBaseline, PublishDeadline,
     WITNESS_REQUEST_TIMEOUT, WitnessClient, WitnessClientError,
 };
 pub use protocol::{AckConflict, HaMessage, PROTOCOL_VERSION, UpstreamReport};

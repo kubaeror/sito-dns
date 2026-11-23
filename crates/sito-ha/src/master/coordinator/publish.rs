@@ -243,6 +243,20 @@ impl MasterCoordinator {
     /// engine has already confirmed the version is above the published
     /// baseline; this method must not be used by normal API publishes.
     pub fn publish_promoted_bundle(&self, bundle: ConfigBundle) -> Result<String, HaError> {
+        self.publish_promoted_bundle_checked(bundle, &|| true)
+    }
+
+    /// Like [`Self::publish_promoted_bundle`], with a deadline guard.
+    ///
+    /// `safe_to_push` is consulted after the pre-publish state write (which may
+    /// include a slow fsync) and immediately before the bundle is installed and
+    /// enqueued. A `false` result aborts with no push: the durable state is the
+    /// recoverable `publishing` marker written by the engine.
+    pub fn publish_promoted_bundle_checked(
+        &self,
+        bundle: ConfigBundle,
+        safe_to_push: &dyn Fn() -> bool,
+    ) -> Result<String, HaError> {
         let mut bundle = bundle;
         bundle.strip_structured_secrets();
         seal_bundle_identity(&mut bundle, &self.signing_key.public_key());
@@ -270,6 +284,7 @@ impl MasterCoordinator {
         Self::ensure_push_fits(&push)?;
         let hash = crate::bundle::push_payload_hash(&push)?;
         let version = bundle.version;
+        let publishing_bookkeeping = self.promotion_bookkeeping();
         {
             let _publish_guard = sito_core::sync::lock_or_recover(&self.publish_lock);
             // Narrow the fence/persist race: a serving transition must be
@@ -282,12 +297,31 @@ impl MasterCoordinator {
                 });
             }
             self.persist_bundle(&bundle)?;
+            // The durable `publishing` write above may have taken a slow
+            // fsync. Re-check the lease budget immediately before the push; a
+            // publish after the local deadline is never allowed.
+            if !safe_to_push() {
+                return Err(HaError::Validation {
+                    field: "ha_promotion".to_string(),
+                    reason: "self-fence deadline passed before the first push".to_string(),
+                });
+            }
             self.publish_prepared(bundle.clone(), version, &push);
         }
-        self.record_published_from_push(&push);
-        self.persist_bundle(&bundle)?;
-        self.record_published_version(version);
+        #[cfg(test)]
+        self.run_before_broadcast_hook();
+        // Enqueue before advancing the durable published baseline: the witness
+        // baseline must never lead the actual enqueue (ADR-0010).
         self.broadcast(&push);
+        self.record_published_from_push(&push);
+        if let Err(error) = self.persist_bundle(&bundle) {
+            // The active bundle was enqueued but the durable baseline did not
+            // advance. Keep the `publishing` bookkeeping that matches the first
+            // write; reconciliation can prove the publish from a peer.
+            self.restore_promotion_bookkeeping(publishing_bookkeeping);
+            return Err(HaError::Io(error));
+        }
+        self.record_published_version(version);
         Ok(hash)
     }
 
@@ -371,25 +405,27 @@ impl MasterCoordinator {
             return Err(HaError::Io(error));
         }
         self.publish_prepared(bundle, version, &push_msg);
+        #[cfg(test)]
+        self.run_before_broadcast_hook();
+        // Broadcast before advancing the durable published baseline: the
+        // witness baseline must never lead the enqueue (ADR-0010).
+        self.broadcast(&push_msg);
         if promotion_baseline {
-            // ADR-0010: after a successful publish the durable published
+            // ADR-0010: after the publish is enqueued the durable published
             // baseline advances with the active bundle. The witness is renewed
             // by the promotion engine only after this second write, so an
-            // unpublished version is never advertised.
+            // unenqueued version is never advertised.
             self.record_published_from_push(&push_msg);
             if let Err(error) = self.persist_bundle(&bundle_for_state) {
-                // The active bundle may have been installed, but the durable
-                // baseline did not advance. Keep the in-memory bookkeeping that
-                // matches the first write (`publishing` with the pending hash),
-                // which reconciliation can prove or safely reuse.
+                // The active bundle was enqueued, but the durable baseline did
+                // not advance. Keep the in-memory bookkeeping that matches the
+                // first write (`publishing` with the pending hash), which
+                // reconciliation can prove or safely reuse.
                 self.restore_promotion_bookkeeping(publishing_bookkeeping);
                 return Err(HaError::Io(error));
             }
         }
         self.record_published_version(version);
-
-        // Broadcast to all active slaves
-        self.broadcast(&push_msg);
 
         info!(
             version,
@@ -529,6 +565,13 @@ impl MasterCoordinator {
         };
 
         if let Some(active) = conflict {
+            // The prepared version lost the race to a newer active bundle.
+            // Restore both the active bundle and the pre-publish bookkeeping so
+            // the durable file is not left with our `publishing` marker beside
+            // the newer bundle.
+            if promotion_baseline {
+                self.restore_promotion_bookkeeping(previous_bookkeeping);
+            }
             // `persist_lock` is still held, so no async publisher can interleave
             // with this restore. The write runs on the blocking pool: a
             // synchronous `std::fs` write here would stall a tokio worker.
@@ -545,10 +588,17 @@ impl MasterCoordinator {
             });
         }
 
+        #[cfg(test)]
+        self.run_before_broadcast_hook();
+        // Broadcast before advancing the durable published baseline: the
+        // witness baseline must never lead the enqueue (ADR-0010).
+        let broadcast = self.broadcast_with_counts(&push_msg);
+
         if promotion_baseline {
             // ADR-0010: persist the advanced published baseline only after the
-            // active bundle is published in memory. A failure here is a publish
-            // failure and no broadcast is attempted with an unrecorded baseline.
+            // bundle is enqueued to every connected slave. A failure here is a
+            // publish failure; the state file keeps the `publishing` marker so
+            // reconciliation can prove the publish.
             self.record_published_from_push(&push_msg);
             if let Err(e) = self.persist_bundle_async(&bundle_for_state).await {
                 self.restore_promotion_bookkeeping(publishing_bookkeeping);
@@ -557,11 +607,6 @@ impl MasterCoordinator {
             }
         }
         self.record_published_version(version);
-
-        // Broadcast to all active slaves. Keep connected/queued/coalesced
-        // counts distinct: a connected slave with a closed channel must not
-        // turn the outcome into NoSlaves.
-        let broadcast = self.broadcast_with_counts(&push_msg);
 
         info!(
             version,
@@ -694,6 +739,12 @@ impl MasterCoordinator {
         wire_size: usize,
         msg: HaMessage,
     ) -> Result<(), String> {
+        // A latched late-ahead peer must never be overwritten. This is the
+        // single queueing entry point for initial/catch-up/resync pushes, so
+        // the check also covers a push prepared before the latch was set.
+        if self.is_late_peer_latched(instance) {
+            return Err("slave is latched as a late ahead peer".to_string());
+        }
         let session = (instance.to_string(), connection_id);
         // Hold the accounting lock across the budget check, `try_send` and the
         // increment: the session loop subtracts under the same lock, and
@@ -763,6 +814,19 @@ impl MasterCoordinator {
         let sender = sender.clone();
         let fallback = fallback_msg.clone();
         tokio::spawn(async move {
+            let remove_pending = |session: &SessionKey| {
+                sito_core::sync::lock_or_recover(&coordinator.pending_fallbacks).remove(session);
+            };
+            // The peer may have been latched between scheduling and this task's
+            // first poll. A latched late-ahead peer must never be overwritten.
+            if coordinator.is_late_peer_latched(&instance) {
+                debug!(
+                    instance = %instance,
+                    "Coalesced delivery skipped: slave is latched as a late ahead peer"
+                );
+                remove_pending(&session);
+                return;
+            }
             // Prefer the latest active bundle; fall back to the message that
             // could not be enqueued.
             let latest = sito_core::sync::lock_or_recover(&coordinator.active_push)
@@ -780,6 +844,9 @@ impl MasterCoordinator {
                 // leave phantom bytes.
                 let mut reserved = false;
                 loop {
+                    if coordinator.is_late_peer_latched(&instance) {
+                        break;
+                    }
                     let (owns, has_room) = {
                         let slaves = sito_core::sync::lock_or_recover(&coordinator.slaves);
                         let owns = slaves
@@ -810,6 +877,18 @@ impl MasterCoordinator {
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
+                if reserved && coordinator.is_late_peer_latched(&instance) {
+                    // Latched after the reservation but before the send:
+                    // release the bytes and drop the push.
+                    if size > 0 {
+                        let mut queued =
+                            sito_core::sync::lock_or_recover(&coordinator.queued_bytes);
+                        if let Some(current) = queued.get_mut(&session) {
+                            *current = current.saturating_sub(size);
+                        }
+                    }
+                    reserved = false;
+                }
                 if reserved && let Err(e) = sender.send(latest).await {
                     // The send failed, so release the reservation. The key may
                     // already be gone if a reconnect superseded this session.
@@ -823,7 +902,7 @@ impl MasterCoordinator {
                     warn!(instance = %instance, "Failed to deliver queued HA push: {e}");
                 }
             }
-            sito_core::sync::lock_or_recover(&coordinator.pending_fallbacks).remove(&session);
+            remove_pending(&session);
         });
     }
 

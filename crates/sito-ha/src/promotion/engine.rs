@@ -146,6 +146,47 @@ pub struct PreparedBundle {
     pub hash: String,
 }
 
+/// A monotonic self-fence deadline handle for the first publish.
+///
+/// The first publish performs a durable state write before it enqueues the
+/// bundle. A slow fsync must not let the push happen after the local deadline
+/// (or the witness expiry). The host consults [`Self::is_safe`] immediately
+/// before installing/enqueueing the bundle; the engine fences when the host
+/// reports that the deadline was missed.
+#[derive(Clone)]
+pub struct PublishDeadline {
+    clock: Arc<dyn MonotonicClock>,
+    deadline_millis: u64,
+}
+
+impl PublishDeadline {
+    /// Builds a deadline handle for `deadline_millis` (monotonic milliseconds).
+    #[must_use]
+    pub fn new(clock: Arc<dyn MonotonicClock>, deadline_millis: u64) -> Self {
+        Self {
+            clock,
+            deadline_millis,
+        }
+    }
+
+    /// Whether the local self-fence deadline is still in the future.
+    #[must_use]
+    pub fn is_safe(&self) -> bool {
+        self.clock
+            .boot_millis()
+            .is_ok_and(|now| now < self.deadline_millis)
+    }
+
+    /// The remaining safe time, if the boot clock is readable.
+    #[must_use]
+    pub fn remaining(&self) -> Option<Duration> {
+        let now = self.clock.boot_millis().ok()?;
+        Some(Duration::from_millis(
+            self.deadline_millis.saturating_sub(now),
+        ))
+    }
+}
+
 /// Runtime integration points for the engine.
 pub trait PromotionHost: Send + Sync + 'static {
     /// Applies the slave watermark and current local document to a bundle built
@@ -226,7 +267,15 @@ pub trait PromotionHost: Send + Sync + 'static {
 
     /// Publishes the first bundle: enqueue it to connected slaves and make it
     /// the active bundle. Returns the signed-payload hash that was pushed.
-    fn publish_first(&self, prepared: &PreparedBundle) -> BoxFuture<'_, Result<String, String>>;
+    ///
+    /// The host must consult `deadline` after its durable pre-publish write and
+    /// immediately before installing/enqueueing the bundle. If the deadline is
+    /// no longer safe, it must return an error without pushing.
+    fn publish_first<'a>(
+        &'a self,
+        prepared: &'a PreparedBundle,
+        deadline: &'a PublishDeadline,
+    ) -> BoxFuture<'a, Result<String, String>>;
 
     /// Stops publishing immediately (fence step 2).
     fn stop_publishing(&self);
@@ -426,6 +475,11 @@ pub struct PromotionEngine {
     fail_published_state_write: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_pending_state_write: std::sync::atomic::AtomicBool,
+    /// Test-only hook invoked after the quiesce window completes and before
+    /// reconciliation starts. Lets a test fail the boot clock exactly at the
+    /// reconcile-window read.
+    #[cfg(test)]
+    quiesce_complete_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl PromotionEngine {
@@ -500,6 +554,8 @@ impl PromotionEngine {
                 fail_published_state_write: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(test)]
                 fail_pending_state_write: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                quiesce_complete_hook: Mutex::new(None),
             });
         }
         let cluster_id = config
@@ -577,6 +633,8 @@ impl PromotionEngine {
             fail_published_state_write: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_pending_state_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            quiesce_complete_hook: Mutex::new(None),
         })
     }
 
@@ -602,6 +660,28 @@ impl PromotionEngine {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Test-only: run `hook` after quiesce and before the reconcile-window
+    /// clock read.
+    #[cfg(test)]
+    pub fn set_quiesce_complete_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .quiesce_complete_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_quiesce_complete_hook(&self) {
+        let hook = self
+            .quiesce_complete_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// Current internal snapshot.
     #[must_use]
     pub fn snapshot(&self) -> PromotionSnapshot {
@@ -616,6 +696,21 @@ impl PromotionEngine {
             .deadline
             .as_ref()
             .map(SelfFenceDeadline::deadline_millis)
+    }
+
+    /// The current self-fence deadline as a monotonic handle for the first
+    /// publish. `None` before a lease is held or after a fence.
+    #[must_use]
+    pub fn publish_deadline(&self) -> Option<PublishDeadline> {
+        let deadline_millis = self
+            .lock()
+            .deadline
+            .as_ref()
+            .map(SelfFenceDeadline::deadline_millis)?;
+        Some(PublishDeadline::new(
+            Arc::clone(&self.clock),
+            deadline_millis,
+        ))
     }
 
     /// The per-process witness holder identity (`node_id/boot_uuid`).
@@ -1004,10 +1099,12 @@ impl PromotionEngine {
                     // more than the TTL on a slow/retried renewal.
                     let fresh_now = self.refresh_witness_now().await?;
                     if fresh_now.is_none() && error.current_record().is_some() {
-                        return Err(HaError::Connection(
-                            "cannot classify a renewal conflict without the witness clock"
-                                .to_string(),
-                        ));
+                        // A conflict that cannot be classified without the
+                        // witness clock is uncertain lease state: fail closed
+                        // rather than retrying with a record we cannot judge.
+                        let detail = "cannot classify a renewal conflict without the witness clock";
+                        self.fence(FenceReason::LeaseLost, detail)?;
+                        return Err(HaError::Connection(detail.to_string()));
                     }
                     witness_now = fresh_now.or(witness_now);
                     let action = classify_renewal_error(
@@ -1315,6 +1412,8 @@ impl PromotionEngine {
         {
             self.lock().snapshot.quiesce_remaining_secs = 0;
         }
+        #[cfg(test)]
+        self.run_quiesce_complete_hook();
         Ok(())
     }
 
@@ -1680,10 +1779,33 @@ impl PromotionEngine {
             }
             return self.transition_read_only(PromotionPhase::Aborted, "lease_lost", true);
         }
-        let published_hash = match self.host.publish_first(prepared).await {
+        // The first publish includes a durable state write and an enqueue. A
+        // slow fsync or broadcast must not push after the local deadline; the
+        // host re-checks this handle immediately before the push and aborts
+        // without enqueueing when it is no longer safe.
+        let Some(deadline) = self.publish_deadline() else {
+            let _ = self.fence(
+                FenceReason::LeaseLost,
+                "no self-fence deadline is armed before the first publish",
+            );
+            return PromotionOutcome::Fenced;
+        };
+        if !deadline.is_safe() {
+            let _ = self.fence(
+                FenceReason::LeaseLost,
+                "the self-fence deadline passed before the first publish",
+            );
+            return PromotionOutcome::Fenced;
+        }
+        let published_hash = match self.host.publish_first(prepared, &deadline).await {
             Ok(hash) => hash,
             Err(error) => {
                 warn!(error = %error, "first publish failed; state remains 'publishing' for reconciliation");
+                // A slow pre-publish write may have consumed the lease budget;
+                // fence instead of leaving an open gate for a later retry.
+                if self.check_self_fence().unwrap_or(false) {
+                    return PromotionOutcome::Fenced;
+                }
                 return self.transition_read_only(
                     PromotionPhase::Aborted,
                     "promotion_interrupted",

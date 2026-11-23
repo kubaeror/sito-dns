@@ -45,6 +45,8 @@ impl MasterCoordinator {
             state_write_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             state_write_fail_after: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            before_broadcast_hook: Arc::new(Mutex::new(None)),
             diverged: Arc::new(Mutex::new(HashMap::new())),
             active_push_history: Arc::new(Mutex::new(VecDeque::new())),
             queued_bytes: Arc::new(Mutex::new(HashMap::new())),
@@ -268,6 +270,12 @@ impl MasterCoordinator {
 
     /// Queues a Hello report that arrived after the reconciliation window and
     /// is ahead of this master.
+    ///
+    /// The peer is latched *synchronously* here, before `register` can queue
+    /// the active push: the engine's asynchronous consumption is only for its
+    /// own never-bump-above bookkeeping. A Hello that is ahead must never
+    /// receive a `ConfigPush`, not even the active push queued during its own
+    /// registration.
     pub(super) fn record_late_peer_report(
         &self,
         instance: &str,
@@ -289,6 +297,10 @@ impl MasterCoordinator {
             have_version,
             have_bundle_hash,
         };
+        self.latch_late_peer(
+            &report,
+            "peer reported a term/version above this master after the reconcile window",
+        );
         let mut reports = sito_core::sync::lock_or_recover(&self.late_peer_reports);
         if reports.len() >= MAX_LATE_PEER_REPORTS {
             reports.remove(0);
@@ -300,7 +312,7 @@ impl MasterCoordinator {
             have_term,
             current_version,
             current_term,
-            "Recorded a late ahead peer for promotion-engine latching"
+            "Latched a late ahead peer and recorded it for the promotion engine"
         );
     }
 
@@ -560,6 +572,22 @@ impl MasterCoordinator {
     #[cfg(test)]
     pub(super) fn fail_state_write_after(&self, successful_writes: usize) {
         *sito_core::sync::lock_or_recover(&self.state_write_fail_after) = Some(successful_writes);
+    }
+
+    /// Test-only: install a hook invoked after the active bundle is installed
+    /// and before the first broadcast.
+    #[cfg(test)]
+    pub(super) fn set_before_broadcast_hook(&self, hook: BeforeBroadcastHook) {
+        *sito_core::sync::lock_or_recover(&self.before_broadcast_hook) = Some(hook);
+    }
+
+    /// Test-only: run the before-broadcast hook, if installed.
+    #[cfg(test)]
+    pub(super) fn run_before_broadcast_hook(&self) {
+        let hook = sito_core::sync::lock_or_recover(&self.before_broadcast_hook);
+        if let Some(hook) = hook.as_ref() {
+            hook();
+        }
     }
 
     /// Test-only injected write failure.

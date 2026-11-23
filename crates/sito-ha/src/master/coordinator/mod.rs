@@ -151,6 +151,11 @@ pub const MAX_PEER_VERSION_LEAD: u64 = 1_000_000;
 #[cfg(test)]
 type StateWriteHook = Arc<dyn Fn(u64) + Send + Sync>;
 
+/// Test-only hook invoked after the active bundle is installed and before the
+/// first broadcast.
+#[cfg(test)]
+type BeforeBroadcastHook = Box<dyn Fn() + Send + Sync>;
+
 /// Severity of a recorded divergence. Ordered so a fork outranks a term
 /// mismatch, which outranks a same-term version gap; `mark_diverged` never
 /// downgrades an existing higher-severity record.
@@ -253,6 +258,10 @@ pub struct MasterCoordinator {
     /// successful writes. `None` never fails.
     #[cfg(test)]
     state_write_fail_after: Arc<Mutex<Option<usize>>>,
+    /// Test-only hook invoked after the active bundle is installed and before
+    /// the first broadcast. Lets a test observe the persist/enqueue window.
+    #[cfg(test)]
+    before_broadcast_hook: Arc<Mutex<Option<BeforeBroadcastHook>>>,
     /// Divergence records per currently connected slave. They are sticky: only
     /// that slave's applied ACK for the current term/version or a disconnect
     /// removes them, never an unrelated version advance or a global resync.

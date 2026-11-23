@@ -39,7 +39,8 @@ pub use confirm::{
 };
 pub use engine::{
     ConfiguredRole, EffectiveRole, Eligibility, LeaseBackend, PreparedBundle, PromotionEngine,
-    PromotionHost, PromotionOutcome, PromotionPhase, PromotionSnapshot, manual_clock,
+    PromotionHost, PromotionOutcome, PromotionPhase, PromotionSnapshot, PublishDeadline,
+    manual_clock,
 };
 pub use fence::{
     FENCE_FILE, FENCE_PENDING_FILE, FENCE_PROTOCOL_VERSION, FenceMarker, FencePersistOutcome,
