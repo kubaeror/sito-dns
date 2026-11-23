@@ -265,6 +265,10 @@ pub async fn run_server_with_lease(
     #[cfg(feature = "ha")]
     let ha_write_gate = ha_runtime.write_gate.clone();
     #[cfg(feature = "ha")]
+    let promotion_status = ha_runtime.promotion_status_handle();
+    #[cfg(not(feature = "ha"))]
+    let promotion_status = sito_api::PromotionStatusHandle::default();
+    #[cfg(feature = "ha")]
     let promoted_master_coordinator = ha_runtime.promoted_master.clone();
     #[cfg(not(feature = "ha"))]
     let promoted_master_coordinator = Arc::new(Mutex::new(None));
@@ -376,6 +380,7 @@ pub async fn run_server_with_lease(
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         ha_write_gate: ha_write_gate.clone(),
+        promotion_status,
         master_coordinator,
         promoted_master_coordinator: promoted_master_coordinator.clone(),
         slave_tracker,

@@ -24,6 +24,7 @@ use crate::crypto::Ed25519SigningKey;
 use crate::witness::clock::ManualClock;
 use crate::witness::record::{AcquireRequest, LeaseInfo, LeaseRecord, RenewRequest};
 use crate::witness::server::{WitnessConfig, WitnessHandle, start_witness_server};
+use sito_stats::MetricsRegistry;
 
 const CLUSTER: &str = "home-dns";
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1051,6 +1052,41 @@ async fn reconciliation_aborts_on_same_version_fork_and_unknown_hash() {
 }
 
 #[tokio::test]
+async fn promotion_records_metrics_from_a_successful_acquisition() {
+    let harness = Harness::new("metrics", "node-a").await;
+    let metrics = MetricsRegistry::new("2.0.0", "test");
+    metrics.init_ha_promotion_metrics(true);
+    let engine = harness
+        .engine("node-a", ConfiguredRole::Master)
+        .with_metrics(metrics.clone());
+    assert_eq!(engine.start_master().await, PromotionOutcome::Master);
+
+    let rendered = metrics.render_prometheus();
+    assert!(rendered.contains(r#"sito_ha_promotion_attempts_total{result="success"} 1"#));
+    assert!(
+        rendered.contains(
+            r#"sito_ha_promotion_witness_requests_total{op="acquire",result="success"} 1"#
+        )
+    );
+    assert!(
+        rendered
+            .contains(r#"sito_ha_promotion_witness_requests_total{op="lease",result="success"}"#)
+    );
+    assert!(rendered.contains("sito_ha_promotion_last_success_timestamp_seconds"));
+    assert!(
+        !rendered.contains("sito_ha_promotion_last_success_timestamp_seconds 0"),
+        "a successful acquisition must publish a non-zero success timestamp"
+    );
+    // Bounded labels only: no node, holder, token or cluster labels.
+    for forbidden in ["node_id=", "holder=", "token=", "cluster_id="] {
+        assert!(
+            !rendered.contains(forbidden),
+            "{forbidden} must not be a label"
+        );
+    }
+}
+
+#[tokio::test]
 async fn self_fence_persists_and_a_restart_refuses_to_acquire() {
     let harness = Harness::new("self_fence", "node-a").await;
     let engine = harness.engine("node-a", ConfiguredRole::Master);
@@ -1081,6 +1117,22 @@ async fn self_fence_persists_and_a_restart_refuses_to_acquire() {
         record.term, term,
         "a fenced node must not acquire a new term"
     );
+
+    // `sito ha clear-fence --confirm` removes both markers locally; the next
+    // start is no longer refused and may acquire a fresh term.
+    restarted.fence_store().clear().unwrap();
+    assert!(restarted.fence_store().load().unwrap().is_none());
+    // Expire the old holder's witness record: clearing the fence only removes
+    // the durable no-reacquire marker, it does not grant a lease.
+    harness.fixture.clock.advance(5_000);
+    let cleared = harness.engine("node-a", ConfiguredRole::Master);
+    assert_ne!(cleared.boot().unwrap(), PromotionOutcome::Fenced);
+    assert_eq!(
+        cleared.start_master().await,
+        PromotionOutcome::Master,
+        "after clearing the fence the node may acquire a new term"
+    );
+    assert!(cleared.snapshot().term > term);
 }
 
 #[tokio::test]

@@ -376,6 +376,24 @@ pub enum HaCommands {
         #[command(subcommand)]
         command: LeaseAdminCommands,
     },
+    /// Write a one-shot local confirmation so the candidate may acquire the lease
+    ConfirmPromotion {
+        /// Optional path to configuration file (defaults to the main --config)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Required confirmation; writes `<data_dir>/ha_promote.confirm` (0600)
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Remove the durable fence markers after operator verification
+    ClearFence {
+        /// Optional path to configuration file (defaults to the main --config)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Required confirmation; removes `ha_fence.json` and `ha_fence.pending`
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 /// Offline witness lease administration.
@@ -1585,6 +1603,109 @@ pub fn run_ha_lease_admin_set(
         outcome.record.version,
         outcome.record.bundle_hash,
         outcome.record.term.saturating_add(1)
+    );
+    Ok(())
+}
+
+/// Loads the `[ha.promotion]` identity and data directory for the local CLI.
+#[cfg(feature = "ha")]
+fn promotion_cli_context(
+    config_path: &Path,
+    require_enabled: bool,
+) -> Result<(PathBuf, sito_ha::config::HaConfig), anyhow::Error> {
+    let content = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read configuration file '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+    let config = Config::from_toml_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Configuration validation failed for '{}': {}",
+            config_path.display(),
+            e
+        )
+    })?;
+    let ha = sito_ha::config_from_unvalidated(&config)
+        .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
+    if require_enabled && !ha.promotion.enabled {
+        return Err(anyhow::anyhow!(
+            "ha.promotion.enabled is false in '{}'; automatic promotion is not active on this node",
+            config_path.display()
+        ));
+    }
+    Ok((config.server.data_dir.clone(), ha))
+}
+
+/// Executes `sito ha confirm-promotion`.
+///
+/// Writes the ADR-0010 one-shot local confirmation for this node. The running
+/// candidate consumes it only after master loss, verifies cluster/node identity
+/// and age, and removes it. This never bypasses the witness lease.
+#[cfg(feature = "ha")]
+pub fn run_ha_confirm_promotion(config_path: &Path, confirm: bool) -> Result<(), anyhow::Error> {
+    if !confirm {
+        return Err(anyhow::anyhow!(
+            "Refusing to write a promotion confirmation without --confirm. Run `sito ha confirm-promotion --confirm` on the candidate after verifying master loss."
+        ));
+    }
+    let (data_dir, ha) = promotion_cli_context(config_path, true)?;
+    let cluster_id = ha.promotion.cluster_id.clone().ok_or_else(|| {
+        anyhow::anyhow!("ha.promotion.cluster_id is required to write a confirmation")
+    })?;
+    let node_id = ha.promotion.node_id.clone().ok_or_else(|| {
+        anyhow::anyhow!("ha.promotion.node_id is required to write a confirmation")
+    })?;
+    let store = sito_ha::promotion::ConfirmationStore::new(data_dir, cluster_id, node_id);
+    let now = chrono::Utc::now().timestamp_millis();
+    let confirmation = store
+        .confirm(now)
+        .map_err(|e| anyhow::anyhow!("Failed to write promotion confirmation: {e}"))?;
+    println!(
+        "Wrote one-shot promotion confirmation for cluster '{}', node '{}' at '{}' (mode 0600).\nIt authorizes one acquisition after master loss and expires with the heartbeat timeout.",
+        confirmation.cluster_id,
+        confirmation.node_id,
+        store.path().display()
+    );
+    Ok(())
+}
+
+/// Executes `sito ha clear-fence`.
+///
+/// Removes both durable fence markers after the operator has verified the
+/// current master/term. It is a local action and does not grant a lease.
+#[cfg(feature = "ha")]
+pub fn run_ha_clear_fence(config_path: &Path, confirm: bool) -> Result<(), anyhow::Error> {
+    if !confirm {
+        return Err(anyhow::anyhow!(
+            "Refusing to clear the HA fence without --confirm. Verify the current master/term first, then re-run with --confirm."
+        ));
+    }
+    let (data_dir, ha) = promotion_cli_context(config_path, false)?;
+    let cluster_id = ha.promotion.cluster_id.clone().ok_or_else(|| {
+        anyhow::anyhow!("ha.promotion.cluster_id is required to validate the fence marker identity")
+    })?;
+    let node_id = ha.promotion.node_id.clone().ok_or_else(|| {
+        anyhow::anyhow!("ha.promotion.node_id is required to validate the fence marker identity")
+    })?;
+    let store = sito_ha::promotion::FenceStore::new(data_dir.clone(), cluster_id, node_id);
+    if let Some(marker) = store
+        .load()
+        .map_err(|e| anyhow::anyhow!("Failed to read the fence marker: {e}"))?
+    {
+        println!(
+            "Clearing fence for cluster '{}', node '{}', fenced term {}, reason '{}'.",
+            marker.cluster_id, marker.node_id, marker.fenced_term, marker.reason
+        );
+    }
+    store
+        .clear()
+        .map_err(|e| anyhow::anyhow!("Failed to clear the fence marker: {e}"))?;
+    println!(
+        "Removed '{}' and '{}'. This does not grant a lease; the node must acquire a new term from the witness.",
+        store.marker_path().display(),
+        store.pending_path().display()
     );
     Ok(())
 }
@@ -3148,6 +3269,110 @@ mod tests {
         let error = run_ha_lease_admin_set(Path::new("/nonexistent"), 9, 128, "none", false)
             .expect_err("without --confirm the tool must refuse before touching disk");
         assert!(error.to_string().contains("--confirm"));
+    }
+
+    #[cfg(feature = "ha")]
+    #[test]
+    fn test_cli_confirm_promotion_and_clear_fence() {
+        use sito_ha::promotion::{
+            ConfirmationFile, ConfirmationStore, FenceMarker, FenceReason, FenceStore,
+        };
+
+        let dir = temp_config_dir("promotion_cli");
+        let data_dir = dir.join("state");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let document = format!(
+            "config_version = 2\n\
+             [server]\n\
+             role = \"slave\"\n\
+             data_dir = \"{}\"\n\
+             [upstream]\n\
+             servers = [\"1.1.1.1\"]\n\
+             [ha]\n\
+             replication_port = 0\n\
+             [ha.promotion]\n\
+             enabled = true\n\
+             candidate = true\n\
+             cluster_id = \"home-dns\"\n\
+             node_id = \"node-a\"\n\
+             backend = \"witness\"\n\
+             [ha.promotion.witness]\n\
+             url = \"https://witness.lan:8954\"\n\
+             ca = \"/etc/sito/witness-ca.crt\"\n\
+             token_file = \"/etc/sito/witness.token\"\n",
+            data_dir.display()
+        );
+        std::fs::write(&config_path, document).unwrap();
+
+        // Both CLIs refuse to act without the explicit confirmation flag.
+        let error = run_ha_confirm_promotion(&config_path, false)
+            .expect_err("confirm-promotion without --confirm must refuse");
+        assert!(error.to_string().contains("--confirm"));
+        let error = run_ha_clear_fence(&config_path, false)
+            .expect_err("clear-fence without --confirm must refuse");
+        assert!(error.to_string().contains("--confirm"));
+
+        // confirm-promotion writes the exact identity and one-shot file.
+        run_ha_confirm_promotion(&config_path, true).expect("write confirmation");
+        let store = ConfirmationStore::new(data_dir.clone(), "home-dns", "node-a");
+        let written = store.peek().unwrap().expect("confirmation file");
+        assert_eq!(written.cluster_id, "home-dns");
+        assert_eq!(written.node_id, "node-a");
+        let consumed = store
+            .consume(written.requested_at_unix_ms, 60_000)
+            .expect("consume");
+        assert_eq!(consumed.nonce, written.nonce);
+        assert_eq!(
+            store.consume(consumed.requested_at_unix_ms, 60_000),
+            Err(sito_ha::promotion::ConfirmationError::Missing),
+            "the confirmation is one-shot"
+        );
+
+        // A stale file is discarded; a foreign identity is rejected.
+        let stale = ConfirmationFile::with_nonce("home-dns", "node-a", 1_000, "aa");
+        store.write(&stale).unwrap();
+        assert_eq!(
+            store.consume(10_000, 1_000),
+            Err(sito_ha::promotion::ConfirmationError::Expired)
+        );
+        store.confirm(written.requested_at_unix_ms).unwrap();
+        let foreign = ConfirmationStore::new(data_dir.clone(), "other", "node-a");
+        assert_eq!(
+            foreign.consume(written.requested_at_unix_ms, 60_000),
+            Err(sito_ha::promotion::ConfirmationError::WrongIdentity)
+        );
+
+        // clear-fence removes both markers and leaves no durable fence.
+        let fence = FenceStore::new(data_dir.clone(), "home-dns", "node-a");
+        let marker = FenceMarker::new("home-dns", "node-a", 8, FenceReason::LeaseLost, 42);
+        assert_eq!(
+            fence.persist(&marker),
+            sito_ha::promotion::FencePersistOutcome::Durable
+        );
+        assert!(fence.load().unwrap().is_some());
+        run_ha_clear_fence(&config_path, true).expect("clear fence");
+        assert!(fence.load().unwrap().is_none());
+        assert!(!fence.marker_path().exists());
+        assert!(!fence.pending_path().exists());
+
+        // Parsing accepts both commands and keeps --confirm visible.
+        let cli = Cli::try_parse_from(["sito", "ha", "confirm-promotion"]).expect("parse");
+        match cli.command {
+            Some(Commands::Ha {
+                command: HaCommands::ConfirmPromotion { confirm, .. },
+            }) => assert!(!confirm),
+            other => panic!("expected confirm-promotion, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["sito", "ha", "clear-fence", "--confirm"]).expect("parse");
+        match cli.command {
+            Some(Commands::Ha {
+                command: HaCommands::ClearFence { confirm, .. },
+            }) => assert!(confirm),
+            other => panic!("expected clear-fence, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "ha")]

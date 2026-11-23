@@ -99,6 +99,7 @@ pub async fn get_ha_status(
     };
     let instance_name = cfg.server.instance_name.clone();
     let readiness = ctx.ha_readiness(&cfg);
+    let promotion = (*ctx.promotion_status.load()).clone();
 
     if role == "master" {
         let (version, slaves_connected, diverged, diverged_reason, master_pubkey) =
@@ -128,6 +129,7 @@ pub async fn get_ha_status(
             diverged,
             diverged_reason,
             master_pubkey,
+            promotion,
         }))
     } else {
         let (version, state, last_synced_at, degraded_reason, master_url) =
@@ -164,6 +166,7 @@ pub async fn get_ha_status(
             diverged: false,
             diverged_reason: None,
             master_pubkey: None,
+            promotion,
         }))
     }
 }
@@ -326,11 +329,14 @@ mod tests {
             diverged: true,
             diverged_reason: Some("continuity is broken".to_string()),
             master_pubkey: Some("ab".repeat(32)),
+            promotion: crate::models::PromotionStatus::disabled(),
         };
         let json = serde_json::to_value(&response).unwrap();
         assert_eq!(json["diverged"], true);
         assert_eq!(json["diverged_reason"], "continuity is broken");
         assert_eq!(json["master_pubkey"], "ab".repeat(32));
+        assert_eq!(json["promotion"]["state"], "disabled");
+        assert_eq!(json["promotion"]["reason"], "promotion_disabled");
 
         // A slave summary flags the diverged slave instead of showing lag 0 as
         // "in sync".
@@ -492,6 +498,62 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[tokio::test]
+    async fn status_exposes_the_shared_promotion_snapshot_without_secrets() {
+        use crate::auth::AuthUser;
+        use crate::auth::Role;
+
+        let dir = crate::test_support::temp_dir("sito_ha_promotion_status");
+        let ctx = crate::test_support::mock_context(&dir).await;
+        let mut config = (*ctx.config.load_full()).clone();
+        config.server.role = "master".to_string();
+        config.ha = Some(toml::from_str("replication_port = 0").expect("[ha] table"));
+        ctx.config.store(std::sync::Arc::new(config));
+        ctx.promotion_status.store(crate::models::PromotionStatus {
+            enabled: true,
+            candidate: false,
+            cluster_id: Some("home-dns".to_string()),
+            node_id: Some("sito-node-a".to_string()),
+            state: "master".to_string(),
+            reason: None,
+            term: 8,
+            version: 129,
+            bundle_hash: "ab".repeat(32),
+            publication_state: "published".to_string(),
+            published_version: 128,
+            lease_revision: Some(13),
+            lease_expires_in_secs: Some(22),
+            witness_reachable: true,
+            last_attempt_unix_ms: Some(1_760_000_000_000),
+            promoted_at_unix_ms: Some(1_760_000_000_000),
+            ..crate::models::PromotionStatus::disabled()
+        });
+
+        let admin = RequireAdmin(AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+            owner: None,
+        });
+        let status = get_ha_status(admin, State(ctx)).await.expect("status").0;
+        let json = serde_json::to_value(&status).expect("serialize status");
+        assert_eq!(json["promotion"]["state"], "master");
+        assert_eq!(json["promotion"]["term"], 8);
+        assert_eq!(json["promotion"]["lease_revision"], 13);
+        assert_eq!(json["promotion"]["lease_expires_in_secs"], 22);
+        assert_eq!(json["promotion"]["fenced"], false);
+
+        let serialized = json.to_string().to_ascii_lowercase();
+        for forbidden in ["token", "private_key", "certificate", "password", "secret"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "status leaked {forbidden}: {serialized}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn promoted_effective_master_reports_master_and_resyncs_from_the_live_coordinator() {
         use crate::auth::AuthUser;

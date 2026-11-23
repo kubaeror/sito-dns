@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 #[cfg(test)]
 use std::sync::PoisonError;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Standard latency buckets for DNS query duration and upstream RTT (in seconds).
@@ -386,6 +386,25 @@ pub struct MetricsRegistry {
     /// HA peers rejected for an incompatible protocol version, keyed by
     /// (role, reason code).
     ha_protocol_rejections: Arc<Mutex<BTreeMap<(String, String), u64>>>,
+    /// ADR-0010 promotion configured in this process (HA build only).
+    ha_promotion_configured: Arc<AtomicBool>,
+    ha_promotion_enabled: Arc<AtomicBool>,
+    ha_promotion_lease_held: Arc<AtomicBool>,
+    ha_promotion_term: Arc<AtomicU64>,
+    /// Promotion acquisition attempt outcomes, keyed by bounded result.
+    ha_promotion_attempts: Arc<Mutex<BTreeMap<String, u64>>>,
+    /// Witness requests, keyed by bounded (op, result).
+    ha_promotion_witness_requests: Arc<Mutex<BTreeMap<(String, String), u64>>>,
+    ha_promotion_lease_renew_failures: Arc<AtomicU64>,
+    /// Durable fences, keyed by bounded reason.
+    ha_promotion_fenced: Arc<Mutex<BTreeMap<String, u64>>>,
+    /// Promotion refusals, keyed by bounded reason.
+    ha_promotion_refusals: Arc<Mutex<BTreeMap<String, u64>>>,
+    /// First-publish aborts, keyed by bounded reason.
+    ha_promotion_publish_aborts: Arc<Mutex<BTreeMap<String, u64>>>,
+    ha_promotion_quiesce_remaining_seconds: Arc<AtomicU64>,
+    ha_promotion_reconcile_remaining_seconds: Arc<AtomicU64>,
+    ha_promotion_last_success_seconds: Arc<AtomicU64>,
     querylog_dropped: Arc<AtomicU64>,
     stats_retention_last_success_seconds: Arc<AtomicU64>,
     stats_retention_last_failure_seconds: Arc<AtomicU64>,
@@ -467,6 +486,19 @@ impl MetricsRegistry {
             ha_diverged: Arc::new(Mutex::new(BTreeMap::new())),
             ha_startup_noop: Arc::new(Mutex::new(BTreeMap::new())),
             ha_protocol_rejections: Arc::new(Mutex::new(BTreeMap::new())),
+            ha_promotion_configured: Arc::new(AtomicBool::new(false)),
+            ha_promotion_enabled: Arc::new(AtomicBool::new(false)),
+            ha_promotion_lease_held: Arc::new(AtomicBool::new(false)),
+            ha_promotion_term: Arc::new(AtomicU64::new(0)),
+            ha_promotion_attempts: Arc::new(Mutex::new(BTreeMap::new())),
+            ha_promotion_witness_requests: Arc::new(Mutex::new(BTreeMap::new())),
+            ha_promotion_lease_renew_failures: Arc::new(AtomicU64::new(0)),
+            ha_promotion_fenced: Arc::new(Mutex::new(BTreeMap::new())),
+            ha_promotion_refusals: Arc::new(Mutex::new(BTreeMap::new())),
+            ha_promotion_publish_aborts: Arc::new(Mutex::new(BTreeMap::new())),
+            ha_promotion_quiesce_remaining_seconds: Arc::new(AtomicU64::new(0)),
+            ha_promotion_reconcile_remaining_seconds: Arc::new(AtomicU64::new(0)),
+            ha_promotion_last_success_seconds: Arc::new(AtomicU64::new(0)),
             querylog_dropped: Arc::new(AtomicU64::new(0)),
             stats_retention_last_success_seconds: Arc::new(AtomicU64::new(0)),
             stats_retention_last_failure_seconds: Arc::new(AtomicU64::new(0)),
@@ -736,6 +768,88 @@ impl MetricsRegistry {
             .or_insert(0) += 1;
     }
 
+    /// Marks ADR-0010 promotion metrics as configured for this process.
+    ///
+    /// Called by the HA startup path even when promotion is disabled, so the
+    /// exposition can truthfully report `sito_ha_promotion_enabled 0` without
+    /// inventing a misleading lease/term series for a cluster that never opted
+    /// in. A build without HA never calls this and emits no promotion series.
+    pub fn init_ha_promotion_metrics(&self, enabled: bool) {
+        self.ha_promotion_configured.store(true, Ordering::Relaxed);
+        self.ha_promotion_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Publishes the promotion gauge snapshot.
+    pub fn observe_ha_promotion_status(
+        &self,
+        enabled: bool,
+        lease_held: bool,
+        term: u64,
+        quiesce_remaining_secs: u64,
+        reconcile_remaining_secs: u64,
+    ) {
+        self.ha_promotion_configured.store(true, Ordering::Relaxed);
+        self.ha_promotion_enabled.store(enabled, Ordering::Relaxed);
+        self.ha_promotion_lease_held
+            .store(lease_held, Ordering::Relaxed);
+        self.ha_promotion_term.store(term, Ordering::Relaxed);
+        self.ha_promotion_quiesce_remaining_seconds
+            .store(quiesce_remaining_secs, Ordering::Relaxed);
+        self.ha_promotion_reconcile_remaining_seconds
+            .store(reconcile_remaining_secs, Ordering::Relaxed);
+    }
+
+    /// Counts one acquisition attempt outcome.
+    ///
+    /// `result` is bounded to `success`, `refused`, `conflict`,
+    /// `witness_error`, `fenced` or `other`.
+    pub fn inc_ha_promotion_attempt(&self, result: &str) {
+        let result = bounded_promotion_result(result);
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_promotion_attempts);
+        *map.entry(result.to_string()).or_insert(0) += 1;
+    }
+
+    /// Counts one witness request by bounded operation and result.
+    pub fn inc_ha_promotion_witness_request(&self, op: &str, result: &str) {
+        let op = bounded_promotion_op(op);
+        let result = bounded_promotion_result(result);
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_promotion_witness_requests);
+        *map.entry((op.to_string(), result.to_string())).or_insert(0) += 1;
+    }
+
+    /// Counts a failed lease renewal attempt.
+    pub fn inc_ha_promotion_lease_renew_failure(&self) {
+        self.ha_promotion_lease_renew_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a durable fence by bounded reason.
+    pub fn inc_ha_promotion_fenced(&self, reason: &str) {
+        let reason = bounded_promotion_reason(reason);
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_promotion_fenced);
+        *map.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    /// Counts a promotion refusal by bounded reason.
+    pub fn inc_ha_promotion_refusal(&self, reason: &str) {
+        let reason = bounded_promotion_reason(reason);
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_promotion_refusals);
+        *map.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    /// Counts a first-publish abort by bounded reason.
+    pub fn inc_ha_promotion_publish_abort(&self, reason: &str) {
+        let reason = bounded_promotion_reason(reason);
+        let mut map = sito_core::sync::lock_or_recover(&self.ha_promotion_publish_aborts);
+        *map.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    /// Records the Unix timestamp of the last successful lease operation.
+    pub fn set_ha_promotion_last_success_seconds(&self, seconds: u64) {
+        self.ha_promotion_last_success_seconds
+            .store(seconds, Ordering::Relaxed);
+    }
+
     pub fn set_querylog_dropped(&self, dropped: u64) {
         self.querylog_dropped.store(dropped, Ordering::Relaxed);
     }
@@ -949,6 +1063,7 @@ impl MetricsRegistry {
         self.render_filter_family(&mut out);
         self.render_dnssec_client_family(&mut out);
         self.render_ha_retention_family(&mut out);
+        self.render_ha_promotion_family(&mut out);
         self.render_build_info(&mut out);
         out
     }
@@ -1686,6 +1801,145 @@ impl MetricsRegistry {
         );
     }
 
+    /// ADR-0010 promotion families.
+    ///
+    /// Nothing is emitted unless HA startup marked promotion as configured. A
+    /// configured-but-disabled cluster emits only the truthful `enabled 0`
+    /// gauge; lease/term/counter series would otherwise suggest an engine is
+    /// running. Every label value is normalized to a bounded set.
+    fn render_ha_promotion_family(&self, out: &mut String) {
+        if !self.ha_promotion_configured.load(Ordering::Relaxed) {
+            return;
+        }
+        out.push_str("# HELP sito_ha_promotion_enabled Whether automatic promotion is enabled on this node\n");
+        out.push_str("# TYPE sito_ha_promotion_enabled gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_ha_promotion_enabled {}",
+            u8::from(self.ha_promotion_enabled.load(Ordering::Relaxed))
+        );
+        if !self.ha_promotion_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+
+        out.push_str(
+            "# HELP sito_ha_promotion_lease_held Whether this node currently holds a live lease\n",
+        );
+        out.push_str("# TYPE sito_ha_promotion_lease_held gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_ha_promotion_lease_held {}",
+            u8::from(self.ha_promotion_lease_held.load(Ordering::Relaxed))
+        );
+
+        out.push_str("# HELP sito_ha_promotion_term Cluster term held or attempted by the promotion engine\n");
+        out.push_str("# TYPE sito_ha_promotion_term gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_ha_promotion_term {}",
+            self.ha_promotion_term.load(Ordering::Relaxed)
+        );
+
+        {
+            let map = sito_core::sync::lock_or_recover(&self.ha_promotion_attempts);
+            if !map.is_empty() {
+                out.push_str("# HELP sito_ha_promotion_attempts_total Promotion acquisition attempts by bounded result\n");
+                out.push_str("# TYPE sito_ha_promotion_attempts_total counter\n");
+                for (result, count) in map.iter() {
+                    let _ = writeln!(
+                        out,
+                        "sito_ha_promotion_attempts_total{{result=\"{}\"}} {count}",
+                        escape_label_value(result)
+                    );
+                }
+            }
+        }
+
+        {
+            let map = sito_core::sync::lock_or_recover(&self.ha_promotion_witness_requests);
+            if !map.is_empty() {
+                out.push_str("# HELP sito_ha_promotion_witness_requests_total Witness lease requests by bounded operation and result\n");
+                out.push_str("# TYPE sito_ha_promotion_witness_requests_total counter\n");
+                for ((op, result), count) in map.iter() {
+                    let _ = writeln!(
+                        out,
+                        "sito_ha_promotion_witness_requests_total{{op=\"{}\",result=\"{}\"}} {count}",
+                        escape_label_value(op),
+                        escape_label_value(result)
+                    );
+                }
+            }
+        }
+
+        out.push_str("# HELP sito_ha_promotion_lease_renew_failures_total Lease renewals that failed and needed conflict/timeout handling\n");
+        out.push_str("# TYPE sito_ha_promotion_lease_renew_failures_total counter\n");
+        let _ = writeln!(
+            out,
+            "sito_ha_promotion_lease_renew_failures_total {}",
+            self.ha_promotion_lease_renew_failures
+                .load(Ordering::Relaxed)
+        );
+
+        for (metric, help, map) in [
+            (
+                "sito_ha_promotion_fenced_total",
+                "Durable promotion fences by bounded reason",
+                &self.ha_promotion_fenced,
+            ),
+            (
+                "sito_ha_promotion_refusals_total",
+                "Promotion refusals by bounded reason",
+                &self.ha_promotion_refusals,
+            ),
+            (
+                "sito_ha_promotion_publish_aborts_total",
+                "First-publish aborts by bounded reason",
+                &self.ha_promotion_publish_aborts,
+            ),
+        ] {
+            let entries = sito_core::sync::lock_or_recover(map);
+            if entries.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "# HELP {metric} {help}");
+            let _ = writeln!(out, "# TYPE {metric} counter");
+            for (reason, count) in entries.iter() {
+                let _ = writeln!(
+                    out,
+                    "{metric}{{reason=\"{}\"}} {count}",
+                    escape_label_value(reason)
+                );
+            }
+        }
+
+        out.push_str("# HELP sito_ha_promotion_quiesce_remaining_seconds Remaining pre-publish quiesce window\n");
+        out.push_str("# TYPE sito_ha_promotion_quiesce_remaining_seconds gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_ha_promotion_quiesce_remaining_seconds {}",
+            self.ha_promotion_quiesce_remaining_seconds
+                .load(Ordering::Relaxed)
+        );
+
+        out.push_str("# HELP sito_ha_promotion_reconcile_remaining_seconds Remaining hello-only reconciliation window\n");
+        out.push_str("# TYPE sito_ha_promotion_reconcile_remaining_seconds gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_ha_promotion_reconcile_remaining_seconds {}",
+            self.ha_promotion_reconcile_remaining_seconds
+                .load(Ordering::Relaxed)
+        );
+
+        out.push_str("# HELP sito_ha_promotion_last_success_timestamp_seconds Unix timestamp of the last successful lease operation\n");
+        out.push_str("# TYPE sito_ha_promotion_last_success_timestamp_seconds gauge\n");
+        let _ = writeln!(
+            out,
+            "sito_ha_promotion_last_success_timestamp_seconds {}",
+            self.ha_promotion_last_success_seconds
+                .load(Ordering::Relaxed)
+        );
+    }
+
     /// Build metadata.
     fn render_build_info(&self, out: &mut String) {
         // 20. sito_build_info
@@ -1857,6 +2111,71 @@ fn escape_label_value(value: &str) -> String {
         }
     }
     escaped
+}
+
+/// Bounded promotion attempt/witness result labels.
+fn bounded_promotion_result(value: &str) -> &'static str {
+    match value {
+        "success" => "success",
+        "refused" => "refused",
+        "conflict" => "conflict",
+        "witness_error" => "witness_error",
+        "fenced" => "fenced",
+        _ => "other",
+    }
+}
+
+/// Bounded witness operation labels.
+fn bounded_promotion_op(value: &str) -> &'static str {
+    match value {
+        "info" => "info",
+        "lease" => "lease",
+        "acquire" => "acquire",
+        "renew" => "renew",
+        _ => "other",
+    }
+}
+
+/// Bounded promotion/fence reason labels from ADR-0010.
+fn bounded_promotion_reason(value: &str) -> &'static str {
+    const REASONS: &[&str] = &[
+        "promotion_disabled",
+        "not_candidate",
+        "master_alive",
+        "lease_held_by_other",
+        "witness_unavailable",
+        "witness_auth_failed",
+        "witness_tls_failed",
+        "witness_cluster_mismatch",
+        "witness_protocol_mismatch",
+        "lease_record_missing",
+        "candidate_behind",
+        "candidate_forked",
+        "candidate_hash_unknown",
+        "cluster_forked",
+        "candidate_diverged",
+        "candidate_term_ahead",
+        "candidate_identity_mismatch",
+        "master_state_behind",
+        "master_state_forked",
+        "master_term_ahead",
+        "manual_confirmation_required",
+        "lease_lost",
+        "lease_version_regression",
+        "fenced",
+        "fenced_until_reconciled",
+        "v1_state",
+        "promotion_interrupted",
+        "endpoint_is_ip_literal",
+        "clock_step",
+        "state_write_failed",
+        "role_switch_failed",
+    ];
+    REASONS
+        .iter()
+        .find(|reason| **reason == value)
+        .copied()
+        .unwrap_or("other")
 }
 
 #[cfg(test)]
@@ -2264,6 +2583,89 @@ sito_build_info{version="1.0.0",commit="abc1234"} 1
         assert!(rendered.contains(
             r#"sito_ha_protocol_rejections_total{role="slave",reason="version_mismatch"} 1"#
         ));
+    }
+
+    #[test]
+    fn test_ha_promotion_metrics_are_absent_until_configured() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        let rendered = reg.render_prometheus();
+        assert!(
+            !rendered.contains("sito_ha_promotion_"),
+            "a non-HA process must not emit promotion series"
+        );
+    }
+
+    #[test]
+    fn test_ha_promotion_disabled_emits_only_the_enabled_gauge() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.init_ha_promotion_metrics(false);
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains("sito_ha_promotion_enabled 0"));
+        for absent in [
+            "sito_ha_promotion_lease_held",
+            "sito_ha_promotion_term",
+            "sito_ha_promotion_attempts_total",
+            "sito_ha_promotion_witness_requests_total",
+            "sito_ha_promotion_quiesce_remaining_seconds",
+            "sito_ha_promotion_reconcile_remaining_seconds",
+            "sito_ha_promotion_last_success_timestamp_seconds",
+        ] {
+            assert!(
+                !rendered.contains(absent),
+                "{absent} must not be exposed for a disabled promotion engine"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ha_promotion_enabled_families_and_bounded_labels() {
+        let reg = MetricsRegistry::new("1.0.0", "test");
+        reg.init_ha_promotion_metrics(true);
+        reg.observe_ha_promotion_status(true, true, 8, 12, 0);
+        reg.inc_ha_promotion_attempt("success");
+        reg.inc_ha_promotion_attempt("not-a-real-result");
+        reg.inc_ha_promotion_witness_request("renew", "success");
+        reg.inc_ha_promotion_witness_request("not-an-op", "success");
+        reg.inc_ha_promotion_lease_renew_failure();
+        reg.inc_ha_promotion_fenced("lease_lost");
+        reg.inc_ha_promotion_fenced("injected detail that must not become a label");
+        reg.inc_ha_promotion_refusal("candidate_behind");
+        reg.inc_ha_promotion_publish_abort("cluster_forked");
+        reg.set_ha_promotion_last_success_seconds(1_760_000_000);
+
+        let rendered = reg.render_prometheus();
+        assert!(rendered.contains("sito_ha_promotion_enabled 1"));
+        assert!(rendered.contains("sito_ha_promotion_lease_held 1"));
+        assert!(rendered.contains("sito_ha_promotion_term 8"));
+        assert!(rendered.contains(r#"sito_ha_promotion_attempts_total{result="success"} 1"#));
+        assert!(rendered.contains(r#"sito_ha_promotion_attempts_total{result="other"} 1"#));
+        assert!(rendered.contains(
+            r#"sito_ha_promotion_witness_requests_total{op="renew",result="success"} 1"#
+        ));
+        assert!(rendered.contains(
+            r#"sito_ha_promotion_witness_requests_total{op="other",result="success"} 1"#
+        ));
+        assert!(rendered.contains("sito_ha_promotion_lease_renew_failures_total 1"));
+        assert!(rendered.contains(r#"sito_ha_promotion_fenced_total{reason="lease_lost"} 1"#));
+        assert!(rendered.contains(r#"sito_ha_promotion_fenced_total{reason="other"} 1"#));
+        assert!(
+            rendered.contains(r#"sito_ha_promotion_refusals_total{reason="candidate_behind"} 1"#)
+        );
+        assert!(
+            rendered
+                .contains(r#"sito_ha_promotion_publish_aborts_total{reason="cluster_forked"} 1"#)
+        );
+        assert!(rendered.contains("sito_ha_promotion_quiesce_remaining_seconds 12"));
+        assert!(rendered.contains("sito_ha_promotion_reconcile_remaining_seconds 0"));
+        assert!(rendered.contains("sito_ha_promotion_last_success_timestamp_seconds 1760000000"));
+
+        // No node, holder, token or cluster identifiers may become labels.
+        for forbidden in ["node_id=", "holder=", "token=", "cluster_id="] {
+            assert!(
+                !rendered.contains(forbidden),
+                "{forbidden} must not be a label"
+            );
+        }
     }
 
     #[test]

@@ -75,16 +75,16 @@ slave without the capability makes master readiness report
 publish transition is made). Upgrade every DNS-serving node before enabling
 deny; a mixed-version cluster must stay on `default_policy = "allow"`. Legacy v2
 peers that cannot report `have_bundle_hash` also cannot participate in promotion
-candidate reconciliation; that flow is not part of this ACL change and remains
-release-gated until the promotion engine is merged.
+candidate reconciliation: reconciliation aborts with `candidate_hash_unknown`
+rather than overwrite a possible fork. Upgrade every peer before enabling
+promotion.
 
-**Promotion.** Automatic promotion is governed by ADR-0010 and is not part of
-this ACL change. A node that has already applied the bundle keeps that shared
-ACL if a promotion flow later runs. The ACL startup gate does not invent a
-policy for an unprovisioned node, but the claim that an unprovisioned slave
-cannot be promoted is not enforced by this tree until the promotion engine is
-merged; keep promotion disabled until then. A promoted node writes the shared
-configuration it received, so verify the all-site allow plan before promotion.
+**Promotion.** Automatic promotion is governed by ADR-0010. A node that has
+already applied the bundle keeps that shared ACL if a promotion flow runs. An
+unprovisioned, degraded, diverged or fork-latched slave is ineligible and the
+engine refuses with `candidate_diverged`; it does not invent a policy for an
+unprovisioned node. A promoted node writes the shared configuration it received,
+so verify the all-site allow plan before promotion.
 
 **Discovery.** Denied queries are absent from the detailed query log and the
 `unidentified_clients` list by design. Use
@@ -281,6 +281,52 @@ first real certificate (with `allow_bootstrap_cert = false`) is reported by the
 ## 2. Manual Slave -> Master Promotion Procedure
 
 In the event of a catastrophic or permanent failure of the master node, a slave node must be manually promoted to become the new authoritative master.
+
+### Automatic promotion (when `[ha.promotion]` is enabled)
+
+ADR-0010 automatic promotion removes most manual steps, but the operator still
+owns the decisions the witness cannot make. With `enabled = true` on every node:
+
+1. The configured master holds the witness lease. On master loss, the single
+   designated candidate (`candidate = true`) waits the heartbeat timeout, reads
+   the witness, acquires `term + 1`, writes the pending state, quiesces for
+   `lease_ttl_secs`, reconciles hello-only, publishes `max(baseline + 1,
+   pending_version)`, and only then becomes writable.
+2. A manually started master must also acquire the lease. Do **not** hand-edit a
+   term above the witness record; the witness rejects it and the correct action
+   is manual witness reconciliation (`sito ha lease-admin set`, section 7 or the
+   witness runbook).
+3. With `require_manual_confirmation = true`, run the one-shot local
+   confirmation **on the candidate** after verifying master loss:
+
+   ```bash
+   sudo -u sito sito ha confirm-promotion --confirm --config /etc/sito/config.toml
+   ```
+
+   It writes `data_dir/ha_promote.confirm` (mode `0600`) and authorizes exactly
+   one acquisition. It expires after the effective heartbeat timeout, is
+   discarded if the master returns first, and is discarded on restart. It never
+   bypasses the witness.
+4. After fencing, the node stays read-only across restarts until the operator
+   verifies the current master/term and clears the durable marker:
+
+   ```bash
+   sudo -u sito sito ha clear-fence --confirm --config /etc/sito/config.toml
+   ```
+
+   This removes `ha_fence.json` and `ha_fence.pending`; it does not grant a
+   lease. The node still has to acquire a new term.
+5. Watch `GET /api/v2/ha/status` (`promotion.state`/`reason`/`term`/`version`),
+   the `sito_ha_promotion_*` metrics and the `ha.promotion.*` audit records.
+   A witness outage is a single point of **availability**: the master fences
+   after the TTL and no promotion happens until the witness returns. DNS keeps
+   serving from the last snapshot. Run the witness on a third failure domain and
+   monitor it.
+
+The manual procedure below remains the escape hatch, including when promotion
+is disabled. If promotion is enabled cluster-wide, prefer the automatic path or
+start the manual master with `role = "master"` and `enabled = true` so it
+acquires the lease; otherwise disable promotion everywhere first (section 7).
 
 ### Prerequisites
 - SSH or root terminal access to the target slave node.

@@ -121,6 +121,48 @@ impl HaWriteGate {
     }
 }
 
+/// Shared handle for the ADR-0010 promotion status snapshot.
+///
+/// The promotion supervisor publishes its internal engine snapshot here after
+/// every attempt/loop step; the API reads it without contacting the engine or
+/// the witness. Default is the stable disabled shape, so a no-HA build or a
+/// node with promotion off reports exactly that.
+#[derive(Debug, Clone)]
+pub struct PromotionStatusHandle {
+    inner: Arc<ArcSwap<crate::models::PromotionStatus>>,
+}
+
+impl Default for PromotionStatusHandle {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(
+                crate::models::PromotionStatus::disabled(),
+            )),
+        }
+    }
+}
+
+impl PromotionStatusHandle {
+    /// Creates a handle with an explicit initial status.
+    #[must_use]
+    pub fn new(status: crate::models::PromotionStatus) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(status)),
+        }
+    }
+
+    /// Publishes a new status snapshot.
+    pub fn store(&self, status: crate::models::PromotionStatus) {
+        self.inner.store(Arc::new(status));
+    }
+
+    /// Returns the current status snapshot.
+    #[must_use]
+    pub fn load(&self) -> Arc<crate::models::PromotionStatus> {
+        self.inner.load_full()
+    }
+}
+
 /// Shared application state container across all REST API handlers.
 #[derive(Clone)]
 pub struct ServerContext {
@@ -164,6 +206,8 @@ pub struct ServerContext {
     pub apply_lock: Arc<tokio::sync::Mutex<()>>,
     /// ADR-0010 write gate for opt-in automatic promotion.
     pub ha_write_gate: Arc<HaWriteGate>,
+    /// ADR-0010 promotion status snapshot shared with the promotion runtime.
+    pub promotion_status: PromotionStatusHandle,
 }
 
 impl ServerContext {
@@ -456,6 +500,22 @@ pub fn ha_readiness_required(_config: &Config) -> bool {
     false
 }
 
+/// Whether a write-gate reason is a witness/TLS/auth failure that makes the
+/// node not-ready even when it is still a slave (ADR-0010 §Observability).
+#[cfg(feature = "ha")]
+fn is_witness_failure_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "witness_unavailable"
+            | "witness_auth_failed"
+            | "witness_tls_failed"
+            | "witness_cluster_mismatch"
+            | "witness_protocol_mismatch"
+            | "promotion_config_invalid"
+    ) || reason.starts_with("witness_config_invalid")
+        || reason.starts_with("promotion_config_invalid")
+}
+
 impl ServerContext {
     /// Current HA readiness for the configured role.
     ///
@@ -468,10 +528,14 @@ impl ServerContext {
         if let Some((reason, fenced)) = self.ha_write_gate.blocked()
             && (fenced
                 || config.server.role == "master"
-                || self.ha_write_gate.is_effective_master())
+                || self.ha_write_gate.is_effective_master()
+                || is_witness_failure_reason(&reason))
         {
             // A waiting candidate is still a healthy replica; readiness follows
-            // its slave tracker until it actually becomes master.
+            // its slave tracker until it actually becomes master. A witness
+            // failure or a fence, however, is not-ready even on the candidate:
+            // promotion cannot proceed and the ADR defines those conditions as
+            // not-ready.
             return HaReadiness::not_ready(reason);
         }
         // A role with no `[ha]` section is simply not an HA deployment. A
@@ -1208,5 +1272,64 @@ mod acme_readiness_ladder_tests {
             ),
             (false, Some("acme_challenge_unavailable"))
         );
+    }
+}
+
+#[cfg(all(test, feature = "ha"))]
+mod ha_promotion_readiness_tests {
+    use super::*;
+
+    async fn slave_context() -> (std::path::PathBuf, ServerContext) {
+        let dir = crate::test_support::temp_dir("sito_ha_promotion_readiness");
+        let ctx = crate::test_support::mock_context(&dir).await;
+        let mut config = (*ctx.config.load_full()).clone();
+        config.server.role = "slave".to_string();
+        config.ha = Some(toml::from_str("replication_port = 0").expect("[ha] table"));
+        ctx.config.store(std::sync::Arc::new(config));
+        (dir, ctx)
+    }
+
+    #[tokio::test]
+    async fn witness_failure_is_not_ready_even_for_a_candidate_but_waiting_is_ready() {
+        let (dir, ctx) = slave_context().await;
+        let config = ctx.config.load();
+
+        // The candidate tracker is absent, so an unrelated readiness path is
+        // not ready; start from the witness failure we care about.
+        ctx.ha_write_gate.block("witness_unavailable");
+        let readiness = ctx.ha_readiness(&config);
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason.as_deref(), Some("witness_unavailable"));
+
+        for code in [
+            "witness_auth_failed",
+            "witness_tls_failed",
+            "witness_cluster_mismatch",
+            "witness_protocol_mismatch",
+        ] {
+            ctx.ha_write_gate.block(code);
+            assert!(
+                !ctx.ha_readiness(&config).ready,
+                "{code} must make the candidate not-ready"
+            );
+        }
+
+        // Waiting for master loss / confirmation is normal replica operation
+        // and must not flip readiness by itself.
+        ctx.ha_write_gate.block("master_alive");
+        let readiness = ctx.ha_readiness(&config);
+        assert_ne!(
+            readiness.reason.as_deref(),
+            Some("master_alive"),
+            "a waiting candidate must not become not-ready merely for waiting"
+        );
+
+        // A fence is always not-ready.
+        ctx.ha_write_gate.fence("ha_promotion_fenced");
+        let readiness = ctx.ha_readiness(&config);
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason.as_deref(), Some("ha_promotion_fenced"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

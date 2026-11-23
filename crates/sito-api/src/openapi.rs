@@ -206,6 +206,7 @@ struct BaseApiDoc;
     components(
         schemas(
             crate::models::HaStatusResponse,
+            crate::models::PromotionStatus,
             crate::models::HaSlaveSummary,
             crate::models::HaSlaveStatsSummary,
             crate::models::HaResyncResponse,

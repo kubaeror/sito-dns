@@ -892,12 +892,12 @@ per-node ACL override and no node-local allow file.
   `acl_capability_missing` and logs a warning (on the Hello and on the
   allow→deny publish transition). Upgrade every DNS-serving node before enabling
   deny; a mixed-version cluster must stay on allow.
-- **Promotion:** automatic promotion is governed by ADR-0010 and is not part of
-  this ACL change. A node that has already applied a bundle keeps that shared
-  ACL if a promotion flow later runs; the ACL step itself never invents a policy
-  for an unprovisioned node. The claim matrix keeps promotion integration
-  release-gated until the promotion engine is merged and enforces the
-  applied-bundle requirement.
+- **Promotion:** automatic promotion is governed by ADR-0010. A promoted node
+  keeps the shared ACL it last applied and requires that a candidate has applied
+  a valid bundle (an unprovisioned or diverged slave reports not-ready and is
+  ineligible). The promotion engine never invents a policy for an unprovisioned
+  node. See [the promotion status and CLI](#promotion-status) and
+  [the runbook](runbook-ha.md#2-manual-slave---master-promotion-procedure).
 - **Multi-site:** the allow list must contain every site's client networks.
   A site-B network omitted from `[clients.acl] allow` is denied on every node
   after the bundle applies. That is a shared-policy decision, not a local
@@ -941,7 +941,7 @@ token_file = "/etc/sito/witness.token"  # 0600, one shared cluster token
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `promotion.enabled` | boolean | `false` | Master gate for automatic promotion. When false, bounds are not validated and the feature is inert. |
-| `promotion.candidate` | boolean | `false` | Exactly one slave in the cluster may try to acquire the lease. Requires `server.role = "slave"` when enabled; when disabled it is inert (the operator-facing warning for a `true` value on a master is C3b2b runtime behavior, not config validation). |
+| `promotion.candidate` | boolean | `false` | Exactly one slave in the cluster may try to acquire the lease. Requires `server.role = "slave"` when enabled; when disabled it is inert (a `true` value on a master only logs a startup warning). |
 | `promotion.cluster_id` | string | `None` | Stable cluster identifier, 1–64 characters from `[A-Za-z0-9._-]`; must match the witness. Required when enabled. |
 | `promotion.node_id` | string | `None` | Stable per-node identifier, 1–64 characters from `[A-Za-z0-9._-]`; unique per node. Required when enabled. |
 | `promotion.backend` | string | `"witness"` | Lease backend. Only `"witness"` is supported in 2.0; any other value is rejected as `unsupported_lease_backend` even when disabled. |
@@ -961,8 +961,115 @@ token_file = "/etc/sito/witness.token"  # 0600, one shared cluster token
 contacting the witness. A valid config with an unreachable witness does not
 exit; the node stays read-only with a specific reason and retries. See
 [ADR-0010](adr/0010-ha-automatic-promotion.md) for the witness API, lease
-semantics and failure model. The client transport foundation is documented in
-[`ha-promotion-client.md`](ha-promotion-client.md).
+semantics and failure model. The client engine, status/metrics/audit and CLI are
+documented in [`ha-promotion-client.md`](ha-promotion-client.md).
+
+##### Promotion status
+
+`GET /api/v2/ha/status` always includes a `promotion` object. When promotion is
+disabled it has the stable shape below; no witness connection, thread, file or
+readiness gate exists.
+
+```json
+{
+  "promotion": {
+    "enabled": false,
+    "candidate": false,
+    "backend": "witness",
+    "cluster_id": null,
+    "node_id": null,
+    "state": "disabled",
+    "reason": "promotion_disabled",
+    "term": 0,
+    "version": 0,
+    "bundle_hash": "none",
+    "publication_state": "published",
+    "published_version": 0,
+    "lease_revision": null,
+    "lease_expires_in_secs": null,
+    "witness_reachable": false,
+    "quiesce_remaining_secs": 0,
+    "reconcile_remaining_secs": 0,
+    "last_attempt_unix_ms": null,
+    "promoted_at_unix_ms": null,
+    "fenced": false
+  }
+}
+```
+
+With promotion enabled, `state` is one of `disabled`,
+`waiting_for_master_loss`, `manual_confirmation_required`, `acquiring`,
+`quiescing`, `reconciling`, `publishing`, `master`, `fenced`, `aborted` or
+`unavailable`. `reason` is a stable code: `promotion_disabled`,
+`not_candidate`, `master_alive`, `lease_held_by_other`, `witness_unavailable`,
+`witness_auth_failed`, `witness_tls_failed`, `witness_cluster_mismatch`,
+`witness_protocol_mismatch`, `lease_record_missing`, `candidate_behind`,
+`candidate_forked`, `candidate_hash_unknown`, `cluster_forked`,
+`candidate_diverged`, `candidate_term_ahead`, `candidate_identity_mismatch`,
+`master_state_behind`, `master_state_forked`, `master_term_ahead`,
+`manual_confirmation_required`, `lease_lost`, `lease_version_regression`,
+`fenced`, `fenced_until_reconciled`, `v1_state`, `promotion_interrupted` or
+`endpoint_is_ip_literal`.
+
+`version`/`bundle_hash` are the active bundle (which may be pending during a
+promotion); `publication_state` and `published_version` identify the last
+bundle actually published. The top-level `ready`/`readiness_reason` remain
+authoritative: a witness failure or a fence is not-ready, while merely being a
+candidate or waiting is not. `witness_reachable` is a last-probe observation,
+never a safety input. The object contains no tokens, private keys, certificate
+material or full witness URLs.
+
+##### Promotion metrics and audit events
+
+With promotion enabled, `/metrics` exposes bounded-label families:
+
+- `sito_ha_promotion_enabled`, `sito_ha_promotion_lease_held`,
+  `sito_ha_promotion_term`;
+- `sito_ha_promotion_attempts_total{result}`;
+- `sito_ha_promotion_witness_requests_total{op,result}`;
+- `sito_ha_promotion_lease_renew_failures_total`;
+- `sito_ha_promotion_fenced_total{reason}`,
+  `sito_ha_promotion_refusals_total{reason}`,
+  `sito_ha_promotion_publish_aborts_total{reason}`;
+- `sito_ha_promotion_quiesce_remaining_seconds`,
+  `sito_ha_promotion_reconcile_remaining_seconds`;
+- `sito_ha_promotion_last_success_timestamp_seconds` (observability only).
+
+Labels are normalized to a fixed set (`result`, `op` and the reason codes above;
+unknown values become `other`). Node IDs, holders, tokens and cluster IDs are
+never labels. A configured-but-disabled cluster exposes only
+`sito_ha_promotion_enabled 0`; a non-HA build exposes no promotion series.
+
+Structured `tracing` audit records use the `sito::ha::promotion` target with
+fixed fields (`node_id`, `outcome`, `reason`, `term`, `version`, `holder`) and
+the events `ha.promotion.lease_acquired`, `_lease_renewed`, `_lease_lost`,
+`_fenced`, `_refused`, `_quiesced`, `_reconciled`, `_completed`,
+`_publish_aborted`, `_manual_confirmation_required` and
+`_manual_confirmation_confirmed`. They never contain tokens, keys or
+certificate material.
+
+##### Local promotion CLI
+
+```bash
+# On the candidate, after an operator has verified master loss:
+sudo -u sito sito ha confirm-promotion --confirm --config /etc/sito/config.toml
+
+# After verifying the current master/term, remove both fence markers:
+sudo -u sito sito ha clear-fence --confirm --config /etc/sito/config.toml
+```
+
+`confirm-promotion` writes `<data_dir>/ha_promote.confirm` atomically (mode
+`0600`) for the configured `cluster_id`/`node_id`. The running candidate consumes
+it once, only after master loss, and only while it is no older than the effective
+heartbeat timeout; a restart discards an unconsumed file. It never bypasses the
+witness. `clear-fence` removes `ha_fence.json` and `ha_fence.pending`; it does not
+grant a lease, so the node still has to acquire a new term.
+
+The witness is a single point of **availability**, not safety: if it is
+unreachable, the current master fences after the TTL and no promotion happens
+until it returns. DNS reads continue from the last snapshot. Run the witness on
+a third failure domain and monitor it; co-locating it on an HA node is a lab-only
+deployment.
 
 HA protocol **v2** is required on every node. A `Hello` without
 `protocol_version`, a v1 `ConfigPush`, or a v1 `ha_state.toml`/

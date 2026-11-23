@@ -150,6 +150,7 @@ async fn mock_context(temp_dir: &std::path::Path) -> ServerContext {
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         ha_write_gate: Arc::new(crate::state::HaWriteGate::new()),
+        promotion_status: Default::default(),
         master_coordinator: None,
         promoted_master_coordinator: std::sync::Arc::new(std::sync::Mutex::new(None)),
         slave_tracker: None,

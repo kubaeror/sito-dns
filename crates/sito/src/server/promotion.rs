@@ -42,6 +42,8 @@ pub(super) struct PromotionRuntimeState {
     pub(super) master_slot: Arc<Mutex<Option<MasterCoordinator>>>,
     pub(super) initial_toml: Mutex<Option<String>>,
     pub(super) known_secrets: Vec<String>,
+    /// Shared ADR-0010 status snapshot read by `GET /api/v2/ha/status`.
+    pub(super) status: sito_api::PromotionStatusHandle,
 }
 
 impl PromotionRuntimeState {
@@ -74,6 +76,48 @@ impl PromotionRuntimeState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+}
+
+/// Builds the initial status snapshot for an enabled promotion node.
+///
+/// The supervisor replaces it as soon as the engine boots, but the API must
+/// never report `disabled` for a node that configured `enabled = true`.
+pub(super) fn initial_promotion_status(
+    ha_config: &HaConfig,
+    role: ConfiguredRole,
+) -> sito_api::models::PromotionStatus {
+    let promotion = &ha_config.promotion;
+    if !promotion.enabled {
+        return sito_api::models::PromotionStatus::disabled();
+    }
+    let (state, reason) = match (role, promotion.candidate) {
+        (ConfiguredRole::Master, _) => ("unavailable", Some("witness_unavailable")),
+        (ConfiguredRole::Slave, true) => ("waiting_for_master_loss", None),
+        (ConfiguredRole::Slave, false) => ("aborted", Some("not_candidate")),
+    };
+    sito_api::models::PromotionStatus {
+        enabled: true,
+        candidate: promotion.candidate,
+        backend: promotion.backend.clone(),
+        cluster_id: promotion.cluster_id.clone(),
+        node_id: promotion.node_id.clone(),
+        state: state.to_string(),
+        reason: reason.map(str::to_string),
+        ..sito_api::models::PromotionStatus::disabled()
+    }
+}
+
+/// Publishes the engine snapshot to the API/metrics shared handles.
+fn publish_promotion_status(state: &PromotionRuntimeState, engine: &PromotionEngine) {
+    let status = sito_api::models::PromotionStatus::from_snapshot(&engine.snapshot());
+    state.metrics.observe_ha_promotion_status(
+        status.enabled,
+        status.state == "master",
+        status.term,
+        status.quiesce_remaining_secs,
+        status.reconcile_remaining_secs,
+    );
+    state.status.store(status);
 }
 
 /// Starts the promotion supervisor. It never exits the process on witness
@@ -120,15 +164,42 @@ async fn run_supervisor(state: Arc<PromotionRuntimeState>, mut shutdown_rx: watc
         backend,
         host.clone(),
     ) {
-        Ok(engine) => {
-            Arc::new(engine.with_heartbeat_timeout_secs(state.heartbeat_timeout().as_secs()))
-        }
+        Ok(engine) => Arc::new(
+            engine
+                .with_heartbeat_timeout_secs(state.heartbeat_timeout().as_secs())
+                .with_metrics(state.metrics.clone()),
+        ),
         Err(error) => {
             state.write_gate.block("promotion_config_invalid");
             error!(error = %error, "Automatic promotion configuration failed at runtime");
             return;
         }
     };
+
+    // Publish the status snapshot independently of the supervisor's return
+    // paths: a fenced/aborted supervisor stops, but the API must keep reporting
+    // the terminal state until the process exits.
+    {
+        let status_state = Arc::clone(&state);
+        let status_engine = Arc::clone(&engine);
+        let mut status_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                publish_promotion_status(&status_state, &status_engine);
+                if *status_shutdown.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = status_shutdown.changed() => {
+                        if *status_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     match engine.boot() {
         Ok(PromotionOutcome::Fenced) => {
@@ -849,6 +920,7 @@ mod tests {
             master_slot: Arc::new(Mutex::new(None)),
             initial_toml: Mutex::new(None),
             known_secrets: Vec::new(),
+            status: Default::default(),
         })
     }
 
@@ -1624,6 +1696,7 @@ mod integration_tests {
             master_slot: master_slot.clone(),
             initial_toml: Mutex::new(Some(toml::to_string_pretty(&config).unwrap())),
             known_secrets: Vec::new(),
+            status: Default::default(),
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         spawn_promotion_supervisor(state.clone(), shutdown_rx);
@@ -1867,6 +1940,7 @@ mod integration_tests {
             master_slot: Arc::new(Mutex::new(None)),
             initial_toml: Mutex::new(Some(toml::to_string_pretty(&config).unwrap())),
             known_secrets: Vec::new(),
+            status: Default::default(),
         });
         let host = Arc::new(RuntimePromotionHost {
             state: Arc::clone(&state),
@@ -2017,6 +2091,7 @@ mod integration_tests {
             master_slot: Arc::new(Mutex::new(None)),
             initial_toml: Mutex::new(Some(toml_doc)),
             known_secrets: Vec::new(),
+            status: Default::default(),
         });
         let host = Arc::new(RuntimePromotionHost {
             state: Arc::clone(&state),
@@ -2152,6 +2227,7 @@ mod integration_tests {
             master_slot: Arc::new(Mutex::new(None)),
             initial_toml: Mutex::new(Some(toml_doc)),
             known_secrets: Vec::new(),
+            status: Default::default(),
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         spawn_promotion_supervisor(Arc::clone(&state), shutdown_rx);

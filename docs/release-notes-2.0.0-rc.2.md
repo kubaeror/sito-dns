@@ -31,6 +31,10 @@ tag must not move. Use an explicit version/tag for evaluation.
   re-clamping and per-transport oversize truncation.
 - HA protocol v2 with signed config digest/signing-key fingerprint, explicit v1
   rejection, truthful publish outcomes and bounded queues/history.
+- Opt-in HA automatic promotion (ADR-0010, default `false`): witness lease,
+  pre-publish quiesce, hello-only reconciliation, durable self-fencing,
+  `promotion` status, bounded-label metrics/audit events and the local
+  `confirm-promotion`/`clear-fence` CLI.
 - Self-service password/2FA for every role; session-bound re-authentication for
   sensitive Admin mutations; bounded Argon2 work.
 - OpenAPI security/tag/path coverage, fail-closed config apply, `no-store` API

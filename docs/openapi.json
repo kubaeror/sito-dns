@@ -6033,6 +6033,10 @@
               "null"
             ]
           },
+          "promotion": {
+            "$ref": "#/components/schemas/PromotionStatus",
+            "description": "ADR-0010 automatic-promotion status. Always present; disabled clusters\nget the stable `state = \"disabled\"` shape."
+          },
           "readiness_reason": {
             "type": [
               "string",
@@ -6210,6 +6214,144 @@
           "type": {
             "type": "string",
             "description": "URI reference identifying the problem type."
+          }
+        }
+      },
+      "PromotionStatus": {
+        "type": "object",
+        "description": "ADR-0010 automatic-promotion status exposed by `GET /api/v2/ha/status`.\n\nThe object is always present. With promotion disabled every field keeps a\nstable, secret-free default and `state = \"disabled\"` /\n`reason = \"promotion_disabled\"`. `version`/`bundle_hash` describe the active\nbundle (which may be pending during a promotion); `publication_state` and\n`published_version` identify the last bundle actually published, which is the\nonly witness baseline.",
+        "required": [
+          "enabled",
+          "candidate",
+          "backend",
+          "state",
+          "term",
+          "version",
+          "bundle_hash",
+          "publication_state",
+          "published_version",
+          "witness_reachable",
+          "quiesce_remaining_secs",
+          "reconcile_remaining_secs",
+          "fenced"
+        ],
+        "properties": {
+          "backend": {
+            "type": "string",
+            "description": "Lease backend; always `\"witness\"` in 2.0."
+          },
+          "bundle_hash": {
+            "type": "string",
+            "description": "Active bundle signed-payload hash, or `\"none\"`."
+          },
+          "candidate": {
+            "type": "boolean",
+            "description": "Designated candidate node."
+          },
+          "cluster_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stable cluster identifier, when configured."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "`ha.promotion.enabled`."
+          },
+          "fenced": {
+            "type": "boolean",
+            "description": "A durable fence marker is present."
+          },
+          "last_attempt_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix milliseconds of the last acquisition or renewal attempt."
+          },
+          "lease_expires_in_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds until the witness lease expires, from the last observation.",
+            "minimum": 0
+          },
+          "lease_revision": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Witness revision of the current grant.",
+            "minimum": 0
+          },
+          "node_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stable node identifier, when configured."
+          },
+          "promoted_at_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix milliseconds at which this promotion started."
+          },
+          "publication_state": {
+            "type": "string",
+            "description": "`pending`, `publishing` or `published`."
+          },
+          "published_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Last published version (the witness baseline).",
+            "minimum": 0
+          },
+          "quiesce_remaining_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Remaining pre-publish quiesce window.",
+            "minimum": 0
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stable reason code, or `null`."
+          },
+          "reconcile_remaining_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Remaining reconciliation window.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`disabled`, `waiting_for_master_loss`, `manual_confirmation_required`,\n`acquiring`, `quiescing`, `reconciling`, `publishing`, `master`,\n`fenced`, `aborted` or `unavailable`."
+          },
+          "term": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Term held or attempted.",
+            "minimum": 0
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Active bundle version.",
+            "minimum": 0
+          },
+          "witness_reachable": {
+            "type": "boolean",
+            "description": "Last witness probe succeeded; observability only, not a safety input."
           }
         }
       },
