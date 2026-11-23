@@ -171,7 +171,8 @@ and [fuzz/README.md](../fuzz/README.md).
 * RouterOS integration is experimental/niche and is not part of the core
   security posture. It now lives in the optional `sito-routeros` crate and is
   absent from the default build. If enabled, only a verified `https://` lease
-  grants identity; plaintext or insecure-TLS leases are display-only.
+  grants identity; plaintext or insecure-TLS leases are unverified, ignored by
+  identity matching, and not exposed by the 2.0 admin UI/API.
 * Pull requests compile the Criterion benches but do not run a performance
   threshold. The nightly `bench.yml` comparison is **active**: it runs on
   GitHub-hosted `ubuntu-24.04`, compares against the committed

@@ -41,6 +41,16 @@ const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
 /// Request timeout applied to every RouterOS HTTP client.
 pub const ROUTEROS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Minimum poll interval enforced by the sync task.
+///
+/// `[integrations.mikrotik] interval_s` accepts any positive integer, so the
+/// runtime raises smaller values to this floor instead of hammering the
+/// router. Larger values are used unchanged.
+const MIN_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Path of the RouterOS DHCP lease collection.
+const LEASE_PATH: &str = "/rest/ip/dhcp-server/lease";
+
 /// Errors occurring during RouterOS lease synchronization.
 #[derive(Debug, Error)]
 pub enum RouterOsError {
@@ -58,6 +68,9 @@ pub enum RouterOsError {
 
     #[error("failed to build the RouterOS HTTP client: {0}")]
     ClientBuild(String),
+
+    #[error("invalid RouterOS URL: {0}")]
+    InvalidUrl(String),
 
     #[error(
         "RouterOS password environment variable '{variable}' is not set or empty; \
@@ -99,7 +112,8 @@ impl RawRouterOsLease {
     /// Converts a raw REST row into a lease.
     ///
     /// `verified` is false when the API client was built with
-    /// `allow_invalid_certs = true`; such leases are display-only (D10/D15).
+    /// `allow_invalid_certs = true`; such leases are ignored by identity
+    /// matching and are not exposed by the 2.0 admin UI/API (D10/D15).
     pub fn into_lease(self, verified: bool) -> Option<RouterOsLease> {
         // Filter out explicitly disabled leases
         if let Some(ref d) = self.disabled
@@ -142,12 +156,49 @@ impl RawRouterOsLease {
 /// Identity is only authenticated by an `https://` connection whose
 /// certificate was verified. A plaintext `http://` URL has no peer
 /// certificate (even when `allow_invalid_certs` is false), and a non-HTTP(S)
-/// scheme is unsupported; both are display-only.
+/// scheme is unsupported; both yield unverified leases that identity matching
+/// ignores.
 fn leases_are_verified(config: &RouterOsConfig) -> bool {
     if config.allow_invalid_certs {
         return false;
     }
     reqwest::Url::parse(&config.url).is_ok_and(|url| url.scheme() == "https")
+}
+
+/// Builds the DHCP lease endpoint from the configured base URL.
+///
+/// The join is idempotent: a base URL, a base URL with a trailing slash and a
+/// URL that already names the lease collection (with or without a trailing
+/// slash) all produce the same endpoint. Query strings, fragments and embedded
+/// userinfo are rejected: a lease request has no meaningful query, and URL
+/// credentials would bypass the configured `token_env`/`username` handling.
+fn lease_endpoint(config: &RouterOsConfig) -> Result<reqwest::Url, RouterOsError> {
+    let mut url = reqwest::Url::parse(&config.url).map_err(|err| {
+        // Do not echo the configured URL: it may contain embedded credentials.
+        RouterOsError::InvalidUrl(format!("invalid RouterOS URL: {err}"))
+    })?;
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(RouterOsError::InvalidUrl(
+            "RouterOS URL must not contain embedded credentials; use token_env or \
+             username/password_env instead"
+                .to_string(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(RouterOsError::InvalidUrl(
+            "RouterOS URL must not contain a query string or fragment".to_string(),
+        ));
+    }
+
+    let path = url.path().trim_end_matches('/');
+    let path = if path.ends_with(LEASE_PATH) {
+        path.to_string()
+    } else {
+        format!("{path}{LEASE_PATH}")
+    };
+    url.set_path(&path);
+    Ok(url)
 }
 
 /// Fetch and parse DHCP leases from the RouterOS REST API.
@@ -172,16 +223,8 @@ async fn fetch_with_client(
     config: &RouterOsConfig,
     verified: bool,
 ) -> Result<Vec<RouterOsLease>, RouterOsError> {
-    let endpoint = if config.url.ends_with("/rest/ip/dhcp-server/lease") {
-        config.url.clone()
-    } else {
-        format!(
-            "{}/rest/ip/dhcp-server/lease",
-            config.url.trim_end_matches('/')
-        )
-    };
-
-    let mut req = client.get(&endpoint);
+    let endpoint = lease_endpoint(config)?;
+    let mut req = client.get(endpoint);
 
     // Authentication: a configured token_env is mandatory. Falling through
     // to basic auth when the operator asked for a bearer token would silently
@@ -227,7 +270,8 @@ async fn fetch_with_client(
     let body = read_capped_body(response, MAX_RESPONSE_BYTES).await?;
     let raw_leases: Vec<RawRouterOsLease> = serde_json::from_slice(&body)?;
     // Only HTTPS with certificate verification authenticates the peer; a
-    // plaintext URL or `allow_invalid_certs` is display-only (D10/D15).
+    // plaintext URL or `allow_invalid_certs` yields unverified leases that
+    // identity matching ignores (D10/D15).
     let leases = raw_leases
         .into_iter()
         .filter_map(|raw| raw.into_lease(verified))
@@ -317,36 +361,75 @@ fn report_client_build_failure(err: &RouterOsError) -> Option<reqwest::Client> {
     None
 }
 
+/// Poll interval enforced by the sync task: the configured `interval_s` raised
+/// to [`MIN_SYNC_INTERVAL`].
+fn sync_interval(config: &RouterOsConfig) -> Duration {
+    Duration::from_secs(config.interval_s.max(MIN_SYNC_INTERVAL.as_secs()))
+}
+
+/// Fetches the lease table once and replaces the registry snapshot.
+///
+/// The registry is only touched on success, so a failed tick retains the
+/// previous leases (including verified identity) until the next successful
+/// sync. Returns the number of stored leases.
+async fn sync_once(
+    client: &reqwest::Client,
+    config: &RouterOsConfig,
+    registry: &ClientRegistry,
+) -> Result<usize, RouterOsError> {
+    let leases = fetch_with_client(client, config, leases_are_verified(config)).await?;
+    let count = leases.len();
+    registry.update_routeros_leases(leases);
+    Ok(count)
+}
+
 /// Background task synchronizing RouterOS DHCP leases periodically.
 pub fn spawn_routeros_sync(
     config: RouterOsConfig,
     registry: Arc<ClientRegistry>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_routeros_sync_with(config, registry, shutdown_rx, init_sync_client)
+}
+
+/// Testable task body: `init_client` supplies the configured client (or does
+/// not, which disables the task) so the early-return path can be exercised
+/// without a global test switch.
+fn spawn_routeros_sync_with<F>(
+    config: RouterOsConfig,
+    registry: Arc<ClientRegistry>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    init_client: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnOnce(&RouterOsConfig) -> Option<reqwest::Client> + Send + 'static,
+{
     tokio::spawn(async move {
         if !config.enabled {
             return;
         }
 
-        let Some(client) = init_sync_client(&config) else {
+        let Some(client) = init_client(&config) else {
+            // A failed client build disables the task. It must not clear the
+            // leases already in the registry: identity survives the failure.
             return;
         };
         if !leases_are_verified(&config) {
             if config.allow_invalid_certs {
                 warn!(
                     "RouterOS TLS verification is disabled (allow_invalid_certs = true); \
-                     leases are display-only and will not identify clients"
+                     leases are unverified and will not identify clients"
                 );
             } else {
                 warn!(
                     url = %config.url,
-                    "RouterOS URL does not use https; leases are display-only and will not identify clients"
+                    "RouterOS URL does not use https; leases are unverified and will not \
+                     identify clients"
                 );
             }
         }
 
-        let interval = Duration::from_secs(config.interval_s.max(5));
-        let mut ticker = tokio::time::interval(interval);
+        let mut ticker = tokio::time::interval(sync_interval(&config));
 
         loop {
             tokio::select! {
@@ -361,10 +444,9 @@ pub fn spawn_routeros_sync(
                     }
                 }
                 _ = ticker.tick() => {
-                    match fetch_with_client(&client, &config, leases_are_verified(&config)).await {
-                        Ok(leases) => {
-                            info!(count = leases.len(), "Synced RouterOS DHCP leases");
-                            registry.update_routeros_leases(leases);
+                    match sync_once(&client, &config, &registry).await {
+                        Ok(count) => {
+                            info!(count, "Synced RouterOS DHCP leases");
                         }
                         Err(err) => {
                             warn!(error = %err, "Failed to sync RouterOS DHCP leases; retaining previous leases");
@@ -391,6 +473,43 @@ mod tests {
         config: &RouterOsConfig,
     ) -> Result<Vec<RouterOsLease>, RouterOsError> {
         super::fetch_with_client(client, config, super::leases_are_verified(config)).await
+    }
+
+    fn routeros_config(port: u16) -> RouterOsConfig {
+        RouterOsConfig {
+            enabled: true,
+            url: format!("http://127.0.0.1:{port}"),
+            token_env: None,
+            username: None,
+            password: None,
+            password_env: None,
+            interval_s: 300,
+            allow_invalid_certs: false,
+        }
+    }
+
+    fn config_with_interval(interval_s: u64) -> RouterOsConfig {
+        RouterOsConfig {
+            interval_s,
+            ..RouterOsConfig::default()
+        }
+    }
+
+    /// Reads one mock request's headers (through the blank line).
+    async fn read_request_headers(socket: &mut tokio::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut scratch = [0u8; 1024];
+        loop {
+            let read = socket.read(&mut scratch).await.unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            buf.extend_from_slice(&scratch[..read]);
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") || buf.len() > 16 * 1024 {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
     }
 
     #[tokio::test]
@@ -476,7 +595,7 @@ mod tests {
         assert_eq!(leases[0].comment.as_deref(), Some("Alice Laptop"));
         assert!(
             !leases[0].verified,
-            "the mock URL is plaintext http://, so the leases are display-only"
+            "the mock URL is plaintext http://, so identity matching ignores the lease"
         );
 
         // Update ClientRegistry with these leases
@@ -897,5 +1016,339 @@ mod tests {
             !leases_are_verified(&unsupported),
             "a non-HTTP(S) scheme must never grant identity"
         );
+    }
+
+    #[tokio::test]
+    async fn test_routeros_sync_once_updates_registry_and_retains_previous_on_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            // First tick: one bound lease.
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let _ = read_request_headers(&mut socket).await;
+                let body = r#"[{
+                    "address": "192.168.1.150",
+                    "mac-address": "AA:BB:CC:DD:EE:01",
+                    "host-name": "alice-laptop",
+                    "status": "bound",
+                    "disabled": false
+                }]"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+
+            // Second tick: router error.
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let _ = read_request_headers(&mut socket).await;
+                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let config = routeros_config(port);
+        let client = build_routeros_client(&config).expect("client must build");
+        let registry = ClientRegistry::new(ClientsConfig::default());
+
+        let count = sync_once(&client, &config, &registry)
+            .await
+            .expect("first sync must succeed");
+        assert_eq!(count, 1);
+        let store = registry.routeros_leases_store();
+        {
+            let leases = store.read().expect("lease store lock");
+            assert_eq!(leases.len(), 1);
+            assert_eq!(leases[0].mac, "aa:bb:cc:dd:ee:01");
+            assert_eq!(leases[0].hostname.as_deref(), Some("alice-laptop"));
+        }
+
+        let err = sync_once(&client, &config, &registry)
+            .await
+            .expect_err("the 500 response must fail the tick");
+        assert!(
+            matches!(
+                err,
+                RouterOsError::BadStatus(StatusCode::INTERNAL_SERVER_ERROR, _)
+            ),
+            "unexpected error: {err:?}"
+        );
+        let leases = store.read().expect("lease store lock");
+        assert_eq!(
+            leases.len(),
+            1,
+            "a failed tick must retain the previous leases"
+        );
+        assert_eq!(leases[0].mac, "aa:bb:cc:dd:ee:01");
+    }
+
+    #[tokio::test]
+    async fn test_routeros_sync_task_stops_on_shutdown() {
+        // Use a port that was just free: the immediate first tick fails fast
+        // with a connection error instead of waiting for a response.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let config = RouterOsConfig {
+            interval_s: 1,
+            ..routeros_config(port)
+        };
+        let registry = Arc::new(ClientRegistry::new(ClientsConfig::default()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = spawn_routeros_sync_with(config, registry, shutdown_rx, |config| {
+            build_routeros_client(config).ok()
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let signalled = tokio::time::Instant::now();
+        shutdown_tx.send(true).expect("shutdown receiver is alive");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("the sync task must stop on shutdown without waiting for the next tick")
+            .expect("the sync task must not panic");
+        assert!(
+            signalled.elapsed() < Duration::from_secs(1),
+            "shutdown must not wait for the (floored) poll interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_routeros_client_build_failure_returns_early_without_clearing_identity() {
+        let registry = Arc::new(ClientRegistry::new(ClientsConfig::default()));
+        let lease = RouterOsLease {
+            mac: "aa:bb:cc:dd:ee:01".to_string(),
+            ip: Some(IpAddr::from_str("192.168.1.150").unwrap()),
+            hostname: Some("alice-laptop".to_string()),
+            comment: None,
+            verified: true,
+        };
+        registry.update_routeros_leases(vec![lease]);
+
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = spawn_routeros_sync_with(
+            routeros_config(1),
+            Arc::clone(&registry),
+            shutdown_rx,
+            |_| None,
+        );
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("a task without a client must exit immediately")
+            .expect("the sync task must not panic");
+
+        let store = registry.routeros_leases_store();
+        let leases = store.read().expect("lease store lock");
+        assert_eq!(
+            leases.len(),
+            1,
+            "a client-build failure must not clear existing leases"
+        );
+        assert!(leases[0].verified);
+        assert_eq!(leases[0].mac, "aa:bb:cc:dd:ee:01");
+    }
+
+    #[tokio::test]
+    async fn test_routeros_chunked_response_over_cap_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let _ = read_request_headers(&mut socket).await;
+                // No Content-Length: the cap must be enforced while streaming.
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(head.as_bytes()).await;
+                let chunk = vec![b' '; 600 * 1024];
+                for _ in 0..2 {
+                    let size = format!("{:x}\r\n", chunk.len());
+                    let _ = socket.write_all(size.as_bytes()).await;
+                    let _ = socket.write_all(&chunk).await;
+                    let _ = socket.write_all(b"\r\n").await;
+                }
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+            }
+        });
+
+        let config = routeros_config(port);
+        let client = build_routeros_client(&config).expect("client must build");
+        let err = fetch_with_test_client(&client, &config)
+            .await
+            .expect_err("a chunked body over the cap must be rejected");
+        assert!(
+            matches!(err, RouterOsError::ResponseTooLarge { limit } if limit == MAX_RESPONSE_BYTES),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_routeros_redirect_is_not_followed() {
+        // The redirect target records any connection it receives.
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let (target_hit_tx, target_hit_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = target.accept().await {
+                let _ = target_hit_tx.send(());
+                let _ = read_request_headers(&mut socket).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                    )
+                    .await;
+            }
+        });
+
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_port = source.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = source.accept().await {
+                let request = read_request_headers(&mut socket).await;
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: basic "),
+                    "the request to the router must carry the configured credentials: {request:?}"
+                );
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/rest/ip/dhcp-server/lease\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let config = RouterOsConfig {
+            username: Some("admin".to_string()),
+            password: Some("secret".to_string()),
+            ..routeros_config(source_port)
+        };
+
+        // The production path (client built from config) must not follow the
+        // redirect: the 3xx response is returned as an error.
+        let err = fetch_routeros_leases(&config)
+            .await
+            .expect_err("a 3xx response must not be treated as success");
+        match err {
+            RouterOsError::BadStatus(status, _) => {
+                assert!(
+                    status.is_redirection(),
+                    "the redirect status must surface unchanged: {status}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+
+        // Credentials must never be replayed to the redirect target.
+        let contacted = tokio::time::timeout(Duration::from_millis(250), target_hit_rx).await;
+        assert!(
+            contacted.is_err(),
+            "the redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_routeros_interval_is_floored_at_five_seconds() {
+        for seconds in [0_u64, 1, 4, 5] {
+            assert_eq!(
+                sync_interval(&config_with_interval(seconds)),
+                Duration::from_secs(5),
+                "interval_s = {seconds} must be raised to the 5 s floor"
+            );
+            let ticker = tokio::time::interval(sync_interval(&config_with_interval(seconds)));
+            assert_eq!(ticker.period(), Duration::from_secs(5));
+        }
+        assert_eq!(
+            sync_interval(&config_with_interval(300)),
+            Duration::from_secs(300),
+            "intervals above the floor must be used unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_routeros_successful_empty_lease_list_clears_stored_leases() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let _ = read_request_headers(&mut socket).await;
+                let body = "[]";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let config = routeros_config(port);
+        let client = build_routeros_client(&config).expect("client must build");
+        let registry = ClientRegistry::new(ClientsConfig::default());
+        registry.update_routeros_leases(vec![RouterOsLease {
+            mac: "aa:bb:cc:dd:ee:01".to_string(),
+            ip: Some(IpAddr::from_str("192.168.1.150").unwrap()),
+            hostname: Some("alice-laptop".to_string()),
+            comment: None,
+            verified: true,
+        }]);
+
+        let count = sync_once(&client, &config, &registry)
+            .await
+            .expect("an empty lease list is a successful sync");
+        assert_eq!(count, 0);
+        let store = registry.routeros_leases_store();
+        assert!(
+            store.read().expect("lease store lock").is_empty(),
+            "a successful empty response replaces the snapshot with no leases"
+        );
+    }
+
+    #[test]
+    fn test_routeros_endpoint_join_is_idempotent() {
+        let expected = "https://router.lan/rest/ip/dhcp-server/lease";
+        for url in [
+            "https://router.lan",
+            "https://router.lan/",
+            "https://router.lan/rest/ip/dhcp-server/lease",
+            "https://router.lan/rest/ip/dhcp-server/lease/",
+        ] {
+            let config = RouterOsConfig {
+                url: url.to_string(),
+                ..RouterOsConfig::default()
+            };
+            assert_eq!(
+                lease_endpoint(&config)
+                    .unwrap_or_else(|err| panic!("{url} must join: {err}"))
+                    .as_str(),
+                expected,
+                "unexpected endpoint for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_routeros_endpoint_rejects_query_fragment_and_userinfo() {
+        for url in [
+            "https://router.lan?x=1",
+            "https://router.lan#lease",
+            "https://admin:s3cret@router.lan",
+        ] {
+            let config = RouterOsConfig {
+                url: url.to_string(),
+                ..RouterOsConfig::default()
+            };
+            let err = lease_endpoint(&config).expect_err("the URL must be rejected");
+            assert!(
+                matches!(err, RouterOsError::InvalidUrl(_)),
+                "unexpected error for {url}: {err:?}"
+            );
+            assert!(
+                !err.to_string().contains("s3cret"),
+                "the error must not echo embedded credentials: {err}"
+            );
+        }
     }
 }

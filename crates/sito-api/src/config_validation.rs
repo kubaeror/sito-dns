@@ -410,7 +410,8 @@ mod tests {
         );
 
         // Plaintext http:// is a documented lab opt-out: accepted, but the
-        // RouterOS client marks its leases unverified (display-only).
+        // RouterOS client marks its leases unverified, so identity matching
+        // ignores them.
         let plaintext: sito_clients::IntegrationsConfig =
             toml::from_str("[mikrotik]\nenabled = true\nurl = \"http://router.lan\"\n")
                 .expect("parses [integrations]");
