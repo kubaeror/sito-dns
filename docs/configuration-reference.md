@@ -1100,13 +1100,44 @@ interval_s = 300
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Enable automated client discovery from RouterOS DHCP server. |
-| `url` | string | `"https://192.168.1.1"` | Base URL of the RouterOS REST API (`https://router.lan`). Only `https://` with certificate verification grants client identity; a plaintext `http://` URL is a lab opt-out whose leases are display-only. Non-HTTP(S) schemes are rejected when `enabled = true`. |
+| `url` | string | `"https://192.168.1.1"` | Base URL of the RouterOS REST API (`https://router.lan`). Only `https://` with certificate verification grants client identity; a plaintext `http://` URL is a lab opt-out whose leases are unverified, so identity matching ignores them. Non-HTTP(S) schemes are rejected when `enabled = true`; a query string, fragment or embedded userinfo is rejected at sync time. |
 | `token_env` | string | `None` | Environment variable containing the RouterOS API token. When unset, no bearer-token authentication is attempted (use `username`/`password_env` instead). If set but unresolved or empty, sync fails instead of silently falling back to basic authentication. |
 | `username` | string | `None` | Username for HTTP basic authentication when no token is used. |
 | `password` | string | `None` | Password for HTTP basic authentication (prefer `password_env` to keep secrets out of the config). |
-| `password_env` | string | `None` | Environment variable containing the RouterOS password. |
-| `allow_invalid_certs` | boolean | `false` | Accept untrusted/self-signed RouterOS TLS certificates (insecure; lab use only). Leases fetched this way are marked unverified: they are display-only and never grant a client entry's group, trusted flag, or MAC identity. |
-| `interval_s` | integer | `300` | Polling interval in seconds to refresh active DHCP lease table. |
+| `password_env` | string | `None` | Environment variable containing the RouterOS password. An unset or empty variable is an error, never an empty password. |
+| `allow_invalid_certs` | boolean | `false` | Accept untrusted/self-signed RouterOS TLS certificates (insecure; lab use only). Leases fetched this way are marked unverified: identity matching ignores them, they are not exposed by the 2.0 admin UI/API, and they never grant a client entry's group, trusted flag or MAC identity. |
+| `interval_s` | integer | `300` | Polling interval in seconds to refresh the active DHCP lease table. The runtime enforces a 5-second floor: values below `5` are raised to `5`. |
+
+Lease use is deliberately narrow and fail-closed:
+
+- Only **enabled** leases with `status = "bound"` are stored. Disabled leases
+  and leases in any other state (`waiting`, `offered`, `expired`, `conflict`,
+  or a missing status) are dropped, so they cannot grant policy.
+- MAC and source-IP lease matches always apply to verified leases.
+  `[clients] trust_routeros_lease_names` (default `false`) gates hostname and
+  comment matching, because DHCP names are client-controlled.
+- A successful response **replaces** the stored lease snapshot, including an
+  empty `[]` response: after the router reports no leases, previous verified
+  lease identity is gone until the next non-empty successful sync. A failed
+  request (network error, non-2xx status, oversized body) leaves the previous
+  snapshot in place.
+- Only `https://` with certificate verification yields identity-capable
+  leases. An unverified lease (plaintext `http://` or
+  `allow_invalid_certs = true`) is ignored by identity matching and is not
+  exposed by the 2.0 admin UI/API.
+- **No status surface in 2.0.** There is no RouterOS status endpoint, admin
+  page or sync metric. Observability is the server log: a successful tick logs
+  `Synced RouterOS DHCP leases`, and a failed tick logs a warning that the
+  previous leases are retained. A status/metrics surface is future work.
+- **HA is node-local.** `[integrations.mikrotik]` is preserved as node-local
+  configuration, not replicated: the master does not overwrite a slave's
+  section, so each node that should sync leases needs its own router URL and
+  credentials.
+- The HTTP client keeps the D15 security bar: environment proxies are
+  disabled, redirects are not followed, requests time out after 10 seconds,
+  success bodies are capped at 1 MiB and error bodies at 4 KiB, and a
+  configured but unresolved token or password is an error rather than a
+  silent credential fallback.
 
 ---
 

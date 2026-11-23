@@ -57,7 +57,8 @@ pub struct RouterOsLease {
     /// verification enabled (`allow_invalid_certs = false`).
     ///
     /// D10/D15: a lease from a plaintext `http://` RouterOS API, or from an
-    /// API with TLS verification disabled, is display-only. It must never
+    /// API with TLS verification disabled, is unverified: identity matching
+    /// ignores it and the 2.0 admin UI/API does not expose it. It must never
     /// grant a client entry's group, trusted flag, or MAC identity, because
     /// any host on the path could forge it.
     pub verified: bool,
@@ -1056,7 +1057,8 @@ group = "subnet"
             verified,
         };
 
-        // A lease fetched with TLS verification disabled is display-only.
+        // A lease fetched with TLS verification disabled is unverified:
+        // identity matching ignores it.
         reg.update_routeros_leases(vec![lease(false)]);
         let mut unverified_ctx = ClientContext::new(ip);
         let policy = reg.resolve(&mut unverified_ctx, reg.now());

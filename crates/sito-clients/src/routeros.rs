@@ -17,7 +17,8 @@ pub struct RouterOsConfig {
     /// Only an `https://` URL with certificate verification enabled
     /// (`allow_invalid_certs = false`) authenticates the peer; a plaintext
     /// `http://` URL is allowed as a lab opt-out but its leases are
-    /// display-only and never grant client identity.
+    /// unverified, ignored by identity matching and not exposed by the 2.0
+    /// admin UI/API.
     #[serde(default = "default_url")]
     pub url: String,
     pub token_env: Option<String>,
