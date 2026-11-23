@@ -92,8 +92,8 @@ allow_plaintext_doh = false
 > `dns.bind` defaults to `["0.0.0.0", "::"]`. The ADR-0011 source-address ACL is
 > available in 2.0, but its typed default is `clients.default_policy = "allow"`
 > so upgrades preserve existing behavior. Only a fresh install that completes
-> the first-boot wizard starts with default deny. A wildcard bind with an
-> effective allow policy accepts recursive queries from any source that can
+> the first-boot wizard starts with default deny. A wildcard bind with no DNS client allow-list
+> (the default allow policy) accepts recursive queries from any source that can
 > reach the host; `rate_limit_per_ip` only limits rate, it does not authorize
 > clients. Keep the DNS ports behind a host firewall (defense in depth) and
 > configure `[clients.acl]` deliberately. The server emits a startup warning
