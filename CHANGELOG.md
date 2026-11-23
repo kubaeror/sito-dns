@@ -15,6 +15,17 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   apply to `upstream.servers`; per-domain weights are config-file-only and
   per-client scoped upstream lists remain unweighted (round-robin).
 
+### Fixed
+- Stale upstream metrics are now pruned across every upstream scope. The
+  post-apply prune set is the union of global `upstream.servers`,
+  `upstream.per_domain[].servers` and per-client `clients.entries[].upstreams`
+  scopes (`use_global_upstreams = false`) instead of only the global and
+  per-domain lists. A removed per-client upstream can therefore no longer leave
+  stale health, RTT, error or `sito_dnssec_bogus_total` series behind, and a
+  label that another scope still uses is never pruned. A malformed optional
+  `[clients]` section logs a warning and skips pruning rather than failing an
+  already-live apply.
+
 ---
 
 ## [2.0.0-rc.2] - 2026-11-22

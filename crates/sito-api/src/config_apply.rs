@@ -409,27 +409,71 @@ async fn commit_staged(
 /// Drops health/RTT/error series for upstream names that disappeared in a
 /// successful apply. The config is already live here, so these labels cannot
 /// be produced again and would otherwise stay in the exposition forever.
+///
+/// A `[clients]` section that cannot be parsed is logged and pruning is
+/// skipped: a malformed optional section could hide a name that is still live,
+/// and keeping a stale series is safer than pruning a live one.
 fn prune_stale_upstream_metrics(ctx: &ServerContext, previous: &Config, candidate: &Config) {
-    let names = |config: &Config| -> std::collections::BTreeSet<String> {
-        config
-            .upstream
-            .servers
-            .iter()
-            .cloned()
-            .chain(
-                config
-                    .upstream
-                    .per_domain
-                    .iter()
-                    .flat_map(|rule| rule.servers.iter().cloned()),
-            )
-            .collect()
+    let (Some(previous_names), Some(current_names)) = (
+        active_upstream_names(previous),
+        active_upstream_names(candidate),
+    ) else {
+        return;
     };
-    let previous_names = names(previous);
-    let current_names = names(candidate);
     for name in previous_names.difference(&current_names) {
         ctx.metrics.remove_upstream_health(name);
     }
+}
+
+/// Every configured upstream name that can still emit per-upstream series:
+/// the global `[upstream.servers]` list, every `[upstream.per_domain[].servers]`
+/// scope and every per-client scope (`[clients.entries[].upstreams]` for entries
+/// that do not inherit the global list).
+///
+/// The names are unioned once instead of pruning scope by scope, so a label
+/// that is still live through any other scope is never removed.
+///
+/// Returns `None` when the optional `[clients]` section cannot be parsed; the
+/// caller then skips pruning rather than risk dropping a live label.
+fn active_upstream_names(config: &Config) -> Option<std::collections::BTreeSet<String>> {
+    let mut names: std::collections::BTreeSet<String> = config
+        .upstream
+        .servers
+        .iter()
+        .cloned()
+        .chain(
+            config
+                .upstream
+                .per_domain
+                .iter()
+                .flat_map(|rule| rule.servers.iter().cloned()),
+        )
+        .collect();
+
+    if config.clients.is_none() {
+        return Some(names);
+    }
+    let clients = match clients_from_config(config) {
+        Ok(clients) => clients,
+        Err(error) => {
+            tracing::warn!(
+                detail = %error.detail,
+                "Skipping stale upstream metric pruning: the optional [clients] section could not be parsed"
+            );
+            return None;
+        }
+    };
+    for entry in &clients.entries {
+        // `use_global_upstreams = true` entries use the global list; any
+        // `upstreams` they still carry are not built as a scope.
+        if entry.use_global_upstreams {
+            continue;
+        }
+        if let Some(upstreams) = &entry.upstreams {
+            names.extend(upstreams.iter().cloned());
+        }
+    }
+    Some(names)
 }
 
 /// Applies `candidate` and persists it only after the apply succeeded. A
@@ -1533,6 +1577,366 @@ mod tests {
         assert!(
             rendered.contains(r#"sito_upstream_errors_total{upstream="9.9.9.9",kind="timeout"}"#),
             "a retained upstream must keep its error series: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Builds a client entry for the pruning tests. `upstreams` is `None` when
+    /// the entry inherits the global list.
+    fn prune_test_client(
+        name: &str,
+        ids: &[&str],
+        use_global_upstreams: bool,
+        upstreams: &[&str],
+    ) -> sito_clients::ClientEntryConfig {
+        sito_clients::ClientEntryConfig {
+            name: name.to_string(),
+            ids: ids.iter().map(|id| (*id).to_string()).collect(),
+            group: "default".to_string(),
+            ignore_query_log: false,
+            ignore_stats: false,
+            use_global_upstreams,
+            upstreams: (!upstreams.is_empty()).then(|| {
+                upstreams
+                    .iter()
+                    .map(|upstream| (*upstream).to_string())
+                    .collect()
+            }),
+            trusted: false,
+        }
+    }
+
+    fn set_prune_test_clients(config: &mut Config, entries: Vec<sito_clients::ClientEntryConfig>) {
+        let clients = sito_clients::ClientsConfig {
+            entries,
+            ..Default::default()
+        };
+        config.clients = Some(toml::Value::try_from(&clients).expect("[clients] serializes"));
+    }
+
+    fn seed_prune_test_metrics(ctx: &ServerContext, names: &[&str]) {
+        for name in names {
+            ctx.metrics.observe_upstream_rtt(name, 0.010);
+            ctx.metrics.inc_upstream_errors(name, "timeout");
+            ctx.metrics.set_upstream_health(name, 0.0);
+        }
+    }
+
+    /// G1: an upstream that only existed in a per-client scope must be pruned
+    /// when that client drops it, while a sibling scope entry survives.
+    #[tokio::test]
+    async fn test_config_apply_prunes_removed_client_only_upstream() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_prune_client_only");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.upstream.servers = vec!["9.9.9.9".to_string()];
+        set_prune_test_clients(
+            &mut previous,
+            vec![prune_test_client(
+                "laptop",
+                &["10.70.0.10"],
+                false,
+                &["10.60.0.53", "10.60.0.54"],
+            )],
+        );
+        ctx.config.store(std::sync::Arc::new(previous.clone()));
+        seed_prune_test_metrics(&ctx, &["9.9.9.9", "10.60.0.53", "10.60.0.54"]);
+
+        let mut candidate = previous;
+        set_prune_test_clients(
+            &mut candidate,
+            vec![prune_test_client(
+                "laptop",
+                &["10.70.0.10"],
+                false,
+                &["10.60.0.53"],
+            )],
+        );
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, None)
+            .await
+            .expect("the client-only upstream removal must apply");
+
+        let rendered = ctx.metrics.render_prometheus();
+        assert!(
+            !rendered.contains(r#"upstream="10.60.0.54""#),
+            "the removed per-client-only upstream must be pruned: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_upstream_health{upstream="10.60.0.53"}"#),
+            "the retained per-client upstream must keep its series: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_upstream_health{upstream="9.9.9.9"}"#),
+            "the global upstream must keep its series: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// G1: switching a client back to the global upstream list retires its
+    /// former per-client scope, so those labels are pruned.
+    #[tokio::test]
+    async fn test_config_apply_prunes_upstream_after_use_global_conversion() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_prune_use_global");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.upstream.servers = vec!["9.9.9.9".to_string()];
+        set_prune_test_clients(
+            &mut previous,
+            vec![prune_test_client(
+                "phone",
+                &["10.70.0.11"],
+                false,
+                &["10.60.0.60"],
+            )],
+        );
+        ctx.config.store(std::sync::Arc::new(previous.clone()));
+        seed_prune_test_metrics(&ctx, &["9.9.9.9", "10.60.0.60"]);
+
+        let mut candidate = previous;
+        set_prune_test_clients(
+            &mut candidate,
+            vec![prune_test_client("phone", &["10.70.0.11"], true, &[])],
+        );
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, None)
+            .await
+            .expect("the use_global_upstreams conversion must apply");
+
+        let rendered = ctx.metrics.render_prometheus();
+        assert!(
+            !rendered.contains(r#"upstream="10.60.0.60""#),
+            "the retired per-client scope must be pruned: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_upstream_health{upstream="9.9.9.9"}"#),
+            "the global upstream must keep its series: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// G1: a name shared by the global list and two client scopes stays live
+    /// while any scope still references it, and is pruned once the last one
+    /// drops it (no sequential per-scope pruning).
+    #[tokio::test]
+    async fn test_config_apply_keeps_upstream_shared_across_scopes() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_prune_shared_scope");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        let shared = "9.9.9.9";
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.upstream.servers = vec![shared.to_string(), "1.1.1.1".to_string()];
+        set_prune_test_clients(
+            &mut previous,
+            vec![
+                prune_test_client("one", &["10.70.0.21"], false, &[shared]),
+                prune_test_client("two", &["10.70.0.22"], false, &[shared]),
+            ],
+        );
+        ctx.config.store(std::sync::Arc::new(previous.clone()));
+        seed_prune_test_metrics(&ctx, &[shared, "1.1.1.1"]);
+
+        // Drop the name from the global list only.
+        let mut candidate = previous.clone();
+        candidate.upstream.servers = vec!["1.1.1.1".to_string()];
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, None)
+            .await
+            .expect("removing the global-only reference must apply");
+        assert!(
+            ctx.metrics
+                .render_prometheus()
+                .contains(r#"sito_upstream_health{upstream="9.9.9.9"}"#),
+            "a name still live through two client scopes must not be pruned"
+        );
+
+        // Drop it from client "one"; client "two" still uses it.
+        set_prune_test_clients(
+            &mut candidate,
+            vec![
+                prune_test_client("one", &["10.70.0.21"], true, &[]),
+                prune_test_client("two", &["10.70.0.22"], false, &[shared]),
+            ],
+        );
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, None)
+            .await
+            .expect("removing one of two client references must apply");
+        assert!(
+            ctx.metrics
+                .render_prometheus()
+                .contains(r#"sito_upstream_health{upstream="9.9.9.9"}"#),
+            "a name still live through the last client scope must not be pruned"
+        );
+
+        // Drop the last reference.
+        set_prune_test_clients(
+            &mut candidate,
+            vec![
+                prune_test_client("one", &["10.70.0.21"], true, &[]),
+                prune_test_client("two", &["10.70.0.22"], true, &[]),
+            ],
+        );
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, None)
+            .await
+            .expect("removing the last reference must apply");
+        assert!(
+            !ctx.metrics
+                .render_prometheus()
+                .contains(r#"upstream="9.9.9.9""#),
+            "the name must be pruned once no scope references it"
+        );
+        assert!(
+            ctx.metrics
+                .render_prometheus()
+                .contains(r#"sito_upstream_health{upstream="1.1.1.1"}"#),
+            "the retained global upstream must keep its series"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// G1 regression: per-domain-only removals still prune (the original
+    /// `[upstream]`/`per_domain` behavior).
+    #[tokio::test]
+    async fn test_config_apply_prunes_removed_per_domain_upstream() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_prune_per_domain");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.upstream.servers = vec!["9.9.9.9".to_string()];
+        previous.upstream.per_domain = vec![sito_core::config::PerDomainUpstream {
+            domains: vec!["internal.example".to_string()],
+            servers: vec!["10.60.0.70".to_string()],
+            weights: Vec::new(),
+        }];
+        ctx.config.store(std::sync::Arc::new(previous.clone()));
+        seed_prune_test_metrics(&ctx, &["9.9.9.9", "10.60.0.70"]);
+
+        let mut candidate = previous;
+        candidate.upstream.per_domain.clear();
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, None)
+            .await
+            .expect("the per-domain removal must apply");
+
+        let rendered = ctx.metrics.render_prometheus();
+        assert!(
+            !rendered.contains(r#"upstream="10.60.0.70""#),
+            "a removed per-domain-only upstream must still be pruned: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"sito_upstream_health{upstream="9.9.9.9"}"#),
+            "the global upstream must keep its series: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// G1: a configuration without a `[clients]` section is handled as "no
+    /// client scopes" instead of panicking or skipping global pruning.
+    #[tokio::test]
+    async fn test_config_apply_without_clients_section_does_not_panic() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_prune_no_clients");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.upstream.servers = vec!["1.1.1.1".to_string()];
+        assert!(previous.clients.is_none(), "the test needs no [clients]");
+        ctx.config.store(std::sync::Arc::new(previous.clone()));
+        seed_prune_test_metrics(&ctx, &["1.1.1.1"]);
+
+        let mut candidate = previous;
+        candidate.upstream.servers = vec!["9.9.9.9".to_string()];
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, None)
+            .await
+            .expect("a config without [clients] must still apply");
+        assert!(
+            !ctx.metrics
+                .render_prometheus()
+                .contains(r#"upstream="1.1.1.1""#),
+            "global pruning must still work without a [clients] section"
+        );
+
+        let names = active_upstream_names(&candidate).expect("no [clients] means no parse failure");
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["9.9.9.9".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// G1: the `sito_dnssec_bogus_total` series for a removed per-client-only
+    /// name is pruned together with the health/RTT/error series.
+    #[tokio::test]
+    async fn test_config_apply_prunes_dnssec_bogus_for_removed_client_upstream() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_prune_client_bogus");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.upstream.servers = vec!["9.9.9.9".to_string()];
+        set_prune_test_clients(
+            &mut previous,
+            vec![prune_test_client(
+                "lab",
+                &["10.70.0.31"],
+                false,
+                &["10.60.0.80"],
+            )],
+        );
+        ctx.config.store(std::sync::Arc::new(previous.clone()));
+        seed_prune_test_metrics(&ctx, &["10.60.0.80"]);
+        ctx.metrics.inc_dnssec_bogus("10.60.0.80");
+
+        let mut candidate = previous;
+        set_prune_test_clients(
+            &mut candidate,
+            vec![prune_test_client("lab", &["10.70.0.31"], true, &[])],
+        );
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, None)
+            .await
+            .expect("the client-only upstream removal must apply");
+
+        let rendered = ctx.metrics.render_prometheus();
+        assert!(
+            !rendered.contains(r#"sito_dnssec_bogus_total{upstream="10.60.0.80"}"#),
+            "the removed per-client name must lose its dnssec_bogus series: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// G1: a malformed `[clients]` section can hide a live label, so pruning is
+    /// skipped (logged) instead of dropping series that may still be produced.
+    #[tokio::test]
+    async fn test_config_apply_skips_pruning_when_clients_malformed() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_prune_malformed_clients");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+
+        let mut previous = (**ctx.config.load()).clone();
+        previous.upstream.servers = vec!["1.1.1.1".to_string()];
+        // Not a table: the typed conversion fails, but the config is already
+        // live (for example restored from an older in-memory snapshot).
+        previous.clients = Some(toml::Value::String("not-a-table".to_string()));
+        ctx.config.store(std::sync::Arc::new(previous.clone()));
+        seed_prune_test_metrics(&ctx, &["1.1.1.1"]);
+        assert!(
+            active_upstream_names(&previous).is_none(),
+            "a malformed [clients] section must not yield a name set"
+        );
+
+        let mut candidate = (**ctx.config.load()).clone();
+        candidate.clients = None;
+        candidate.upstream.servers = vec!["9.9.9.9".to_string()];
+        apply_full_config(&ctx, &candidate, FilterApply::Sync, None)
+            .await
+            .expect("the apply must not fail because the previous [clients] is malformed");
+        assert!(
+            ctx.metrics
+                .render_prometheus()
+                .contains(r#"sito_upstream_health{upstream="1.1.1.1"}"#),
+            "pruning must be skipped when the previous [clients] section is malformed"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
