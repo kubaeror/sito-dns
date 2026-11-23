@@ -108,6 +108,48 @@ async fn test_scoped_upstream_reload_rebuilds_on_allow_private_targets_change() 
     );
 }
 
+/// F1: per-client scoped upstream lists are unweighted. They must never
+/// inherit the global index-aligned weight list, and a global weight change
+/// must not reweight or rebuild an unrelated scoped manager.
+#[tokio::test]
+async fn test_scoped_upstreams_do_not_inherit_global_weights() {
+    let mut config = Config::default();
+    config.upstream.servers = vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()];
+    config.upstream.weights = vec![100, 1];
+    let clients = scoped_clients(&["udp://127.0.0.1:53", "udp://127.0.0.2:53"]);
+
+    let first = build_scoped_upstreams(&config, &clients, &HashMap::new())
+        .await
+        .expect("scoped upstreams must build");
+    assert_eq!(first.len(), 1);
+    let first_key = first.keys().next().unwrap().clone();
+    let first_manager = first.values().next().unwrap().clone();
+    assert_eq!(
+        first_manager.weights(),
+        vec![1, 1],
+        "scoped lists must not inherit global weights by position"
+    );
+
+    // Changing only the global weight list keeps the scoped key stable and
+    // reuses the existing manager (and its all-1 weights).
+    config.upstream.weights = vec![1, 100];
+    let second = build_scoped_upstreams(&config, &clients, &first)
+        .await
+        .expect("scoped upstreams must rebuild/reuse");
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        second.keys().next().unwrap(),
+        &first_key,
+        "global weights must not be part of the scoped reuse key"
+    );
+    let second_manager = second.values().next().unwrap().clone();
+    assert!(
+        Arc::ptr_eq(&first_manager, &second_manager),
+        "a global weight change must not rebuild an unweighted scoped manager"
+    );
+    assert_eq!(second_manager.weights(), vec![1, 1]);
+}
+
 /// The reuse key must also change when inherited connection settings change,
 /// not only when the server list changes.
 #[test]
@@ -136,6 +178,12 @@ fn test_scoped_upstream_key_includes_inherited_settings() {
     let mut config = Config::default();
     config.upstream.allow_private_targets = true;
     assert_ne!(base, scoped_upstream_key(&config, &servers));
+
+    // Weights are intentionally absent from the key: scoped upstreams never
+    // inherit them, so a global weight edit must not churn scoped managers.
+    let mut config = Config::default();
+    config.upstream.weights = vec![5, 1];
+    assert_eq!(base, scoped_upstream_key(&config, &servers));
 }
 
 /// I5 regression: the production `init_ha` call site records the

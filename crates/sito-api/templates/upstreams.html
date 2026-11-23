@@ -44,9 +44,10 @@
             {% if user_role != "viewer" %}
             <form action="/ui/upstreams/weight" method="POST" style="display: flex; gap: 6px; align-items: center;">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="index" value="{{ loop.index0 }}">
               <input type="hidden" name="address" value="{{ u.address }}">
-              <input type="number" name="weight" class="form-input mono" min="1" max="100" step="1"
-                     value="{{ u.weight }}" aria-label="Load balancing weight for {{ u.address }}"
+              <input type="number" name="weight" class="form-input mono" min="1" max="{{ max_upstream_weight }}" step="1"
+                     value="{{ u.weight }}" required aria-label="Load balancing weight for {{ u.address }}"
                      style="width: 80px; padding: 4px 8px;">
               <button type="submit" class="btn btn-outline btn-sm">Save</button>
             </form>
@@ -99,8 +100,8 @@
           </div>
           <div class="form-group">
             <label class="form-label" for="up-weight">Load Balancing Weight</label>
-            <input type="number" id="up-weight" name="weight" class="form-input mono" min="1" max="100" step="1" value="1">
-            <div class="form-help">Default 1. Higher values receive proportionally more queries under the load_balance strategy.</div>
+            <input type="number" id="up-weight" name="weight" class="form-input mono" min="1" max="{{ max_upstream_weight }}" step="1" value="1" required>
+            <div class="form-help">Default 1. Higher values receive proportionally more queries under the load_balance strategy (range 1-{{ max_upstream_weight }}).</div>
           </div>
         </div>
         <div class="modal-footer">

@@ -2258,7 +2258,7 @@ acme_enabled = false
                     timeout_ms: 2000,
                     probe_domain: "example.com".to_string(),
                     pool_size: 2,
-                    weights: Vec::new(),
+                    weights: None,
                 }),
             )
             .await

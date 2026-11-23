@@ -4841,6 +4841,10 @@ async fn test_upstreams_page_offers_weight_controls_and_effective_values() {
         panic!("admin login failed");
     };
 
+    let mut cfg = (**ctx.config.load()).clone();
+    cfg.upstream.weights = vec![7, 1];
+    ctx.set_config(cfg);
+
     let body =
         response_body(upstreams_page(State(ctx.clone()), session_headers(&session)).await).await;
     assert!(
@@ -4851,18 +4855,34 @@ async fn test_upstreams_page_offers_weight_controls_and_effective_values() {
         body.contains("id=\"up-weight\"") && body.contains("name=\"weight\""),
         "missing add-modal weight input: {body}"
     );
+    let max = sito_core::config::MAX_UPSTREAM_WEIGHT;
     assert!(
-        body.contains("min=\"1\"") && body.contains("max=\"100\""),
+        body.contains("min=\"1\"") && body.contains(&format!("max=\"{max}\"")),
         "the weight input must expose its bounds: {body}"
     );
     assert!(
-        body.contains("action=\"/ui/upstreams/weight\"") && body.contains("name=\"csrf_token\""),
-        "the edit form must post through the CSRF-protected route: {body}"
+        body.contains("name=\"index\"") && body.contains("name=\"address\""),
+        "the edit form must address a stable server index: {body}"
     );
-    // Default servers are unweighted, so their effective weight is 1.
     assert!(
-        body.matches("value=\"1\"").count() >= 2,
-        "each default upstream must show weight 1: {body}"
+        body.contains("aria-label=\"Load balancing weight for 1.1.1.1\""),
+        "the table must render a weight input for the first server: {body}"
+    );
+    assert!(
+        body.contains("value=\"7\""),
+        "the stored non-default weight must be rendered in the table: {body}"
+    );
+    assert!(
+        body.matches("action=\"/ui/upstreams/weight\"").count() >= 2,
+        "each upstream row must expose the CSRF-protected edit form: {body}"
+    );
+    assert!(
+        body.matches("name=\"csrf_token\"").count() >= 2,
+        "the edit forms must carry the CSRF token: {body}"
+    );
+    assert!(
+        body.matches(" required").count() >= 3,
+        "the modal and per-row weight inputs must be required: {body}"
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -4947,6 +4967,7 @@ async fn test_upstreams_weight_edit_persists_and_normalizes_defaults() {
         Extension(ApplyHooks::default()),
         session_headers(&session),
         Form(UpdateUpstreamWeightForm {
+            index: 0,
             address: "1.1.1.1".to_string(),
             weight: 1,
         }),
@@ -4963,6 +4984,7 @@ async fn test_upstreams_weight_edit_persists_and_normalizes_defaults() {
         Extension(ApplyHooks::default()),
         session_headers(&session),
         Form(UpdateUpstreamWeightForm {
+            index: 0,
             address: "1.1.1.1".to_string(),
             weight: 4,
         }),
@@ -4973,12 +4995,13 @@ async fn test_upstreams_weight_edit_persists_and_normalizes_defaults() {
 
     // Setting every server to 1 drops the list, keeping default configs
     // byte-identical to a pre-weight document.
-    for address in ["1.1.1.1", "1.0.0.1"] {
+    for (index, address) in ["1.1.1.1", "1.0.0.1"].into_iter().enumerate() {
         let response = upstreams_weight_handler(
             State(ctx.clone()),
             Extension(ApplyHooks::default()),
             session_headers(&session),
             Form(UpdateUpstreamWeightForm {
+                index,
                 address: address.to_string(),
                 weight: 1,
             }),
@@ -4992,6 +5015,60 @@ async fn test_upstreams_weight_edit_persists_and_normalizes_defaults() {
         !persisted.contains("weights"),
         "an all-default weight list must stay omitted: {persisted}"
     );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// F1: duplicate server strings are separate entries, so the edit form uses
+/// the list index rather than the (ambiguous) address.
+#[tokio::test]
+async fn test_upstreams_weight_edit_targets_duplicate_entries_by_index() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_upstreams_duplicate_weight_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+    let mut cfg = (**ctx.config.load()).clone();
+    cfg.upstream.servers = vec!["1.1.1.1".to_string(), "1.1.1.1".to_string()];
+    cfg.upstream.weights = Vec::new();
+    ctx.set_config(cfg);
+
+    for (index, weight) in [(1usize, 5u32), (0, 3)] {
+        let response = upstreams_weight_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            session_headers(&session),
+            Form(UpdateUpstreamWeightForm {
+                index,
+                address: "1.1.1.1".to_string(),
+                weight,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+    assert_eq!(ctx.config.load().upstream.weights, vec![3, 5]);
+
+    // A stale form whose address no longer matches the index is rejected.
+    let response = upstreams_weight_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        session_headers(&session),
+        Form(UpdateUpstreamWeightForm {
+            index: 0,
+            address: "9.9.9.9".to_string(),
+            weight: 2,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(ctx.config.load().upstream.weights, vec![3, 5]);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -5018,6 +5095,7 @@ async fn test_upstreams_weight_edit_rejects_out_of_bounds_and_unknown_targets() 
             Extension(ApplyHooks::default()),
             session_headers(&session),
             Form(UpdateUpstreamWeightForm {
+                index: 0,
                 address: "1.1.1.1".to_string(),
                 weight,
             }),
@@ -5030,6 +5108,7 @@ async fn test_upstreams_weight_edit_rejects_out_of_bounds_and_unknown_targets() 
         Extension(ApplyHooks::default()),
         session_headers(&session),
         Form(UpdateUpstreamWeightForm {
+            index: 99,
             address: "203.0.113.1".to_string(),
             weight: 2,
         }),
@@ -5113,6 +5192,7 @@ async fn test_upstreams_weights_are_read_only_for_viewers() {
         Extension(ApplyHooks::default()),
         session_headers(&session),
         Form(UpdateUpstreamWeightForm {
+            index: 0,
             address: "1.1.1.1".to_string(),
             weight: 2,
         }),
@@ -5184,7 +5264,7 @@ async fn test_upstreams_weight_route_requires_csrf_token() {
                 .header(header::COOKIE, cookie)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from(format!(
-                    "csrf_token={}&address=1.1.1.1&weight=4",
+                    "csrf_token={}&index=0&address=1.1.1.1&weight=4",
                     session.csrf_token
                 )))
                 .unwrap(),

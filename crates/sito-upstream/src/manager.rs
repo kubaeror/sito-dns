@@ -281,37 +281,33 @@ fn random_weight_seed() -> u64 {
     rand::random::<u64>() | 1
 }
 
-/// Builds a weighted ordering of candidate indexes without replacement.
+/// Picks one candidate index with probability proportional to its weight.
 ///
-/// Each step picks one remaining index with probability proportional to its
-/// weight, so the first index alone follows the configured ratio while every
-/// candidate still appears exactly once. Callers use that ordering as the
-/// failover sequence: a failed first pick does not starve the rest.
-fn weighted_order(weights: &[u32], mut roll: impl FnMut() -> u64) -> Vec<usize> {
-    let mut remaining: Vec<usize> = (0..weights.len()).collect();
-    let mut order = Vec::with_capacity(weights.len());
-    while !remaining.is_empty() {
-        // Out-of-range or zero weights only come from internal/test callers;
-        // treating them as unit weight keeps the selector total and avoids a
-        // division by zero without hiding a configuration error (validation
-        // rejects 0 before the manager is built).
-        let total: u64 = remaining
-            .iter()
-            .map(|&index| u64::from(weights[index].max(1)))
-            .sum();
-        let mut pick = roll() % total;
-        let mut chosen = 0;
-        for (position, &index) in remaining.iter().enumerate() {
-            let weight = u64::from(weights[index].max(1));
-            if pick < weight {
-                chosen = position;
-                break;
-            }
-            pick -= weight;
-        }
-        order.push(remaining.remove(chosen));
+/// A single weighted choice is enough for the load-balance path: after the
+/// first pick the remaining candidates are tried in configuration order, so a
+/// failure still falls through to every other candidate. This is O(n) and
+/// allocates nothing, and all candidates remain reachable.
+fn weighted_start(weights: &[u32], mut roll: impl FnMut() -> u64) -> usize {
+    if weights.is_empty() {
+        return 0;
     }
-    order
+    // Out-of-range or zero weights only come from internal/test callers;
+    // treating them as unit weight keeps the selector total and avoids a
+    // division by zero without hiding a configuration error (validation
+    // rejects 0 before the manager is built).
+    let total: u64 = weights
+        .iter()
+        .map(|weight| u64::from((*weight).max(1)))
+        .sum();
+    let mut pick = roll() % total;
+    for (index, weight) in weights.iter().enumerate() {
+        let weight = u64::from((*weight).max(1));
+        if pick < weight {
+            return index;
+        }
+        pick -= weight;
+    }
+    weights.len().saturating_sub(1)
 }
 
 /// A validated replacement upstream set that is not live yet.
@@ -967,7 +963,7 @@ impl UpstreamManager {
 
     /// Deterministic variant of [`Self::with_weighted_upstreams`].
     ///
-    /// The seed drives the weighted ordering only; failover, health,
+    /// The seed drives the weighted first pick only; failover, health,
     /// deadlines, EDNS fallback and parallel racing are unchanged.
     #[must_use]
     pub fn with_weighted_upstreams_seeded(
@@ -1043,6 +1039,18 @@ impl UpstreamManager {
 
     pub fn timeout(&self) -> Duration {
         self.inner.load().timeout_duration
+    }
+
+    /// Effective weights for the global entry list, in the same order as
+    /// [`Self::statuses`]. Per-domain rules keep their own weights.
+    #[must_use]
+    pub fn weights(&self) -> Vec<u32> {
+        self.inner
+            .load()
+            .entries
+            .iter()
+            .map(|entry| entry.weight)
+            .collect()
     }
 
     /// Retrieve the current health status of all configured upstreams.
@@ -1169,10 +1177,10 @@ impl UpstreamManager {
     /// - `Failover`: candidates in configuration order. Weights never reorder
     ///   an explicit failover chain.
     /// - `LoadBalance`: historical round-robin while every weight is the
-    ///   default; once an operator opts in, a weighted random ordering of
-    ///   eligible candidates. The first pick follows the configured weight
-    ///   ratio and a failed pick falls through to the rest of the weighted
-    ///   permutation, so weights cannot starve a candidate.
+    ///   default; once an operator opts in, a weighted first pick followed by
+    ///   the remaining eligible candidates in configuration order. The first
+    ///   pick follows the weight ratio and a failed pick falls through to
+    ///   every other candidate, so weights cannot starve one.
     /// - `Parallel`: all candidates are raced; a retryable reply is treated as
     ///   a failure for that candidate so the race continues with the others.
     ///   Weights do not apply because every eligible candidate runs anyway.
@@ -1288,14 +1296,15 @@ impl UpstreamManager {
                         .collect();
                     resolve_sequential(&ordered, msg, deadline, attempts).await
                 } else {
-                    let order = weighted_order(&weights, || {
+                    let start = weighted_start(&weights, || {
                         splitmix64(
                             self.weight_rng
                                 .fetch_add(WEIGHT_RNG_GAMMA, Ordering::Relaxed),
                         )
                     });
-                    let ordered: Vec<&ManagedEntry> =
-                        order.into_iter().map(|index| candidates[index]).collect();
+                    let ordered: Vec<&ManagedEntry> = (0..candidates.len())
+                        .map(|offset| candidates[(start + offset) % candidates.len()])
+                        .collect();
                     resolve_sequential(&ordered, msg, deadline, attempts).await
                 }
             }
@@ -1729,38 +1738,37 @@ mod tests {
         )
         .await;
 
-        // Give the failing server most of the weight so the weighted ordering
-        // normally tries it first; whichever order the seeded roll produces,
-        // a retryable reply must still end at the healthy candidate.
-        let manager = UpstreamManager::with_weighted_upstreams_seeded(
-            vec![
-                (
-                    "servfail.dns".to_string(),
-                    Arc::new(PlainUpstream::new(
-                        servfail_addr,
-                        Duration::from_millis(500),
-                    )),
-                    99,
-                ),
-                (
-                    "healthy.dns".to_string(),
-                    Arc::new(PlainUpstream::new(healthy_addr, Duration::from_millis(500))),
-                    1,
-                ),
-            ],
-            UpstreamStrategy::LoadBalance,
+        // Try several seeds instead of pinning one: whichever candidate the
+        // weighted first pick chooses, a retryable reply must end at the
+        // healthy candidate.
+        let servfail: Arc<dyn Upstream> = Arc::new(PlainUpstream::new(
+            servfail_addr,
             Duration::from_millis(500),
-            1,
+        ));
+        let healthy: Arc<dyn Upstream> =
+            Arc::new(PlainUpstream::new(healthy_addr, Duration::from_millis(500)));
+        for seed in 1..=8 {
+            let manager = UpstreamManager::with_weighted_upstreams_seeded(
+                vec![
+                    ("servfail.dns".to_string(), Arc::clone(&servfail), 99),
+                    ("healthy.dns".to_string(), Arc::clone(&healthy), 1),
+                ],
+                UpstreamStrategy::LoadBalance,
+                Duration::from_millis(500),
+                seed,
+            );
+            let (resp, upstream) = manager
+                .resolve_with_upstream(&test_query())
+                .await
+                .expect("load_balance must retry on SERVFAIL");
+            assert_eq!(upstream, "healthy.dns");
+            assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        }
+        assert!(
+            servfail_calls.load(Ordering::SeqCst) >= 1,
+            "across seeds the weighted failing candidate must be tried at least once"
         );
-
-        let (resp, upstream) = manager
-            .resolve_with_upstream(&test_query())
-            .await
-            .expect("load_balance must retry on SERVFAIL");
-        assert_eq!(upstream, "healthy.dns");
-        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
-        assert_eq!(servfail_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy_calls.load(Ordering::SeqCst), 8);
     }
 
     /// WP-6.1 item 2: parallel racing must not accept a retryable reply while
@@ -2094,25 +2102,27 @@ mod tests {
         splitmix64(*seed)
     }
 
-    /// F1: the pure selector is a weighted permutation: every candidate
-    /// appears once, and the first position follows the weight ratio.
+    /// F1: the pure selector picks the first candidate proportionally to its
+    /// weight and every index stays reachable.
     #[test]
-    fn test_weighted_order_is_a_proportional_permutation() {
+    fn test_weighted_start_is_proportional() {
         let weights = [3u32, 1];
         let mut seed = 42u64;
         let mut first_counts = [0u32; 2];
         for _ in 0..10_000 {
-            let order = weighted_order(&weights, || seeded_roll(&mut seed));
-            assert_eq!(order.len(), 2);
-            let mut sorted = order.clone();
-            sorted.sort_unstable();
-            assert_eq!(sorted, vec![0, 1], "order must be a permutation");
-            first_counts[order[0]] += 1;
+            let start = weighted_start(&weights, || seeded_roll(&mut seed));
+            assert!(start < weights.len());
+            first_counts[start] += 1;
         }
         let heavy_share = f64::from(first_counts[0]) / 10_000.0;
         assert!(
             (0.72..=0.78).contains(&heavy_share),
             "a 3:1 split must put the heavy upstream first ~75% of the time (got {heavy_share})"
+        );
+        assert_eq!(
+            weighted_start(&[], || 0),
+            0,
+            "an empty candidate list must not panic"
         );
     }
 
@@ -2169,55 +2179,135 @@ mod tests {
         );
     }
 
-    /// F1: a failed weighted pick still falls through to the remaining
-    /// candidates inside the same deadline.
+    /// F1: three candidates share the first pick in proportion to
+    /// `4:2:1` weights (no two-way-only shortcut).
     #[tokio::test]
-    async fn test_weighted_load_balance_falls_back_after_a_failed_pick() {
-        let failing_calls = Arc::new(AtomicU32::new(0));
-        let healthy_calls = Arc::new(AtomicU32::new(0));
+    async fn test_weighted_load_balance_three_candidate_distribution() {
+        const SAMPLES: u32 = 2_100;
+        let calls = [
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
+        ];
         let manager = UpstreamManager::with_weighted_upstreams_seeded(
             vec![
                 (
-                    "failing.dns".to_string(),
-                    Arc::new(ConfigurableMockUpstream {
-                        succeed: false,
-                        delay: Duration::ZERO,
-                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
-                        call_count: Arc::clone(&failing_calls),
-                    }),
-                    100,
-                ),
-                (
-                    "healthy.dns".to_string(),
+                    "heavy.dns".to_string(),
                     Arc::new(ConfigurableMockUpstream {
                         succeed: true,
                         delay: Duration::ZERO,
-                        result_ip: std::net::Ipv4Addr::new(9, 9, 9, 9),
-                        call_count: Arc::clone(&healthy_calls),
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::clone(&calls[0]),
+                    }),
+                    4,
+                ),
+                (
+                    "medium.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+                        call_count: Arc::clone(&calls[1]),
+                    }),
+                    2,
+                ),
+                (
+                    "light.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(3, 3, 3, 3),
+                        call_count: Arc::clone(&calls[2]),
                     }),
                     1,
                 ),
             ],
             UpstreamStrategy::LoadBalance,
             Duration::from_secs(1),
-            11,
+            17,
         );
 
-        for _ in 0..100 {
+        for _ in 0..SAMPLES {
+            manager
+                .resolve(&test_query())
+                .await
+                .expect("all three weighted candidates answer");
+        }
+        let shares: Vec<f64> = calls
+            .iter()
+            .map(|calls| f64::from(calls.load(Ordering::SeqCst)) / f64::from(SAMPLES))
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|calls| calls.load(Ordering::SeqCst))
+                .sum::<u32>(),
+            SAMPLES
+        );
+        assert!(
+            (0.52..=0.62).contains(&shares[0]),
+            "weight 4/7 must take ~57% (got {shares:?})"
+        );
+        assert!(
+            (0.24..=0.34).contains(&shares[1]),
+            "weight 2/7 must take ~29% (got {shares:?})"
+        );
+        assert!(
+            (0.10..=0.19).contains(&shares[2]),
+            "weight 1/7 must take ~14% (got {shares:?})"
+        );
+    }
+
+    /// F1: a failed weighted pick still falls through to the remaining
+    /// candidates inside the same deadline.
+    #[tokio::test]
+    async fn test_weighted_load_balance_falls_back_after_a_failed_pick() {
+        // Exercise many seeds instead of pinning one: whichever order the
+        // weighted first pick produces, the healthy candidate must answer.
+        let mut failing_attempts = 0;
+        for seed in 1..=16 {
+            let failing_calls = Arc::new(AtomicU32::new(0));
+            let healthy_calls = Arc::new(AtomicU32::new(0));
+            let manager = UpstreamManager::with_weighted_upstreams_seeded(
+                vec![
+                    (
+                        "failing.dns".to_string(),
+                        Arc::new(ConfigurableMockUpstream {
+                            succeed: false,
+                            delay: Duration::ZERO,
+                            result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                            call_count: Arc::clone(&failing_calls),
+                        }),
+                        100,
+                    ),
+                    (
+                        "healthy.dns".to_string(),
+                        Arc::new(ConfigurableMockUpstream {
+                            succeed: true,
+                            delay: Duration::ZERO,
+                            result_ip: std::net::Ipv4Addr::new(9, 9, 9, 9),
+                            call_count: Arc::clone(&healthy_calls),
+                        }),
+                        1,
+                    ),
+                ],
+                UpstreamStrategy::LoadBalance,
+                Duration::from_secs(1),
+                seed,
+            );
+
             let (response, upstream) = manager
                 .resolve_with_upstream(&test_query())
                 .await
                 .expect("the healthy candidate must answer after the weighted failure");
             assert_eq!(upstream, "healthy.dns");
             assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+            assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+            failing_attempts += failing_calls.load(Ordering::SeqCst);
         }
-        assert_eq!(healthy_calls.load(Ordering::SeqCst), 100);
-        // The failing candidate is tried first until passive health marks it
-        // down (6 consecutive errors); every one of those attempts still fell
-        // back to the healthy candidate.
         assert!(
-            failing_calls.load(Ordering::SeqCst) >= 6,
-            "the weighted candidate must be attempted before health excludes it"
+            failing_attempts > 0,
+            "across seeds the weighted candidate must be attempted at least once"
         );
     }
 
@@ -2225,17 +2315,18 @@ mod tests {
     /// weight is excluded until the all-down emergency path runs.
     #[tokio::test]
     async fn test_weight_does_not_bypass_health_state() {
-        let heavy_calls = Arc::new(AtomicU32::new(0));
+        let down_calls = Arc::new(AtomicU32::new(0));
         let light_calls = Arc::new(AtomicU32::new(0));
+        let heavy_calls = Arc::new(AtomicU32::new(0));
         let manager = UpstreamManager::with_weighted_upstreams_seeded(
             vec![
                 (
-                    "down-heavy.dns".to_string(),
+                    "down-heaviest.dns".to_string(),
                     Arc::new(ConfigurableMockUpstream {
                         succeed: true,
                         delay: Duration::ZERO,
                         result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
-                        call_count: Arc::clone(&heavy_calls),
+                        call_count: Arc::clone(&down_calls),
                     }),
                     100,
                 ),
@@ -2249,6 +2340,16 @@ mod tests {
                     }),
                     1,
                 ),
+                (
+                    "up-heavy.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(3, 3, 3, 3),
+                        call_count: Arc::clone(&heavy_calls),
+                    }),
+                    4,
+                ),
             ],
             UpstreamStrategy::LoadBalance,
             Duration::from_secs(1),
@@ -2260,7 +2361,7 @@ mod tests {
             .load_full()
             .entries
             .iter()
-            .find(|entry| entry.name == "down-heavy.dns")
+            .find(|entry| entry.name == "down-heaviest.dns")
             .expect("entry")
             .clone();
         {
@@ -2271,15 +2372,24 @@ mod tests {
             assert_eq!(health.status(), HealthStatus::Down);
         }
 
-        for _ in 0..50 {
+        // Two healthy candidates remain, so the weighted selector (not a
+        // one-candidate fallback) is exercised while the down server is
+        // excluded at weight 100.
+        for _ in 0..200 {
             let (_, upstream) = manager
                 .resolve_with_upstream(&test_query())
                 .await
-                .expect("the healthy low-weight upstream must answer");
-            assert_eq!(upstream, "up-light.dns");
+                .expect("a healthy candidate must answer");
+            assert!(upstream == "up-light.dns" || upstream == "up-heavy.dns");
         }
-        assert_eq!(heavy_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(light_calls.load(Ordering::SeqCst), 50);
+        assert_eq!(down_calls.load(Ordering::SeqCst), 0);
+        let light = light_calls.load(Ordering::SeqCst);
+        let heavy = heavy_calls.load(Ordering::SeqCst);
+        assert_eq!(light + heavy, 200);
+        assert!(
+            heavy > light,
+            "the heavier healthy candidate should dominate (light={light}, heavy={heavy})"
+        );
     }
 
     /// F1: when every upstream is marked down, the emergency path still tries

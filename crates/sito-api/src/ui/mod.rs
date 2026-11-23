@@ -644,6 +644,7 @@ mod tests {
             user_role: "admin",
             active_tab: "upstreams",
             version: "1.2.1",
+            max_upstream_weight: sito_core::config::MAX_UPSTREAM_WEIGHT,
             upstreams: vec![],
         };
         assert!(upstreams_tmpl.render().is_ok());

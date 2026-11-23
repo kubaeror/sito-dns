@@ -84,6 +84,11 @@ pub(crate) async fn build_scoped_upstreams(
         let mut upstream_cfg = config.upstream.clone();
         upstream_cfg.servers.clone_from(servers);
         upstream_cfg.per_domain.clear();
+        // `upstream.weights` is index-aligned with the global `servers` list.
+        // A scoped client has an unrelated server list, so inheriting the
+        // global weights would apply them by position to the wrong servers.
+        // Per-client scopes are deliberately unweighted (round-robin).
+        upstream_cfg.weights.clear();
         let manager = UpstreamManager::from_config(&upstream_cfg, &bootstrap)
             .await
             .map_err(|e| {

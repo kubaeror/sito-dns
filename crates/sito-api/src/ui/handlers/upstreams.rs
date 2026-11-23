@@ -22,6 +22,7 @@ pub async fn upstreams_page(State(ctx): State<ServerContext>, headers: HeaderMap
         user_role: &user.role.to_string(),
         active_tab: "upstreams",
         version: env!("CARGO_PKG_VERSION"),
+        max_upstream_weight: sito_core::config::MAX_UPSTREAM_WEIGHT,
         upstreams,
     })
     .into_response()
@@ -115,6 +116,10 @@ pub async fn upstreams_add_handler(
 
 #[derive(Deserialize)]
 pub struct UpdateUpstreamWeightForm {
+    /// Index into `upstream.servers`. Index-addressed so duplicate server
+    /// strings (validated as separate entries) can be edited independently.
+    pub index: usize,
+    /// Echoed by the form to detect a stale page after a concurrent edit.
     pub address: String,
     pub weight: u32,
 }
@@ -144,14 +149,16 @@ pub async fn upstreams_weight_handler(
 
     let _apply_guard = ctx.lock_config_apply().await;
     let mut new_cfg = (**ctx.config.load()).clone();
-    let Some(index) = new_cfg
-        .upstream
-        .servers
-        .iter()
-        .position(|server| server.as_str() == address)
-    else {
+    let Some(server) = new_cfg.upstream.servers.get(form.index) else {
         return error_response(StatusCode::NOT_FOUND, "Upstream is not configured");
     };
+    if server != address {
+        return error_response(
+            StatusCode::CONFLICT,
+            "Upstream list changed since this form was loaded; reload and retry",
+        );
+    }
+    let index = form.index;
 
     if new_cfg.upstream.weights.is_empty() {
         if form.weight == sito_core::config::DEFAULT_UPSTREAM_WEIGHT {

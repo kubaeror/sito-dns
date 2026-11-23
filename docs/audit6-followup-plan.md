@@ -1397,14 +1397,16 @@ from a browser session require a fresh session-bound `X-Reauth-Token` (Admin API
 tokens are exempt). Argon2 hash/verify work is bounded to four concurrent
 operations and all login/re-auth/change-password inputs are length-capped.
 The wizard now treats an unchecked cache/filtering/DNSSEC/CNAME box as an
-explicit disable, and the unimplemented upstream weight control is removed.
+explicit disable, and the inert upstream weight control was later replaced by
+F1's working weighted-balancing control.
 `create_client`, `add_client_group`, `add_filter_list` and `add_rewrite` return
 `201`; the TOTP challenge remains `202`, duplicate groups remain `409`, and
 `update_user` reports the real TOTP state. Evidence: Phase 2 — auth, RBAC and
 self-service 2FA section in `docs/audit6-test-matrix.md` and §22 of
 `docs/2.0-public-api-diff.md`. Deferred residuals: second proof for
-`delete_user`/`delete_token` and real weighted upstream balancing remain
-unimplemented beyond Phase 2 (they were not delivered by WP-2.11).
+`delete_user`/`delete_token` remained unimplemented beyond Phase 2 (not
+delivered by WP-2.11); real weighted upstream balancing was delivered later by
+F1.
 
 ### WP-2.11 — API hardening, OpenAPI, config apply, updater
 
@@ -1440,7 +1442,7 @@ updater section in `docs/audit6-test-matrix.md` and §26 of
 compatibility facade are absent and deferred; systemd unit/installer E2E and
 atomic installer rollback are WP-2.13; the update lock is process-wide (no
 cross-process file lock); legacy `?token=` WebSocket authentication removal is
-implemented by WP-2.14; weighted upstream balancing remains unimplemented.
+implemented by WP-2.14; weighted upstream balancing was delivered later by F1.
 
 ### WP-2.12 — Stats retention, PII, and polling
 

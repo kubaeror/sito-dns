@@ -383,6 +383,8 @@ pub struct UpstreamsTemplate<'a> {
     pub user_role: &'a str,
     pub active_tab: &'a str,
     pub version: &'a str,
+    /// Schema upper bound, so the template never hardcodes a stale value.
+    pub max_upstream_weight: u32,
     pub upstreams: Vec<UpstreamViewItem>,
 }
 

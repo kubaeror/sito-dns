@@ -409,16 +409,23 @@ bind = "127.0.0.1"
 
 #### Upstream weights
 
-`upstream.weights` is optional and index-aligned with `upstream.servers`;
-`[[upstream.per_domain]]` rules accept the same `weights` list for their own
-servers. Leave it out (or set every value to `1`) for the historical behavior. Under
-`strategy = "load_balance"`, a weight of `3` receives roughly three times as
-many first attempts as a weight of `1`; if that pick fails, the resolver still
-tries the remaining healthy upstreams within the normal `timeout_ms` budget.
-Weights never override health checks: a server marked down is skipped at any
-weight and is only used by the all-down emergency path. `0` is rejected
-instead of disabling a server silently. The upstream page/API and the HA
-bundle carry weights; the per-node client secrets remain local.
+`upstream.weights` is optional and index-aligned with the **global**
+`upstream.servers` list; `[[upstream.per_domain]]` rules accept the same
+`weights` list for their own servers. Leave it out (or set every value to `1`)
+for the historical behavior. Under `strategy = "load_balance"`, a weight of
+`3` receives roughly three times as many first attempts as a weight of `1`;
+if that pick fails, the resolver still tries the remaining healthy upstreams
+in configuration order within the normal `timeout_ms` budget. Weights never
+override health checks: a server marked down is skipped at any weight and is
+only used by the all-down emergency path. `0` is rejected instead of disabling
+a server silently.
+
+The upstream page and the REST `UpstreamConfigDto` expose only the **global**
+list. `per_domain.weights` is config-file-only (there is no per-domain editor
+in 2.0). Per-client `clients.entries[].upstreams` scopes have no weight field:
+they are always unweighted (round-robin) and never inherit `upstream.weights`,
+so a global weight change does not reweight them. The HA bundle carries the
+global weights; per-node client secrets remain local.
 
 ### 2.5 Install Systemd Unit
 The canonical unit is [`contrib/systemd/sito.service`](../contrib/systemd/sito.service);
