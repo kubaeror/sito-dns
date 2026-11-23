@@ -288,8 +288,7 @@ async fn test_wizard_gate_forbidden_after_setup() {
     //    `filtering_enabled=on` keeps the seeded local `file://` list instead
     //    of pulling the OISD default, so the test never touches the network.
     let app = create_router(ctx.clone());
-    let form_body =
-        "admin_user=admin&admin_password=newpassword123&upstream=1.1.1.1&filtering_enabled=on&client_acl_present=1";
+    let form_body = "admin_user=admin&admin_password=newpassword123&upstream=1.1.1.1&filtering_enabled=on&client_acl_present=1";
     let req = Request::builder()
         .method("POST")
         .uri("/ui/wizard/complete")
