@@ -82,6 +82,11 @@ impl MasterCoordinator {
     }
 
     /// Permanently disables admission/serving for the current process.
+    ///
+    /// Transitions are owned by the single promotion supervisor for this
+    /// coordinator; cross-thread readers use the SeqCst atomics. The sticky
+    /// fence bit is checked by every later transition, so a racing
+    /// `allow_sessions` can never re-enable a fenced node.
     pub fn mark_fenced(&self) {
         self.fenced.store(true, Ordering::SeqCst);
         self.serving.store(false, Ordering::SeqCst);

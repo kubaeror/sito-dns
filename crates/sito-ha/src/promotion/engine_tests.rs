@@ -265,6 +265,48 @@ impl LeaseBackend for ConflictBackend {
     }
 }
 
+struct ToggleBackend {
+    inner: Arc<WitnessClient>,
+    fail_renew: Arc<AtomicBool>,
+}
+
+impl LeaseBackend for ToggleBackend {
+    fn info(&self) -> super::clock::BoxFuture<'_, Result<LeaseInfo, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.info().await })
+    }
+
+    fn lease(
+        &self,
+    ) -> super::clock::BoxFuture<'_, Result<Option<LeaseRecord>, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.lease().await })
+    }
+
+    fn acquire(
+        &self,
+        request: AcquireRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.acquire(&request).await })
+    }
+
+    fn renew(
+        &self,
+        request: RenewRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        if self.fail_renew.load(Ordering::SeqCst) {
+            return Box::pin(async {
+                Err(WitnessClientError::Unavailable {
+                    detail: "injected transport renewal failure".to_string(),
+                })
+            });
+        }
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.renew(&request).await })
+    }
+}
+
 struct TestHost {
     key: Ed25519SigningKey,
     state_path: PathBuf,
@@ -283,6 +325,9 @@ struct TestHost {
     publish_during_hello_only: AtomicBool,
     published_baseline: Mutex<Option<PublicationBaseline>>,
     latched: Mutex<Vec<String>>,
+    fail_renew_on_reports: Mutex<Option<Arc<AtomicBool>>>,
+    fail_renew_on_hello_end: Mutex<Option<Arc<AtomicBool>>>,
+    admissions_denied: AtomicBool,
 }
 
 impl TestHost {
@@ -305,7 +350,18 @@ impl TestHost {
             publish_during_hello_only: AtomicBool::new(false),
             published_baseline: Mutex::new(None),
             latched: Mutex::new(Vec::new()),
+            fail_renew_on_reports: Mutex::new(None),
+            fail_renew_on_hello_end: Mutex::new(None),
+            admissions_denied: AtomicBool::new(false),
         }
+    }
+
+    fn fail_renew_on_reports(&self, flag: Arc<AtomicBool>) {
+        *self.fail_renew_on_reports.lock().unwrap() = Some(flag);
+    }
+
+    fn fail_renew_on_hello_end(&self, flag: Arc<AtomicBool>) {
+        *self.fail_renew_on_hello_end.lock().unwrap() = Some(flag);
     }
 
     fn log(&self, event: impl Into<String>) {
@@ -361,6 +417,9 @@ impl PromotionHost for TestHost {
     }
 
     fn set_writable(&self, writable: bool, reason: Option<String>) {
+        if !writable {
+            self.admissions_denied.store(true, Ordering::SeqCst);
+        }
         self.writable.store(writable, Ordering::SeqCst);
         *self.writable_reason.lock().unwrap() = reason.clone();
         self.log(format!(
@@ -383,6 +442,9 @@ impl PromotionHost for TestHost {
 
     fn end_hello_only(&self) -> super::clock::BoxFuture<'_, Result<(), String>> {
         self.hello_only.store(false, Ordering::SeqCst);
+        if let Some(flag) = self.fail_renew_on_hello_end.lock().unwrap().clone() {
+            flag.store(true, Ordering::SeqCst);
+        }
         self.log("end_hello_only");
         Box::pin(async { Ok(()) })
     }
@@ -391,6 +453,9 @@ impl PromotionHost for TestHost {
         &self,
     ) -> super::clock::BoxFuture<'_, Result<Vec<PeerReport>, String>> {
         let reports = self.reports.lock().unwrap().clone();
+        if let Some(flag) = self.fail_renew_on_reports.lock().unwrap().clone() {
+            flag.store(true, Ordering::SeqCst);
+        }
         self.log(format!("reports:{}", reports.len()));
         Box::pin(async move { Ok(reports) })
     }
@@ -1639,4 +1704,67 @@ async fn engine_level_renewal_409_fences_immediately() {
         engine.fence_store().load().unwrap().unwrap().reason,
         "lease_lost"
     );
+}
+
+fn run_toggle_engine(
+    harness: &Harness,
+    host: Arc<TestHost>,
+    flag: Arc<AtomicBool>,
+) -> PromotionEngine {
+    let config = harness.fixture.config("node-a");
+    let clock: Arc<dyn MonotonicClock> = harness.clock.clone();
+    let host_trait: Arc<dyn PromotionHost> = host;
+    let backend = Arc::new(ToggleBackend {
+        inner: Arc::new(harness.fixture.client("node-a")),
+        fail_renew: flag,
+    });
+    PromotionEngine::with_runtime(
+        config,
+        ConfiguredRole::Master,
+        harness.data_dir("node-a"),
+        backend,
+        host_trait,
+        clock,
+        Arc::new(ManualTimers::new(Arc::clone(&harness.clock))),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn transport_renewal_failure_at_first_publish_boundary_denies_admission() {
+    let harness = Harness::new("renew_boundary", "node-a").await;
+    let flag = Arc::new(AtomicBool::new(false));
+    harness.host.fail_renew_on_reports(Arc::clone(&flag));
+    let engine = run_toggle_engine(&harness, Arc::clone(&harness.host), flag);
+    let outcome = engine.start_master().await;
+    assert_eq!(
+        outcome,
+        PromotionOutcome::ReadOnly {
+            reason: "lease_lost".to_string(),
+            retryable: true,
+        }
+    );
+    assert!(
+        harness.host.admissions_denied.load(Ordering::SeqCst),
+        "a terminal read-only return must deny replication admission"
+    );
+    assert!(!harness.host.writable.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn transport_renewal_failure_before_first_push_denies_admission() {
+    let harness = Harness::new("renew_before_push", "node-a").await;
+    let flag = Arc::new(AtomicBool::new(false));
+    harness.host.fail_renew_on_hello_end(Arc::clone(&flag));
+    let engine = run_toggle_engine(&harness, Arc::clone(&harness.host), flag);
+    let outcome = engine.start_master().await;
+    assert_eq!(
+        outcome,
+        PromotionOutcome::ReadOnly {
+            reason: "lease_lost".to_string(),
+            retryable: true,
+        }
+    );
+    assert!(harness.host.admissions_denied.load(Ordering::SeqCst));
+    assert!(harness.event_index("publish:").is_none());
 }

@@ -645,9 +645,13 @@ impl PromotionHost for RuntimePromotionHost {
             // may dequeue after this method returns. Failure paths call
             // set_writable(false), which denies and closes sessions.
             coordinator.set_serving(true);
-            coordinator
+            let result = coordinator
                 .publish_promoted_bundle(prepared.bundle)
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string());
+            if result.is_err() {
+                coordinator.set_serving(false);
+            }
+            result
         })
     }
 
@@ -695,8 +699,9 @@ impl PromotionHost for RuntimePromotionHost {
         }
     }
 
-    fn close_replication_sessions(&self, _reason: &str) {
+    fn close_replication_sessions(&self, reason: &str) {
         if let Some(coordinator) = self.state.coordinator() {
+            coordinator.deny_sessions(reason);
             coordinator.close_all_sessions();
         }
     }

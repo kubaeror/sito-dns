@@ -1105,27 +1105,51 @@ impl PromotionEngine {
         }
     }
 
+    /// Single terminal read-only transition after acquisition/hello-only.
+    ///
+    /// It must end hello-only and deny replication admission/close sessions;
+    /// merely blocking the API gate leaves the listener admitting peers.
+    fn transition_read_only(
+        &self,
+        phase: PromotionPhase,
+        reason: &str,
+        retryable: bool,
+    ) -> PromotionOutcome {
+        self.host.set_writable(false, Some(reason.to_string()));
+        self.set_phase(phase, Some(reason));
+        PromotionOutcome::ReadOnly {
+            reason: reason.to_string(),
+            retryable,
+        }
+    }
+
     async fn reconcile_and_publish(&self) -> PromotionOutcome {
         self.set_phase(PromotionPhase::Reconciling, None);
         let (grant, baseline, publish_version, publication_state, prepared) = {
             let inner = self.lock();
             let Some(grant) = inner.grant.clone() else {
-                return PromotionOutcome::ReadOnly {
-                    reason: "lease_record_missing".to_string(),
-                    retryable: true,
-                };
+                drop(inner);
+                return self.transition_read_only(
+                    PromotionPhase::Aborted,
+                    "lease_record_missing",
+                    true,
+                );
             };
             let Some(ref bookkeeping) = inner.bookkeeping else {
-                return PromotionOutcome::ReadOnly {
-                    reason: "promotion_interrupted".to_string(),
-                    retryable: false,
-                };
+                drop(inner);
+                return self.transition_read_only(
+                    PromotionPhase::Aborted,
+                    "promotion_interrupted",
+                    false,
+                );
             };
             let Some(ref prepared) = inner.pending else {
-                return PromotionOutcome::ReadOnly {
-                    reason: "promotion_interrupted".to_string(),
-                    retryable: false,
-                };
+                drop(inner);
+                return self.transition_read_only(
+                    PromotionPhase::Aborted,
+                    "promotion_interrupted",
+                    false,
+                );
             };
             (
                 grant.clone(),
@@ -1171,15 +1195,12 @@ impl PromotionEngine {
         let peers = match self.host.collect_reconcile_reports().await {
             Ok(peers) => peers,
             Err(error) => {
-                let _ = self.host.end_hello_only().await;
-                self.host
-                    .set_writable(false, Some("candidate_hash_unknown".to_string()));
-                self.set_phase(PromotionPhase::Aborted, Some("candidate_hash_unknown"));
                 warn!(error = %error, "reconciliation report collection failed");
-                return PromotionOutcome::ReadOnly {
-                    reason: "candidate_hash_unknown".to_string(),
-                    retryable: false,
-                };
+                return self.transition_read_only(
+                    PromotionPhase::Aborted,
+                    "candidate_hash_unknown",
+                    false,
+                );
             }
         };
         self.lock().snapshot.reconcile_remaining_secs = 0;
@@ -1187,7 +1208,6 @@ impl PromotionEngine {
         let witness = match self.backend.lease().await {
             Ok(Some(record)) => record,
             Ok(None) => {
-                let _ = self.host.end_hello_only().await;
                 let _ = self.fence(
                     FenceReason::LeaseRecordMissing,
                     "witness record disappeared",
@@ -1195,14 +1215,11 @@ impl PromotionEngine {
                 return PromotionOutcome::Fenced;
             }
             Err(error) => {
-                let _ = self.host.end_hello_only().await;
-                self.host
-                    .set_writable(false, Some(error.reason_code().to_string()));
-                self.set_phase(PromotionPhase::Unavailable, Some(error.reason_code()));
-                return PromotionOutcome::ReadOnly {
-                    reason: error.reason_code().to_string(),
-                    retryable: error.is_retryable(),
-                };
+                return self.transition_read_only(
+                    PromotionPhase::Unavailable,
+                    error.reason_code(),
+                    error.is_retryable(),
+                );
             }
         };
 
@@ -1215,7 +1232,6 @@ impl PromotionEngine {
             Err(_) => None,
         };
         if !lease_is_live(&witness, &grant, live_now) {
-            let _ = self.host.end_hello_only().await;
             let _ = self.fence(
                 FenceReason::LeaseLost,
                 "the witness record is not a live grant held by this node at the first-publish boundary",
@@ -1235,34 +1251,22 @@ impl PromotionEngine {
 
         match decision {
             ReconcileDecision::Abort(reason) => {
-                let _ = self.host.end_hello_only().await;
                 self.host
                     .close_replication_sessions("reconciliation aborted");
-                self.set_phase(PromotionPhase::Aborted, Some(reason.code()));
-                self.host
-                    .set_writable(false, Some(reason.code().to_string()));
                 // Let the lease expire; the node never publishes or becomes
                 // writable in this term.
                 self.lock().grant = None;
                 self.lock().deadline = None;
-                PromotionOutcome::ReadOnly {
-                    reason: reason.code().to_string(),
-                    retryable: false,
-                }
+                self.transition_read_only(PromotionPhase::Aborted, reason.code(), false)
             }
             ReconcileDecision::AlreadyPublished => self.complete_already_published(&prepared).await,
             ReconcileDecision::Publish => {
                 if let Err(error) = self.renew_once().await {
-                    let _ = self.host.end_hello_only().await;
                     warn!(error = %error, "renewal at the first-publish boundary failed");
-                    return if self.is_fenced() {
-                        PromotionOutcome::Fenced
-                    } else {
-                        PromotionOutcome::ReadOnly {
-                            reason: "lease_lost".to_string(),
-                            retryable: true,
-                        }
-                    };
+                    if self.is_fenced() {
+                        return PromotionOutcome::Fenced;
+                    }
+                    return self.transition_read_only(PromotionPhase::Aborted, "lease_lost", true);
                 }
                 self.complete_first_publish(&prepared, publish_version)
                     .await
@@ -1280,22 +1284,28 @@ impl PromotionEngine {
         let (proven, term) = {
             let inner = self.lock();
             let Some(ref loaded) = inner.loaded else {
-                return PromotionOutcome::ReadOnly {
-                    reason: "promotion_interrupted".to_string(),
-                    retryable: false,
-                };
+                drop(inner);
+                return self.transition_read_only(
+                    PromotionPhase::Aborted,
+                    "promotion_interrupted",
+                    false,
+                );
             };
             let Some(ref bookkeeping) = inner.bookkeeping else {
-                return PromotionOutcome::ReadOnly {
-                    reason: "promotion_interrupted".to_string(),
-                    retryable: false,
-                };
+                drop(inner);
+                return self.transition_read_only(
+                    PromotionPhase::Aborted,
+                    "promotion_interrupted",
+                    false,
+                );
             };
             let Some(proof_hash) = inner.reconcile_proof_hash.clone() else {
-                return PromotionOutcome::ReadOnly {
-                    reason: "promotion_interrupted".to_string(),
-                    retryable: false,
-                };
+                drop(inner);
+                return self.transition_read_only(
+                    PromotionPhase::Aborted,
+                    "promotion_interrupted",
+                    false,
+                );
             };
             let _ = bookkeeping;
             (
@@ -1311,20 +1321,16 @@ impl PromotionEngine {
             "reconciliation proved the pending publish succeeded; establishing the published baseline"
         );
         if let Err(error) = self.write_published_state(&proven) {
-            let _ = self.host.end_hello_only().await;
             warn!(error = %error, "failed to persist the recovered 'published' state");
-            self.set_phase(PromotionPhase::Aborted, Some("promotion_interrupted"));
-            self.host
-                .set_writable(false, Some("promotion_interrupted".to_string()));
-            return PromotionOutcome::ReadOnly {
-                reason: "promotion_interrupted".to_string(),
-                retryable: false,
-            };
+            return self.transition_read_only(
+                PromotionPhase::Aborted,
+                "promotion_interrupted",
+                false,
+            );
         }
         self.lock().pending = Some(proven.clone());
         self.lock().reconcile_proof_hash = None;
         if let Err(error) = self.host.adopt_published(&proven).await {
-            let _ = self.host.end_hello_only().await;
             let _ = self.fence(
                 FenceReason::RoleSwitchFailed,
                 &format!("cannot adopt published bundle: {error}"),
@@ -1332,28 +1338,20 @@ impl PromotionEngine {
             return PromotionOutcome::Fenced;
         }
         if let Err(error) = self.renew_published().await {
-            let _ = self.host.end_hello_only().await;
-            self.host
-                .set_writable(false, Some("lease_lost".to_string()));
             warn!(error = %error, "post-publish renewal failed");
-            return PromotionOutcome::ReadOnly {
-                reason: "lease_lost".to_string(),
-                retryable: false,
-            };
+            return self.transition_read_only(PromotionPhase::Aborted, "lease_lost", false);
         }
 
         // The new term still needs its own publish strictly above the proven
         // baseline. Prepare it at the current term and continue through the
         // normal first-publish path.
         let Some(next_version) = proven.bundle.version.checked_add(1) else {
-            let _ = self.host.end_hello_only().await;
             let _ = self.fence(FenceReason::StateWriteFailed, "publish version overflow");
             return PromotionOutcome::Fenced;
         };
         let next = match self.host.prepare_bundle(term, next_version) {
             Ok(next) => next,
             Err(error) => {
-                let _ = self.host.end_hello_only().await;
                 let _ = self.fence(
                     FenceReason::StateWriteFailed,
                     &format!("cannot prepare the post-recovery bundle: {error}"),
@@ -1362,7 +1360,6 @@ impl PromotionEngine {
             }
         };
         if let Err(error) = self.write_next_pending_state(&next, term) {
-            let _ = self.host.end_hello_only().await;
             let _ = self.fence(
                 FenceReason::StateWriteFailed,
                 &format!("cannot persist the post-recovery pending state: {error}"),
@@ -1381,10 +1378,12 @@ impl PromotionEngine {
         {
             let mut inner = self.lock();
             let Some(ref mut bookkeeping) = inner.bookkeeping else {
-                return PromotionOutcome::ReadOnly {
-                    reason: "promotion_interrupted".to_string(),
-                    retryable: false,
-                };
+                drop(inner);
+                return self.transition_read_only(
+                    PromotionPhase::Aborted,
+                    "promotion_interrupted",
+                    false,
+                );
             };
             bookkeeping.publication_state = PublicationState::Publishing;
             bookkeeping.pending_hash = Some(prepared.hash.clone());
@@ -1393,7 +1392,6 @@ impl PromotionEngine {
             inner.snapshot.bundle_hash.clone_from(&prepared.hash);
         }
         if let Err(error) = self.persist_current_state() {
-            let _ = self.host.end_hello_only().await;
             let _ = self.fence(
                 FenceReason::StateWriteFailed,
                 &format!("cannot persist 'publishing' state: {error}"),
@@ -1420,23 +1418,17 @@ impl PromotionEngine {
             if self.is_fenced() {
                 return PromotionOutcome::Fenced;
             }
-            self.set_phase(PromotionPhase::Aborted, Some("lease_lost"));
-            return PromotionOutcome::ReadOnly {
-                reason: "lease_lost".to_string(),
-                retryable: true,
-            };
+            return self.transition_read_only(PromotionPhase::Aborted, "lease_lost", true);
         }
         let published_hash = match self.host.publish_first(prepared).await {
             Ok(hash) => hash,
             Err(error) => {
-                self.set_phase(PromotionPhase::Aborted, Some("promotion_interrupted"));
-                self.host
-                    .set_writable(false, Some("promotion_interrupted".to_string()));
                 warn!(error = %error, "first publish failed; state remains 'publishing' for reconciliation");
-                return PromotionOutcome::ReadOnly {
-                    reason: "promotion_interrupted".to_string(),
-                    retryable: true,
-                };
+                return self.transition_read_only(
+                    PromotionPhase::Aborted,
+                    "promotion_interrupted",
+                    true,
+                );
             }
         };
         if !hashes_equal(&published_hash, &prepared.hash) {
@@ -1448,27 +1440,19 @@ impl PromotionEngine {
         }
 
         if let Err(error) = self.write_published_state(prepared) {
-            self.set_phase(PromotionPhase::Aborted, Some("promotion_interrupted"));
-            self.host
-                .set_writable(false, Some("promotion_interrupted".to_string()));
             // The ADR is explicit: do not renew the witness with the new
             // version if the durable "published" state write failed.
             warn!(error = %error, "published state write failed after the first push");
-            return PromotionOutcome::ReadOnly {
-                reason: "promotion_interrupted".to_string(),
-                retryable: false,
-            };
+            return self.transition_read_only(
+                PromotionPhase::Aborted,
+                "promotion_interrupted",
+                false,
+            );
         }
 
         if let Err(error) = self.renew_published().await {
-            let _ = self.host.end_hello_only().await;
-            self.host
-                .set_writable(false, Some("lease_lost".to_string()));
             warn!(error = %error, "post-publish renewal failed");
-            return PromotionOutcome::ReadOnly {
-                reason: "lease_lost".to_string(),
-                retryable: false,
-            };
+            return self.transition_read_only(PromotionPhase::Aborted, "lease_lost", false);
         }
         self.become_master().await
     }
