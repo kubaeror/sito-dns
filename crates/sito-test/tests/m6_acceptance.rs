@@ -106,6 +106,8 @@ async fn create_test_context() -> (ServerContext, PathBuf) {
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+        ha_write_gate: std::sync::Arc::new(sito_api::state::HaWriteGate::new()),
+        promoted_master_coordinator: std::sync::Arc::new(std::sync::Mutex::new(None)),
         master_coordinator: None,
         slave_tracker: None,
         resync_sender: None,
@@ -287,7 +289,7 @@ async fn test_wizard_gate_forbidden_after_setup() {
     //    of pulling the OISD default, so the test never touches the network.
     let app = create_router(ctx.clone());
     let form_body =
-        "admin_user=admin&admin_password=newpassword123&upstream=1.1.1.1&filtering_enabled=on";
+        "admin_user=admin&admin_password=newpassword123&upstream=1.1.1.1&filtering_enabled=on&client_acl_present=1";
     let req = Request::builder()
         .method("POST")
         .uri("/ui/wizard/complete")
@@ -421,7 +423,7 @@ async fn test_setup_pending_route_gating_and_wizard_flow() {
         .uri("/ui/wizard/complete")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from(
-            "admin_user=setupadmin&admin_password=Setuppassword123!&confirm_password=Setuppassword123!&bind_ipv4=on&port=5353&upstreams=1.1.1.1"
+            "admin_user=setupadmin&admin_password=Setuppassword123!&confirm_password=Setuppassword123!&bind_ipv4=on&port=5353&upstreams=1.1.1.1&client_acl_present=1"
         ))
         .unwrap();
     let resp = app.clone().oneshot(complete_req).await.unwrap();
@@ -729,7 +731,7 @@ async fn test_default_admin_with_existing_config_is_gated_by_setup_token() {
                 .uri("/ui/wizard/complete")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from(format!(
-                    "setup_token={token}&admin_user=admin&admin_password=Recovered-Password-1!&confirm_password=Recovered-Password-1!"
+                    "setup_token={token}&admin_user=admin&admin_password=Recovered-Password-1!&confirm_password=Recovered-Password-1!&client_acl_present=1"
                 )))
                 .unwrap(),
         )

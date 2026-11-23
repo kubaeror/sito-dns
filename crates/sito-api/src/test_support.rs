@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 /// tests. The auth manager is a memory-only manager with the default admin
 /// account, and the config file is *not* created (handlers that persist must
 /// write it).
-pub(crate) async fn mock_context(temp_dir: &Path) -> ServerContext {
+pub async fn mock_context(temp_dir: &Path) -> ServerContext {
     let db_path = temp_dir.join("test.db");
     let stats_db = sito_stats::StatsDb::open(&db_path).await.unwrap();
     let querylog_writer = sito_stats::QueryLogWriter::spawn(stats_db.clone(), 100);
@@ -82,7 +82,9 @@ pub(crate) async fn mock_context(temp_dir: &Path) -> ServerContext {
         start_time: std::time::Instant::now(),
         restore_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+        ha_write_gate: Arc::new(crate::state::HaWriteGate::new()),
         master_coordinator: None,
+        promoted_master_coordinator: std::sync::Arc::new(std::sync::Mutex::new(None)),
         slave_tracker: None,
         resync_sender: None,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -94,7 +96,7 @@ pub(crate) async fn mock_context(temp_dir: &Path) -> ServerContext {
 }
 
 /// Creates a unique temporary directory for a test.
-pub(crate) fn temp_dir(prefix: &str) -> std::path::PathBuf {
+pub fn temp_dir(prefix: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("{prefix}_{}", rand::random::<u64>()));
     let _ = std::fs::create_dir_all(&dir);
     dir

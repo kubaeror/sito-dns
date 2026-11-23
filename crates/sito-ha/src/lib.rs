@@ -36,7 +36,12 @@ pub use error::HaError;
 pub use master::{
     MasterCoordinator, PublishOutcome, ResyncOutcome, SlaveSummary, spawn_master_server,
 };
-pub use promotion::{WITNESS_REQUEST_TIMEOUT, WitnessClient, WitnessClientError};
+pub use promotion::{
+    ConfiguredRole, EffectiveRole, Eligibility, FenceMarker, FenceReason, FenceStore, HaStateStore,
+    LeaseBackend, LoadedState, PromotionBookkeeping, PromotionEngine, PromotionHost,
+    PromotionOutcome, PromotionPhase, PromotionSnapshot, PublicationBaseline,
+    WITNESS_REQUEST_TIMEOUT, WitnessClient, WitnessClientError,
+};
 pub use protocol::{AckConflict, HaMessage, PROTOCOL_VERSION, UpstreamReport};
 pub use readiness::{HaReadiness, HaReadinessState};
 pub use slave::{

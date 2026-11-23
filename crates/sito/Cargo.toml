@@ -39,6 +39,7 @@ tracing-subscriber.workspace = true
 mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
+sito-api = { workspace = true, features = ["test-support"] }
 async-trait.workspace = true
 # Real DoH ACL/XFF regression test.
 reqwest = { workspace = true, features = ["http2"] }

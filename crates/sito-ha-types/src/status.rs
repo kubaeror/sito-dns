@@ -30,6 +30,32 @@ impl std::fmt::Display for SlaveState {
     }
 }
 
+/// Local publication state of the master's active bundle.
+///
+/// ADR-0010 distinguishes the last bundle this node *published* (the witness
+/// baseline) from a bundle it has staged but not yet published. The pending
+/// bundle version is local only and must never be sent to the witness as an
+/// acquisition or renewal baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationState {
+    /// A promotion staged `version` locally but has not started publishing it.
+    Pending,
+    /// The first push of the staged bundle has started (or may have completed
+    /// before a crash). Reconciliation decides whether it succeeded.
+    Publishing,
+    /// `published_version`/`published_hash` identify the last published bundle.
+    Published,
+}
+
+impl PublicationState {
+    /// Whether a bundle is staged but not yet confirmed published.
+    #[must_use]
+    pub const fn is_pending(self) -> bool {
+        matches!(self, Self::Pending | Self::Publishing)
+    }
+}
+
 /// Summary of a connected slave exposed via `/api/v2/ha/slaves` REST API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaveSummary {
@@ -112,6 +138,21 @@ mod tests {
         assert_eq!(SlaveState::Synced.to_string(), "synced");
         assert_eq!(SlaveState::Applying.to_string(), "applying");
         assert_eq!(SlaveState::Degraded.to_string(), "degraded");
+    }
+
+    #[test]
+    fn publication_states_serialize_as_snake_case_and_mark_pending() {
+        assert!(PublicationState::Pending.is_pending());
+        assert!(PublicationState::Publishing.is_pending());
+        assert!(!PublicationState::Published.is_pending());
+        assert_eq!(
+            serde_json::to_string(&PublicationState::Publishing).unwrap(),
+            "\"publishing\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PublicationState>("\"pending\"").unwrap(),
+            PublicationState::Pending
+        );
     }
 
     #[test]

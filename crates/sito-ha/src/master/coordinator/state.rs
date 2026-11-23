@@ -45,7 +45,151 @@ impl MasterCoordinator {
             require_slaves: Arc::new(AtomicBool::new(false)),
             require_all_slaves: Arc::new(AtomicBool::new(false)),
             acl_enforcement: Arc::new(AtomicBool::new(false)),
+            promotion_bookkeeping: Arc::new(Mutex::new(None)),
+            fenced: Arc::new(AtomicBool::new(false)),
+            accepting_sessions: Arc::new(AtomicBool::new(true)),
+            session_refusal_reason: Arc::new(Mutex::new("read_only".to_string())),
+            serving: Arc::new(AtomicBool::new(true)),
+            hello_only: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Sets whether the listener may serve configuration pushes.
+    ///
+    /// This is the synchronous replication half of the promotion write gate:
+    /// it is cleared before a fence/read-only transition and never inferred
+    /// from the API gate afterwards.
+    pub fn set_serving(&self, serving: bool) {
+        if serving && self.fenced.load(Ordering::SeqCst) {
+            return;
+        }
+        self.serving.store(serving, Ordering::SeqCst);
+    }
+
+    /// Whether the listener may queue/push configuration bundles.
+    #[must_use]
+    pub fn is_serving(&self) -> bool {
+        self.serving.load(Ordering::SeqCst)
+    }
+
+    /// Allows new slave Hellos without enabling configuration pushes.
+    ///
+    /// A fenced coordinator can never re-enable admission.
+    pub fn allow_sessions(&self) {
+        if self.fenced.load(Ordering::SeqCst) {
+            return;
+        }
+        self.accepting_sessions.store(true, Ordering::SeqCst);
+    }
+
+    /// Permanently disables admission/serving for the current process.
+    ///
+    /// Transitions are owned by the single promotion supervisor for this
+    /// coordinator; cross-thread readers use the SeqCst atomics. The sticky
+    /// fence bit is checked by every later transition, so a racing
+    /// `allow_sessions` can never re-enable a fenced node.
+    pub fn mark_fenced(&self) {
+        self.fenced.store(true, Ordering::SeqCst);
+        self.serving.store(false, Ordering::SeqCst);
+        self.hello_only.store(false, Ordering::SeqCst);
+        *sito_core::sync::lock_or_recover(&self.session_refusal_reason) = "fenced".to_string();
+        self.accepting_sessions.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether this coordinator has been fenced.
+    #[must_use]
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
+    }
+
+    /// Refuses new slave Hellos with a specific reason.
+    pub fn deny_sessions(&self, reason: impl Into<String>) {
+        *sito_core::sync::lock_or_recover(&self.session_refusal_reason) = reason.into();
+        self.accepting_sessions.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether new slave Hellos may be admitted.
+    #[must_use]
+    pub fn is_accepting_sessions(&self) -> bool {
+        self.accepting_sessions.load(Ordering::SeqCst)
+    }
+
+    /// The stable reason returned for a refused Hello.
+    #[must_use]
+    pub fn session_refusal_reason(&self) -> String {
+        sito_core::sync::lock_or_recover(&self.session_refusal_reason).clone()
+    }
+
+    /// Installs (or clears) the ADR-0010 promotion bookkeeping persisted with
+    /// the master state.
+    ///
+    /// The caller (the promotion engine or its runtime adapter) is responsible
+    /// for writing the state file when the bookkeeping changes; this method
+    /// only ensures subsequent normal publishes preserve it.
+    pub fn set_promotion_bookkeeping(
+        &self,
+        bookkeeping: Option<crate::promotion::state::PromotionBookkeeping>,
+    ) {
+        *sito_core::sync::lock_or_recover(&self.promotion_bookkeeping) = bookkeeping;
+    }
+
+    /// Returns a copy of the current promotion bookkeeping.
+    pub fn promotion_bookkeeping(&self) -> Option<crate::promotion::state::PromotionBookkeeping> {
+        sito_core::sync::lock_or_recover(&self.promotion_bookkeeping).clone()
+    }
+
+    /// Records the published baseline after a successful publish.
+    ///
+    /// A normal publish advances the cluster sequence, so the published
+    /// baseline must advance with it; otherwise a later promotion would send an
+    /// older baseline to the witness. Only updates when promotion bookkeeping
+    /// is installed (promotion enabled).
+    pub fn record_published_baseline(&self, version: u64, payload_hash: &str) {
+        let mut bookkeeping = sito_core::sync::lock_or_recover(&self.promotion_bookkeeping);
+        if let Some(ref mut bookkeeping) = *bookkeeping {
+            bookkeeping.publication_state = sito_ha_types::status::PublicationState::Published;
+            bookkeeping.published_version = version;
+            bookkeeping.published_hash = payload_hash.trim_start_matches("blake3:").to_string();
+            bookkeeping.pending_hash = None;
+        }
+    }
+
+    /// Starts hello-only reconciliation mode.
+    ///
+    /// While active the listener admits TLS/WebSocket/Hello and answers
+    /// ping/pong, but never enqueues a `ConfigPush`. This prevents a forked
+    /// slave from applying a pending bundle before reconciliation completes.
+    pub fn begin_hello_only(&self) {
+        if self.fenced.load(Ordering::SeqCst) {
+            return;
+        }
+        self.hello_only.store(true, Ordering::SeqCst);
+    }
+
+    /// Leaves hello-only mode. Normal push-on-Hello resumes.
+    pub fn end_hello_only(&self) {
+        self.hello_only.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the listener is currently hello-only.
+    #[must_use]
+    pub fn is_hello_only(&self) -> bool {
+        self.hello_only.load(Ordering::SeqCst)
+    }
+
+    /// Snapshot of the peer reports collected during a reconciliation window.
+    #[must_use]
+    pub fn hello_only_peer_reports(&self) -> Vec<crate::promotion::reconcile::PeerReport> {
+        let slaves = sito_core::sync::lock_or_recover(&self.slaves);
+        slaves
+            .values()
+            .map(|slave| crate::promotion::reconcile::PeerReport {
+                instance: slave.instance.clone(),
+                have_term: slave.have_term,
+                have_version: slave.have_version,
+                have_bundle_hash: slave.have_bundle_hash.clone(),
+            })
+            .collect()
     }
 
     /// Current readiness of the master replication path.
@@ -221,6 +365,11 @@ impl MasterCoordinator {
         self
     }
 
+    /// Sets the cluster epoch/term for an ex-post promotion runtime.
+    pub fn set_term(&self, term: u64) {
+        self.current_term.store(term, Ordering::SeqCst);
+    }
+
     /// Sets the cluster epoch/term for an explicit promotion.
     ///
     /// Normal nodes restore the term from `ha_state.toml`. This builder exists
@@ -283,11 +432,27 @@ impl MasterCoordinator {
         let Some(path) = path else {
             return Ok(None);
         };
-        let state = PersistedMasterState {
+        let mut state = PersistedMasterState {
             protocol_version: crate::protocol::PROTOCOL_VERSION,
             bundle: bundle.clone(),
             signing_key_pubkey: Some(self.signing_key.public_key_hex()),
+            publication_state: None,
+            published_version: None,
+            published_hash: None,
+            pending_hash: None,
+            promotion_origin: None,
+            lease_holder: None,
+            cluster_id: None,
+            node_id: None,
+            promoted_at_unix_ms: None,
+            last_applied_version: None,
+            last_applied_hash: None,
         };
+        if let Some(ref bookkeeping) =
+            *sito_core::sync::lock_or_recover(&self.promotion_bookkeeping)
+        {
+            bookkeeping.apply_to(&mut state);
+        }
         let payload = serde_json::to_vec_pretty(&state).map_err(|e| {
             std::io::Error::other(format!("failed to serialize HA master state: {e}"))
         })?;
@@ -408,13 +573,32 @@ impl MasterCoordinator {
                 ),
             });
         }
-        if let Some(expected) = state.signing_key_pubkey {
+        if let Some(ref expected) = state.signing_key_pubkey {
             let actual = self.signing_key.public_key_hex();
-            if expected != actual {
+            if *expected != actual {
                 return Err(HaError::Validation {
                     field: "ha_signing_key".to_string(),
                     reason: format!(
                         "HA state at {} was written by signing key {expected}, but the loaded key is {actual}. ha_signing.key was lost or replaced. Restore the original key from backup, or delete the state file and re-enroll every slave with this master's new master_pubkey after an explicit higher-version promotion",
+                        path.display()
+                    ),
+                });
+            }
+        }
+        // Restore promotion bookkeeping before the bundle is re-sealed: a
+        // normal restart must not drop the published baseline.
+        match crate::promotion::state::PromotionBookkeeping::from_state(&state) {
+            Ok(bookkeeping) => {
+                *sito_core::sync::lock_or_recover(&self.promotion_bookkeeping) = bookkeeping;
+            }
+            Err(error) => {
+                // A file that claims promotion bookkeeping but is malformed is
+                // corrupt state: fail closed instead of silently discarding the
+                // published baseline.
+                return Err(HaError::Validation {
+                    field: "ha_state".to_string(),
+                    reason: format!(
+                        "invalid promotion bookkeeping in {}: {error}",
                         path.display()
                     ),
                 });

@@ -38,6 +38,89 @@ pub type SlaveTrackerHandle = sito_ha::SlaveStatusTracker;
 #[cfg(not(feature = "ha"))]
 pub type SlaveTrackerHandle = ();
 
+/// Slot shared with the promotion supervisor for a coordinator created when a
+/// slave is promoted to master. `config.toml` keeps `role = "slave"`, so the
+/// normal `master_coordinator` field stays `None`; publish/resync paths must
+/// consult this slot as the effective master coordinator.
+pub type PromotedMasterCoordinator = Arc<Mutex<Option<MasterCoordinatorHandle>>>;
+
+/// Runtime write gate for ADR-0010 automatic promotion.
+///
+/// While blocked, every mutating API request returns `409 Conflict` with a
+/// stable `urn:sito:ha:promotion_read_only` type for witness/quiesce reasons or
+/// `urn:sito:ha:promotion_fenced` for a durable fence, plus the specific reason
+/// in `detail`. The gate is independent of the configured role: an enabled
+/// master is blocked from startup until it holds the lease and has published,
+/// and a fenced node stays blocked across restarts.
+#[derive(Debug, Default)]
+pub struct HaWriteGate {
+    blocked: AtomicBool,
+    fenced: AtomicBool,
+    effective_master: AtomicBool,
+    reason: Mutex<Option<String>>,
+}
+
+impl HaWriteGate {
+    /// Creates an open gate (the pre-promotion default).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Blocks mutating requests until [`Self::allow`] is called.
+    pub fn block(&self, reason: impl Into<String>) {
+        *self
+            .reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.into());
+        self.blocked.store(true, Ordering::SeqCst);
+    }
+
+    /// Blocks and marks the node durably fenced.
+    pub fn fence(&self, reason: impl Into<String>) {
+        self.fenced.store(true, Ordering::SeqCst);
+        self.block(reason);
+    }
+
+    /// Marks the in-memory effective role as master after promotion.
+    ///
+    /// `config.toml` intentionally remains `role = "slave"`; the API must use
+    /// this effective-role flag instead of the configured role.
+    pub fn mark_effective_master(&self) {
+        self.effective_master.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this process has been promoted to the master role in memory.
+    #[must_use]
+    pub fn is_effective_master(&self) -> bool {
+        self.effective_master.load(Ordering::SeqCst)
+    }
+
+    /// Opens the gate after a successful first publish.
+    pub fn allow(&self) {
+        *self
+            .reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.blocked.store(false, Ordering::SeqCst);
+    }
+
+    /// Returns `(reason, fenced)` when mutating requests are blocked.
+    #[must_use]
+    pub fn blocked(&self) -> Option<(String, bool)> {
+        if !self.blocked.load(Ordering::SeqCst) {
+            return None;
+        }
+        let reason = self
+            .reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| "ha_promotion_read_only".to_string());
+        Some((reason, self.fenced.load(Ordering::SeqCst)))
+    }
+}
+
 /// Shared application state container across all REST API handlers.
 #[derive(Clone)]
 pub struct ServerContext {
@@ -60,6 +143,8 @@ pub struct ServerContext {
     /// Pending backup restorations awaiting confirmation token: token -> (toml_content, expires_at).
     pub restore_tokens: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     pub master_coordinator: Option<MasterCoordinatorHandle>,
+    /// Coordinator created by an in-memory slave→master promotion.
+    pub promoted_master_coordinator: PromotedMasterCoordinator,
     pub slave_tracker: Option<SlaveTrackerHandle>,
     pub resync_sender: Option<tokio::sync::mpsc::Sender<()>>,
     pub setup_pending: Arc<AtomicBool>,
@@ -77,6 +162,8 @@ pub struct ServerContext {
     /// watcher, REST/UI handlers) so a slower older document cannot overwrite
     /// a newer one after the newer push already reached the runtime.
     pub apply_lock: Arc<tokio::sync::Mutex<()>>,
+    /// ADR-0010 write gate for opt-in automatic promotion.
+    pub ha_write_gate: Arc<HaWriteGate>,
 }
 
 impl ServerContext {
@@ -86,6 +173,29 @@ impl ServerContext {
     pub(crate) fn publish_cache_size(&self) {
         self.metrics
             .set_cache_size_bytes(cache_size_bytes(&self.cache));
+    }
+
+    /// The coordinator actually running the master role.
+    ///
+    /// A configured master has `master_coordinator`; a promoted slave has only
+    /// the shared promotion slot. Every publish/resync/status path must use this
+    /// accessor so an in-memory promotion is not silently dropped.
+    #[must_use]
+    #[cfg(feature = "ha")]
+    pub fn active_master_coordinator(&self) -> Option<MasterCoordinatorHandle> {
+        self.master_coordinator.clone().or_else(|| {
+            self.promoted_master_coordinator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    }
+
+    /// No HA build has no coordinator.
+    #[must_use]
+    #[cfg(not(feature = "ha"))]
+    pub fn active_master_coordinator(&self) -> Option<MasterCoordinatorHandle> {
+        None
     }
 }
 
@@ -355,39 +465,44 @@ impl ServerContext {
     #[must_use]
     #[cfg(feature = "ha")]
     pub fn ha_readiness(&self, config: &Config) -> HaReadiness {
+        if let Some((reason, fenced)) = self.ha_write_gate.blocked()
+            && (fenced
+                || config.server.role == "master"
+                || self.ha_write_gate.is_effective_master())
+        {
+            // A waiting candidate is still a healthy replica; readiness follows
+            // its slave tracker until it actually becomes master.
+            return HaReadiness::not_ready(reason);
+        }
         // A role with no `[ha]` section is simply not an HA deployment. A
         // master that *did* configure `[ha]` but explicitly disabled the
         // listener (`replication_port = 0`) still has a meaningful state: the
         // coordinator carries the "replication disabled" explanation and must
         // be surfaced instead of being discarded as a generic ready.
+        let effective_master = self.ha_write_gate.is_effective_master();
         if !ha_readiness_required(config) {
             if config.ha.is_some()
-                && config.server.role == "master"
-                && let Some(coordinator) = self.master_coordinator.as_ref()
+                && (config.server.role == "master" || effective_master)
+                && let Some(coordinator) = self.active_master_coordinator()
             {
                 return coordinator.readiness();
             }
             return HaReadiness::ready();
         }
-        match config.server.role.as_str() {
-            "master" => self.master_coordinator.as_ref().map_or_else(
+        if config.server.role == "master" || effective_master {
+            return self.active_master_coordinator().map_or_else(
                 || {
                     HaReadiness::not_ready(
                         "master coordinator is not initialized; replication cannot run",
                     )
                 },
-                sito_ha::MasterCoordinator::readiness,
-            ),
-            "slave" => self.slave_tracker.as_ref().map_or_else(
-                || {
-                    HaReadiness::not_ready(
-                        "slave tracker is not initialized; replication cannot run",
-                    )
-                },
-                sito_ha::SlaveStatusTracker::readiness,
-            ),
-            _ => HaReadiness::ready(),
+                |coordinator| coordinator.readiness(),
+            );
         }
+        self.slave_tracker.as_ref().map_or_else(
+            || HaReadiness::not_ready("slave tracker is not initialized; replication cannot run"),
+            sito_ha::SlaveStatusTracker::readiness,
+        )
     }
 
     /// Without HA support there is no coordinator that could be unready.
@@ -603,7 +718,7 @@ impl ServerContext {
             // Some failures happen before the coordinator sees a bundle
             // (unreadable/empty/sanitize/secret/version errors). They must
             // still make HA readiness false, not only return an API error.
-            if let Some(ref coordinator) = self.master_coordinator {
+            if let Some(coordinator) = self.active_master_coordinator() {
                 coordinator.mark_publish_failed(e.to_string());
             }
             retry_delay = self.schedule_publish_retry();
@@ -624,7 +739,20 @@ impl ServerContext {
 
     #[cfg(feature = "ha")]
     async fn publish_bundle_inner(&self) -> Result<PublishOutcome, HaError> {
-        let Some(ref coordinator) = self.master_coordinator else {
+        if let Some((reason, fenced)) = self.ha_write_gate.blocked() {
+            return Err(HaError::Validation {
+                field: "ha_promotion".to_string(),
+                reason: format!(
+                    "{}: {reason}",
+                    if fenced {
+                        "ha_promotion_fenced"
+                    } else {
+                        "ha_promotion_read_only"
+                    }
+                ),
+            });
+        }
+        let Some(coordinator) = self.active_master_coordinator() else {
             return Ok(PublishOutcome::NoSlaves);
         };
 
@@ -714,7 +842,10 @@ impl ServerContext {
     /// `None` means an existing loop owns the schedule (or HA is not active).
     #[cfg(feature = "ha")]
     fn schedule_publish_retry(&self) -> Option<std::time::Duration> {
-        let coordinator = self.master_coordinator.as_ref()?;
+        if self.ha_write_gate.blocked().is_some() {
+            return None;
+        }
+        let coordinator = self.active_master_coordinator()?;
         if !coordinator.begin_publish_retry() {
             return None;
         }

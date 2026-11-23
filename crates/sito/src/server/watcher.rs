@@ -220,13 +220,51 @@ pub(super) fn spawn_slave_worker_after_listeners(
         config_path: Some(config_path.to_path_buf()),
         applier,
     };
-    let _slave_worker_handle = sito_ha::spawn_slave_worker(
+
+    // Give the promotion runtime a per-slave shutdown switch so a candidate can
+    // stop the slave role before it starts the master listener. Without
+    // promotion the worker keeps the global shutdown receiver.
+    let slave_shutdown_rx = if let Some(promotion) = ha_runtime.promotion.as_ref() {
+        let (tx, rx) = watch::channel(false);
+        if let Ok(mut slot) = promotion.slave_shutdown.lock() {
+            *slot = Some(tx.clone());
+        }
+        let mut global = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                if *global.borrow() {
+                    let _ = tx.send(true);
+                    break;
+                }
+                if global.changed().await.is_err() {
+                    let _ = tx.send(true);
+                    break;
+                }
+            }
+        });
+        rx
+    } else {
+        shutdown_rx.clone()
+    };
+
+    let slave_worker_handle = sito_ha::spawn_slave_worker(
         ha_runtime.config.clone(),
         tracker,
         slave_handles,
         resync_rx,
-        shutdown_rx.clone(),
+        slave_shutdown_rx,
     );
+
+    if let Some(promotion) = ha_runtime.promotion.clone() {
+        if let Ok(mut slot) = promotion.live_config.lock() {
+            *slot = Some(server_ctx.config.clone());
+        }
+        *promotion
+            .slave_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(slave_worker_handle);
+        spawn_promotion_supervisor(promotion, shutdown_rx.clone());
+    }
 }
 
 /// Watches the configuration file and applies hot reloads in-process. Returns

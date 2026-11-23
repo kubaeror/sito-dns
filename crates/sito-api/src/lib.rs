@@ -22,8 +22,8 @@ pub mod security;
 pub mod state;
 pub mod updater;
 
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 #[cfg(feature = "embed-ui")]
 pub mod ui;

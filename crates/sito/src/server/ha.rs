@@ -13,6 +13,13 @@ pub(super) struct HaRuntime {
     /// apply hooks exist so the worker can receive the shared
     /// [`HaConfigApplier`].
     pub(super) resync_receiver: Option<tokio::sync::mpsc::Receiver<()>>,
+    /// ADR-0010 write gate shared with the API middleware.
+    pub(super) write_gate: Arc<sito_api::state::HaWriteGate>,
+    /// Promotion runtime state (enabled only).
+    pub(super) promotion: Option<Arc<PromotionRuntimeState>>,
+    /// Coordinator created by an in-memory slave→master promotion, shared with
+    /// `ServerContext` so normal API/watcher publishes are not dropped.
+    pub(super) promoted_master: Arc<Mutex<Option<sito_ha::MasterCoordinator>>>,
 }
 
 /// True when the shared client ACL denies by default.
@@ -55,7 +62,25 @@ pub(super) fn init_ha(
         .validate(&config.server.role)
         .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
 
-    let (master_coordinator, slave_tracker, resync_sender, resync_receiver) = if config.server.role
+    let write_gate = Arc::new(sito_api::state::HaWriteGate::new());
+    let promoted_master = Arc::new(Mutex::new(None));
+    if ha_config.promotion.enabled {
+        write_gate.block("ha_promotion_starting");
+    }
+
+    // ADR-0010: with promotion disabled the entire section is inert. A
+    // disabled `candidate = true` remains accepted for upgrade compatibility,
+    // but it must not silently look like an active candidate.
+    if !ha_config.promotion.enabled && ha_config.promotion.candidate {
+        tracing::warn!(
+            "ha.promotion.candidate = true is ignored because ha.promotion.enabled = false; set enabled = true on every HA node to use automatic promotion"
+        );
+    }
+
+    let promotion_enabled = ha_config.promotion.enabled;
+    let (master_coordinator, slave_tracker, resync_sender, resync_receiver, promotion) = if config
+        .server
+        .role
         == "master"
     {
         // The replication listener is only spawned when the port is non-zero;
@@ -86,10 +111,22 @@ pub(super) fn init_ha(
         if ha_config.replication_port == 0 {
             coordinator.mark_replication_disabled();
         }
+        if promotion_enabled {
+            // The listener may exist before the supervisor acquires the lease,
+            // but it must not admit slaves or serve pushes in that window.
+            coordinator.set_serving(false);
+            coordinator.deny_sessions("read_only");
+        }
 
-        // Continue the version sequence across restarts; only a master with no
-        // recoverable state starts a fresh v1 sequence.
-        let restored_version = coordinator.restore_state()?;
+        // Continue the version sequence across restarts in the normal path.
+        // With promotion enabled the engine reads the state file strictly and
+        // must not mutate anything before it holds the lease, so the
+        // coordinator is not restored/written here.
+        let restored_version = if promotion_enabled {
+            None
+        } else {
+            coordinator.restore_state()?
+        };
 
         let initial_toml = match std::fs::read_to_string(config_path) {
             Ok(raw) => raw,
@@ -119,7 +156,14 @@ pub(super) fn init_ha(
             })
         };
 
-        if let Some(restored_version) = restored_version {
+        if promotion_enabled {
+            // The promotion supervisor acquires the lease, quiesces,
+            // reconciles and publishes the first bundle. Nothing may mutate or
+            // publish before that point.
+            info!(
+                "Automatic promotion is enabled; master starts read-only until the lease is acquired"
+            );
+        } else if let Some(restored_version) = restored_version {
             // A restart must never resume a bundle that no longer matches the
             // current `config.toml`: slaves would stay on the old shared
             // configuration indefinitely. Republish a fresh `N + 1` bundle
@@ -165,18 +209,70 @@ pub(super) fn init_ha(
             info!("Published initial HA configuration bundle version 1");
         }
 
-        // Spawn master replication listener if replication_port > 0
-        let _master_server_handle = if ha_config.replication_port > 0 {
+        // Spawn master replication listener if replication_port > 0. A
+        // promotion-enabled master gets its own shutdown switch so fencing can
+        // stop accepting new slaves; the global shutdown is forwarded to it.
+        let mut configured_master_shutdown = None;
+        let mut configured_master_handle = None;
+        let master_server_handle = if ha_config.replication_port > 0 {
+            let listener_shutdown = if promotion_enabled {
+                let (tx, rx) = watch::channel(false);
+                let mut global = shutdown_rx.clone();
+                let forward_tx = tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if *global.borrow() {
+                            let _ = forward_tx.send(true);
+                            break;
+                        }
+                        if global.changed().await.is_err() {
+                            let _ = forward_tx.send(true);
+                            break;
+                        }
+                    }
+                });
+                configured_master_shutdown = Some(tx);
+                rx
+            } else {
+                shutdown_rx.clone()
+            };
             Some(sito_ha::spawn_master_server(
                 ha_config.clone(),
                 coordinator.clone(),
-                shutdown_rx.clone(),
+                listener_shutdown,
             ))
         } else {
             None
         };
+        if promotion_enabled {
+            configured_master_handle = master_server_handle;
+        } else {
+            let _master_server_handle = master_server_handle;
+        }
 
-        (Some(coordinator), None, None, None)
+        let promotion = promotion_enabled.then(|| {
+            Arc::new(PromotionRuntimeState {
+                config: config.clone(),
+                config_path: config_path.to_path_buf(),
+                ha_config: ha_config.clone(),
+                role: sito_ha::ConfiguredRole::Master,
+                metrics: metrics.clone(),
+                write_gate: Arc::clone(&write_gate),
+                signing_key: Mutex::new(Some(signing_key.clone())),
+                coordinator: Mutex::new(Some(coordinator.clone())),
+                tracker: None,
+                slave_shutdown: Mutex::new(None),
+                master_shutdown: Mutex::new(configured_master_shutdown),
+                master_handle: Mutex::new(configured_master_handle),
+                live_config: Mutex::new(None),
+                slave_handle: Mutex::new(None),
+                master_slot: Arc::clone(&promoted_master),
+                initial_toml: Mutex::new(Some(initial_toml.clone())),
+                known_secrets: known_secrets.iter().map(|s| (*s).to_string()).collect(),
+            })
+        });
+
+        (Some(coordinator), None, None, None, promotion)
     } else {
         // Slave role. The worker is spawned by `run_server_full` once the
         // server context and apply hooks exist, so a push can apply every
@@ -203,7 +299,34 @@ pub(super) fn init_ha(
             }
         }
         let (resync_tx, resync_rx) = tokio::sync::mpsc::channel(4);
-        (None, Some(tracker), Some(resync_tx), Some(resync_rx))
+        let promotion = promotion_enabled.then(|| {
+            Arc::new(PromotionRuntimeState {
+                config: config.clone(),
+                config_path: config_path.to_path_buf(),
+                ha_config: ha_config.clone(),
+                role: sito_ha::ConfiguredRole::Slave,
+                metrics: metrics.clone(),
+                write_gate: Arc::clone(&write_gate),
+                signing_key: Mutex::new(None),
+                coordinator: Mutex::new(None),
+                tracker: Some(tracker.clone()),
+                slave_shutdown: Mutex::new(None),
+                master_shutdown: Mutex::new(None),
+                master_handle: Mutex::new(None),
+                live_config: Mutex::new(None),
+                slave_handle: Mutex::new(None),
+                master_slot: Arc::clone(&promoted_master),
+                initial_toml: Mutex::new(None),
+                known_secrets: Vec::new(),
+            })
+        });
+        (
+            None,
+            Some(tracker),
+            Some(resync_tx),
+            Some(resync_rx),
+            promotion,
+        )
     };
 
     Ok(HaRuntime {
@@ -212,7 +335,31 @@ pub(super) fn init_ha(
         tracker: slave_tracker,
         resync_sender,
         resync_receiver,
+        write_gate,
+        promotion,
+        promoted_master,
     })
+}
+
+impl HaRuntime {
+    /// Starts the master promotion supervisor after the live config handle
+    /// exists. Candidate promotion is started by the slave worker bootstrap.
+    pub(super) fn start_master_promotion(
+        &self,
+        config: Arc<ArcSwap<Config>>,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) {
+        let Some(promotion) = self.promotion.as_ref() else {
+            return;
+        };
+        if promotion.role != sito_ha::ConfiguredRole::Master {
+            return;
+        }
+        if let Ok(mut slot) = promotion.live_config.lock() {
+            *slot = Some(config);
+        }
+        spawn_promotion_supervisor(Arc::clone(promotion), shutdown_rx.clone());
+    }
 }
 
 /// Production [`sito_ha::SlaveConfigApplier`] backed by the shared

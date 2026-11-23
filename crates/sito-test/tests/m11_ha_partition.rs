@@ -452,6 +452,7 @@ async fn test_delayed_same_version_fork_ack_after_newer_publish_is_divergence() 
                 token: None,
                 role: Some("slave".to_string()),
                 protocol_version: Some(sito_ha::PROTOCOL_VERSION),
+                have_bundle_hash: None,
             }
             .to_json()
             .unwrap()
@@ -733,6 +734,8 @@ async fn publish_context(dir: &Path, config_path: &Path) -> ServerContext {
         rewrites,
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        ha_write_gate: std::sync::Arc::new(sito_api::state::HaWriteGate::new()),
+        promoted_master_coordinator: std::sync::Arc::new(std::sync::Mutex::new(None)),
         master_coordinator: Some(coordinator),
         slave_tracker: None,
         resync_sender: None,

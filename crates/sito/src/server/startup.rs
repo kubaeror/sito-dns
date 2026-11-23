@@ -263,6 +263,14 @@ pub async fn run_server_with_lease(
     #[cfg(not(feature = "ha"))]
     let ha_acl_unprovisioned = false;
     #[cfg(feature = "ha")]
+    let ha_write_gate = ha_runtime.write_gate.clone();
+    #[cfg(feature = "ha")]
+    let promoted_master_coordinator = ha_runtime.promoted_master.clone();
+    #[cfg(not(feature = "ha"))]
+    let promoted_master_coordinator = Arc::new(Mutex::new(None));
+    #[cfg(not(feature = "ha"))]
+    let ha_write_gate = Arc::new(sito_api::state::HaWriteGate::new());
+    #[cfg(feature = "ha")]
     let _ha_config = ha_runtime.config.clone();
     #[cfg(feature = "ha")]
     let (master_coordinator, slave_tracker, resync_sender) = (
@@ -367,7 +375,9 @@ pub async fn run_server_with_lease(
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+        ha_write_gate: ha_write_gate.clone(),
         master_coordinator,
+        promoted_master_coordinator: promoted_master_coordinator.clone(),
         slave_tracker,
         resync_sender,
         setup_pending: Arc::new(std::sync::atomic::AtomicBool::new(setup_pending)),
@@ -376,6 +386,9 @@ pub async fn run_server_with_lease(
         acme_challenges: Some(acme_challenges.clone()),
         dns_starter,
     };
+
+    #[cfg(feature = "ha")]
+    ha_runtime.start_master_promotion(config_arc.clone(), &shutdown_rx);
 
     let api_router = sito_api::create_router_with_hooks(
         server_ctx.clone(),

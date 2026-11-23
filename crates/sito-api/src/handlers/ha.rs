@@ -91,13 +91,18 @@ pub async fn get_ha_status(
     State(ctx): State<ServerContext>,
 ) -> Result<Json<HaStatusResponse>, ProblemDetails> {
     let cfg = ctx.config.load();
-    let role = cfg.server.role.clone();
+    let configured_role = cfg.server.role.clone();
+    let role = if ctx.ha_write_gate.is_effective_master() {
+        "master".to_string()
+    } else {
+        configured_role
+    };
     let instance_name = cfg.server.instance_name.clone();
     let readiness = ctx.ha_readiness(&cfg);
 
     if role == "master" {
         let (version, slaves_connected, diverged, diverged_reason, master_pubkey) =
-            if let Some(ref coord) = ctx.master_coordinator {
+            if let Some(ref coord) = ctx.active_master_coordinator() {
                 (
                     coord.get_current_version(),
                     coord.connected_slave_count(),
@@ -179,7 +184,7 @@ pub async fn get_ha_slaves(
     _admin: RequireAdmin,
     State(ctx): State<ServerContext>,
 ) -> Result<Json<Vec<HaSlaveSummary>>, ProblemDetails> {
-    if let Some(ref coord) = ctx.master_coordinator {
+    if let Some(ref coord) = ctx.active_master_coordinator() {
         let summaries = coord
             .list_slaves()
             .into_iter()
@@ -209,10 +214,33 @@ pub async fn trigger_ha_resync(
     _admin: RequireAdmin,
     State(ctx): State<ServerContext>,
 ) -> Result<Json<HaResyncResponse>, ProblemDetails> {
-    let role = ctx.config.load().server.role.clone();
+    let configured_role = ctx.config.load().server.role.clone();
+    let effective_master = ctx.ha_write_gate.is_effective_master();
+    let role = if effective_master {
+        "master".to_string()
+    } else {
+        configured_role
+    };
+    if let Some((reason, fenced)) = ctx.ha_write_gate.blocked()
+        && (fenced || role == "master" || ctx.ha_write_gate.is_effective_master())
+    {
+        let mut problem = ProblemDetails::conflict(if fenced {
+            "Resynchronization is disabled while this node is fenced for HA promotion."
+        } else {
+            "Resynchronization is disabled until this node holds the lease and has published."
+        });
+        problem.error_type = if fenced {
+            "urn:sito:ha:promotion_fenced".to_string()
+        } else {
+            "urn:sito:ha:promotion_read_only".to_string()
+        };
+        problem.title = "HA Promotion Read-Only".to_string();
+        problem.detail = reason;
+        return Err(problem);
+    }
 
     let response = if role == "master" {
-        resync_master(ctx.master_coordinator.as_ref(), &role)?
+        resync_master(ctx.active_master_coordinator().as_ref(), &role)?
     } else {
         resync_slave(
             ctx.slave_tracker.as_ref(),
@@ -273,6 +301,9 @@ mod tests {
                 sender: tx,
                 capabilities: vec![],
                 connection_id: 1,
+                have_term: 0,
+                have_version: 0,
+                have_bundle_hash: None,
             },
         );
         // The receiver is gone: every delivery attempt fails.
@@ -386,6 +417,9 @@ mod tests {
                 sender: tx,
                 capabilities: vec![],
                 connection_id: 2,
+                have_term: 0,
+                have_version: 0,
+                have_bundle_hash: None,
             },
         );
         let response = resync_master(Some(&coordinator), "master").unwrap();
@@ -396,5 +430,116 @@ mod tests {
             rx.try_recv().is_err(),
             "each slave must receive exactly one push"
         );
+    }
+    #[tokio::test]
+    async fn resync_is_refused_on_a_fenced_or_read_only_master() {
+        use crate::auth::AuthUser;
+        use crate::auth::Role;
+
+        let dir = crate::test_support::temp_dir("sito_ha_resync_gate");
+        let ctx = crate::test_support::mock_context(&dir).await;
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+        let mut config = (*ctx.config.load_full()).clone();
+        config.server.role = "master".to_string();
+        config.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+        ctx.config.store(std::sync::Arc::new(config));
+
+        // Publish/replication paths read the effective coordinator, including a
+        // promoted slave's shared slot.
+        ctx.promoted_master_coordinator
+            .lock()
+            .unwrap()
+            .replace(coordinator.clone());
+        ctx.ha_write_gate.fence("ha_promotion_fenced");
+
+        let admin = RequireAdmin(AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+            owner: None,
+        });
+        let error = trigger_ha_resync(admin, State(ctx.clone()))
+            .await
+            .expect_err("a fenced master must not broadcast a resync");
+        assert_eq!(error.status, StatusCode::CONFLICT.as_u16());
+        assert_eq!(error.error_type, "urn:sito:ha:promotion_fenced");
+        assert_eq!(coordinator.get_current_version(), 2);
+
+        // A read-only (not yet fenced) node reports the distinct reason.
+        let ctx = crate::test_support::mock_context(&dir).await;
+        let mut config = (*ctx.config.load_full()).clone();
+        config.server.role = "master".to_string();
+        config.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+        ctx.config.store(std::sync::Arc::new(config));
+        ctx.promoted_master_coordinator
+            .lock()
+            .unwrap()
+            .replace(coordinator.clone());
+        ctx.ha_write_gate.block("ha_promotion_witness_unavailable");
+        let admin = RequireAdmin(AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+            owner: None,
+        });
+        let error = trigger_ha_resync(admin, State(ctx))
+            .await
+            .expect_err("a read-only master must not broadcast a resync");
+        assert_eq!(error.status, StatusCode::CONFLICT.as_u16());
+        assert_eq!(error.error_type, "urn:sito:ha:promotion_read_only");
+        assert_eq!(error.detail, "ha_promotion_witness_unavailable");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[tokio::test]
+    async fn promoted_effective_master_reports_master_and_resyncs_from_the_live_coordinator() {
+        use crate::auth::AuthUser;
+        use crate::auth::Role;
+
+        let dir = crate::test_support::temp_dir("sito_ha_promoted_status");
+        let ctx = crate::test_support::mock_context(&dir).await;
+        let coordinator = test_coordinator();
+        coordinator.update_bundle(test_bundle(2)).unwrap();
+        coordinator.mark_replication_ready();
+        let mut config = (*ctx.config.load_full()).clone();
+        config.server.role = "slave".to_string();
+        config.ha = Some(toml::from_str("replication_port = 8953").unwrap());
+        ctx.config.store(std::sync::Arc::new(config));
+        ctx.promoted_master_coordinator
+            .lock()
+            .unwrap()
+            .replace(coordinator.clone());
+        ctx.ha_write_gate.mark_effective_master();
+        ctx.ha_write_gate.allow();
+
+        let admin = RequireAdmin(AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+            owner: None,
+        });
+        let status = get_ha_status(admin, State(ctx.clone()))
+            .await
+            .expect("status")
+            .0;
+        assert_eq!(status.role, "master");
+        assert_eq!(status.version, 2);
+        assert!(status.ready);
+
+        let admin = RequireAdmin(AuthUser {
+            username: "admin".to_string(),
+            role: Role::Admin,
+            token_id: None,
+            owner: None,
+        });
+        let resync = trigger_ha_resync(admin, State(ctx))
+            .await
+            .expect("promoted resync")
+            .0;
+        assert_eq!(resync.role, "master");
+        assert_eq!(resync.version, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

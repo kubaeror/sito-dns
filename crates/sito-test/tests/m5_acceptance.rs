@@ -100,6 +100,8 @@ async fn create_test_context(temp_dir: &Path) -> (ServerContext, PathBuf, QueryL
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(HashMap::new())),
         apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+        ha_write_gate: std::sync::Arc::new(sito_api::state::HaWriteGate::new()),
+        promoted_master_coordinator: std::sync::Arc::new(std::sync::Mutex::new(None)),
         master_coordinator: None,
         slave_tracker: None,
         resync_sender: None,
