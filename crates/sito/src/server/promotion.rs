@@ -242,6 +242,17 @@ async fn run_supervisor(state: Arc<PromotionRuntimeState>, mut shutdown_rx: watc
         if *shutdown_rx.borrow() {
             return;
         }
+        // Consume late ahead peer Hellos: a peer that connected after the
+        // reconcile window and reports a term/version above this master is
+        // latched, marked diverged and receives no further pushes. The engine
+        // never bumps above it.
+        let latched = engine.process_late_peer_reports();
+        if latched > 0 {
+            warn!(
+                count = latched,
+                "Latched late ahead peer(s) after the reconcile window"
+            );
+        }
         match engine.check_self_fence() {
             Ok(true) => {
                 state.write_gate.fence("ha_promotion_fenced");
@@ -437,21 +448,53 @@ impl PromotionHost for RuntimePromotionHost {
     }
 
     fn current_published_baseline(&self) -> Option<PublicationBaseline> {
-        if let Some(coordinator) = self.state.coordinator() {
-            if let Some(bookkeeping) = coordinator.promotion_bookkeeping() {
-                return Some(PublicationBaseline {
-                    version: bookkeeping.published_version,
-                    hash: bookkeeping.published_hash,
-                });
-            }
-            if let Some(hash) = coordinator.active_payload_hash() {
-                return Some(PublicationBaseline {
-                    version: coordinator.get_current_version(),
-                    hash,
-                });
+        // ADR-0010: only the durable published baseline may be sent to the
+        // witness. The coordinator advances its in-memory bookkeeping before
+        // the second durable write of a normal publish; reading that would
+        // advertise an uncommitted version. Read `ha_state.toml` instead: its
+        // `published_version`/`published_hash` fields are the last baseline
+        // that completed both writes, even while the active bundle is pending.
+        let mut store = HaStateStore::new(self.state.state_path());
+        if let (Some(cluster_id), Some(node_id)) = (
+            self.state.ha_config.promotion.cluster_id.as_deref(),
+            self.state.ha_config.promotion.node_id.as_deref(),
+        ) {
+            store = store.with_identity(cluster_id, node_id);
+        }
+        match store.load() {
+            Ok(LoadedState::Present {
+                bookkeeping: Some(bookkeeping),
+                ..
+            }) => Some(bookkeeping.baseline()),
+            Ok(LoadedState::Missing | LoadedState::Present { .. }) => None,
+            Err(error) => {
+                // A corrupt/unreadable state must not become an uncommitted
+                // baseline. Keep the grant's last known published baseline and
+                // let the renewal deadline govern safety.
+                warn!(
+                    error = %error,
+                    "cannot read the durable published baseline; keeping the last known renewal baseline"
+                );
+                None
             }
         }
-        None
+    }
+
+    fn signing_key_pubkey(&self) -> Option<String> {
+        self.state.signing_key().map(|key| key.public_key_hex())
+    }
+
+    fn take_late_peer_reports(&self) -> Vec<sito_ha::promotion::PeerReport> {
+        self.state
+            .coordinator()
+            .map(|coordinator| coordinator.take_late_peer_reports())
+            .unwrap_or_default()
+    }
+
+    fn latch_peer(&self, report: &sito_ha::promotion::PeerReport, reason: &str) {
+        if let Some(coordinator) = self.state.coordinator() {
+            coordinator.latch_late_peer(report, reason);
+        }
     }
 
     fn hash_bundle(&self, bundle: &ConfigBundle) -> Result<String, String> {
@@ -632,10 +675,35 @@ impl PromotionHost for RuntimePromotionHost {
         Box::pin(async move {
             let coordinator = self.coordinator()?;
             coordinator.set_term(prepared.bundle.term);
+            // The engine wrote the `publishing` state immediately before this
+            // call. A state-load failure must fail closed: publishing with no
+            // bookkeeping would drop the durable published baseline.
             let store = HaStateStore::new(self.state.state_path());
-            if let Ok(LoadedState::Present { bookkeeping, .. }) = store.load() {
-                coordinator.set_promotion_bookkeeping(bookkeeping);
-            }
+            let bookkeeping = match store.load() {
+                Ok(LoadedState::Present {
+                    bookkeeping: Some(bookkeeping),
+                    ..
+                }) => bookkeeping,
+                Ok(LoadedState::Present {
+                    bookkeeping: None, ..
+                }) => {
+                    return Err(
+                        "the promotion state has no publication bookkeeping before the first publish"
+                            .to_string(),
+                    );
+                }
+                Ok(LoadedState::Missing) => {
+                    return Err(
+                        "the promotion state is missing before the first publish".to_string()
+                    );
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "cannot load the promotion state before the first publish: {error}"
+                    ));
+                }
+            };
+            coordinator.set_promotion_bookkeeping(Some(bookkeeping));
             // The first push is the one publish allowed while the API gate is
             // still closed. It is enabled only for the duration of this call.
             if coordinator.is_fenced() {
@@ -652,21 +720,6 @@ impl PromotionHost for RuntimePromotionHost {
                 coordinator.set_serving(false);
             }
             result
-        })
-    }
-
-    fn adopt_published(
-        &self,
-        prepared: &PreparedBundle,
-    ) -> sito_ha::promotion::BoxFuture<'_, Result<(), String>> {
-        let prepared = prepared.clone();
-        Box::pin(async move {
-            let coordinator = self.coordinator()?;
-            coordinator.set_term(prepared.bundle.term);
-            coordinator
-                .adopt_promoted_bundle(prepared.bundle)
-                .map(|_| ())
-                .map_err(|error| error.to_string())
         })
     }
 
@@ -854,6 +907,17 @@ mod tests {
         let host = RuntimePromotionHost {
             state: Arc::clone(&state),
         };
+        // The promotion engine writes the `publishing` state immediately before
+        // the first publish; the host must load it to preserve the baseline.
+        write_promotion_state(
+            &state.state_path(),
+            1,
+            2,
+            "publishing",
+            (0, "none"),
+            Some(&"cd".repeat(32)),
+            Some(&state.signing_key().unwrap().public_key_hex()),
+        );
         let prepared = host.prepare_bundle(1, 2).expect("bundle");
         host.publish_first(&prepared).await.expect("first publish");
         assert!(
@@ -909,6 +973,183 @@ mod tests {
             eligibility.restart_required,
             "a watermark without an applied-config digest requires a full apply"
         );
+    }
+
+    pub(super) fn write_promotion_state(
+        path: &std::path::Path,
+        term: u64,
+        active_version: u64,
+        publication_state: &str,
+        published: (u64, &str),
+        pending_hash: Option<&str>,
+        signing_key_pubkey: Option<&str>,
+    ) {
+        let bundle = ConfigBundle {
+            version: active_version,
+            term,
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
+            ..ConfigBundle::default()
+        };
+        let mut state = serde_json::json!({
+            "protocol_version": 2,
+            "bundle": serde_json::to_value(&bundle).unwrap(),
+            "publication_state": publication_state,
+            "published_version": published.0,
+            "published_hash": published.1,
+            "cluster_id": "home-dns",
+            "node_id": "node-a",
+        });
+        if let Some(hash) = pending_hash {
+            state["pending_hash"] = serde_json::Value::String(hash.to_string());
+        }
+        if let Some(key) = signing_key_pubkey {
+            state["signing_key_pubkey"] = serde_json::Value::String(key.to_string());
+        }
+        std::fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
+    }
+
+    fn promotion_state(label: &str) -> Arc<PromotionRuntimeState> {
+        let mut state = test_state(label);
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        {
+            let state = Arc::get_mut(&mut state).expect("unique test state");
+            state.signing_key.lock().unwrap().replace(key);
+            state.ha_config.promotion.enabled = true;
+            state.ha_config.promotion.cluster_id = Some("home-dns".to_string());
+            state.ha_config.promotion.node_id = Some("node-a".to_string());
+            state.ha_config.promotion.lease_ttl_secs = 5;
+            state.ha_config.promotion.renew_interval_secs = 1;
+            state.ha_config.promotion.reconcile_window_secs = 1;
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn current_published_baseline_reads_only_the_durable_state() {
+        use sito_ha::{PromotionBookkeeping, PublicationBaseline};
+
+        let state = promotion_state("durable_baseline");
+        let path = state.state_path();
+        let durable_hash = "ab".repeat(32);
+        let pending_hash = "cd".repeat(32);
+        let uncommitted_hash = "ef".repeat(32);
+        let key_hex = state.signing_key().unwrap().public_key_hex();
+        // Durable: active bundle 4 is still `publishing` above published 3.
+        write_promotion_state(
+            &path,
+            2,
+            4,
+            "publishing",
+            (3, &durable_hash),
+            Some(&pending_hash),
+            Some(&key_hex),
+        );
+        // In-memory coordinator: a normal publish advanced its bookkeeping to
+        // 4 before the second durable write, which has not happened/failed.
+        let coordinator = MasterCoordinator::new(
+            "node-a".to_string(),
+            4,
+            Arc::new(Ed25519SigningKey::generate().unwrap()),
+            sito_stats::MetricsRegistry::new("2.0.0", "test"),
+        );
+        coordinator.set_promotion_bookkeeping(Some(PromotionBookkeeping::published(
+            PublicationBaseline::new(4, &uncommitted_hash).unwrap(),
+        )));
+        *state.coordinator.lock().unwrap() = Some(coordinator);
+        let host = RuntimePromotionHost {
+            state: Arc::clone(&state),
+        };
+        let baseline = host.current_published_baseline().expect("durable baseline");
+        assert_eq!(
+            baseline,
+            PublicationBaseline::new(3, &durable_hash).unwrap(),
+            "the in-memory pre-commit value must never be the renewal baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_first_fails_closed_on_a_missing_or_corrupt_promotion_state() {
+        let mut state = promotion_state("publish_first_load");
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        {
+            let state = Arc::get_mut(&mut state).expect("unique test state");
+            state.signing_key.lock().unwrap().replace(key.clone());
+        }
+        let coordinator = MasterCoordinator::new(
+            "node-a".to_string(),
+            0,
+            key,
+            sito_stats::MetricsRegistry::new("2.0.0", "test"),
+        );
+        coordinator.set_term(1);
+        coordinator.set_serving(true);
+        *state.coordinator.lock().unwrap() = Some(coordinator);
+        let mut live = Config::default();
+        live.server.role = "slave".to_string();
+        let toml_doc = toml::to_string_pretty(&live).unwrap();
+        *state.live_config.lock().unwrap() = Some(Arc::new(ArcSwap::from_pointee(live)));
+        *state.initial_toml.lock().unwrap() = Some(toml_doc);
+        let host = RuntimePromotionHost {
+            state: Arc::clone(&state),
+        };
+        let prepared = host.prepare_bundle(1, 1).expect("bundle");
+
+        // Missing state file.
+        let error = host.publish_first(&prepared).await.unwrap_err();
+        assert!(error.contains("missing"), "{error}");
+
+        // Corrupt state file.
+        std::fs::write(state.state_path(), b"not-json").unwrap();
+        let error = host.publish_first(&prepared).await.unwrap_err();
+        assert!(error.contains("cannot load"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn late_peer_latch_is_wired_to_the_coordinator() {
+        use sito_ha::promotion::PeerReport;
+
+        let state = promotion_state("late_latch");
+        let coordinator = MasterCoordinator::new(
+            "node-a".to_string(),
+            2,
+            Arc::new(Ed25519SigningKey::generate().unwrap()),
+            sito_stats::MetricsRegistry::new("2.0.0", "test"),
+        );
+        coordinator.set_term(3);
+        let host = RuntimePromotionHost {
+            state: Arc::clone(&state),
+        };
+        *state.coordinator.lock().unwrap() = Some(coordinator.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        coordinator.slaves.lock().unwrap().insert(
+            "late".to_string(),
+            sito_ha::master::ActiveSlave {
+                instance: "late".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: std::time::Instant::now(),
+                connected_at: chrono::Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                have_term: 3,
+                have_version: 9,
+                have_bundle_hash: Some("ef".repeat(32)),
+                connection_id: 1,
+            },
+        );
+        assert_eq!(host.take_late_peer_reports(), Vec::new());
+        host.latch_peer(
+            &PeerReport {
+                instance: "late".to_string(),
+                have_term: 3,
+                have_version: 9,
+                have_bundle_hash: Some("ef".repeat(32)),
+            },
+            "late ahead of the master",
+        );
+        assert!(coordinator.is_late_peer_latched("late"));
+        assert!(coordinator.is_diverged());
     }
 
     #[tokio::test]
@@ -1155,6 +1396,218 @@ mod integration_tests {
         witness.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&ctx_dir);
+    }
+
+    /// Real-host sibling of the engine `AlreadyPublished` test: a candidate
+    /// recovers a crash-interrupted publish whose proof hash is the *old-term*
+    /// pending hash. The current host falls back to the coordinator's active
+    /// hash at the same version, which made the pre-fix engine self-fence
+    /// (`lease_version_regression`). The durable published state must win.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn already_published_recovery_does_not_self_fence_with_the_real_host() {
+        use super::tests::write_promotion_state;
+        use sito_ha::promotion::{ManualMonotonicClock, ManualTimers};
+
+        let dir = temp_path("already_published_host");
+        let certs = sito_ha::generate_ha_certs(&dir.join("certs"), true, false).unwrap();
+        let token_file = dir.join("witness.token");
+        write_secret(&token_file, b"test-token-0123456789abcdef");
+        let witness_clock = Arc::new(ManualClock::new(1_760_000_000_000));
+        let witness = start_witness_server(
+            WitnessConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                cluster_id: "home-dns".to_string(),
+                cert: certs.master_cert_path.clone().unwrap(),
+                key: certs.master_key_path.clone().unwrap(),
+                token_file: token_file.clone(),
+                state_dir: dir.join("witness-state"),
+            },
+            witness_clock.clone(),
+        )
+        .await
+        .unwrap();
+        let witness_addr = witness.local_addr();
+
+        let mut promotion = HaConfig::default().promotion;
+        promotion.enabled = true;
+        promotion.candidate = true;
+        promotion.cluster_id = Some("home-dns".to_string());
+        promotion.node_id = Some("node-a".to_string());
+        promotion.lease_ttl_secs = 5;
+        promotion.renew_interval_secs = 1;
+        promotion.heartbeat_timeout_secs = Some(3);
+        promotion.reconcile_window_secs = 1;
+        promotion.witness.url = Some(format!("https://{witness_addr}"));
+        promotion.witness.ca = Some(certs.ca_cert_path.clone());
+        promotion.witness.token_file = Some(token_file.clone());
+
+        let baseline = format!("{:02x}", 0xab).repeat(32);
+        let pending = format!("{:02x}", 0xcd).repeat(32);
+        let client = WitnessClient::new(&promotion).unwrap();
+        let first = client
+            .acquire(&sito_ha::witness::AcquireRequest {
+                holder: "node-a/old-boot".to_string(),
+                node_id: "node-a".to_string(),
+                expected_term: None,
+                expected_revision: None,
+                term: 1,
+                version: 7,
+                bundle_hash: baseline.clone(),
+                ttl_secs: 5,
+            })
+            .await
+            .unwrap();
+        witness_clock.advance(5_000);
+        client
+            .acquire(&sito_ha::witness::AcquireRequest {
+                holder: "node-a/old-boot".to_string(),
+                node_id: "node-a".to_string(),
+                expected_term: Some(first.term),
+                expected_revision: Some(first.revision),
+                term: 2,
+                version: 7,
+                bundle_hash: baseline.clone(),
+                ttl_secs: 5,
+            })
+            .await
+            .unwrap();
+        witness_clock.advance(5_000);
+
+        let mut config = Config::default();
+        config.server.role = "slave".to_string();
+        config.server.instance_name = "candidate-a".to_string();
+        config.server.data_dir = dir.clone();
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        let signing = Ed25519SigningKey::generate().unwrap();
+        let key = Arc::new(signing);
+        let key_hex = key.public_key_hex();
+        write_promotion_state(
+            &dir.join("ha_state.toml"),
+            2,
+            8,
+            "publishing",
+            (7, &baseline),
+            Some(&pending),
+            Some(&key_hex),
+        );
+        let tracker = SlaveStatusTracker::new("candidate-a".to_string(), 0, None)
+            .with_watermark_path(dir.join("ha_watermark.toml"))
+            .unwrap();
+        tracker
+            .persist_watermark_with_config_digest(7, 2, &baseline, Some("digest"))
+            .unwrap();
+
+        let coordinator = MasterCoordinator::new(
+            "candidate-a".to_string(),
+            8,
+            Arc::clone(&key),
+            sito_stats::MetricsRegistry::new("2.0.0", "test"),
+        )
+        .with_state_path(dir.join("ha_state.toml"))
+        .with_term(2);
+        coordinator.set_term(2);
+        let mut ha_config = HaConfig {
+            replication_port: 0,
+            listen_addr: "127.0.0.1".to_string(),
+            master_url: Some("ws://127.0.0.1:1".to_string()),
+            master_pubkey: Some(key_hex.clone()),
+            allow_insecure_ws: true,
+            ping_interval_secs: 1,
+            ..HaConfig::default()
+        };
+        ha_config.promotion = promotion.clone();
+
+        let gate = Arc::new(sito_api::state::HaWriteGate::new());
+        gate.block("ha_promotion_starting");
+        let state = Arc::new(PromotionRuntimeState {
+            config: config.clone(),
+            config_path,
+            ha_config,
+            role: ConfiguredRole::Slave,
+            metrics: sito_stats::MetricsRegistry::new("2.0.0", "test"),
+            write_gate: gate.clone(),
+            signing_key: Mutex::new(Some(Arc::clone(&key))),
+            coordinator: Mutex::new(Some(coordinator.clone())),
+            tracker: Some(tracker),
+            slave_shutdown: Mutex::new(None),
+            master_shutdown: Mutex::new(None),
+            master_handle: Mutex::new(None),
+            live_config: Mutex::new(Some(Arc::new(ArcSwap::from_pointee(config.clone())))),
+            slave_handle: Mutex::new(None),
+            master_slot: Arc::new(Mutex::new(None)),
+            initial_toml: Mutex::new(Some(toml::to_string_pretty(&config).unwrap())),
+            known_secrets: Vec::new(),
+        });
+        let host = Arc::new(RuntimePromotionHost {
+            state: Arc::clone(&state),
+        });
+        let clock = Arc::new(ManualMonotonicClock::new(1_000, 1_760_000_000_000));
+        let backend = Arc::new(WitnessClient::new(&promotion).unwrap());
+        let engine = PromotionEngine::with_runtime(
+            promotion,
+            ConfiguredRole::Slave,
+            dir.clone(),
+            backend,
+            host,
+            clock.clone(),
+            Arc::new(ManualTimers::new(clock)),
+        )
+        .unwrap()
+        .with_heartbeat_timeout_secs(3);
+        // Boot first: it clears any previous sessions (the startup read-only
+        // transition), so inject the proof peer afterwards.
+        engine.boot().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        coordinator.slaves.lock().unwrap().insert(
+            "proof-slave".to_string(),
+            ActiveSlave {
+                instance: "proof-slave".to_string(),
+                remote_addr: "127.0.0.1:1000".parse().unwrap(),
+                synced_version: 0,
+                last_ping: std::time::Instant::now(),
+                connected_at: Utc::now(),
+                last_stats: None,
+                sender: tx,
+                capabilities: vec![],
+                have_term: 2,
+                have_version: 8,
+                have_bundle_hash: Some(pending.clone()),
+                connection_id: 1,
+            },
+        );
+
+        let outcome = engine.candidate_attempt(false).await;
+        assert_eq!(
+            outcome,
+            PromotionOutcome::Master,
+            "recovery failed; fenced={} phase={:?}",
+            engine.snapshot().fenced,
+            engine.snapshot().phase
+        );
+        assert!(!engine.snapshot().fenced, "must not self-fence");
+        assert!(
+            gate.blocked().is_none(),
+            "the recovered master must be writable: {:?}",
+            gate.blocked()
+        );
+        let record = client.lease().await.unwrap().unwrap();
+        assert_eq!(record.term, 3);
+        assert_eq!(record.version, 9);
+        assert_eq!(coordinator.get_current_version(), 9);
+        assert_eq!(coordinator.get_current_term(), 3);
+        let raw = std::fs::read_to_string(dir.join("ha_state.toml")).unwrap();
+        let state_json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(state_json["publication_state"], "published");
+        assert_eq!(state_json["published_version"], 9);
+        assert_eq!(state_json["bundle"]["version"], 9);
+        assert!(
+            state_json["signing_key_pubkey"].as_str() == Some(key_hex.as_str()),
+            "the promoted state records the signing key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        witness.shutdown().await;
     }
 
     fn temp_path(label: &str) -> PathBuf {

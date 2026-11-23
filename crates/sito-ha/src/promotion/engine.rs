@@ -17,7 +17,9 @@
 //! master/slave runtime implement those traits; tests use the real in-process
 //! TLS witness with a deterministic host.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sito_ha_types::bundle::{AppliedWatermark, ConfigBundle};
 use sito_ha_types::config::PromotionConfig;
@@ -27,7 +29,7 @@ use tracing::{info, warn};
 use crate::error::HaError;
 use crate::witness::{AcquireRequest, LeaseInfo, LeaseRecord, RenewRequest};
 
-use super::witness_client::{WitnessClient, WitnessClientError};
+use super::witness_client::{WITNESS_REQUEST_TIMEOUT, WitnessClient, WitnessClientError};
 
 use super::acquisition::{AcquisitionDecision, AcquisitionRole, LocalContent, decide_acquisition};
 use super::clock::{
@@ -153,12 +155,26 @@ pub trait PromotionHost: Send + Sync + 'static {
     /// Returns the durable applied watermark, if any.
     fn applied_watermark(&self) -> Option<AppliedWatermark>;
 
-    /// Returns the latest bundle this node has published, if any.
+    /// Returns the latest **durably published** bundle baseline, if any.
     ///
     /// The engine refreshes its witness renewal baseline from this hook so a
     /// normal configuration publish does not leave the witness at the first
-    /// promoted version.
+    /// promoted version. The implementation must read durable state only
+    /// (`ha_state.toml`): an in-memory value that has not completed its second
+    /// durable write is an uncommitted/pending version and must never be sent
+    /// to the witness (ADR-0010, "Publish baseline vs pending promotion
+    /// version").
     fn current_published_baseline(&self) -> Option<PublicationBaseline> {
+        None
+    }
+
+    /// Returns the public key recorded with the persisted master state, if the
+    /// runtime can supply it.
+    ///
+    /// A promoted candidate may have no prior `ha_state.toml` and therefore no
+    /// recorded key; the engine writes this value with its own state so key
+    /// loss stays detectable after a promotion.
+    fn signing_key_pubkey(&self) -> Option<String> {
         None
     }
 
@@ -171,8 +187,19 @@ pub trait PromotionHost: Send + Sync + 'static {
         Err("the host cannot recompute a legacy bundle hash".to_string())
     }
 
-    /// Records a late ahead/diverged peer after reconciliation.
-    fn latch_peer(&self, _instance: &str, _reason: &str) {}
+    /// Returns peer reports observed after the reconcile window, draining the
+    /// runtime's queue.
+    ///
+    /// A peer that reports a term/version above this master after the
+    /// reconciliation window is a late ahead peer: it must be latched, never
+    /// overwritten, and the master must stop pushing to it.
+    fn take_late_peer_reports(&self) -> Vec<PeerReport> {
+        Vec::new()
+    }
+
+    /// Records a late ahead/diverged peer after reconciliation: mark it
+    /// diverged and stop pushing to it.
+    fn latch_peer(&self, _report: &PeerReport, _reason: &str) {}
 
     /// Returns local eligibility facts.
     fn eligibility(&self) -> Eligibility;
@@ -200,10 +227,6 @@ pub trait PromotionHost: Send + Sync + 'static {
     /// Publishes the first bundle: enqueue it to connected slaves and make it
     /// the active bundle. Returns the signed-payload hash that was pushed.
     fn publish_first(&self, prepared: &PreparedBundle) -> BoxFuture<'_, Result<String, String>>;
-
-    /// Makes an already-published bundle active without re-pushing it (used
-    /// when reconciliation proves a crash-interrupted publish succeeded).
-    fn adopt_published(&self, prepared: &PreparedBundle) -> BoxFuture<'_, Result<(), String>>;
 
     /// Stops publishing immediately (fence step 2).
     fn stop_publishing(&self);
@@ -585,6 +608,16 @@ impl PromotionEngine {
         self.lock().snapshot.clone()
     }
 
+    /// Test-only: the armed self-fence deadline in monotonic milliseconds.
+    #[cfg(test)]
+    #[must_use]
+    pub fn self_fence_deadline_millis(&self) -> Option<u64> {
+        self.lock()
+            .deadline
+            .as_ref()
+            .map(SelfFenceDeadline::deadline_millis)
+    }
+
     /// The per-process witness holder identity (`node_id/boot_uuid`).
     #[must_use]
     pub fn holder(&self) -> &str {
@@ -874,6 +907,17 @@ impl PromotionEngine {
     }
 
     /// Renews the current lease once.
+    ///
+    /// Safety rules enforced here:
+    ///
+    /// * the request always carries the **published** baseline, never the
+    ///   staged/pending bundle version;
+    /// * every witness call is bounded by the remaining self-fence deadline, so
+    ///   a slow/hung witness cannot leave the write gate open past the lease
+    ///   expiry;
+    /// * a conflict that only advances a revision is retried; the deadline is
+    ///   re-armed only by an actual successful renewal ACK;
+    /// * a successful ACK observed after the deadline is not accepted.
     pub async fn renew_once(&self) -> Result<u64, HaError> {
         let grant = {
             let inner = self.lock();
@@ -885,15 +929,32 @@ impl PromotionEngine {
                 reason: "cannot renew without a lease grant".to_string(),
             });
         };
-        // A normal configuration publish advances the active bundle without
-        // going through the promotion engine. Refresh the renewal baseline so
-        // the witness does not stay at the first promoted version.
+        // Read only the durable published baseline from the host. During a
+        // promotion the in-memory active bundle is staged at a higher version,
+        // and a normal publish advances the coordinator's in-memory bookkeeping
+        // before its second durable write; neither may become the witness
+        // baseline.
         if let Some(latest) = self.host.current_published_baseline() {
             if latest.version > grant.baseline.version {
+                if self.is_staged_baseline(latest.version) {
+                    self.fence(
+                        FenceReason::LeaseVersionRegression,
+                        "the host returned a staged/pending version as the published renewal baseline",
+                    )?;
+                    return Err(HaError::Connection(
+                        "host published baseline is a pending promotion version".to_string(),
+                    ));
+                }
                 grant.baseline = latest;
-                if let Some(ref mut current) = self.lock().grant {
+                let mut inner = self.lock();
+                if let Some(ref mut current) = inner.grant {
                     current.baseline = grant.baseline.clone();
                 }
+                inner.snapshot.published_version = grant.baseline.version;
+                inner
+                    .snapshot
+                    .published_hash
+                    .clone_from(&grant.baseline.hash);
             } else if latest.version == grant.baseline.version
                 && !hashes_equal(&latest.hash, &grant.baseline.hash)
             {
@@ -906,14 +967,9 @@ impl PromotionEngine {
                 ));
             }
         }
-        let mut witness_now = match self.backend.info().await {
-            Ok(info) => {
-                self.lock().last_witness_now_unix_ms = Some(info.now_unix_ms);
-                Some(info.now_unix_ms)
-            }
-            Err(_) => None,
-        };
+        let mut witness_now = self.refresh_witness_now().await?;
         let mut higher_baseline_retries = 0u32;
+        let mut adopted_revision_retries = 0u32;
         loop {
             let request = RenewRequest {
                 holder: grant.holder.clone(),
@@ -923,22 +979,30 @@ impl PromotionEngine {
                 bundle_hash: grant.baseline.hash.clone(),
                 ttl_secs: self.config.lease_ttl_secs,
             };
-            match self.backend.renew(request).await {
+            // Arm from the request start: the witness expiry is at or after
+            // `start + TTL`, so a local deadline derived from the start cannot
+            // outlive the witness record even when the response is slow.
+            let boot_before = self.current_boot_millis("lease renewal start")?;
+            let result = self
+                .bounded_witness_call("lease renewal", self.backend.renew(request))
+                .await?;
+            match result {
                 Ok(record) => {
-                    self.record_successful_renewal(record.revision);
+                    // Never accept an ACK that only arrives after the local
+                    // deadline: a slow witness call must not extend the gate.
+                    if self.check_self_fence()? {
+                        return Err(HaError::Connection(
+                            "the renewal ACK arrived after the self-fence deadline".to_string(),
+                        ));
+                    }
+                    self.record_successful_renewal(record.revision, boot_before)?;
                     return Ok(record.revision);
                 }
                 Err(error) => {
                     // Re-read the witness clock at classification time; a
                     // timestamp captured before the request can be stale by
                     // more than the TTL on a slow/retried renewal.
-                    let fresh_now = match self.backend.info().await {
-                        Ok(info) => {
-                            self.lock().last_witness_now_unix_ms = Some(info.now_unix_ms);
-                            Some(info.now_unix_ms)
-                        }
-                        Err(_) => None,
-                    };
+                    let fresh_now = self.refresh_witness_now().await?;
                     if fresh_now.is_none() && error.current_record().is_some() {
                         return Err(HaError::Connection(
                             "cannot classify a renewal conflict without the witness clock"
@@ -965,16 +1029,163 @@ impl PromotionEngine {
                                     "witness baseline retry exhausted".to_string(),
                                 ));
                             }
-                            grant.revision = revision;
-                            if let Some(ref mut current) = self.lock().grant {
-                                current.revision = revision;
+                            // Adopt the revision only; the deadline is re-armed
+                            // by the successful renewal that must follow.
+                            self.adopt_grant_revision(&mut grant, revision);
+                        }
+                        RenewalAction::AdoptRevision { revision } => {
+                            adopted_revision_retries += 1;
+                            if adopted_revision_retries > 2 {
+                                self.fence(
+                                    FenceReason::LeaseLost,
+                                    "witness kept reporting a revision that could not be renewed",
+                                )?;
+                                return Err(HaError::Connection(
+                                    "witness revision adoption retry exhausted".to_string(),
+                                ));
                             }
-                            self.record_successful_renewal(revision);
+                            // A lost ACK proves the witness still holds this
+                            // grant, but it did not extend it now. Retry the
+                            // renewal; do not re-arm the deadline on a 409.
+                            self.adopt_grant_revision(&mut grant, revision);
                         }
                         other => return self.handle_renewal_action(other),
                     }
                 }
             }
+        }
+    }
+
+    /// Replaces the in-memory grant revision after a lost-ACK conflict.
+    fn adopt_grant_revision(&self, grant: &mut LeaseGrant, revision: u64) {
+        grant.revision = revision;
+        if let Some(ref mut current) = self.lock().grant {
+            current.revision = revision;
+        }
+        self.lock().snapshot.lease_revision = Some(revision);
+    }
+
+    /// Whether `version` is the staged (not yet published) bundle version of an
+    /// in-progress promotion.
+    fn is_staged_baseline(&self, version: u64) -> bool {
+        let inner = self.lock();
+        let staged = inner
+            .bookkeeping
+            .as_ref()
+            .is_some_and(PromotionBookkeeping::has_pending_bundle);
+        staged
+            && inner
+                .pending
+                .as_ref()
+                .is_some_and(|pending| version >= pending.bundle.version)
+    }
+
+    /// Fetches `GET /v1/info`, bounded by the self-fence deadline, and records
+    /// the witness clock. A transport failure is returned as `None`; a missing
+    /// deadline/timeout fences and returns an error.
+    async fn refresh_witness_now(&self) -> Result<Option<i64>, HaError> {
+        match self
+            .bounded_witness_call("witness info", self.backend.info())
+            .await?
+        {
+            Ok(info) => {
+                self.lock().last_witness_now_unix_ms = Some(info.now_unix_ms);
+                Ok(Some(info.now_unix_ms))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn current_boot_millis(&self, label: &str) -> Result<u64, HaError> {
+        self.clock.boot_millis().map_err(|detail| {
+            let message = format!("{label}: boot clock unavailable: {detail}");
+            let _ = self.fence(FenceReason::ClockAnomaly, &message);
+            HaError::Connection(message)
+        })
+    }
+
+    /// Checks the self-fence deadline and returns the remaining call budget.
+    ///
+    /// The budget is capped by the witness request timeout so one call cannot
+    /// consume the whole lease window, and by the remaining deadline so the
+    /// caller returns (and fences) before the witness record can expire.
+    fn renewal_budget(&self, label: &str) -> Result<Duration, HaError> {
+        let deadline = {
+            let inner = self.lock();
+            inner.deadline.clone()
+        };
+        let Some(deadline) = deadline else {
+            let message = format!("{label}: no self-fence deadline is armed");
+            let _ = self.fence(FenceReason::LeaseLost, &message);
+            return Err(HaError::Connection(message));
+        };
+        if self.deadline_fenced(&deadline, label)? {
+            return Err(HaError::Connection(format!(
+                "{label}: the self-fence deadline passed before the witness call"
+            )));
+        }
+        let now = self.current_boot_millis(label)?;
+        let remaining = deadline.remaining(now);
+        if remaining.is_zero() {
+            let message =
+                format!("{label}: the self-fence deadline passed before the witness call");
+            let _ = self.fence(FenceReason::LeaseLost, &message);
+            return Err(HaError::Connection(message));
+        }
+        Ok(remaining.min(WITNESS_REQUEST_TIMEOUT))
+    }
+
+    /// Applies the full deadline/clock integrity check and fences when it is
+    /// unsafe. Returns `true` when the caller must stop.
+    fn deadline_fenced(&self, deadline: &SelfFenceDeadline, label: &str) -> Result<bool, HaError> {
+        match deadline.check(self.clock.as_ref()) {
+            SelfFenceCheck::Safe => Ok(false),
+            SelfFenceCheck::DeadlinePassed => {
+                self.fence(
+                    FenceReason::LeaseLost,
+                    &format!("{label}: self-fence deadline passed"),
+                )?;
+                Ok(true)
+            }
+            SelfFenceCheck::ClockUnavailable(detail) => {
+                self.fence(
+                    FenceReason::ClockAnomaly,
+                    &format!("{label}: boot clock unavailable: {detail}"),
+                )?;
+                Ok(true)
+            }
+            SelfFenceCheck::BootIdChanged => {
+                self.fence(
+                    FenceReason::ClockAnomaly,
+                    &format!("{label}: boot identity changed"),
+                )?;
+                Ok(true)
+            }
+            SelfFenceCheck::WallStep => {
+                self.fence(
+                    FenceReason::ClockAnomaly,
+                    &format!("{label}: wall clock stepped beyond the lease TTL"),
+                )?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Runs one witness call with the remaining self-fence budget.
+    ///
+    /// On timeout the node fences immediately: the API gate must never stay
+    /// open while a renewal that could outlive the lease is in flight.
+    async fn bounded_witness_call<T, F>(&self, label: &str, future: F) -> Result<T, HaError>
+    where
+        F: Future<Output = T>,
+    {
+        let budget = self.renewal_budget(label)?;
+        if let Ok(output) = tokio::time::timeout(budget, future).await {
+            Ok(output)
+        } else {
+            let message = format!("{label} did not complete before the self-fence deadline");
+            let _ = self.fence(FenceReason::LeaseLost, &message);
+            Err(HaError::Connection(message))
         }
     }
 
@@ -1029,9 +1240,24 @@ impl PromotionEngine {
                 "peer '{}' reported term {} version {} after the reconcile window; latched as diverged",
                 report.instance, report.have_term, report.have_version
             );
-            self.host.latch_peer(&report.instance, &reason);
+            self.host.latch_peer(report, &reason);
+            warn!(instance = %report.instance, reason, "latched a late ahead peer");
         }
         newly_latched
+    }
+
+    /// Drains late peer reports from the runtime and latches any ahead peer.
+    ///
+    /// Returns the number of newly latched instances. Called by the runtime's
+    /// long-running renewal loop: a peer that connects after the reconcile
+    /// window and reports a term/version above this master is never overwritten
+    /// and receives no further pushes.
+    pub fn process_late_peer_reports(&self) -> usize {
+        let reports = self.host.take_late_peer_reports();
+        reports
+            .iter()
+            .filter(|report| self.note_late_peer(report))
+            .count()
     }
 
     /// Latched late-ahead peers.
@@ -1170,12 +1396,31 @@ impl PromotionEngine {
         // Renew and check the self-fence throughout the reconcile window: a
         // valid `reconcile_window_secs` may be longer than the lease TTL, and a
         // silent holder would let another candidate acquire T+1 before our
-        // first publish.
-        let window_start = self.clock.boot_millis().unwrap_or(0);
+        // first publish. An unavailable boot clock must fence, never skip the
+        // window and proceed to the first publish.
+        let window_start = match self.clock.boot_millis() {
+            Ok(now) => now,
+            Err(detail) => {
+                let _ = self.fence(
+                    FenceReason::ClockAnomaly,
+                    &format!("reconciliation: boot clock unavailable: {detail}"),
+                );
+                return PromotionOutcome::Fenced;
+            }
+        };
         let window_end =
             window_start.saturating_add(self.config.reconcile_window_secs.saturating_mul(1_000));
         loop {
-            let now = self.clock.boot_millis().unwrap_or(window_end);
+            let now = match self.clock.boot_millis() {
+                Ok(now) => now,
+                Err(detail) => {
+                    let _ = self.fence(
+                        FenceReason::ClockAnomaly,
+                        &format!("reconciliation: boot clock unavailable: {detail}"),
+                    );
+                    return PromotionOutcome::Fenced;
+                }
+            };
             if now >= window_end {
                 break;
             }
@@ -1259,7 +1504,7 @@ impl PromotionEngine {
                 self.lock().deadline = None;
                 self.transition_read_only(PromotionPhase::Aborted, reason.code(), false)
             }
-            ReconcileDecision::AlreadyPublished => self.complete_already_published(&prepared).await,
+            ReconcileDecision::AlreadyPublished => self.complete_already_published().await,
             ReconcileDecision::Publish => {
                 if let Err(error) = self.renew_once().await {
                     warn!(error = %error, "renewal at the first-publish boundary failed");
@@ -1274,14 +1519,19 @@ impl PromotionEngine {
         }
     }
 
-    async fn complete_already_published(&self, _prepared: &PreparedBundle) -> PromotionOutcome {
-        // A reachable slave (or the witness record) proved the staged bundle
-        // was published, but the interrupted publish used the *old* term. A
-        // new term must still publish a strictly higher version above the
-        // proven baseline; adopting the old-term bundle alone would leave the
-        // new term with no published bundle and could overwrite a same-version
-        // slave.
-        let (proven, term) = {
+    async fn complete_already_published(&self) -> PromotionOutcome {
+        // A reachable slave proved the staged bundle at `publish_version` with
+        // the pending hash was published by the interrupted (old-term)
+        // promotion. That proof establishes `(publish_version, proof_hash)` as
+        // the published baseline. It does **not** make the in-memory bundle at
+        // that version publishable under the new term: the acquire path may
+        // have re-prepared it with a fresh timestamp/term, so its signed hash
+        // is different from the proof hash. Adopting it would (a) advertise a
+        // same-version/different-hash baseline and self-fence on renewal, and
+        // (b) persist over the recovered published state. Instead write one
+        // pending state for the *next* version with the proven baseline and
+        // publish that above the proof, exactly as the ADR requires.
+        let (proven_version, proof_hash, term) = {
             let inner = self.lock();
             let Some(ref loaded) = inner.loaded else {
                 drop(inner);
@@ -1299,6 +1549,14 @@ impl PromotionEngine {
                     false,
                 );
             };
+            if !bookkeeping.has_pending_bundle() {
+                drop(inner);
+                return self.transition_read_only(
+                    PromotionPhase::Aborted,
+                    "promotion_interrupted",
+                    false,
+                );
+            }
             let Some(proof_hash) = inner.reconcile_proof_hash.clone() else {
                 drop(inner);
                 return self.transition_read_only(
@@ -1307,48 +1565,24 @@ impl PromotionEngine {
                     false,
                 );
             };
-            let _ = bookkeeping;
-            (
-                PreparedBundle {
-                    bundle: loaded.bundle.clone(),
-                    hash: proof_hash,
-                },
-                loaded.bundle.term,
-            )
+            (loaded.bundle.version, proof_hash, loaded.bundle.term)
         };
-        info!(
-            version = proven.bundle.version,
-            "reconciliation proved the pending publish succeeded; establishing the published baseline"
-        );
-        if let Err(error) = self.write_published_state(&proven) {
-            warn!(error = %error, "failed to persist the recovered 'published' state");
+        if proven_version == 0 {
             return self.transition_read_only(
                 PromotionPhase::Aborted,
                 "promotion_interrupted",
                 false,
             );
         }
-        self.lock().pending = Some(proven.clone());
-        self.lock().reconcile_proof_hash = None;
-        if let Err(error) = self.host.adopt_published(&proven).await {
-            let _ = self.fence(
-                FenceReason::RoleSwitchFailed,
-                &format!("cannot adopt published bundle: {error}"),
-            );
-            return PromotionOutcome::Fenced;
-        }
-        if let Err(error) = self.renew_published().await {
-            warn!(error = %error, "post-publish renewal failed");
-            return self.transition_read_only(PromotionPhase::Aborted, "lease_lost", false);
-        }
-
-        // The new term still needs its own publish strictly above the proven
-        // baseline. Prepare it at the current term and continue through the
-        // normal first-publish path.
-        let Some(next_version) = proven.bundle.version.checked_add(1) else {
+        let Some(next_version) = proven_version.checked_add(1) else {
             let _ = self.fence(FenceReason::StateWriteFailed, "publish version overflow");
             return PromotionOutcome::Fenced;
         };
+        info!(
+            proven_version,
+            next_version,
+            "reconciliation proved the pending publish succeeded; publishing above the proven baseline"
+        );
         let next = match self.host.prepare_bundle(term, next_version) {
             Ok(next) => next,
             Err(error) => {
@@ -1359,12 +1593,38 @@ impl PromotionEngine {
                 return PromotionOutcome::Fenced;
             }
         };
-        if let Err(error) = self.write_next_pending_state(&next, term) {
+        let proven = match PublicationBaseline::new(proven_version, &proof_hash) {
+            Ok(proven) => proven,
+            Err(error) => {
+                let _ = self.fence(
+                    FenceReason::StateWriteFailed,
+                    &format!("invalid recovered published baseline: {error}"),
+                );
+                return PromotionOutcome::Fenced;
+            }
+        };
+        if let Err(error) = self.write_post_recovery_pending_state(&next, term, &proven) {
             let _ = self.fence(
                 FenceReason::StateWriteFailed,
                 &format!("cannot persist the post-recovery pending state: {error}"),
             );
             return PromotionOutcome::Fenced;
+        }
+        self.lock().reconcile_proof_hash = None;
+        // Renew with the proven published baseline before the new-term
+        // publish. The staged `next` version is never sent to the witness.
+        {
+            let mut inner = self.lock();
+            if let Some(ref mut grant) = inner.grant {
+                grant.baseline = proven.clone();
+            }
+        }
+        if let Err(error) = self.renew_published().await {
+            warn!(error = %error, "post-recovery renewal failed");
+            if self.is_fenced() {
+                return PromotionOutcome::Fenced;
+            }
+            return self.transition_read_only(PromotionPhase::Aborted, "lease_lost", true);
         }
         self.complete_first_publish(&next, next_version).await
     }
@@ -1501,8 +1761,26 @@ impl PromotionEngine {
             }
         };
 
+        let witness_now = if record
+            .as_ref()
+            .is_some_and(|record| record.holder == self.holder && record.term > 0)
+        {
+            // An own-holder record may have expired while this process was
+            // paused. Expiry is judged with the witness clock; without it the
+            // engine must not assume the grant is still live.
+            match self.backend.info().await {
+                Ok(info) => {
+                    self.lock().last_witness_now_unix_ms = Some(info.now_unix_ms);
+                    Some(info.now_unix_ms)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         let local = self.local_content(role);
-        let decision = decide_acquisition(role, &local, record.as_ref(), &self.holder);
+        let decision = decide_acquisition(role, &local, record.as_ref(), &self.holder, witness_now);
         match decision {
             AcquisitionDecision::Refuse(refusal) => {
                 let reason = match role {
@@ -1519,6 +1797,33 @@ impl PromotionEngine {
                 })
             }
             AcquisitionDecision::Acquire(plan) => {
+                // Capture the local clock before any witness call and arm the
+                // self-fence deadline from the *request start*: the witness
+                // expiry is at or after `start + TTL`, so the local deadline
+                // can never outlive the grant even when the response or the
+                // following state write is slow. An unavailable boot clock
+                // fences instead of arming from a guessed zero.
+                let boot_before = match self.clock.boot_millis() {
+                    Ok(now) => now,
+                    Err(detail) => {
+                        let _ = self.fence(
+                            FenceReason::ClockAnomaly,
+                            &format!("acquisition: boot clock unavailable: {detail}"),
+                        );
+                        return AcquireOutcome::Outcome(PromotionOutcome::Fenced);
+                    }
+                };
+                let boot_id = match self.clock.boot_id() {
+                    Ok(boot_id) => boot_id,
+                    Err(detail) => {
+                        let _ = self.fence(
+                            FenceReason::ClockAnomaly,
+                            &format!("acquisition: boot identity unavailable: {detail}"),
+                        );
+                        return AcquireOutcome::Outcome(PromotionOutcome::Fenced);
+                    }
+                };
+                let wall = self.clock.wall_unix_ms();
                 let record = if plan.existing_grant {
                     // The witness still holds this process' live grant (for
                     // example a retried attempt after a transient failure).
@@ -1603,11 +1908,8 @@ impl PromotionEngine {
                     revision: record.revision,
                     baseline: plan.baseline.clone(),
                 };
-                let boot_id = self.clock.boot_id().unwrap_or_default();
-                let wall = self.clock.wall_unix_ms();
-                let boot_now = self.clock.boot_millis().unwrap_or(0);
                 let deadline = SelfFenceDeadline::arm(
-                    boot_now,
+                    boot_before,
                     boot_id.clone(),
                     wall,
                     self.config.lease_ttl_secs,
@@ -1747,11 +2049,18 @@ impl PromotionEngine {
         } else {
             PublicationState::Pending
         };
+        // While a `publishing` bundle at this exact version is being re-tested,
+        // keep the old pending hash durable: it is the hash a surviving slave
+        // (or the witness record) can prove. The freshly prepared bundle is
+        // not published yet and must not replace that crash-proof in the state
+        // file. `complete_first_publish` replaces it immediately before the
+        // first push.
+        let durable_pending_hash = proof_hash.clone().or_else(|| Some(prepared.hash.clone()));
         let bookkeeping = PromotionBookkeeping {
             publication_state,
             published_version: plan.baseline.version,
             published_hash: plan.baseline.hash.clone(),
-            pending_hash: Some(prepared.hash.clone()),
+            pending_hash: durable_pending_hash,
             promotion_origin: Some(origin.to_string()),
             lease_holder: Some(record.holder.clone()),
             cluster_id: Some(self.cluster_id.clone()),
@@ -1791,10 +2100,17 @@ impl PromotionEngine {
         Ok(())
     }
 
-    fn write_next_pending_state(
+    /// Persists the post-recovery pending state.
+    ///
+    /// The recovered proof establishes `published` as the last actually
+    /// published baseline; the new-term bundle at `prepared.bundle.version` is
+    /// the staged version one above it. Both are written atomically so a crash
+    /// can never lose the proven baseline or skip the staged version.
+    fn write_post_recovery_pending_state(
         &self,
         prepared: &PreparedBundle,
         term: u64,
+        published: &PublicationBaseline,
     ) -> Result<(), HaError> {
         let mut state = self.current_state_with_bundle(prepared.bundle.clone());
         state.bundle.term = term;
@@ -1808,6 +2124,8 @@ impl PromotionEngine {
                 });
             };
             bookkeeping.publication_state = PublicationState::Pending;
+            bookkeeping.published_version = published.version;
+            bookkeeping.published_hash.clone_from(&published.hash);
             bookkeeping.pending_hash = Some(prepared.hash.clone());
             bookkeeping.promotion_origin = Some("restart".to_string());
             bookkeeping.promoted_at_unix_ms = Some(self.clock.wall_unix_ms());
@@ -1815,6 +2133,8 @@ impl PromotionEngine {
             inner.snapshot.version = prepared.bundle.version;
             inner.snapshot.bundle_hash.clone_from(&prepared.hash);
             inner.snapshot.publication_state = PublicationState::Pending;
+            inner.snapshot.published_version = published.version;
+            inner.snapshot.published_hash.clone_from(&published.hash);
         }
         self.state.save(&state)?;
         let mut inner = self.lock();
@@ -1888,9 +2208,14 @@ impl PromotionEngine {
         PersistedMasterState {
             protocol_version: crate::protocol::PROTOCOL_VERSION,
             bundle,
+            // A candidate may have no prior `ha_state.toml` (and a prior state
+            // may predate the identity field). Preserve the durable value when
+            // present and otherwise record the runtime's signing key so key
+            // loss stays detectable after a promotion.
             signing_key_pubkey: previous
                 .as_ref()
-                .and_then(|state| state.signing_key_pubkey.clone()),
+                .and_then(|state| state.signing_key_pubkey.clone())
+                .or_else(|| self.host.signing_key_pubkey()),
             publication_state: None,
             published_version: None,
             published_hash: None,
@@ -1905,56 +2230,93 @@ impl PromotionEngine {
         }
     }
 
-    fn record_successful_renewal(&self, revision: u64) {
-        let boot_id = self.clock.boot_id().unwrap_or_default();
+    fn record_successful_renewal(
+        &self,
+        revision: u64,
+        arm_boot_millis: u64,
+    ) -> Result<(), HaError> {
+        let boot_id = match self.clock.boot_id() {
+            Ok(boot_id) => boot_id,
+            Err(detail) => {
+                let message = format!("renewal ACK: boot identity unavailable: {detail}");
+                let _ = self.fence(FenceReason::ClockAnomaly, &message);
+                return Err(HaError::Connection(message));
+            }
+        };
         let wall = self.clock.wall_unix_ms();
-        let boot_now = self.clock.boot_millis().unwrap_or(0);
-        let mut inner = self.lock();
-        if let Some(ref mut grant) = inner.grant {
-            grant.revision = revision;
-        }
-        inner.deadline = Some(SelfFenceDeadline::arm(
-            boot_now,
+        let boot_now = match self.clock.boot_millis() {
+            Ok(now) => now,
+            Err(detail) => {
+                let message = format!("renewal ACK: boot clock unavailable: {detail}");
+                let _ = self.fence(FenceReason::ClockAnomaly, &message);
+                return Err(HaError::Connection(message));
+            }
+        };
+        // Arm from the request start, not the response time: the witness
+        // expiry is at or after `request_start + TTL`, so the local deadline
+        // stays before the record can be granted elsewhere even when the
+        // response is slow. A request that consumed the whole budget leaves no
+        // safe window: fence immediately instead of returning a lease that is
+        // already past its local deadline.
+        let deadline = SelfFenceDeadline::arm(
+            arm_boot_millis,
             boot_id,
             wall,
             self.config.lease_ttl_secs,
             self.config.renew_interval_secs,
-        ));
+        );
+        if deadline.remaining(boot_now).is_zero() {
+            let message = "renewal ACK left no self-fence budget; fencing";
+            let _ = self.fence(FenceReason::LeaseLost, message);
+            return Err(HaError::Connection(message.to_string()));
+        }
+        let mut inner = self.lock();
+        if let Some(ref mut grant) = inner.grant {
+            grant.revision = revision;
+        }
+        inner.deadline = Some(deadline);
         inner.last_wall_unix_ms = Some(wall);
         inner.snapshot.lease_revision = Some(revision);
         inner.snapshot.witness_reachable = true;
+        Ok(())
     }
 
     async fn renew_published(&self) -> Result<(), HaError> {
-        let prepared = {
+        // The durable published baseline is the only value that may be sent to
+        // the witness. `pending` is the active bundle and may be a staged
+        // version; it is never a renewal baseline.
+        let baseline = {
             let inner = self.lock();
-            inner.pending.clone()
-        };
-        let Some(prepared) = prepared else {
-            return Err(HaError::Validation {
-                field: "ha.promotion".to_string(),
-                reason: "no published bundle to renew".to_string(),
-            });
+            let Some(ref bookkeeping) = inner.bookkeeping else {
+                return Err(HaError::Validation {
+                    field: "ha.promotion".to_string(),
+                    reason: "no promotion bookkeeping to renew".to_string(),
+                });
+            };
+            bookkeeping.baseline()
         };
         {
             let mut inner = self.lock();
-            if let Some(ref mut grant) = inner.grant {
-                grant.baseline = PublicationBaseline {
-                    version: prepared.bundle.version,
-                    hash: prepared.hash.clone(),
-                };
-            }
+            let Some(ref mut grant) = inner.grant else {
+                return Err(HaError::Validation {
+                    field: "ha.promotion".to_string(),
+                    reason: "cannot renew without a lease grant".to_string(),
+                });
+            };
+            grant.baseline = baseline;
         }
         self.renew_once().await.map(|_| ())
     }
 
     fn handle_renewal_action(&self, action: RenewalAction) -> Result<u64, HaError> {
         match action {
-            RenewalAction::Continue { revision }
-            | RenewalAction::AdoptRevision { revision }
-            | RenewalAction::RetryHigherBaseline { revision } => {
-                self.record_successful_renewal(revision);
-                Ok(revision)
+            RenewalAction::AdoptRevision { .. } | RenewalAction::RetryHigherBaseline { .. } => {
+                // These are handled as *retries* in `renew_once`; treating one
+                // as a successful ACK would re-arm the deadline without the
+                // witness extending the lease.
+                Err(HaError::Connection(
+                    "renewal revision adoption must be retried, not accepted".to_string(),
+                ))
             }
             RenewalAction::RetryTransport => Err(HaError::Connection(
                 "witness renewal failed; retry before the self-fence deadline".to_string(),

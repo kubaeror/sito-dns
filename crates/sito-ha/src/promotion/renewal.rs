@@ -16,8 +16,6 @@ use super::state::PublicationBaseline;
 /// How the engine should react to a renewal result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenewalAction {
-    /// Renewal succeeded; continue with this revision.
-    Continue { revision: u64 },
     /// The witness is behind our published baseline; retry with this revision
     /// and the higher baseline (already held locally).
     RetryHigherBaseline { revision: u64 },

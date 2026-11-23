@@ -291,35 +291,6 @@ impl MasterCoordinator {
         Ok(hash)
     }
 
-    /// Makes a bundle published by an interrupted promotion active without
-    /// re-pushing it. Used only by the ADR-0010 reconciliation recovery path.
-    pub fn adopt_promoted_bundle(&self, bundle: ConfigBundle) -> Result<String, HaError> {
-        let mut bundle = bundle;
-        bundle.strip_structured_secrets();
-        seal_bundle_identity(&mut bundle, &self.signing_key.public_key());
-        if bundle.term != self.get_current_term() {
-            return Err(HaError::Validation {
-                field: "term".to_string(),
-                reason: format!(
-                    "adopted promotion term {} does not match the coordinator term {}",
-                    bundle.term,
-                    self.get_current_term()
-                ),
-            });
-        }
-        let push = build_and_sign_push(&bundle, &self.signing_key)?;
-        Self::ensure_push_fits(&push)?;
-        let hash = crate::bundle::push_payload_hash(&push)?;
-        let version = bundle.version;
-        {
-            let _publish_guard = sito_core::sync::lock_or_recover(&self.publish_lock);
-            self.persist_bundle(&bundle)?;
-            self.publish_prepared(bundle, version, &push);
-        }
-        self.record_published_version(version);
-        Ok(hash)
-    }
-
     /// Returns the signed-payload hash of the current active bundle.
     #[must_use]
     pub fn active_payload_hash(&self) -> Option<String> {
@@ -386,7 +357,19 @@ impl MasterCoordinator {
         // in-memory active bundle/push and the version sequence untouched.
         let bundle_for_state = bundle.clone();
         let promotion_baseline = self.promotion_bookkeeping().is_some();
-        self.persist_bundle(&bundle)?;
+        let previous_bookkeeping = self.promotion_bookkeeping();
+        let publishing_bookkeeping = if promotion_baseline {
+            self.begin_promotion_publish(&push_msg)
+        } else {
+            None
+        };
+        if let Err(error) = self.persist_bundle(&bundle) {
+            if promotion_baseline {
+                // The file was not touched; put the in-memory copy back.
+                self.restore_promotion_bookkeeping(previous_bookkeeping);
+            }
+            return Err(HaError::Io(error));
+        }
         self.publish_prepared(bundle, version, &push_msg);
         if promotion_baseline {
             // ADR-0010: after a successful publish the durable published
@@ -394,7 +377,14 @@ impl MasterCoordinator {
             // by the promotion engine only after this second write, so an
             // unpublished version is never advertised.
             self.record_published_from_push(&push_msg);
-            self.persist_bundle(&bundle_for_state)?;
+            if let Err(error) = self.persist_bundle(&bundle_for_state) {
+                // The active bundle may have been installed, but the durable
+                // baseline did not advance. Keep the in-memory bookkeeping that
+                // matches the first write (`publishing` with the pending hash),
+                // which reconciliation can prove or safely reuse.
+                self.restore_promotion_bookkeeping(publishing_bookkeeping);
+                return Err(HaError::Io(error));
+            }
         }
         self.record_published_version(version);
 
@@ -509,7 +499,16 @@ impl MasterCoordinator {
         // durably publish.
         let bundle_for_state = bundle.clone();
         let promotion_baseline = self.promotion_bookkeeping().is_some();
+        let previous_bookkeeping = self.promotion_bookkeeping();
+        let publishing_bookkeeping = if promotion_baseline {
+            self.begin_promotion_publish(&push_msg)
+        } else {
+            None
+        };
         if let Err(e) = self.persist_bundle_async(&bundle).await {
+            if promotion_baseline {
+                self.restore_promotion_bookkeeping(previous_bookkeeping);
+            }
             error!(error = %e, "Failed to persist HA master state");
             return Err(HaError::Io(e));
         }
@@ -552,6 +551,7 @@ impl MasterCoordinator {
             // failure and no broadcast is attempted with an unrecorded baseline.
             self.record_published_from_push(&push_msg);
             if let Err(e) = self.persist_bundle_async(&bundle_for_state).await {
+                self.restore_promotion_bookkeeping(publishing_bookkeeping);
                 error!(error = %e, "Failed to persist the published promotion baseline");
                 return Err(HaError::Io(e));
             }
@@ -615,9 +615,14 @@ impl MasterCoordinator {
         let mut queued = 0;
         let mut coalesced = 0;
         let slaves = sito_core::sync::lock_or_recover(&self.slaves);
+        let latched = sito_core::sync::lock_or_recover(&self.latched_slaves);
         let connected = slaves.len();
         let mut queued_bytes = sito_core::sync::lock_or_recover(&self.queued_bytes);
         for slave in slaves.values() {
+            if latched.contains(&slave.instance) {
+                // A late ahead peer is never overwritten: skip it entirely.
+                continue;
+            }
             let instance = &slave.instance;
             let session = (instance.clone(), slave.connection_id);
             let current = queued_bytes.get(&session).copied().unwrap_or(0);
@@ -825,6 +830,9 @@ impl MasterCoordinator {
     /// Re-pushes the active bundle to one slave that acknowledged a stale
     /// version, at most once per acknowledged version to avoid retry loops.
     pub(super) fn maybe_repush(&self, instance: &str, stale_version: u64) {
+        if self.is_late_peer_latched(instance) {
+            return;
+        }
         let mut repushed = sito_core::sync::lock_or_recover(&self.stale_repushes);
         if repushed.get(instance) == Some(&stale_version) {
             return;

@@ -231,6 +231,15 @@ impl<'a> SessionMachine<'a> {
         }
 
         let ping_secs = coordinator.ping_interval_secs.max(1);
+        // A Hello after the reconcile window that is ahead of this master is a
+        // late ahead peer. Queue it for the promotion engine, which latches it
+        // and suppresses every push to it.
+        coordinator.record_late_peer_report(
+            &slave_instance,
+            have_version,
+            have_term,
+            have_bundle_hash.clone(),
+        );
         let state = SessionState::new(
             slave_instance,
             coordinator
@@ -302,6 +311,15 @@ impl<'a> SessionMachine<'a> {
             info!(
                 instance = %slave_instance,
                 "Master is not serving replication; refusing to enqueue a push"
+            );
+            return rx;
+        }
+
+        // A latched late-ahead peer is never overwritten and receives no push.
+        if self.coordinator.is_late_peer_latched(slave_instance) {
+            info!(
+                instance = %slave_instance,
+                "Slave is latched as a late ahead peer; no push will be queued"
             );
             return rx;
         }

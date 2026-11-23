@@ -102,6 +102,7 @@ pub struct ManualMonotonicClock {
     boot_millis: AtomicU64,
     wall_unix_ms: AtomicI64,
     boot_id: std::sync::Mutex<String>,
+    boot_unavailable: std::sync::atomic::AtomicBool,
 }
 
 impl ManualMonotonicClock {
@@ -112,7 +113,14 @@ impl ManualMonotonicClock {
             boot_millis: AtomicU64::new(boot_millis),
             wall_unix_ms: AtomicI64::new(wall_unix_ms),
             boot_id: std::sync::Mutex::new("test-boot".to_string()),
+            boot_unavailable: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Makes `boot_millis` fail, modelling `CLOCK_BOOTTIME` becoming
+    /// unavailable. Safety paths must fence instead of guessing a time.
+    pub fn set_boot_unavailable(&self, unavailable: bool) {
+        self.boot_unavailable.store(unavailable, Ordering::SeqCst);
     }
 
     /// Advances monotonic time (used by deterministic timers).
@@ -141,6 +149,12 @@ impl ManualMonotonicClock {
 
 impl MonotonicClock for ManualMonotonicClock {
     fn boot_millis(&self) -> Result<u64, String> {
+        if self
+            .boot_unavailable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("injected boot clock failure".to_string());
+        }
         Ok(self.boot_millis.load(Ordering::SeqCst))
     }
 

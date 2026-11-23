@@ -288,6 +288,11 @@ impl MasterCoordinator {
         }
     }
     fn process_hello(&self, slave_instance: &str, connection_id: u64) {
+        // A resync Hello must obey the same gates as registration: never push
+        // while read-only, hello-only, or to a latched ahead peer.
+        if !self.is_serving() || self.is_hello_only() || self.is_late_peer_latched(slave_instance) {
+            return;
+        }
         if let Some(ref push) = *sito_core::sync::lock_or_recover(&self.active_push) {
             let sender = {
                 let slaves = sito_core::sync::lock_or_recover(&self.slaves);

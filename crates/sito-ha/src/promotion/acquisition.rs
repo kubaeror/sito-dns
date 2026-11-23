@@ -204,11 +204,22 @@ pub fn decide_acquisition(
     local: &LocalContent,
     record: Option<&LeaseRecord>,
     holder: &str,
+    witness_now_unix_ms: Option<i64>,
 ) -> AcquisitionDecision {
     let max_term = local.applied_term.max(local.state_term);
     let record_term = record.map_or(0, |record| record.term);
 
-    let existing_grant = record.is_some_and(|record| record.holder == holder && record.term > 0);
+    // Only a live own grant resumes renewal. An expired own grant (this
+    // process was paused past the TTL) must be re-acquired at `term + 1`; the
+    // witness rejects a renewal of an expired record and the node would stay
+    // fenced for no reason. When the witness clock is unavailable, do not
+    // assume the grant is live: attempt the acquire and let the witness CAS
+    // decide (it rejects an unexpired record).
+    let existing_grant = record.is_some_and(|record| {
+        record.holder == holder
+            && record.term > 0
+            && witness_now_unix_ms.is_some_and(|now| !record.is_expired(now))
+    });
 
     if record.is_none() && max_term > 0 {
         return AcquisitionDecision::Refuse(PromotionRefusal::LeaseRecordMissing);
@@ -449,6 +460,7 @@ mod tests {
             &candidate(3, 7, &hash),
             Some(&record(3, 11, 7, &hash)),
             "node-b/boot",
+            Some(1),
         );
         let AcquisitionDecision::Acquire(plan) = decision else {
             panic!("expected acquire, got {decision:?}");
@@ -479,6 +491,7 @@ mod tests {
             &local,
             Some(&record(3, 11, 7, &hash)),
             "node-b/boot",
+            Some(1),
         );
         let AcquisitionDecision::Acquire(plan) = decision else {
             panic!("expected acquire, got {decision:?}");
@@ -509,6 +522,7 @@ mod tests {
             &local,
             Some(&record(3, 12, 8, &pending)),
             "node-b/boot",
+            Some(1),
         );
         let AcquisitionDecision::Acquire(plan) = decision else {
             panic!("expected acquire, got {decision:?}");
@@ -526,7 +540,8 @@ mod tests {
                 AcquisitionRole::Candidate,
                 &candidate(3, 7, &"ab".repeat(32)),
                 None,
-                "node-b/boot"
+                "node-b/boot",
+                Some(1),
             ),
             AcquisitionDecision::Refuse(PromotionRefusal::LeaseRecordMissing)
         );
@@ -535,7 +550,8 @@ mod tests {
                 AcquisitionRole::Candidate,
                 &candidate(5, 7, &"ab".repeat(32)),
                 Some(&record(4, 1, 7, &"ab".repeat(32))),
-                "node-b/boot"
+                "node-b/boot",
+                Some(1),
             ),
             AcquisitionDecision::Refuse(PromotionRefusal::CandidateTermAhead)
         );
@@ -549,7 +565,8 @@ mod tests {
                 AcquisitionRole::Candidate,
                 &candidate(3, 6, &hash),
                 Some(&record(3, 1, 7, &hash)),
-                "node-b/boot"
+                "node-b/boot",
+                Some(1),
             ),
             AcquisitionDecision::Refuse(PromotionRefusal::CandidateBehind)
         );
@@ -558,7 +575,8 @@ mod tests {
                 AcquisitionRole::Candidate,
                 &candidate(3, 7, &hash),
                 Some(&record(3, 1, 7, &"cd".repeat(32))),
-                "node-b/boot"
+                "node-b/boot",
+                Some(1),
             ),
             AcquisitionDecision::Refuse(PromotionRefusal::CandidateForked)
         );
@@ -573,7 +591,8 @@ mod tests {
                 AcquisitionRole::Candidate,
                 &local,
                 Some(&record(3, 1, 7, &hash)),
-                "node-b/boot"
+                "node-b/boot",
+                Some(1),
             ),
             AcquisitionDecision::Refuse(PromotionRefusal::LocalFork)
         );
@@ -587,6 +606,7 @@ mod tests {
             &candidate(3, 8, &hash),
             Some(&record(3, 1, 7, &"cd".repeat(32))),
             "node-b/boot",
+            Some(1),
         );
         let AcquisitionDecision::Acquire(plan) = decision else {
             panic!("expected acquire, got {decision:?}");
@@ -604,7 +624,8 @@ mod tests {
                 AcquisitionRole::Master,
                 &master,
                 Some(&record(4, 1, 7, &hash)),
-                "node-a/new-boot"
+                "node-a/new-boot",
+                Some(1),
             ),
             AcquisitionDecision::Refuse(PromotionRefusal::MasterTermAhead)
         );
@@ -619,7 +640,8 @@ mod tests {
                     ..master
                 },
                 Some(&record(3, 1, 7, &hash)),
-                "node-a/new-boot"
+                "node-a/new-boot",
+                Some(1),
             ),
             AcquisitionDecision::Refuse(PromotionRefusal::MasterStateBehind)
         );
@@ -634,7 +656,8 @@ mod tests {
                     ..master
                 },
                 Some(&record(3, 1, 7, &"cd".repeat(32))),
-                "node-a/new-boot"
+                "node-a/new-boot",
+                Some(1),
             ),
             AcquisitionDecision::Refuse(PromotionRefusal::MasterStateForked)
         );
@@ -651,6 +674,7 @@ mod tests {
             &master,
             Some(&record(3, 4, 7, &hash)),
             "node-a/new-boot",
+            Some(1),
         ) else {
             panic!("expected acquire");
         };
@@ -672,10 +696,59 @@ mod tests {
                 AcquisitionRole::Candidate,
                 &local,
                 Some(&record(3, 1, 7, &hash)),
-                "node-b/boot"
+                "node-b/boot",
+                Some(1),
             ),
             AcquisitionDecision::Refuse(PromotionRefusal::CandidateTermAhead)
         );
+    }
+
+    #[test]
+    fn expired_own_grant_is_reacquired_instead_of_resumed() {
+        let hash = "ab".repeat(32);
+        let own = record(4, 12, 7, &hash);
+        let local = candidate(4, 7, &hash);
+
+        // Live own grant: resume the same term and renewal.
+        let AcquisitionDecision::Acquire(plan) = decide_acquisition(
+            AcquisitionRole::Candidate,
+            &local,
+            Some(&own),
+            "node-a/boot",
+            Some(1),
+        ) else {
+            panic!("expected acquire");
+        };
+        assert!(plan.existing_grant);
+        assert_eq!(plan.term, 4);
+
+        // Expired own grant: acquire the next term rather than renewing a
+        // record the witness will reject.
+        let AcquisitionDecision::Acquire(plan) = decide_acquisition(
+            AcquisitionRole::Candidate,
+            &local,
+            Some(&own),
+            "node-a/boot",
+            Some(100),
+        ) else {
+            panic!("expected acquire");
+        };
+        assert!(!plan.existing_grant);
+        assert_eq!(plan.term, 5);
+        assert_eq!(plan.baseline.version, 7);
+
+        // Without the witness clock, do not assume the grant is live.
+        let AcquisitionDecision::Acquire(plan) = decide_acquisition(
+            AcquisitionRole::Candidate,
+            &local,
+            Some(&own),
+            "node-a/boot",
+            None,
+        ) else {
+            panic!("expected acquire");
+        };
+        assert!(!plan.existing_grant);
+        assert_eq!(plan.term, 5);
     }
 
     #[test]
@@ -685,6 +758,7 @@ mod tests {
             &candidate(0, 0, "none"),
             None,
             "node-b/boot",
+            Some(1),
         );
         let AcquisitionDecision::Acquire(plan) = decision else {
             panic!("expected acquire, got {decision:?}");

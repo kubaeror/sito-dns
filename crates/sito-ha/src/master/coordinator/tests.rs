@@ -3318,6 +3318,77 @@ fn normal_publish_preserves_promotion_published_baseline() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn failed_second_persist_does_not_advance_the_durable_baseline() {
+    use crate::promotion::state::{PromotionBookkeeping, PublicationBaseline};
+
+    let dir = std::env::temp_dir().join(format!(
+        "sito_coord_persist_fail_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let path = dir.join("ha_state.toml");
+    let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+    let coordinator = MasterCoordinator::new(
+        "test-master".to_string(),
+        1,
+        key,
+        sito_stats::MetricsRegistry::new("test", "test"),
+    )
+    .with_state_path(path.clone());
+    let baseline = "ab".repeat(32);
+    coordinator.set_promotion_bookkeeping(Some(PromotionBookkeeping::published(
+        PublicationBaseline::new(1, &baseline).unwrap(),
+    )));
+    // The first (pre-publish) state write succeeds; the durable published
+    // baseline update after the push fails.
+    coordinator.fail_state_write_after(1);
+    let error = coordinator
+        .update_bundle_async(test_bundle(2))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected"), "{error}");
+
+    // The durable state records the installed bundle as `publishing` above the
+    // old published baseline; it never claims version 2 was published.
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(value["publication_state"], "publishing");
+    assert_eq!(value["published_version"], 1);
+    assert_eq!(value["published_hash"], baseline);
+    assert_eq!(value["bundle"]["version"], 2);
+    assert!(
+        value["pending_hash"]
+            .as_str()
+            .is_some_and(|h| h.len() == 64),
+        "the pending publish hash is durable for reconciliation: {value}"
+    );
+
+    // The in-memory baseline is restored to the pre-publish value: a renewal
+    // host reading it must see 1, never the uncommitted 2.
+    let bookkeeping = coordinator.promotion_bookkeeping().expect("bookkeeping");
+    assert_eq!(bookkeeping.published_version, 1);
+    assert_eq!(bookkeeping.published_hash, baseline);
+    assert_eq!(coordinator.get_current_version(), 2);
+
+    // A retry at 3 starts from the durable published baseline 1.
+    coordinator.fail_state_write_after(usize::MAX);
+    assert_eq!(
+        coordinator
+            .update_bundle_async(test_bundle(3))
+            .await
+            .unwrap(),
+        3
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(value["publication_state"], "published");
+    assert_eq!(value["published_version"], 3);
+    assert_eq!(value["bundle"]["version"], 3);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn hello_only_blocks_normal_publishes_before_reconciliation() {
     let coordinator = test_coordinator();
@@ -3478,5 +3549,156 @@ fn hello_only_with_pushes_disabled_still_admits_and_reports_peers() {
     assert!(
         matches!(rx.try_recv(), Ok(HaMessage::ConfigPush { version: 2, .. })),
         "the registered reconciliation peer must receive the first publish"
+    );
+}
+
+#[test]
+fn late_ahead_hello_is_reported_latched_and_never_pushed() {
+    use crate::promotion::PeerReport;
+
+    let coordinator = test_coordinator();
+    coordinator.update_bundle(test_bundle(2)).unwrap();
+    // A normal promotion runs hello-only through the reconcile window and then
+    // ends it; only afterwards is a new Hello "late".
+    coordinator.begin_hello_only();
+    coordinator.end_hello_only();
+    assert!(coordinator.is_serving());
+
+    let hello = HelloFields {
+        instance: "late-ahead".to_string(),
+        have_version: 3,
+        have_term: 0,
+        capabilities: vec![],
+        token: None,
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: Some("ef".repeat(32)),
+    };
+    let session = SessionMachine::admit(&coordinator, "127.0.0.1:2000".parse().unwrap(), hello)
+        .expect("authenticated v2 peer is admitted");
+    let mut rx = session.register();
+    // The report is queued for the promotion engine; registration itself does
+    // not latch (the engine owns the lateness decision and the divergence).
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(HaMessage::ConfigPush { version: 2, .. })
+    ));
+    let reports = coordinator.take_late_peer_reports();
+    let report = reports
+        .iter()
+        .find(|report| report.instance == "late-ahead")
+        .expect("late ahead hello must be reported");
+    assert_eq!(report.have_version, 3);
+    assert_eq!(report.have_term, 0);
+    assert_eq!(
+        report.have_bundle_hash.as_deref(),
+        Some("ef".repeat(32).as_str())
+    );
+
+    coordinator.latch_late_peer(report, "late ahead of the master");
+    assert!(coordinator.is_late_peer_latched("late-ahead"));
+    assert!(coordinator.is_diverged(), "the latched peer is diverged");
+
+    // A broadcast must not queue anything for the latched peer.
+    let push = coordinator
+        .active_push
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("active push");
+    coordinator.broadcast(&push);
+    assert!(
+        rx.try_recv().is_err(),
+        "a latched ahead peer must never receive a push"
+    );
+
+    // Re-registering the latched instance queues no push either.
+    let hello = HelloFields {
+        instance: "late-ahead".to_string(),
+        have_version: 3,
+        have_term: 0,
+        capabilities: vec![],
+        token: None,
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: Some("ef".repeat(32)),
+    };
+    let session = SessionMachine::admit(&coordinator, "127.0.0.1:2001".parse().unwrap(), hello)
+        .expect("latched peer may reconnect but is not served");
+    let mut rx = session.register();
+    assert!(
+        rx.try_recv().is_err(),
+        "a reconnecting latched peer receives no initial push"
+    );
+    coordinator.broadcast(&push);
+    assert!(rx.try_recv().is_err());
+
+    // A healthy peer still receives pushes.
+    let healthy = HelloFields {
+        instance: "healthy".to_string(),
+        have_version: 2,
+        have_term: 0,
+        capabilities: vec![],
+        token: None,
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: Some("ab".repeat(32)),
+    };
+    let session = SessionMachine::admit(&coordinator, "127.0.0.1:2002".parse().unwrap(), healthy)
+        .expect("healthy peer admitted");
+    let mut rx = session.register();
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(HaMessage::ConfigPush { version: 2, .. })
+    ));
+    coordinator.broadcast(&push);
+    assert!(
+        matches!(rx.try_recv(), Ok(HaMessage::ConfigPush { version: 2, .. })),
+        "a healthy peer keeps receiving pushes"
+    );
+    let _: Option<&PeerReport> = None;
+}
+
+#[test]
+fn hello_only_suppresses_a_resync_hello_push() {
+    let coordinator = test_coordinator();
+    coordinator.update_bundle(test_bundle(2)).unwrap();
+    coordinator.set_serving(false);
+    coordinator.allow_sessions();
+    coordinator.begin_hello_only();
+    let hello = HelloFields {
+        instance: "resync".to_string(),
+        have_version: 2,
+        have_term: 0,
+        capabilities: vec![],
+        token: None,
+        role: Some("slave".to_string()),
+        protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+        have_bundle_hash: Some("ab".repeat(32)),
+    };
+    let session = SessionMachine::admit(&coordinator, "127.0.0.1:3000".parse().unwrap(), hello)
+        .expect("hello-only admits a peer");
+    let mut rx = session.register();
+    assert!(rx.try_recv().is_err(), "no initial push in hello-only");
+    // A repeated Hello during the window must not bypass the gate.
+    assert!(
+        session.on_text(
+            &HaMessage::Hello {
+                instance: "resync".to_string(),
+                have_version: 2,
+                have_term: 0,
+                capabilities: vec![],
+                token: None,
+                role: Some("slave".to_string()),
+                protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+                have_bundle_hash: Some("ab".repeat(32)),
+            }
+            .to_json()
+            .unwrap()
+        )
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a resync Hello must not enqueue a push during hello-only"
     );
 }

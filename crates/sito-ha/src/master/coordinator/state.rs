@@ -3,6 +3,13 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Compares normalized signed-payload hashes, accepting an optional prefix.
+fn hashes_equal(left: &str, right: &str) -> bool {
+    left.trim()
+        .trim_start_matches("blake3:")
+        .eq_ignore_ascii_case(right.trim().trim_start_matches("blake3:"))
+}
+
 impl MasterCoordinator {
     pub fn new(
         instance_name: String,
@@ -36,6 +43,8 @@ impl MasterCoordinator {
             next_connection_id: Arc::new(AtomicU64::new(1)),
             #[cfg(test)]
             state_write_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            state_write_fail_after: Arc::new(Mutex::new(None)),
             diverged: Arc::new(Mutex::new(HashMap::new())),
             active_push_history: Arc::new(Mutex::new(VecDeque::new())),
             queued_bytes: Arc::new(Mutex::new(HashMap::new())),
@@ -51,6 +60,9 @@ impl MasterCoordinator {
             session_refusal_reason: Arc::new(Mutex::new("read_only".to_string())),
             serving: Arc::new(AtomicBool::new(true)),
             hello_only: Arc::new(AtomicBool::new(false)),
+            reconcile_complete: Arc::new(AtomicBool::new(false)),
+            late_peer_reports: Arc::new(Mutex::new(Vec::new())),
+            latched_slaves: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -154,6 +166,69 @@ impl MasterCoordinator {
         }
     }
 
+    /// Reads the durable published baseline from `ha_state.toml`, if any.
+    ///
+    /// Used to keep the in-memory bookkeeping from rewriting an older baseline
+    /// over the engine's recovered/promoted `published_version`.
+    fn durable_published_baseline(&self) -> Option<(u64, String)> {
+        let path = sito_core::sync::lock_or_recover(&self.state_path).clone()?;
+        match crate::promotion::state::HaStateStore::new(path).load() {
+            Ok(crate::promotion::state::LoadedState::Present {
+                bookkeeping: Some(bookkeeping),
+                ..
+            }) => Some((bookkeeping.published_version, bookkeeping.published_hash)),
+            _ => None,
+        }
+    }
+
+    /// Prepares the in-memory promotion bookkeeping for a normal publish.
+    ///
+    /// The durable published baseline is adopted when it is newer than the
+    /// in-memory copy (for example after the promotion engine wrote the first
+    /// promoted `"published"` state), and the active bundle is marked
+    /// `publishing` with its signed hash before the first state write. This
+    /// makes a crash between the two writes recoverable and ensures a later
+    /// publish never rewrites an older published version.
+    ///
+    /// Returns the refreshed bookkeeping so a failed publish can restore it.
+    pub(super) fn begin_promotion_publish(
+        &self,
+        push: &HaMessage,
+    ) -> Option<crate::promotion::state::PromotionBookkeeping> {
+        let durable = self.durable_published_baseline();
+        let mut current = sito_core::sync::lock_or_recover(&self.promotion_bookkeeping).clone()?;
+        if let Some((version, hash)) = durable
+            && (version > current.published_version
+                || (version == current.published_version
+                    && !hashes_equal(&hash, &current.published_hash)))
+        {
+            current.published_version = version;
+            current.published_hash = hash;
+        }
+        if let HaMessage::ConfigPush {
+            payload_hash_blake3,
+            ..
+        } = push
+        {
+            current.publication_state = sito_ha_types::status::PublicationState::Publishing;
+            current.pending_hash = Some(
+                payload_hash_blake3
+                    .trim_start_matches("blake3:")
+                    .to_string(),
+            );
+        }
+        *sito_core::sync::lock_or_recover(&self.promotion_bookkeeping) = Some(current.clone());
+        Some(current)
+    }
+
+    /// Restores the bookkeeping captured before a failed publish attempt.
+    pub(super) fn restore_promotion_bookkeeping(
+        &self,
+        bookkeeping: Option<crate::promotion::state::PromotionBookkeeping>,
+    ) {
+        *sito_core::sync::lock_or_recover(&self.promotion_bookkeeping) = bookkeeping;
+    }
+
     /// Starts hello-only reconciliation mode.
     ///
     /// While active the listener admits TLS/WebSocket/Hello and answers
@@ -163,12 +238,103 @@ impl MasterCoordinator {
         if self.fenced.load(Ordering::SeqCst) {
             return;
         }
+        self.reconcile_complete.store(false, Ordering::SeqCst);
+        sito_core::sync::lock_or_recover(&self.late_peer_reports).clear();
         self.hello_only.store(true, Ordering::SeqCst);
     }
 
     /// Leaves hello-only mode. Normal push-on-Hello resumes.
+    ///
+    /// From this point a peer that connects and reports a term/version above
+    /// this master is a late ahead peer: it is queued for the promotion engine
+    /// ([`Self::take_late_peer_reports`]) and never overwritten.
     pub fn end_hello_only(&self) {
         self.hello_only.store(false, Ordering::SeqCst);
+        self.reconcile_complete.store(true, Ordering::SeqCst);
+    }
+
+    /// Drains peer reports observed after the reconciliation window.
+    pub fn take_late_peer_reports(&self) -> Vec<crate::promotion::reconcile::PeerReport> {
+        std::mem::take(&mut *sito_core::sync::lock_or_recover(
+            &self.late_peer_reports,
+        ))
+    }
+
+    /// Whether an instance has been latched as a late ahead/diverged peer.
+    #[must_use]
+    pub fn is_late_peer_latched(&self, instance: &str) -> bool {
+        sito_core::sync::lock_or_recover(&self.latched_slaves).contains(instance)
+    }
+
+    /// Queues a Hello report that arrived after the reconciliation window and
+    /// is ahead of this master.
+    pub(super) fn record_late_peer_report(
+        &self,
+        instance: &str,
+        have_version: u64,
+        have_term: u64,
+        have_bundle_hash: Option<String>,
+    ) {
+        if !self.reconcile_complete.load(Ordering::SeqCst) {
+            return;
+        }
+        let current_version = self.get_current_version();
+        let current_term = self.get_current_term();
+        if have_term <= current_term && have_version <= current_version {
+            return;
+        }
+        let report = crate::promotion::reconcile::PeerReport {
+            instance: instance.to_string(),
+            have_term,
+            have_version,
+            have_bundle_hash,
+        };
+        let mut reports = sito_core::sync::lock_or_recover(&self.late_peer_reports);
+        if reports.len() >= MAX_LATE_PEER_REPORTS {
+            reports.remove(0);
+        }
+        reports.push(report);
+        debug!(
+            instance,
+            have_version,
+            have_term,
+            current_version,
+            current_term,
+            "Recorded a late ahead peer for promotion-engine latching"
+        );
+    }
+
+    /// Latches a late ahead peer: marks it diverged and stops every push path
+    /// to it. The latch is sticky for the process lifetime.
+    pub fn latch_late_peer(&self, report: &crate::promotion::reconcile::PeerReport, reason: &str) {
+        let newly_latched =
+            sito_core::sync::lock_or_recover(&self.latched_slaves).insert(report.instance.clone());
+        if let Some(slave) =
+            sito_core::sync::lock_or_recover(&self.slaves).get_mut(&report.instance)
+        {
+            slave.synced_version = 0;
+        }
+        let kind = if report.have_term > self.get_current_term() {
+            DivergenceKind::Term
+        } else {
+            DivergenceKind::Ahead
+        };
+        self.mark_diverged(
+            kind,
+            &report.instance,
+            report.have_version,
+            report.have_term,
+            reason.to_string(),
+        );
+        if newly_latched {
+            warn!(
+                instance = %report.instance,
+                have_version = report.have_version,
+                have_term = report.have_term,
+                reason,
+                "Latched a late ahead peer; no further pushes will be queued for it"
+            );
+        }
     }
 
     /// Whether the listener is currently hello-only.
@@ -390,6 +556,26 @@ impl MasterCoordinator {
         self
     }
 
+    /// Test-only: fail the state write after `successful_writes` writes.
+    #[cfg(test)]
+    pub(super) fn fail_state_write_after(&self, successful_writes: usize) {
+        *sito_core::sync::lock_or_recover(&self.state_write_fail_after) = Some(successful_writes);
+    }
+
+    /// Test-only injected write failure.
+    #[cfg(test)]
+    fn injected_state_write_failure(&self) -> Option<std::io::Error> {
+        let mut remaining = sito_core::sync::lock_or_recover(&self.state_write_fail_after);
+        match *remaining {
+            None => None,
+            Some(0) => Some(std::io::Error::other("injected state write failure")),
+            Some(ref mut left) => {
+                *left -= 1;
+                None
+            }
+        }
+    }
+
     /// Writes `payload` to `path` atomically (0600 temp file, fsync, rename).
     pub(super) fn write_state_file(path: &std::path::Path, payload: &[u8]) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
@@ -461,6 +647,10 @@ impl MasterCoordinator {
 
     /// Persists `bundle` synchronously.
     pub(super) fn persist_bundle(&self, bundle: &ConfigBundle) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(error) = self.injected_state_write_failure() {
+            return Err(error);
+        }
         if let Some((path, payload)) = self.serialized_bundle(bundle)? {
             Self::write_state_file(&path, &payload)?;
         }
@@ -473,6 +663,10 @@ impl MasterCoordinator {
     /// (directory creation, 0600 write, `sync_all`, rename) runs in
     /// `spawn_blocking` so a slow disk cannot stall a tokio worker.
     pub(super) async fn persist_bundle_async(&self, bundle: &ConfigBundle) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(error) = self.injected_state_write_failure() {
+            return Err(error);
+        }
         let Some((path, payload)) = self.serialized_bundle(bundle)? else {
             return Ok(());
         };
