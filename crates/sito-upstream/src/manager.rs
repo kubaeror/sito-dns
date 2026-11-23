@@ -43,6 +43,9 @@ pub struct UpstreamAttempt {
     /// Time spent on this attempt alone.
     pub rtt: Duration,
     /// `None` on success and on cancellation; the candidate's error otherwise.
+    ///
+    /// Do not use `error.is_none()` to detect success: a cancelled attempt also
+    /// has `error: None`. Use [`Self::is_success`] or the `cancelled` field.
     pub error: Option<UpstreamError>,
     /// `true` when the candidate was dropped before it could answer because
     /// another parallel candidate won or the overall deadline fired.

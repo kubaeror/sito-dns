@@ -2248,12 +2248,94 @@ async fn test_pipeline_parallel_timeout_counts_cancelled_and_final_timeout_once(
             "a cancellation is not an error: {rendered}"
         );
     }
-    assert_eq!(
+    let timeout_samples = |rendered: &str| -> Vec<u64> {
         rendered
-            .matches("sito_upstream_errors_total{upstream=\"unattributed\",kind=\"timeout\"}")
-            .count(),
-        1,
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix(
+                    "sito_upstream_errors_total{upstream=\"unattributed\",kind=\"timeout\"} ",
+                )
+                .map(|value| value.parse().expect("counter value must be numeric"))
+            })
+            .collect()
+    };
+    assert_eq!(
+        timeout_samples(&rendered),
+        vec![1],
         "the overall timeout must be counted exactly once: {rendered}"
+    );
+
+    // Positive control: the assertion above reads the sample value, so a
+    // second count must be observable as `2` instead of still matching a
+    // prefix of the same single line.
+    metrics.inc_upstream_errors("unattributed", "timeout");
+    assert_eq!(
+        timeout_samples(&metrics.render_prometheus()),
+        vec![2],
+        "the final-timeout assertion must detect a double count"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+/// G2: a fully failed parallel race is not a cancellation. Every candidate
+/// fails on its own, so each attempt is an ordinary error and
+/// `sito_upstream_cancelled_total` stays empty (default zero sample only).
+#[tokio::test]
+async fn test_pipeline_parallel_all_failures_are_errors_without_cancellation() {
+    use sito_core::config::UpstreamStrategy;
+    use sito_upstream::{BootstrapResolver, UpstreamManager};
+
+    let mut config = Config::default();
+    config.filtering.enabled = false;
+    config.dns.dnssec.validate = false;
+
+    let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (first_addr, _first_calls) = spawn_mock_upstream(Some(std::sync::Arc::clone(&fail))).await;
+    let (second_addr, _second_calls) =
+        spawn_mock_upstream(Some(std::sync::Arc::clone(&fail))).await;
+    config.upstream.strategy = UpstreamStrategy::Parallel;
+    config.upstream.servers = vec![first_addr.to_string(), second_addr.to_string()];
+    config.upstream.timeout_ms = 500;
+
+    let bootstrap = BootstrapResolver::new(vec![], std::time::Duration::from_millis(500));
+    let upstream = std::sync::Arc::new(
+        UpstreamManager::from_config(&config.upstream, &bootstrap)
+            .await
+            .expect("two IP-literal upstreams must build"),
+    );
+    let (pipeline, temp_dir) = build_test_pipeline(config, upstream).await;
+    let (pipeline, metrics) = with_test_metrics(pipeline).await;
+    let client = ClientContext::new("127.0.0.1".parse().unwrap());
+
+    let resp = pipeline
+        .handle(rewrite_query("all-fail.example.", RecordType::A), client)
+        .await
+        .unwrap();
+    assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+
+    let rendered = metrics.render_prometheus();
+    for addr in [first_addr, second_addr] {
+        let name = addr.to_string();
+        assert!(
+            rendered.contains(&format!(
+                "sito_upstream_errors_total{{upstream=\"{name}\",kind=\"bad_response\"}} 1"
+            )),
+            "each failed candidate must be an ordinary error: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("sito_upstream_health{{upstream=\"{name}\"}} 0")),
+            "each failed candidate is unhealthy: {rendered}"
+        );
+    }
+    let cancelled: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with("sito_upstream_cancelled_total{"))
+        .collect();
+    assert_eq!(
+        cancelled,
+        vec!["sito_upstream_cancelled_total{upstream=\"default\"} 0"],
+        "a fully failed race must not report any cancellation: {rendered}"
     );
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;

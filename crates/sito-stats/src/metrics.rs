@@ -523,9 +523,9 @@ impl MetricsRegistry {
     /// candidate wins or the overall deadline fires. Those attempts are
     /// observable here, but they are **not** failures: they get no RTT sample
     /// and do not change [`Self::set_upstream_health`]. The single `upstream`
-    /// label is the configured name and stays inside the registry's bounded
-    /// label interner, so cardinality cannot grow beyond configured upstreams
-    /// (plus the usual overflow bucket).
+    /// label is the configured name and passes through the registry's shared
+    /// bounded label interner (4,096 distinct values, then `__other__`), so
+    /// unbounded input cannot grow this family without limit.
     pub fn inc_upstream_cancelled(&self, upstream: &str) {
         let upstream_id = self.labels.intern(upstream);
         increment_counter(&self.upstream_cancelled, upstream_id);
@@ -1673,7 +1673,7 @@ impl MetricsRegistry {
             self.querylog_dropped.load(Ordering::Relaxed)
         );
 
-        // 19. Stats retention / rollup cleanup
+        // 20. Stats retention / rollup cleanup
         out.push_str("# HELP sito_stats_retention_last_success_seconds Unix timestamp of the last successful stats retention sweep\n");
         out.push_str("# TYPE sito_stats_retention_last_success_seconds gauge\n");
         let _ = writeln!(
