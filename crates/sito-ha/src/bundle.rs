@@ -1366,6 +1366,50 @@ tablet = "client_shared_secret_9876"
         );
     }
 
+    /// F1: upstream weights are shared configuration and must travel in the
+    /// bundle, while node-local client secrets are still stripped.
+    #[test]
+    fn test_ha_sanitizer_replicates_upstream_weights_and_strips_client_secrets() {
+        let master_toml = r#"
+config_version = 2
+
+[server]
+role = "master"
+instance_name = "master-prod"
+
+[upstream]
+servers = ["tls://dns.quad9.net", "1.1.1.1"]
+weights = [3, 1]
+
+[clients.client_id_secrets]
+tablet = "client_shared_secret_9876"
+"#;
+        let config = sito_core::config::Config::from_toml_str(master_toml)
+            .expect("weighted master config is valid");
+        let bundle =
+            build_config_bundle(&config, master_toml, 4, 1, &[]).expect("weighted bundle builds");
+
+        assert!(
+            bundle.config_toml.contains("weights") && bundle.config_toml.contains('3'),
+            "shared upstream weights must be in the bundle: {}",
+            bundle.config_toml
+        );
+        assert!(
+            !bundle.config_toml.contains("client_id_secrets")
+                && !bundle.config_toml.contains("client_shared_secret_9876"),
+            "node-local client secrets must never travel: {}",
+            bundle.config_toml
+        );
+        let parsed = sito_core::config::Config::from_toml_str(&bundle.config_toml)
+            .expect("sanitized weighted bundle parses as config v2");
+        assert_eq!(parsed.server.role, "slave");
+        assert_eq!(parsed.upstream.weights, vec![3, 1]);
+        assert_eq!(
+            parsed.upstream.servers,
+            vec!["tls://dns.quad9.net", "1.1.1.1"]
+        );
+    }
+
     #[test]
     fn sanitized_configs_equal_ignores_formatting_but_detects_value_changes() {
         let a = "config_version = 2\n[server]\nrole = \"slave\"\n";

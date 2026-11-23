@@ -10,9 +10,11 @@
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/></svg>
       Forwarding & Encrypted Upstream Resolvers
     </div>
+    {% if user_role != "viewer" %}
     <button @click="showModal = true" class="btn btn-primary btn-sm">
       + Add Upstream
     </button>
+    {% endif %}
   </div>
 
   <div class="table-container">
@@ -22,6 +24,7 @@
           <th>Endpoint URL / Address</th>
           <th>Protocol</th>
           <th>Health Status</th>
+          <th>Weight</th>
           <th style="text-align: center;">Actions</th>
         </tr>
       </thead>
@@ -35,6 +38,21 @@
             <span class="badge badge-success">Healthy</span>
             {% else %}
             <span class="badge badge-danger">Degraded / Unreachable</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if user_role != "viewer" %}
+            <form action="/ui/upstreams/weight" method="POST" style="display: flex; gap: 6px; align-items: center;">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="index" value="{{ loop.index0 }}">
+              <input type="hidden" name="address" value="{{ u.address }}">
+              <input type="number" name="weight" class="form-input mono" min="1" max="{{ max_upstream_weight }}" step="1"
+                     value="{{ u.weight }}" required aria-label="Load balancing weight for {{ u.address }}"
+                     style="width: 80px; padding: 4px 8px;">
+              <button type="submit" class="btn btn-outline btn-sm">Save</button>
+            </form>
+            {% else %}
+            <span class="mono">{{ u.weight }}</span>
             {% endif %}
           </td>
           <td style="text-align: center;">
@@ -56,9 +74,16 @@
     </table>
   </div>
 
+  <div class="form-help" style="margin-top: 10px;">
+    Weights are relative and apply to the <span class="mono">load_balance</span>
+    strategy (default 1, range 1-100). A failed weighted pick still fails over
+    to the remaining upstreams; health checks always decide eligibility.
+  </div>
+
   <div id="test-feedback" style="margin-top: 16px;"></div>
 
-  <!-- Add Modal -->
+  <!-- Add Modal (operators and admins only) -->
+  {% if user_role != "viewer" %}
   <div class="modal-backdrop" x-show="showModal" style="display: none;">
     <div class="modal-dialog" @click.away="showModal = false">
       <div class="modal-header">
@@ -73,6 +98,11 @@
             <input type="text" id="up-addr" name="address" class="form-input mono" required placeholder="tls://1.1.1.1:853 or 1.1.1.1:53">
             <div class="form-help">Supports UDP (1.1.1.1:53) and DoT (tls://...).</div>
           </div>
+          <div class="form-group">
+            <label class="form-label" for="up-weight">Load Balancing Weight</label>
+            <input type="number" id="up-weight" name="weight" class="form-input mono" min="1" max="{{ max_upstream_weight }}" step="1" value="1" required>
+            <div class="form-help">Default 1. Higher values receive proportionally more queries under the load_balance strategy (range 1-{{ max_upstream_weight }}).</div>
+          </div>
         </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary" @click="showModal = false">Cancel</button>
@@ -81,5 +111,6 @@
       </form>
     </div>
   </div>
+  {% endif %}
 </div>
 {% endblock %}

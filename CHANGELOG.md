@@ -5,6 +5,18 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Added
+- Weighted upstream balancing: optional `upstream.weights` and
+  `per_domain.weights` (1–100, default 1) with weighted `load_balance`
+  selection, ordered failover fallback, upstream-page add/edit controls,
+  REST `UpstreamConfigDto.weights`, and HA bundle replication. Global weights
+  apply to `upstream.servers`; per-domain weights are config-file-only and
+  per-client scoped upstream lists remain unweighted (round-robin).
+
+---
+
 ## [2.0.0-rc.2] - 2026-11-22
 
 Second 2.0 release candidate (prerelease). Phase 2 core hardening (WP-2.1
@@ -75,8 +87,9 @@ were WP-2.14. Phase 3 verification/release (WP-3.1 through WP-3.4) followed in
 - `/api/v2` and the API v1 compatibility facade; `/api/v1` is canonical.
 - SQLite schema/PII migration (`sito db migrate`, `SITO_DB_AUTO_MIGRATE`) and
   installer/Docker config auto-migration.
-- Default-deny DNS client ACL, weighted upstream balancing, a second proof for
-  user/token deletion and edit-time read-only HA enforcement.
+- Default-deny DNS client ACL, a second proof for user/token deletion and
+  edit-time read-only HA enforcement. (Weighted upstream balancing was
+  delivered after this prerelease; see Unreleased.)
 - Optional external parental/service data and the Phase 3 regression, fuzz,
   benchmark, Docker/installer E2E and release-candidate work.
 

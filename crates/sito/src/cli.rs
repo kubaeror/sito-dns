@@ -2283,6 +2283,69 @@ mod tests {
     }
 
     #[test]
+    fn test_check_config_accepts_and_rejects_upstream_weights() {
+        let dir = temp_config_dir("check_config_upstream_weights");
+        let path = dir.join("config.toml");
+
+        // Positive: the real loader accepts an aligned, bounded weight list.
+        std::fs::write(
+            &path,
+            "config_version = 2\n\
+             [upstream]\n\
+             servers = [\"1.1.1.1\", \"1.0.0.1\"]\n\
+             weights = [3, 1]\n",
+        )
+        .unwrap();
+        run_check_config(&path).expect("valid weights must pass check-config");
+
+        // Omitting weights keeps the byte-compatible default.
+        std::fs::write(
+            &path,
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+        )
+        .unwrap();
+        run_check_config(&path).expect("an absent weights list must stay valid");
+
+        // Negative: zero is rejected instead of silently disabling a server.
+        std::fs::write(
+            &path,
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\nweights = [0]\n",
+        )
+        .unwrap();
+        let err = run_check_config(&path).expect_err("zero weight must fail");
+        assert!(
+            err.to_string().contains("upstream.weights[0]"),
+            "got: {err}"
+        );
+
+        // Negative: the upper bound is enforced.
+        std::fs::write(
+            &path,
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\"]\nweights = [101]\n",
+        )
+        .unwrap();
+        let err = run_check_config(&path).expect_err("weight above the bound must fail");
+        assert!(
+            err.to_string().contains("upstream.weights[0]") && err.to_string().contains("101"),
+            "got: {err}"
+        );
+
+        // Negative: the list must align with the server list.
+        std::fs::write(
+            &path,
+            "config_version = 2\n[upstream]\nservers = [\"1.1.1.1\", \"1.0.0.1\"]\nweights = [2]\n",
+        )
+        .unwrap();
+        let err = run_check_config(&path).expect_err("misaligned weights must fail");
+        assert!(
+            err.to_string().contains("upstream.weights") && err.to_string().contains('2'),
+            "got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_check_config_accepts_and_rejects_dns_client_acl() {
         let dir = temp_config_dir("check_config_acl");
         let path = dir.join("config.toml");

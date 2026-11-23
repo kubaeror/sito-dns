@@ -457,15 +457,16 @@ of [`docs/2.0-public-api-diff.md`](2.0-public-api-diff.md#21-phase-2--per-attemp
 WP-2.10 bounds Argon2 work, makes password changes self-service for every role
 with a second factor when enrolled, requires a fresh session-bound
 re-authentication proof for sensitive Admin mutations, fixes the wizard's
-unchecked-checkbox handling, removes the unimplemented upstream weight control,
-and normalizes the remaining create endpoints to `201`. Public API and operator
+unchecked-checkbox handling, replaces the inert upstream weight control with a
+working weighted-balancing control (F1), and normalizes the remaining create
+endpoints to `201`. Public API and operator
 guidance are in §22 of
 [`docs/2.0-public-api-diff.md`](2.0-public-api-diff.md#22-phase-2--auth-rbac-and-self-service-2fa-wp-210)
 and [`docs/user-management.md`](user-management.md).
 
 | Finding / acceptance | Named test / check | Focused command |
 |---|---|---|
-| P2-52: an unchecked wizard cache/filtering/DNSSEC/CNAME box disables an already-enabled setting instead of leaving the old value; the unsupported upstream weight input/column is gone | `test_wizard_unchecked_flags_disable_existing_features`, `test_upstreams_page_has_no_unsupported_weight_control` | `cargo test -p sito-api --all-features --lib test_wizard_unchecked_flags_disable_existing_features`; `cargo test -p sito-api --all-features --lib test_upstreams_page_has_no_unsupported_weight_control` |
+| P2-52: an unchecked wizard cache/filtering/DNSSEC/CNAME box disables an already-enabled setting instead of leaving the old value; the upstream weight input/column is real and persists through the CSRF-protected config path (F1) | `test_wizard_unchecked_flags_disable_existing_features`, `test_upstreams_page_offers_weight_controls_and_effective_values`, `test_upstreams_weight_route_requires_csrf_token` | `cargo test -p sito-api --all-features --lib test_wizard_unchecked_flags_disable_existing_features`; `cargo test -p sito-api --all-features --lib test_upstreams_page_offers_weight_controls_and_effective_values`; `cargo test -p sito-api --all-features --lib test_upstreams_weight_route_requires_csrf_token` |
 | P2-54: `create_client`, `add_client_group`, `add_filter_list` and `add_rewrite` return `201` with the created DTO; duplicate groups stay `409`; the TOTP challenge stays `202` and `update_user` reports real TOTP state | `test_client_id_secrets_are_written_and_enforced`, `test_add_duplicate_client_group_returns_conflict`, `test_add_filter_list_returns_201_with_body`, `test_add_and_update_reject_invalid_entries_without_persisting`, `test_totp_challenge_status_and_update_user_reports_totp` | `cargo test -p sito-api --all-features --lib test_add_filter_list_returns_201_with_body`; `cargo test -p sito-api --all-features --lib test_add_duplicate_client_group_returns_conflict`; `cargo test -p sito-api --all-features --lib test_totp_challenge_status_and_update_user_reports_totp` |
 | Argon2 hash/verify work is bounded to four concurrent operations; the probe observes saturation without timing sleeps | `test_argon2_verification_concurrency_is_bounded` | `cargo test -p sito-api --all-features --lib test_argon2_verification_concurrency_is_bounded` |
 | Login, re-auth and both change-password paths cap the current password before Argon2; oversized values return a validation error without rotating the credential | `test_login_rejects_oversized_credentials_before_lockout`, `test_reauth_rejects_oversized_credentials_before_lockout`, `test_user_management_and_change_password`, `test_account_password_change` | `cargo test -p sito-api --all-features --lib test_user_management_and_change_password`; `cargo test -p sito-api --all-features --lib test_account_password_change` |

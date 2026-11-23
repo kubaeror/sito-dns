@@ -7082,6 +7082,19 @@
             "description": "Overall per-query budget; bounded to 1..=60000 ms by core validation\n(`MAX_UPSTREAM_TIMEOUT_MS`).",
             "maximum": 60000,
             "minimum": 1
+          },
+          "weights": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "maximum": 100,
+              "minimum": 1
+            },
+            "description": "Optional load-balancing weights, index-aligned with the global\n`servers` list.\n\n`None` on update preserves the stored list (so older clients and\npartial updates do not reset weights). `Some([])` explicitly clears it\nback to the default weight 1 for every server. A non-empty list must\ncontain one value per server, each in `1..=100`; `0` is rejected\nrather than silently disabling a server. Weights apply to\n`strategy = \"load_balance\"`."
           }
         }
       },

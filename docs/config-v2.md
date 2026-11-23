@@ -56,6 +56,8 @@ rules. Every entry point reaches it:
 - every typed section's field validation;
 - upstream-target syntax for `upstream.servers`, `upstream.per_domain[].servers`
   and `clients.entries[].upstreams`;
+- `upstream.weights` / `upstream.per_domain[].weights` alignment (one entry per server when present) and bounds
+  (`1..=100`; `0` is rejected rather than silently disabling a server);
 - ACME domain normalization, duplicate detection and wildcard rejection;
 - duplicate `dns.bind` addresses and listener port conflicts (DNS TCP
   listeners and the admin UI, plus ACME HTTP-01 vs the admin UI);

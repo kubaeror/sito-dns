@@ -32,6 +32,8 @@ pub struct UpstreamViewItem {
     pub is_healthy: bool,
     pub total_queries: u64,
     pub avg_latency_ms: f64,
+    /// Effective load-balancing weight (defaults to 1 when unset).
+    pub weight: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -381,6 +383,8 @@ pub struct UpstreamsTemplate<'a> {
     pub user_role: &'a str,
     pub active_tab: &'a str,
     pub version: &'a str,
+    /// Schema upper bound, so the template never hardcodes a stale value.
+    pub max_upstream_weight: u32,
     pub upstreams: Vec<UpstreamViewItem>,
 }
 

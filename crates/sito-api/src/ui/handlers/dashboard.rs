@@ -12,8 +12,9 @@ pub(crate) async fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewI
         .await
         .unwrap_or_default();
 
+    let weights = cfg.upstream.effective_weights();
     let mut res = Vec::new();
-    for addr_str in &cfg.upstream.servers {
+    for (index, addr_str) in cfg.upstream.servers.iter().enumerate() {
         let proto = if addr_str.starts_with("tls://") {
             "DoT (TLS)"
         } else if addr_str.starts_with("udp://")
@@ -43,6 +44,10 @@ pub(crate) async fn get_upstreams_list(ctx: &ServerContext) -> Vec<UpstreamViewI
             is_healthy,
             total_queries: total_queries.max(0) as u64,
             avg_latency_ms,
+            weight: weights
+                .get(index)
+                .copied()
+                .unwrap_or(sito_core::config::DEFAULT_UPSTREAM_WEIGHT),
         });
     }
     res

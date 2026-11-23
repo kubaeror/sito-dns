@@ -4828,10 +4828,9 @@ async fn test_wizard_unchecked_flags_disable_existing_features() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
-/// WP-2.10: weighted upstream balancing is not implemented yet (WP-2.11),
-/// so the upstream page must not offer a weight control or column.
+/// F1: the upstream page now offers a real weight column and add-modal input.
 #[tokio::test]
-async fn test_upstreams_page_has_no_unsupported_weight_control() {
+async fn test_upstreams_page_offers_weight_controls_and_effective_values() {
     let temp_dir = std::env::temp_dir().join(format!(
         "sito_ui_upstreams_weight_{}",
         rand::random::<u64>()
@@ -4843,20 +4842,439 @@ async fn test_upstreams_page_has_no_unsupported_weight_control() {
     else {
         panic!("admin login failed");
     };
+
+    let mut cfg = (**ctx.config.load()).clone();
+    cfg.upstream.weights = vec![7, 1];
+    ctx.set_config(cfg);
+
     let body =
         response_body(upstreams_page(State(ctx.clone()), session_headers(&session)).await).await;
     assert!(
-        !body.contains("Load Balancing Weight"),
-        "the unimplemented weight input must not be offered: {body}"
+        body.contains("<th>Weight</th>"),
+        "missing weight column: {body}"
     );
     assert!(
-        !body.contains("name=\"weight\""),
-        "no weight field may be submitted: {body}"
+        body.contains("id=\"up-weight\"") && body.contains("name=\"weight\""),
+        "missing add-modal weight input: {body}"
+    );
+    let max = sito_core::config::MAX_UPSTREAM_WEIGHT;
+    assert!(
+        body.contains("min=\"1\"") && body.contains(&format!("max=\"{max}\"")),
+        "the weight input must expose its bounds: {body}"
     );
     assert!(
-        !body.contains("id=\"up-weight\""),
-        "the old weight control id must be gone: {body}"
+        body.contains("name=\"index\"") && body.contains("name=\"address\""),
+        "the edit form must address a stable server index: {body}"
     );
+    assert!(
+        body.contains("aria-label=\"Load balancing weight for 1.1.1.1\""),
+        "the table must render a weight input for the first server: {body}"
+    );
+    assert!(
+        body.contains("value=\"7\""),
+        "the stored non-default weight must be rendered in the table: {body}"
+    );
+    assert!(
+        body.matches("action=\"/ui/upstreams/weight\"").count() >= 2,
+        "each upstream row must expose the CSRF-protected edit form: {body}"
+    );
+    assert!(
+        body.matches("name=\"csrf_token\"").count() >= 2,
+        "the edit forms must carry the CSRF token: {body}"
+    );
+    assert!(
+        body.matches(" required").count() >= 3,
+        "the modal and per-row weight inputs must be required: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// F1: adding an upstream with a non-default weight persists through the
+/// shared config apply path and the page renders the stored value.
+#[tokio::test]
+async fn test_upstreams_add_with_weight_persists_and_renders() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_upstreams_add_weight_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+
+    let response = upstreams_add_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        session_headers(&session),
+        Form(AddUpstreamForm {
+            address: "9.9.9.9:53".to_string(),
+            weight: 5,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let cfg = ctx.config.load();
+    assert_eq!(
+        cfg.upstream.servers.last().map(String::as_str),
+        Some("9.9.9.9:53")
+    );
+    let weights = cfg.upstream.weights.clone();
+    drop(cfg);
+    assert_eq!(
+        weights,
+        vec![1, 1, 5],
+        "existing servers keep weight 1 and the new server stores its weight"
+    );
+    let persisted = std::fs::read_to_string(ctx.config_path.clone()).expect("config persisted");
+    assert!(
+        persisted.contains("weights") && persisted.contains('5'),
+        "the weight must be written to config.toml: {persisted}"
+    );
+
+    let body =
+        response_body(upstreams_page(State(ctx.clone()), session_headers(&session)).await).await;
+    assert!(
+        body.contains("value=\"5\""),
+        "page must render the saved weight: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// F1: the inline weight form updates one server and normalizes an all-default
+/// list back to the omitted (byte-compatible) form.
+#[tokio::test]
+async fn test_upstreams_weight_edit_persists_and_normalizes_defaults() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_upstreams_edit_weight_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+
+    // Saving the implicit default is a no-op: it must not rewrite the
+    // document just to persist `weights = [1, 1]`.
+    let response = upstreams_weight_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        session_headers(&session),
+        Form(UpdateUpstreamWeightForm {
+            index: 0,
+            address: "1.1.1.1".to_string(),
+            weight: 1,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        !ctx.config_path.exists(),
+        "an unchanged default weight must not rewrite config.toml"
+    );
+
+    let response = upstreams_weight_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        session_headers(&session),
+        Form(UpdateUpstreamWeightForm {
+            index: 0,
+            address: "1.1.1.1".to_string(),
+            weight: 4,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(ctx.config.load().upstream.weights, vec![4, 1]);
+
+    // Setting every server to 1 drops the list, keeping default configs
+    // byte-identical to a pre-weight document.
+    for (index, address) in ["1.1.1.1", "1.0.0.1"].into_iter().enumerate() {
+        let response = upstreams_weight_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            session_headers(&session),
+            Form(UpdateUpstreamWeightForm {
+                index,
+                address: address.to_string(),
+                weight: 1,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+    assert_eq!(ctx.config.load().upstream.weights, Vec::<u32>::new());
+    let persisted = std::fs::read_to_string(ctx.config_path.clone()).expect("config persisted");
+    assert!(
+        !persisted.contains("weights"),
+        "an all-default weight list must stay omitted: {persisted}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// F1: duplicate server strings are separate entries, so the edit form uses
+/// the list index rather than the (ambiguous) address.
+#[tokio::test]
+async fn test_upstreams_weight_edit_targets_duplicate_entries_by_index() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_upstreams_duplicate_weight_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+    let mut cfg = (**ctx.config.load()).clone();
+    cfg.upstream.servers = vec!["1.1.1.1".to_string(), "1.1.1.1".to_string()];
+    cfg.upstream.weights = Vec::new();
+    ctx.set_config(cfg);
+
+    for (index, weight) in [(1usize, 5u32), (0, 3)] {
+        let response = upstreams_weight_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            session_headers(&session),
+            Form(UpdateUpstreamWeightForm {
+                index,
+                address: "1.1.1.1".to_string(),
+                weight,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+    assert_eq!(ctx.config.load().upstream.weights, vec![3, 5]);
+
+    // A stale form whose address no longer matches the index is rejected.
+    let response = upstreams_weight_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        session_headers(&session),
+        Form(UpdateUpstreamWeightForm {
+            index: 0,
+            address: "9.9.9.9".to_string(),
+            weight: 2,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(ctx.config.load().upstream.weights, vec![3, 5]);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// F1: weight bounds and unknown targets are rejected without changing the
+/// live configuration.
+#[tokio::test]
+async fn test_upstreams_weight_edit_rejects_out_of_bounds_and_unknown_targets() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_upstreams_bad_weight_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    let LoginResult::Success(session) =
+        ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await
+    else {
+        panic!("admin login failed");
+    };
+
+    for (weight, expected) in [(0, StatusCode::BAD_REQUEST), (101, StatusCode::BAD_REQUEST)] {
+        let response = upstreams_weight_handler(
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            session_headers(&session),
+            Form(UpdateUpstreamWeightForm {
+                index: 0,
+                address: "1.1.1.1".to_string(),
+                weight,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), expected, "weight {weight}");
+    }
+    let response = upstreams_weight_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        session_headers(&session),
+        Form(UpdateUpstreamWeightForm {
+            index: 99,
+            address: "203.0.113.1".to_string(),
+            weight: 2,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(ctx.config.load().upstream.weights, Vec::<u32>::new());
+
+    // The add form rejects the same bounds before mutating the server list.
+    let response = upstreams_add_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        session_headers(&session),
+        Form(AddUpstreamForm {
+            address: "9.9.9.9:53".to_string(),
+            weight: 0,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !ctx.config
+            .load()
+            .upstream
+            .servers
+            .iter()
+            .any(|server| server == "9.9.9.9:53")
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// F1: a Viewer sees the weight read-only and cannot mutate upstreams.
+#[tokio::test]
+async fn test_upstreams_weights_are_read_only_for_viewers() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_upstreams_viewer_weight_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    ctx.auth_mgr
+        .create_user("view_user", "ViewerPass1", Role::Viewer)
+        .await;
+    let LoginResult::Success(session) = ctx
+        .auth_mgr
+        .login("view_user", "ViewerPass1", "127.0.0.1")
+        .await
+    else {
+        panic!("viewer login failed");
+    };
+
+    let body =
+        response_body(upstreams_page(State(ctx.clone()), session_headers(&session)).await).await;
+    assert!(
+        body.contains("<th>Weight</th>"),
+        "viewers may read weights: {body}"
+    );
+    assert!(
+        !body.contains("name=\"weight\"") && !body.contains("id=\"up-weight\""),
+        "a Viewer must not receive the editable weight controls: {body}"
+    );
+    assert!(
+        !body.contains("+ Add Upstream"),
+        "a Viewer must not receive the add control: {body}"
+    );
+
+    let add = upstreams_add_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        session_headers(&session),
+        Form(AddUpstreamForm {
+            address: "9.9.9.9:53".to_string(),
+            weight: 2,
+        }),
+    )
+    .await;
+    assert_eq!(add.status(), StatusCode::FORBIDDEN);
+    let edit = upstreams_weight_handler(
+        State(ctx.clone()),
+        Extension(ApplyHooks::default()),
+        session_headers(&session),
+        Form(UpdateUpstreamWeightForm {
+            index: 0,
+            address: "1.1.1.1".to_string(),
+            weight: 2,
+        }),
+    )
+    .await;
+    assert_eq!(edit.status(), StatusCode::FORBIDDEN);
+    assert_eq!(ctx.config.load().upstream.weights, Vec::<u32>::new());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// F1: the weight route sits behind the global CSRF middleware, so a session
+/// cookie alone is not enough to change a weight.
+#[tokio::test]
+async fn test_upstreams_weight_route_requires_csrf_token() {
+    use axum::body::Body;
+    use axum::http::{Request, header};
+    use tower::ServiceExt;
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "sito_ui_upstreams_weight_csrf_{}",
+        rand::random::<u64>()
+    ));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+    ctx.auth_mgr
+        .update_user_password("admin", "TestPassword123!")
+        .await;
+    ctx.set_setup_pending(false);
+    let LoginResult::Success(session) = ctx
+        .auth_mgr
+        .login("admin", "TestPassword123!", "127.0.0.1")
+        .await
+    else {
+        panic!("admin login failed");
+    };
+    let cookie = format!(
+        "{}; {}",
+        session.to_cookie_header_secure(false),
+        crate::auth::session::build_csrf_cookie(&session.csrf_token, 3600, false)
+    );
+
+    let app = crate::create_router(ctx.clone());
+    let missing_token = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/upstreams/weight")
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::COOKIE, cookie.clone())
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("address=1.1.1.1&weight=4"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_token.status(), StatusCode::FORBIDDEN);
+    assert_eq!(ctx.config.load().upstream.weights, Vec::<u32>::new());
+
+    let with_token = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/upstreams/weight")
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::COOKIE, cookie)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "csrf_token={}&index=0&address=1.1.1.1&weight=4",
+                    session.csrf_token
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(with_token.status(), StatusCode::SEE_OTHER);
+    assert_eq!(ctx.config.load().upstream.weights, vec![4, 1]);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

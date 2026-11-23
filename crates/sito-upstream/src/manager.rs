@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, timeout};
@@ -193,6 +193,9 @@ struct ManagedEntry {
     name: String,
     upstream: Arc<dyn Upstream>,
     health: Arc<RwLock<UpstreamHealth>>,
+    /// Relative load-balancing weight (1..=100). Managed entries built outside
+    /// the configuration path default to 1.
+    weight: u32,
 }
 
 #[derive(Clone)]
@@ -212,21 +215,23 @@ impl UpstreamInner {
         let timeout_duration = Duration::from_millis(config.timeout_ms);
         let mut entries = Vec::new();
 
-        for server_str in &config.servers {
-            entries.push(
+        for (index, server_str) in config.servers.iter().enumerate() {
+            let mut entry =
                 create_managed_entry(server_str, bootstrap, timeout_duration, config.pool_size)
-                    .await?,
-            );
+                    .await?;
+            entry.weight = config.effective_weight(index);
+            entries.push(entry);
         }
 
         let mut per_domain_rules = Vec::new();
         for pd in &config.per_domain {
             let mut pd_entries = Vec::new();
-            for server_str in &pd.servers {
-                pd_entries.push(
+            for (index, server_str) in pd.servers.iter().enumerate() {
+                let mut entry =
                     create_managed_entry(server_str, bootstrap, timeout_duration, config.pool_size)
-                        .await?,
-                );
+                        .await?;
+                entry.weight = pd.effective_weight(index);
+                pd_entries.push(entry);
             }
             let cleaned_domains = pd
                 .domains
@@ -251,7 +256,58 @@ impl UpstreamInner {
 /// parallel queries, per-domain routing, and health tracking.
 pub struct UpstreamManager {
     inner: arc_swap::ArcSwap<UpstreamInner>,
+    /// Historical round-robin cursor used while every weight is the default.
     rr_counter: AtomicUsize,
+    /// Counter feeding the seeded SplitMix64 roll used for weighted
+    /// `load_balance` selection. Kept as a counter (not a mutable RNG) so
+    /// selection needs no lock on the query path.
+    weight_rng: AtomicU64,
+}
+
+/// Golden-ratio increment for the SplitMix64 counter. Every query advances
+/// the counter by this value and mixes the result, so concurrent callers get
+/// independent, uniformly distributed rolls without sharing mutable state.
+const WEIGHT_RNG_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Mixes one SplitMix64 counter value into a uniformly distributed `u64`.
+fn splitmix64(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+/// Returns a nondeterministic starting point for [`UpstreamManager::weight_rng`].
+fn random_weight_seed() -> u64 {
+    rand::random::<u64>() | 1
+}
+
+/// Picks one candidate index with probability proportional to its weight.
+///
+/// A single weighted choice is enough for the load-balance path: after the
+/// first pick the remaining candidates are tried in configuration order, so a
+/// failure still falls through to every other candidate. This is O(n) and
+/// allocates nothing, and all candidates remain reachable.
+fn weighted_start(weights: &[u32], mut roll: impl FnMut() -> u64) -> usize {
+    if weights.is_empty() {
+        return 0;
+    }
+    // Out-of-range or zero weights only come from internal/test callers;
+    // treating them as unit weight keeps the selector total and avoids a
+    // division by zero without hiding a configuration error (validation
+    // rejects 0 before the manager is built).
+    let total: u64 = weights
+        .iter()
+        .map(|weight| u64::from((*weight).max(1)))
+        .sum();
+    let mut pick = roll() % total;
+    for (index, weight) in weights.iter().enumerate() {
+        let weight = u64::from((*weight).max(1));
+        if pick < weight {
+            return index;
+        }
+        pick -= weight;
+    }
+    weights.len().saturating_sub(1)
 }
 
 /// A validated replacement upstream set that is not live yet.
@@ -671,6 +727,7 @@ async fn create_managed_entry(
         name,
         upstream,
         health: Arc::new(RwLock::new(UpstreamHealth::new())),
+        weight: sito_core::config::DEFAULT_UPSTREAM_WEIGHT,
     })
 }
 
@@ -799,6 +856,7 @@ impl UpstreamManager {
         Ok(Self {
             inner: arc_swap::ArcSwap::new(Arc::new(inner)),
             rr_counter: AtomicUsize::new(0),
+            weight_rng: AtomicU64::new(random_weight_seed()),
         })
     }
 
@@ -880,12 +938,47 @@ impl UpstreamManager {
         strategy: UpstreamStrategy,
         timeout_duration: Duration,
     ) -> Self {
+        let weighted = upstreams
+            .into_iter()
+            .map(|(name, upstream)| (name, upstream, sito_core::config::DEFAULT_UPSTREAM_WEIGHT))
+            .collect();
+        Self::with_weighted_upstreams(weighted, strategy, timeout_duration)
+    }
+
+    /// Create a manager with explicit per-entry weights and a randomly seeded
+    /// selector (for production callers and tests that do not need a fixed
+    /// sequence).
+    pub fn with_weighted_upstreams(
+        upstreams: Vec<(String, Arc<dyn Upstream>, u32)>,
+        strategy: UpstreamStrategy,
+        timeout_duration: Duration,
+    ) -> Self {
+        Self::with_weighted_upstreams_seeded(
+            upstreams,
+            strategy,
+            timeout_duration,
+            random_weight_seed(),
+        )
+    }
+
+    /// Deterministic variant of [`Self::with_weighted_upstreams`].
+    ///
+    /// The seed drives the weighted first pick only; failover, health,
+    /// deadlines, EDNS fallback and parallel racing are unchanged.
+    #[must_use]
+    pub fn with_weighted_upstreams_seeded(
+        upstreams: Vec<(String, Arc<dyn Upstream>, u32)>,
+        strategy: UpstreamStrategy,
+        timeout_duration: Duration,
+        seed: u64,
+    ) -> Self {
         let entries = upstreams
             .into_iter()
-            .map(|(name, upstream)| ManagedEntry {
+            .map(|(name, upstream, weight)| ManagedEntry {
                 name,
                 upstream,
                 health: Arc::new(RwLock::new(UpstreamHealth::new())),
+                weight,
             })
             .collect();
 
@@ -900,6 +993,7 @@ impl UpstreamManager {
         Self {
             inner: arc_swap::ArcSwap::new(Arc::new(inner)),
             rr_counter: AtomicUsize::new(0),
+            weight_rng: AtomicU64::new(seed),
         }
     }
 
@@ -920,6 +1014,7 @@ impl UpstreamManager {
                         name,
                         upstream,
                         health: Arc::new(RwLock::new(UpstreamHealth::new())),
+                        weight: sito_core::config::DEFAULT_UPSTREAM_WEIGHT,
                     })
                     .collect();
                 (cleaned_domains, entries)
@@ -944,6 +1039,18 @@ impl UpstreamManager {
 
     pub fn timeout(&self) -> Duration {
         self.inner.load().timeout_duration
+    }
+
+    /// Effective weights for the global entry list, in the same order as
+    /// [`Self::statuses`]. Per-domain rules keep their own weights.
+    #[must_use]
+    pub fn weights(&self) -> Vec<u32> {
+        self.inner
+            .load()
+            .entries
+            .iter()
+            .map(|entry| entry.weight)
+            .collect()
     }
 
     /// Retrieve the current health status of all configured upstreams.
@@ -1067,10 +1174,16 @@ impl UpstreamManager {
     /// against the entry's health and the next candidate is tried.
     ///
     /// Strategy-specific behavior:
-    /// - `Failover`: candidates in configuration order.
-    /// - `LoadBalance`: round-robin start index, then the same order wrapped.
+    /// - `Failover`: candidates in configuration order. Weights never reorder
+    ///   an explicit failover chain.
+    /// - `LoadBalance`: historical round-robin while every weight is the
+    ///   default; once an operator opts in, a weighted first pick followed by
+    ///   the remaining eligible candidates in configuration order. The first
+    ///   pick follows the weight ratio and a failed pick falls through to
+    ///   every other candidate, so weights cannot starve one.
     /// - `Parallel`: all candidates are raced; a retryable reply is treated as
     ///   a failure for that candidate so the race continues with the others.
+    ///   Weights do not apply because every eligible candidate runs anyway.
     ///
     /// All strategies share one deadline (`timeout_duration` from the start of
     /// this call). Sequential attempts each get an equal share of the remaining
@@ -1167,11 +1280,33 @@ impl UpstreamManager {
                 }
             }
             UpstreamStrategy::LoadBalance => {
-                let start_idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % candidates.len();
-                let ordered: Vec<&ManagedEntry> = (0..candidates.len())
-                    .map(|i| candidates[(start_idx + i) % candidates.len()])
-                    .collect();
-                resolve_sequential(&ordered, msg, deadline, attempts).await
+                let weights: Vec<u32> = candidates.iter().map(|entry| entry.weight).collect();
+                // Keep the historical round-robin order exactly when every
+                // weight is the default. The weighted selector only takes over
+                // once an operator opts in, so default configs keep their
+                // previous selection behavior.
+                if weights
+                    .iter()
+                    .all(|weight| *weight == sito_core::config::DEFAULT_UPSTREAM_WEIGHT)
+                {
+                    let start_idx =
+                        self.rr_counter.fetch_add(1, Ordering::Relaxed) % candidates.len();
+                    let ordered: Vec<&ManagedEntry> = (0..candidates.len())
+                        .map(|index| candidates[(start_idx + index) % candidates.len()])
+                        .collect();
+                    resolve_sequential(&ordered, msg, deadline, attempts).await
+                } else {
+                    let start = weighted_start(&weights, || {
+                        splitmix64(
+                            self.weight_rng
+                                .fetch_add(WEIGHT_RNG_GAMMA, Ordering::Relaxed),
+                        )
+                    });
+                    let ordered: Vec<&ManagedEntry> = (0..candidates.len())
+                        .map(|offset| candidates[(start + offset) % candidates.len()])
+                        .collect();
+                    resolve_sequential(&ordered, msg, deadline, attempts).await
+                }
             }
             UpstreamStrategy::Failover => {
                 resolve_sequential(&candidates, msg, deadline, attempts).await
@@ -1603,34 +1738,37 @@ mod tests {
         )
         .await;
 
-        let manager = UpstreamManager::with_upstreams(
-            vec![
-                (
-                    "servfail.dns".to_string(),
-                    Arc::new(PlainUpstream::new(
-                        servfail_addr,
-                        Duration::from_millis(500),
-                    )),
-                ),
-                (
-                    "healthy.dns".to_string(),
-                    Arc::new(PlainUpstream::new(healthy_addr, Duration::from_millis(500))),
-                ),
-            ],
-            UpstreamStrategy::LoadBalance,
+        // Try several seeds instead of pinning one: whichever candidate the
+        // weighted first pick chooses, a retryable reply must end at the
+        // healthy candidate.
+        let servfail: Arc<dyn Upstream> = Arc::new(PlainUpstream::new(
+            servfail_addr,
             Duration::from_millis(500),
+        ));
+        let healthy: Arc<dyn Upstream> =
+            Arc::new(PlainUpstream::new(healthy_addr, Duration::from_millis(500)));
+        for seed in 1..=8 {
+            let manager = UpstreamManager::with_weighted_upstreams_seeded(
+                vec![
+                    ("servfail.dns".to_string(), Arc::clone(&servfail), 99),
+                    ("healthy.dns".to_string(), Arc::clone(&healthy), 1),
+                ],
+                UpstreamStrategy::LoadBalance,
+                Duration::from_millis(500),
+                seed,
+            );
+            let (resp, upstream) = manager
+                .resolve_with_upstream(&test_query())
+                .await
+                .expect("load_balance must retry on SERVFAIL");
+            assert_eq!(upstream, "healthy.dns");
+            assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        }
+        assert!(
+            servfail_calls.load(Ordering::SeqCst) >= 1,
+            "across seeds the weighted failing candidate must be tried at least once"
         );
-
-        // Round-robin starts at index 0, so the SERVFAIL upstream is tried
-        // first and the healthy one must answer.
-        let (resp, upstream) = manager
-            .resolve_with_upstream(&test_query())
-            .await
-            .expect("load_balance must retry on SERVFAIL");
-        assert_eq!(upstream, "healthy.dns");
-        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
-        assert_eq!(servfail_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy_calls.load(Ordering::SeqCst), 8);
     }
 
     /// WP-6.1 item 2: parallel racing must not accept a retryable reply while
@@ -1809,6 +1947,7 @@ mod tests {
                 call_count: Arc::new(AtomicU32::new(0)),
             }),
             health: Arc::new(RwLock::new(UpstreamHealth::new())),
+            weight: 1,
         };
         let probe_timeout = health_probe_timeout(Duration::from_millis(100));
         let qname = Name::from_str("example.com.").unwrap();
@@ -1837,6 +1976,7 @@ mod tests {
                 call_count: Arc::new(AtomicU32::new(0)),
             }),
             health: Arc::new(RwLock::new(UpstreamHealth::new())),
+            weight: 1,
         };
         {
             let mut health = entry.health.write().await;
@@ -1901,7 +2041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_balance_strategy_round_robin() {
+    async fn test_load_balance_strategy_spreads_across_servers() {
         let calls_a = Arc::new(AtomicU32::new(0));
         let calls_b = Arc::new(AtomicU32::new(0));
 
@@ -1919,10 +2059,16 @@ mod tests {
             call_count: Arc::clone(&calls_b),
         });
 
-        let manager = UpstreamManager::with_upstreams(
-            vec![("a".to_string(), upstream_a), ("b".to_string(), upstream_b)],
+        // Equal default weights keep the historical round-robin behavior, so
+        // both servers receive an even share.
+        let manager = UpstreamManager::with_weighted_upstreams_seeded(
+            vec![
+                ("a".to_string(), upstream_a, 1),
+                ("b".to_string(), upstream_b, 1),
+            ],
             UpstreamStrategy::LoadBalance,
             Duration::from_secs(1),
+            1,
         );
 
         let mut query = Message::new(1, MessageType::Query, OpCode::Query);
@@ -1931,13 +2077,419 @@ mod tests {
             RecordType::A,
         ));
 
-        let resp1 = manager.resolve(&query).await.unwrap();
-        let resp2 = manager.resolve(&query).await.unwrap();
+        let mut answers = Vec::new();
+        for _ in 0..100 {
+            let response = manager.resolve(&query).await.unwrap();
+            assert_eq!(response.answers.len(), 1);
+            answers.push(response.answers[0].data.clone());
+        }
+        assert_ne!(
+            answers[0], answers[1],
+            "default weights must keep the deterministic round-robin alternation"
+        );
 
-        // Round robin should give answers from both servers
-        assert_ne!(resp1.answers[0].data, resp2.answers[0].data);
-        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
-        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+        let a = calls_a.load(Ordering::SeqCst);
+        let b = calls_b.load(Ordering::SeqCst);
+        assert_eq!(a + b, 100);
+        assert!(
+            (30..=70).contains(&a),
+            "equal weights must share the load (a={a}, b={b})"
+        );
+    }
+
+    fn seeded_roll(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_add(WEIGHT_RNG_GAMMA);
+        splitmix64(*seed)
+    }
+
+    /// F1: the pure selector picks the first candidate proportionally to its
+    /// weight and every index stays reachable.
+    #[test]
+    fn test_weighted_start_is_proportional() {
+        let weights = [3u32, 1];
+        let mut seed = 42u64;
+        let mut first_counts = [0u32; 2];
+        for _ in 0..10_000 {
+            let start = weighted_start(&weights, || seeded_roll(&mut seed));
+            assert!(start < weights.len());
+            first_counts[start] += 1;
+        }
+        let heavy_share = f64::from(first_counts[0]) / 10_000.0;
+        assert!(
+            (0.72..=0.78).contains(&heavy_share),
+            "a 3:1 split must put the heavy upstream first ~75% of the time (got {heavy_share})"
+        );
+        assert_eq!(
+            weighted_start(&[], || 0),
+            0,
+            "an empty candidate list must not panic"
+        );
+    }
+
+    /// F1: load_balance picks the first candidate proportionally to its weight
+    /// over many seeded samples instead of round-robin fairness.
+    #[tokio::test]
+    async fn test_weighted_load_balance_distribution_is_proportional() {
+        const SAMPLES: u32 = 2_000;
+        let heavy_calls = Arc::new(AtomicU32::new(0));
+        let light_calls = Arc::new(AtomicU32::new(0));
+        let manager = UpstreamManager::with_weighted_upstreams_seeded(
+            vec![
+                (
+                    "heavy.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::clone(&heavy_calls),
+                    }),
+                    3,
+                ),
+                (
+                    "light.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+                        call_count: Arc::clone(&light_calls),
+                    }),
+                    1,
+                ),
+            ],
+            UpstreamStrategy::LoadBalance,
+            Duration::from_secs(1),
+            7,
+        );
+
+        for _ in 0..SAMPLES {
+            manager
+                .resolve(&test_query())
+                .await
+                .expect("both weighted candidates answer");
+        }
+        assert_eq!(
+            heavy_calls.load(Ordering::SeqCst) + light_calls.load(Ordering::SeqCst),
+            SAMPLES,
+            "exactly one candidate answers each query"
+        );
+        let share = f64::from(heavy_calls.load(Ordering::SeqCst)) / f64::from(SAMPLES);
+        assert!(
+            (0.70..=0.80).contains(&share),
+            "weights 3:1 must select the heavy upstream ~75% of the time (got {share})"
+        );
+    }
+
+    /// F1: three candidates share the first pick in proportion to
+    /// `4:2:1` weights (no two-way-only shortcut).
+    #[tokio::test]
+    async fn test_weighted_load_balance_three_candidate_distribution() {
+        const SAMPLES: u32 = 2_100;
+        let calls = [
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
+        ];
+        let manager = UpstreamManager::with_weighted_upstreams_seeded(
+            vec![
+                (
+                    "heavy.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::clone(&calls[0]),
+                    }),
+                    4,
+                ),
+                (
+                    "medium.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+                        call_count: Arc::clone(&calls[1]),
+                    }),
+                    2,
+                ),
+                (
+                    "light.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(3, 3, 3, 3),
+                        call_count: Arc::clone(&calls[2]),
+                    }),
+                    1,
+                ),
+            ],
+            UpstreamStrategy::LoadBalance,
+            Duration::from_secs(1),
+            17,
+        );
+
+        for _ in 0..SAMPLES {
+            manager
+                .resolve(&test_query())
+                .await
+                .expect("all three weighted candidates answer");
+        }
+        let shares: Vec<f64> = calls
+            .iter()
+            .map(|calls| f64::from(calls.load(Ordering::SeqCst)) / f64::from(SAMPLES))
+            .collect();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|calls| calls.load(Ordering::SeqCst))
+                .sum::<u32>(),
+            SAMPLES
+        );
+        assert!(
+            (0.52..=0.62).contains(&shares[0]),
+            "weight 4/7 must take ~57% (got {shares:?})"
+        );
+        assert!(
+            (0.24..=0.34).contains(&shares[1]),
+            "weight 2/7 must take ~29% (got {shares:?})"
+        );
+        assert!(
+            (0.10..=0.19).contains(&shares[2]),
+            "weight 1/7 must take ~14% (got {shares:?})"
+        );
+    }
+
+    /// F1: a failed weighted pick still falls through to the remaining
+    /// candidates inside the same deadline.
+    #[tokio::test]
+    async fn test_weighted_load_balance_falls_back_after_a_failed_pick() {
+        // Exercise many seeds instead of pinning one: whichever order the
+        // weighted first pick produces, the healthy candidate must answer.
+        let mut failing_attempts = 0;
+        for seed in 1..=16 {
+            let failing_calls = Arc::new(AtomicU32::new(0));
+            let healthy_calls = Arc::new(AtomicU32::new(0));
+            let manager = UpstreamManager::with_weighted_upstreams_seeded(
+                vec![
+                    (
+                        "failing.dns".to_string(),
+                        Arc::new(ConfigurableMockUpstream {
+                            succeed: false,
+                            delay: Duration::ZERO,
+                            result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                            call_count: Arc::clone(&failing_calls),
+                        }),
+                        100,
+                    ),
+                    (
+                        "healthy.dns".to_string(),
+                        Arc::new(ConfigurableMockUpstream {
+                            succeed: true,
+                            delay: Duration::ZERO,
+                            result_ip: std::net::Ipv4Addr::new(9, 9, 9, 9),
+                            call_count: Arc::clone(&healthy_calls),
+                        }),
+                        1,
+                    ),
+                ],
+                UpstreamStrategy::LoadBalance,
+                Duration::from_secs(1),
+                seed,
+            );
+
+            let (response, upstream) = manager
+                .resolve_with_upstream(&test_query())
+                .await
+                .expect("the healthy candidate must answer after the weighted failure");
+            assert_eq!(upstream, "healthy.dns");
+            assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+            assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+            failing_attempts += failing_calls.load(Ordering::SeqCst);
+        }
+        assert!(
+            failing_attempts > 0,
+            "across seeds the weighted candidate must be attempted at least once"
+        );
+    }
+
+    /// F1: weights never override health. A down upstream with the largest
+    /// weight is excluded until the all-down emergency path runs.
+    #[tokio::test]
+    async fn test_weight_does_not_bypass_health_state() {
+        let down_calls = Arc::new(AtomicU32::new(0));
+        let light_calls = Arc::new(AtomicU32::new(0));
+        let heavy_calls = Arc::new(AtomicU32::new(0));
+        let manager = UpstreamManager::with_weighted_upstreams_seeded(
+            vec![
+                (
+                    "down-heaviest.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::clone(&down_calls),
+                    }),
+                    100,
+                ),
+                (
+                    "up-light.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+                        call_count: Arc::clone(&light_calls),
+                    }),
+                    1,
+                ),
+                (
+                    "up-heavy.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(3, 3, 3, 3),
+                        call_count: Arc::clone(&heavy_calls),
+                    }),
+                    4,
+                ),
+            ],
+            UpstreamStrategy::LoadBalance,
+            Duration::from_secs(1),
+            3,
+        );
+
+        let entry = manager
+            .inner
+            .load_full()
+            .entries
+            .iter()
+            .find(|entry| entry.name == "down-heaviest.dns")
+            .expect("entry")
+            .clone();
+        {
+            let mut health = entry.health.write().await;
+            for _ in 0..6 {
+                health.record_error(&UpstreamError::Timeout);
+            }
+            assert_eq!(health.status(), HealthStatus::Down);
+        }
+
+        // Two healthy candidates remain, so the weighted selector (not a
+        // one-candidate fallback) is exercised while the down server is
+        // excluded at weight 100.
+        for _ in 0..200 {
+            let (_, upstream) = manager
+                .resolve_with_upstream(&test_query())
+                .await
+                .expect("a healthy candidate must answer");
+            assert!(upstream == "up-light.dns" || upstream == "up-heavy.dns");
+        }
+        assert_eq!(down_calls.load(Ordering::SeqCst), 0);
+        let light = light_calls.load(Ordering::SeqCst);
+        let heavy = heavy_calls.load(Ordering::SeqCst);
+        assert_eq!(light + heavy, 200);
+        assert!(
+            heavy > light,
+            "the heavier healthy candidate should dominate (light={light}, heavy={heavy})"
+        );
+    }
+
+    /// F1: when every upstream is marked down, the emergency path still tries
+    /// all of them regardless of weight, and a working one answers.
+    #[tokio::test]
+    async fn test_all_down_emergency_still_tries_weighted_candidates() {
+        let broken_calls = Arc::new(AtomicU32::new(0));
+        let working_calls = Arc::new(AtomicU32::new(0));
+        let manager = UpstreamManager::with_weighted_upstreams_seeded(
+            vec![
+                (
+                    "broken-heavy.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: false,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::clone(&broken_calls),
+                    }),
+                    100,
+                ),
+                (
+                    "working-light.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+                        call_count: Arc::clone(&working_calls),
+                    }),
+                    1,
+                ),
+            ],
+            UpstreamStrategy::LoadBalance,
+            Duration::from_secs(1),
+            5,
+        );
+
+        for entry in &manager.inner.load_full().entries {
+            let mut health = entry.health.write().await;
+            for _ in 0..6 {
+                health.record_error(&UpstreamError::Timeout);
+            }
+            assert_eq!(health.status(), HealthStatus::Down);
+        }
+
+        let (response, upstream) = manager
+            .resolve_with_upstream(&test_query())
+            .await
+            .expect("the emergency path must still reach the working upstream");
+        assert_eq!(upstream, "working-light.dns");
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(working_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            broken_calls.load(Ordering::SeqCst) >= 1,
+            "the emergency path must try the heavy candidate too"
+        );
+    }
+
+    /// F1: failover keeps its explicit configuration order even when weights
+    /// are present; only load_balance uses them.
+    #[tokio::test]
+    async fn test_failover_strategy_keeps_configuration_order_with_weights() {
+        let first_calls = Arc::new(AtomicU32::new(0));
+        let second_calls = Arc::new(AtomicU32::new(0));
+        let manager = UpstreamManager::with_weighted_upstreams_seeded(
+            vec![
+                (
+                    "first-light.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(1, 1, 1, 1),
+                        call_count: Arc::clone(&first_calls),
+                    }),
+                    1,
+                ),
+                (
+                    "second-heavy.dns".to_string(),
+                    Arc::new(ConfigurableMockUpstream {
+                        succeed: true,
+                        delay: Duration::ZERO,
+                        result_ip: std::net::Ipv4Addr::new(2, 2, 2, 2),
+                        call_count: Arc::clone(&second_calls),
+                    }),
+                    100,
+                ),
+            ],
+            UpstreamStrategy::Failover,
+            Duration::from_secs(1),
+            9,
+        );
+
+        for _ in 0..20 {
+            let (_, upstream) = manager
+                .resolve_with_upstream(&test_query())
+                .await
+                .expect("the first configured upstream answers");
+            assert_eq!(upstream, "first-light.dns");
+        }
+        assert_eq!(first_calls.load(Ordering::SeqCst), 20);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
     }
 
     /// P1-25: bootstrap/health probes must set RD=1. A recursive resolver that
@@ -1974,6 +2526,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             }),
             health: Arc::new(RwLock::new(UpstreamHealth::new())),
+            weight: 1,
         };
         {
             let mut health = entry.health.write().await;
@@ -2401,6 +2954,7 @@ mod tests {
             allow_private_targets: false,
             per_domain: vec![],
             ecs: Default::default(),
+            weights: Vec::new(),
         };
 
         manager.reload(&new_config, &bootstrap).await.unwrap();
@@ -2410,6 +2964,41 @@ mod tests {
         let statuses = manager.statuses().await;
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].0, "1.1.1.1:53");
+    }
+
+    /// F1: per-domain rule weights are copied onto the managed entries so the
+    /// same weighted load-balance path applies inside a rule.
+    #[tokio::test]
+    async fn test_from_config_applies_global_and_per_domain_weights() {
+        let bootstrap = BootstrapResolver::new(vec![], Duration::from_millis(500));
+        let config = UpstreamConfig {
+            servers: vec!["1.1.1.1:53".to_string(), "1.0.0.1:53".to_string()],
+            bootstrap: vec![],
+            strategy: UpstreamStrategy::LoadBalance,
+            timeout_ms: 1000,
+            probe_domain: "example.com".to_string(),
+            pool_size: 1,
+            allow_private_targets: false,
+            ecs: Default::default(),
+            weights: vec![3, 1],
+            per_domain: vec![sito_core::config::PerDomainUpstream {
+                domains: vec!["lan".to_string()],
+                servers: vec!["192.168.1.1:53".to_string(), "192.168.1.2:53".to_string()],
+                weights: vec![5, 1],
+            }],
+        };
+        let manager = UpstreamManager::from_config(&config, &bootstrap)
+            .await
+            .expect("weighted config constructs");
+        let inner = manager.inner.load_full();
+        let global: Vec<u32> = inner.entries.iter().map(|entry| entry.weight).collect();
+        assert_eq!(global, vec![3, 1]);
+        let rule: Vec<u32> = inner.per_domain_rules[0]
+            .1
+            .iter()
+            .map(|entry| entry.weight)
+            .collect();
+        assert_eq!(rule, vec![5, 1]);
     }
 
     #[tokio::test]
@@ -2427,6 +3016,7 @@ mod tests {
             allow_private_targets: false,
             per_domain: vec![],
             ecs: Default::default(),
+            weights: Vec::new(),
         };
         let manager = UpstreamManager::from_config(&config, &bootstrap).await;
         assert!(
@@ -2763,6 +3353,7 @@ mod tests {
             allow_private_targets: false,
             per_domain: vec![],
             ecs: Default::default(),
+            weights: Vec::new(),
         };
         manager.reload(&config, &bootstrap).await.unwrap();
 

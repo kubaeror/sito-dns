@@ -87,6 +87,10 @@ timeout_ms = 5000
 probe_domain = "example.com"
 # Persistent connections per endpoint. Must be 1..=64.
 pool_size = 4
+# Optional load-balancing weights, index-aligned with `servers` (default 1).
+# Each value must be 1..=100; 0 is rejected. Only used by
+# strategy = "load_balance"; a failed weighted pick still fails over.
+# weights = [3, 1]
 # Hostname-configured upstreams may not resolve to private/reserved addresses
 # unless this is true. IP literals are always accepted.
 allow_private_targets = false
