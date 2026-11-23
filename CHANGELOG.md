@@ -8,6 +8,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- Parallel upstream races now report every launched candidate. A candidate
+  that is still in flight when another candidate answers or the overall
+  deadline fires is reported as a cancelled `UpstreamAttempt`
+  (`cancelled = true`: not a success, not a failure) and increments the new
+  bounded `sito_upstream_cancelled_total{upstream}` counter. Cancellation is
+  not a health failure and produces no RTT sample or error series; an overall
+  parallel timeout still records its final `unattributed`/`timeout` error
+  exactly once. `UpstreamAttempt` is a BC-6 source change.
 - Weighted upstream balancing: optional `upstream.weights` and
   `per_domain.weights` (1–100, default 1) with weighted `load_balance`
   selection, ordered failover fallback, upstream-page add/edit controls,
