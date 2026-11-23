@@ -215,15 +215,36 @@ pub(super) async fn connect_and_run(
     let addr_str = format!("{host}:{port}");
 
     // Refuse a plaintext target before any socket is opened. The config
-    // validator already rejects this combination; keeping the runtime check
+    // validator already rejects these combinations; keeping the runtime check
     // fail-closed here means a config applied through another path cannot
     // cause even an unauthenticated TCP probe (and never a plaintext
-    // handshake) without the explicit opt-in.
-    if !is_secure && !ha_config.allow_insecure_ws {
-        return Err(HaError::Validation {
-            field: "master_url".to_string(),
-            reason: "Plaintext ws:// replication is rejected by default. Use wss:// or explicitly set allow_insecure_ws = true".to_string(),
-        });
+    // handshake) without the explicit opt-in and credentials.
+    if !is_secure {
+        if !ha_config.allow_insecure_ws {
+            return Err(HaError::Validation {
+                field: "master_url".to_string(),
+                reason: "Plaintext ws:// replication is rejected by default. Use wss:// or explicitly set allow_insecure_ws = true".to_string(),
+            });
+        }
+        if ha_config.cert.is_some() != ha_config.key.is_some() {
+            return Err(HaError::Validation {
+                field: "key".to_string(),
+                reason: "Both cert and key must be provided together".to_string(),
+            });
+        }
+        // Without TLS the shared token is the only peer authentication. A
+        // tokenless slave would also promote into an unauthenticated plaintext
+        // master.
+        let has_token = ha_config
+            .slave_token
+            .as_ref()
+            .is_some_and(|token| !token.trim().is_empty());
+        if !has_token {
+            return Err(HaError::Validation {
+                field: "slave_token".to_string(),
+                reason: "Plaintext ws:// replication requires a non-empty slave_token on the slave as well; it is the only peer authentication without TLS".to_string(),
+            });
+        }
     }
 
     // Resolve and connect with the host/port pair instead of formatting a

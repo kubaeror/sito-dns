@@ -541,15 +541,35 @@ impl PromotionHost for RuntimePromotionHost {
             }
             stop_slave_worker(&self.state).await;
             let key = self.key()?;
-            if self.state.ha_config.replication_port > 0
-                && !self.state.ha_config.allow_insecure_ws
-                && (self.state.ha_config.cert.is_none() || self.state.ha_config.key.is_none())
+
+            // Validate the node as a master before it can become writable.
+            // Promotion must not be a path that skips master-role checks: a
+            // tokenless plaintext listener would admit anonymous slaves, and
+            // TLS-only pin/CA material cannot be served over plaintext. The
+            // candidate gate is about the configured (slave) role, so clear it
+            // for this transient master view.
+            let mut promoted = self.state.ha_config.clone();
+            promoted.promotion.candidate = false;
+            promoted.validate("master").map_err(|error| {
+                format!("promotion_refused: promoted master configuration is invalid: {error}")
+            })?;
+            // A candidate that replicates over wss:// but has no server
+            // certificate/key can only serve plaintext after promotion. That
+            // would silently downgrade the cluster transport.
+            let plaintext_master = promoted.replication_port > 0
+                && !(promoted.cert.is_some() && promoted.key.is_some());
+            if plaintext_master
+                && promoted
+                    .master_url
+                    .as_deref()
+                    .is_some_and(|url| url.starts_with("wss://"))
             {
                 return Err(
-                    "candidate_identity_mismatch: promoted master has no mTLS certificate/key"
+                    "promotion_refused: candidate replicates over wss:// but has no server cert/key; refusing to promote to a plaintext master"
                         .to_string(),
                 );
             }
+
             let coordinator = MasterCoordinator::new(
                 self.state.config.server.instance_name.clone(),
                 0,
@@ -575,12 +595,35 @@ impl PromotionHost for RuntimePromotionHost {
             if let Ok(mut slot) = self.state.master_handle.lock() {
                 *slot = Some(handle);
             }
-            *self
-                .state
-                .coordinator
-                .lock()
-                .map_err(|_| "promotion coordinator lock poisoned".to_string())? =
-                Some(coordinator.clone());
+
+            // Fail closed: the spawned listener reports TLS-init/bind/refusal
+            // failures asynchronously. Only install the coordinator and mark
+            // the node writable once the listener is actually active;
+            // otherwise the promotion would "succeed" with no replication.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let listener = coordinator.listener_readiness();
+                if listener.ready {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    self.stop_publishing();
+                    let reason = listener
+                        .reason
+                        .unwrap_or_else(|| "listener did not become ready".to_string());
+                    return Err(format!(
+                        "promotion_refused: master replication listener did not start: {reason}"
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            if let Ok(mut slot) = self.state.coordinator.lock() {
+                *slot = Some(coordinator.clone());
+            } else {
+                self.stop_publishing();
+                return Err("promotion coordinator lock poisoned".to_string());
+            }
             match self.state.master_slot.lock() {
                 Ok(mut slot) => *slot = Some(coordinator),
                 Err(poisoned) => {
@@ -588,6 +631,7 @@ impl PromotionHost for RuntimePromotionHost {
                     // publishes; keep the node read-only rather than report a
                     // writable-but-not-replicating master.
                     poisoned.into_inner().take();
+                    self.stop_publishing();
                     return Err("promotion coordinator slot poisoned".to_string());
                 }
             }
@@ -770,12 +814,134 @@ mod tests {
             .switch_role(EffectiveRole::Master)
             .await
             .expect_err("a promoted master without TLS must not run plaintext");
-        assert!(err.contains("mTLS certificate/key"), "got: {err}");
+        assert!(
+            err.contains("certificate and key") || err.contains("mTLS certificate/key"),
+            "got: {err}"
+        );
         assert!(
             state.master_slot.lock().unwrap().is_none()
                 && state.coordinator.lock().unwrap().is_none(),
             "a refused promotion must not install a coordinator or listener"
         );
+        assert!(
+            !state.write_gate.is_effective_master(),
+            "a refused promotion must not become writable"
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_refuses_tokenless_plaintext_master() {
+        let mut state = test_state("promotion_plaintext_no_token");
+        let port = sito_test_support::reserve_port_number().unwrap();
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        {
+            let state = Arc::get_mut(&mut state).expect("unique test state");
+            state.ha_config.replication_port = port;
+            state.ha_config.listen_addr = "127.0.0.1".to_string();
+            state.ha_config.master_url = Some("ws://127.0.0.1:1".to_string());
+            state.ha_config.allow_insecure_ws = true;
+            state.ha_config.slave_token = None;
+            state.ha_config.master_pubkey = Some(key.public_key_hex());
+            state.signing_key.lock().unwrap().replace(key);
+            state.write_gate.block("ha_promotion_starting");
+        }
+        let host = RuntimePromotionHost {
+            state: Arc::clone(&state),
+        };
+
+        let err = host
+            .switch_role(EffectiveRole::Master)
+            .await
+            .expect_err("a tokenless plaintext master must not be promoted");
+        assert!(err.contains("slave_token"), "got: {err}");
+        assert!(state.master_slot.lock().unwrap().is_none());
+        assert!(state.coordinator.lock().unwrap().is_none());
+        assert!(!state.write_gate.is_effective_master());
+        assert!(
+            state.write_gate.blocked().is_some(),
+            "the node must stay read-only after a refused promotion"
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_refuses_plaintext_master_with_pins_or_ca() {
+        for (label, ca, pins) in [
+            (
+                "ca",
+                Some(std::path::PathBuf::from("/etc/sito/ca.crt")),
+                Vec::new(),
+            ),
+            ("pins", None, vec!["blake3:abcdef0123456789".to_string()]),
+        ] {
+            let mut state = test_state(&format!("promotion_plaintext_{label}"));
+            let port = sito_test_support::reserve_port_number().unwrap();
+            let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+            {
+                let state = Arc::get_mut(&mut state).expect("unique test state");
+                state.ha_config.replication_port = port;
+                state.ha_config.listen_addr = "127.0.0.1".to_string();
+                state.ha_config.master_url = Some("ws://127.0.0.1:1".to_string());
+                state.ha_config.allow_insecure_ws = true;
+                state.ha_config.slave_token = Some("test-token".to_string());
+                state.ha_config.ca = ca;
+                state.ha_config.pinned_slave_fingerprints = pins;
+                state.ha_config.master_pubkey = Some(key.public_key_hex());
+                state.signing_key.lock().unwrap().replace(key);
+                state.write_gate.block("ha_promotion_starting");
+            }
+            let host = RuntimePromotionHost {
+                state: Arc::clone(&state),
+            };
+
+            let err = host
+                .switch_role(EffectiveRole::Master)
+                .await
+                .expect_err("TLS-only material must block a plaintext promotion");
+            assert!(
+                err.contains("ca") || err.contains("pinned_slave_fingerprints"),
+                "{label}: got {err}"
+            );
+            assert!(
+                state.master_slot.lock().unwrap().is_none()
+                    && state.coordinator.lock().unwrap().is_none(),
+                "{label}: no coordinator may be installed"
+            );
+            assert!(
+                !state.write_gate.is_effective_master() && state.write_gate.blocked().is_some(),
+                "{label}: the node must stay read-only"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn promotion_refuses_wss_candidate_without_server_tls() {
+        let mut state = test_state("promotion_wss_no_server_tls");
+        let port = sito_test_support::reserve_port_number().unwrap();
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        {
+            let state = Arc::get_mut(&mut state).expect("unique test state");
+            state.ha_config.replication_port = port;
+            state.ha_config.listen_addr = "127.0.0.1".to_string();
+            state.ha_config.master_url = Some("wss://127.0.0.1:1".to_string());
+            state.ha_config.master_fingerprint = Some("blake3:abcdef0123456789".to_string());
+            state.ha_config.allow_insecure_ws = true;
+            state.ha_config.slave_token = Some("test-token".to_string());
+            state.ha_config.master_pubkey = Some(key.public_key_hex());
+            state.signing_key.lock().unwrap().replace(key);
+            state.write_gate.block("ha_promotion_starting");
+        }
+        let host = RuntimePromotionHost {
+            state: Arc::clone(&state),
+        };
+
+        let err = host
+            .switch_role(EffectiveRole::Master)
+            .await
+            .expect_err("a wss:// candidate must not promote to a plaintext master");
+        assert!(err.contains("wss://"), "got: {err}");
+        assert!(state.master_slot.lock().unwrap().is_none());
+        assert!(state.coordinator.lock().unwrap().is_none());
+        assert!(!state.write_gate.is_effective_master());
     }
 
     #[tokio::test]
@@ -802,6 +968,15 @@ mod tests {
         assert!(
             state.master_slot.lock().unwrap().is_some(),
             "the promoted master must be installed"
+        );
+        assert!(
+            state.write_gate.is_effective_master(),
+            "a successful promotion becomes writable only after the listener is ready"
+        );
+        let coordinator = state.master_slot.lock().unwrap().clone().unwrap();
+        assert!(
+            coordinator.listener_readiness().ready,
+            "the listener must be active before the promotion succeeds"
         );
         host.stop_publishing();
     }

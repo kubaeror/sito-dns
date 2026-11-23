@@ -813,7 +813,7 @@ replication_port = 8953
 | `master_pubkey` | string | `None` | (Slave only, **required**) Ed25519 public key of the master used to verify signed configuration pushes. Protocol v2 also binds a BLAKE3 config digest and this key's fingerprint into every signed bundle. |
 | `cert` / `key` / `ca` | string | `None` | Paths to mTLS certificates and CA bundles for replication. When `ca` is set, the peer chain is validated against it **including hostname/SAN verification**, even when BLAKE3 pinning is also configured. CA-only verification is supported and does not require `allow_unpinned_tls`. |
 | `ping_interval_secs` | integer | `15` | Master heartbeat interval. Slaves silent for 3× this interval are disconnected and removed from the active tracker. |
-| `slave_token` | string | `None` | Pre-shared token for slave authentication (mandatory when serving plaintext `ws://`). |
+| `slave_token` | string | `None` | Pre-shared token for slave authentication. Mandatory on **both** ends when replication is plaintext `ws://` (it is the only peer authentication without TLS). |
 | `pinned_slave_fingerprints` | array of strings | `[]` | BLAKE3 fingerprints of slave certificates accepted by the master. |
 | `allow_unpinned_tls` | boolean | `false` | Explicit no-verification opt-out. It only applies when neither `master_fingerprint` nor `ca` is configured; a configured pin or CA is always enforced. |
 | `allow_insecure_ws` | boolean | `false` | Explicit plaintext-WebSocket opt-in. A master without `cert`/`key` refuses to start the replication listener, and a slave refuses a `ws://` `master_url`, unless this is `true`. Plaintext requires a non-empty `slave_token` and is rejected together with TLS-only material (`pinned_slave_fingerprints`, `ca`, `master_fingerprint`). Never implicit, and there is no TLS→plaintext fallback. |
@@ -825,19 +825,27 @@ replication_port = 8953
 `allow_insecure_ws` is the only way to permit plaintext replication; it is
 never inferred from a missing certificate. On a master, omitting `cert`/`key`
 without the flag makes the listener refuse to start and report the reason in
-`GET /api/v2/ha/status` and `/health`; on a slave, a `ws://` `master_url` is
-rejected during configuration load and again before the runtime opens a socket.
-A `wss://` connection always performs the TLS handshake and honors the
-configured pin, CA, SNI/server name and client certificate; a TLS failure is
-reported as a failure and never falls back to plaintext. Because pins and CAs
-can only be enforced inside TLS, combining `allow_insecure_ws = true` with
-`pinned_slave_fingerprints`, `ca` or a slave-side `master_fingerprint` is a
-validation error rather than a silently ignored control. Plaintext is intended
-**only** for a trusted, private or loopback link between colocated nodes; use
-`wss://` everywhere else. `sito check-config` prints the risk (or reports that a
-leftover flag is inert because TLS is configured) and startup logs the same
-warning. Automatic promotion reuses this transport policy, so a promoted master
-inherits the flag.
+`GET /api/v2/ha/status` (and in the readiness reasons of `/api/v2/status`; the
+generic `/health` endpoint only returns 200/503); on a slave, a `ws://`
+`master_url` is rejected during configuration load and again before the runtime
+opens a socket. Plaintext requires a non-empty `slave_token` on **both** ends:
+without TLS it is the only peer authentication, and a tokenless node could
+otherwise be promoted into an unauthenticated plaintext master. A client
+`cert`/`key` configured on a plaintext slave is inert (a warning says so);
+those files are only used for `wss://`. A `wss://` connection always performs
+the TLS handshake and honors the configured pin, CA, SNI/server name and client
+certificate; a TLS failure is reported as a failure and never falls back to
+plaintext. Because pins and CAs can only be enforced inside TLS, combining
+`allow_insecure_ws = true` with `pinned_slave_fingerprints`, `ca` or a
+slave-side `master_fingerprint` is a validation error rather than a silently
+ignored control. Plaintext is intended **only** for a trusted, private or
+loopback link between colocated nodes; use `wss://` everywhere else.
+`sito check-config` prints the risk (or reports that a leftover flag is inert
+because TLS is configured) and startup logs the same warning. Automatic
+promotion reuses this transport policy: a promoted master is validated as a
+master (token, TLS/plaintext consistency, pin/CA contradiction) and must bring
+its replication listener up before it becomes writable, so promotion cannot
+bypass the policy.
 
 `require_slaves` and `require_all_slaves` are opt-in: both default to `false`,
 so an upgraded master keeps the previous behavior and stays ready (given a

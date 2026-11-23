@@ -2969,6 +2969,110 @@ async fn test_master_refuses_plaintext_with_pins_even_when_opted_in() {
 }
 
 #[tokio::test]
+async fn test_master_refuses_plaintext_without_token() {
+    let port = sito_test_support::reserve_port_number().unwrap();
+    let coordinator = test_coordinator();
+    let master_cfg = HaConfig {
+        replication_port: port,
+        listen_addr: "127.0.0.1".to_string(),
+        allow_insecure_ws: true,
+        slave_token: None,
+        ..Default::default()
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = spawn_master_server(master_cfg, coordinator.clone(), shutdown_rx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let readiness = coordinator.readiness();
+    assert!(!readiness.ready, "{readiness:?}");
+    assert!(
+        readiness
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("slave_token")),
+        "the refusal must name the missing token: {readiness:?}"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "a tokenless plaintext listener must not bind"
+    );
+    assert!(handle.is_finished());
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_master_refuses_plaintext_with_ca_even_when_opted_in() {
+    let port = sito_test_support::reserve_port_number().unwrap();
+    let coordinator = test_coordinator().with_token(Some("tok".to_string()));
+    let master_cfg = HaConfig {
+        replication_port: port,
+        listen_addr: "127.0.0.1".to_string(),
+        slave_token: Some("tok".to_string()),
+        ca: Some(std::path::PathBuf::from("/etc/sito/ca.crt")),
+        allow_insecure_ws: true,
+        ..Default::default()
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = spawn_master_server(master_cfg, coordinator.clone(), shutdown_rx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let readiness = coordinator.readiness();
+    assert!(!readiness.ready, "{readiness:?}");
+    assert!(
+        readiness
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("pin/CA")),
+        "the refusal must name the unenforceable CA: {readiness:?}"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "the listener must not silently drop CA verification"
+    );
+    assert!(handle.is_finished());
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_master_refuses_a_partial_cert_key_pair() {
+    let port = sito_test_support::reserve_port_number().unwrap();
+    let coordinator = test_coordinator();
+    let master_cfg = HaConfig {
+        replication_port: port,
+        listen_addr: "127.0.0.1".to_string(),
+        cert: Some(std::path::PathBuf::from("/etc/sito/master.crt")),
+        key: None,
+        allow_insecure_ws: true,
+        slave_token: Some("tok".to_string()),
+        ..Default::default()
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = spawn_master_server(master_cfg, coordinator.clone(), shutdown_rx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let readiness = coordinator.readiness();
+    assert!(!readiness.ready, "{readiness:?}");
+    assert!(
+        readiness
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cert and key")),
+        "a partial TLS pair must not fall back to plaintext: {readiness:?}"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+    );
+    assert!(handle.is_finished());
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
 async fn test_master_with_tls_never_serves_plaintext_even_when_opted_in() {
     let dir = std::env::temp_dir().join(format!(
         "sito_ha_no_plaintext_downgrade_{}_{}",
@@ -3018,6 +3122,7 @@ async fn test_master_rejects_v1_slave_and_keeps_listening() {
         replication_port: port,
         listen_addr: "127.0.0.1".to_string(),
         allow_insecure_ws: true,
+        slave_token: Some("tok".to_string()),
         ..Default::default()
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -3068,7 +3173,7 @@ async fn test_master_rejects_v1_slave_and_keeps_listening() {
         have_version: 0,
         have_term: 0,
         capabilities: vec![],
-        token: None,
+        token: Some("tok".to_string()),
         role: Some("slave".to_string()),
         protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
         have_bundle_hash: None,

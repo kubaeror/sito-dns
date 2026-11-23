@@ -156,6 +156,7 @@ async fn test_slave_goes_not_ready_when_master_stops_sending_frames() {
         master_url: Some(fake_master.url()),
         master_pubkey: Some(key.public_key_hex()),
         allow_insecure_ws: true,
+        slave_token: Some("test-token".to_string()),
         ping_interval_secs: 1,
         stats_interval_secs: 60,
         ..Default::default()
@@ -263,6 +264,7 @@ servers = ["9.9.9.9"]
         master_url: Some(fake_master.url()),
         master_pubkey: Some(key.public_key_hex()),
         allow_insecure_ws: true,
+        slave_token: Some("test-token".to_string()),
         ping_interval_secs: 60,
         stats_interval_secs: 60,
         ..Default::default()
@@ -362,6 +364,7 @@ servers = ["9.9.9.9"]
         master_url: Some(fake_master.url()),
         master_pubkey: Some(key.public_key_hex()),
         allow_insecure_ws: true,
+        slave_token: Some("test-token".to_string()),
         ping_interval_secs: 60,
         stats_interval_secs: 60,
         ..Default::default()

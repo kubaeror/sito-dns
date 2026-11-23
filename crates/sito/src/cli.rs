@@ -454,15 +454,15 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
     // removes transport encryption. Report the risk (and inert/contradictory
     // uses that validation tolerates) instead of remaining silent.
     #[cfg(feature = "ha")]
-    if config.ha.is_some() {
-        let ha_config = sito_ha::config_from(&config).map_err(|e| {
+    {
+        let warnings = ha_plaintext_warnings(&config).map_err(|e| {
             anyhow::anyhow!(
-                "HA configuration validation failed for '{}': {}",
+                "Configuration validation failed for '{}': {}",
                 path.display(),
                 e
             )
         })?;
-        for warning in ha_config.insecure_ws_warnings(&config.server.role) {
+        for warning in warnings {
             eprintln!("Warning: {warning}");
         }
     }
@@ -513,6 +513,20 @@ pub fn run_check_config(path: &Path) -> Result<(), anyhow::Error> {
     );
 
     Ok(())
+}
+
+/// Returns the HA plaintext-policy warnings that `check-config` prints.
+///
+/// Kept separate from [`run_check_config`] so the exact operator-facing text
+/// is testable without capturing process stderr.
+#[cfg(feature = "ha")]
+fn ha_plaintext_warnings(config: &sito_core::config::Config) -> anyhow::Result<Vec<String>> {
+    if config.ha.is_none() {
+        return Ok(Vec::new());
+    }
+    let ha_config = sito_ha::config_from(config)
+        .map_err(|e| anyhow::anyhow!("HA configuration validation failed: {e}"))?;
+    Ok(ha_config.insecure_ws_warnings(&config.server.role))
 }
 
 /// Options for `sito config migrate`.
@@ -2531,13 +2545,36 @@ mod tests {
                  master_url = \"ws://127.0.0.1:8953\"\n\
                  master_pubkey = \"{}\"\n\
                  master_fingerprint = \"blake3:abcdef0123456789\"\n\
-                 allow_insecure_ws = true\n",
+                 allow_insecure_ws = true\n\
+                 slave_token = \"secret\"\n",
                 "00".repeat(32)
             ),
         )
         .unwrap();
         let err = run_check_config(&path).expect_err("ws:// with a pin must be rejected");
         assert!(err.to_string().contains("master_fingerprint"), "{err}");
+
+        // A tokenless ws:// slave is rejected as well.
+        std::fs::write(
+            &path,
+            format!(
+                "config_version = 2\n\
+                 [server]\n\
+                 role = \"slave\"\n\
+                 [upstream]\n\
+                 servers = [\"1.1.1.1\"]\n\
+                 [ha]\n\
+                 replication_port = 8953\n\
+                 master_url = \"ws://127.0.0.1:8953\"\n\
+                 master_pubkey = \"{}\"\n\
+                 allow_insecure_ws = true\n",
+                "00".repeat(32)
+            ),
+        )
+        .unwrap();
+        let err =
+            run_check_config(&path).expect_err("a tokenless plaintext slave must be rejected");
+        assert!(err.to_string().contains("slave_token"), "{err}");
 
         // Same rule on the master: pins plus plaintext are refused.
         std::fs::write(
@@ -2558,6 +2595,66 @@ mod tests {
         assert!(
             err.to_string().contains("pinned_slave_fingerprints"),
             "{err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "ha")]
+    #[test]
+    fn test_check_config_plaintext_warning_text() {
+        let dir = temp_config_dir("check_config_plaintext_warning");
+        let path = dir.join("config.toml");
+
+        std::fs::write(
+            &path,
+            "config_version = 2\n\
+             [server]\n\
+             role = \"master\"\n\
+             [upstream]\n\
+             servers = [\"1.1.1.1\"]\n\
+             [ha]\n\
+             replication_port = 8953\n\
+             allow_insecure_ws = true\n\
+             slave_token = \"secret\"\n",
+        )
+        .unwrap();
+        let config = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let warnings =
+            ha_plaintext_warnings(&config).expect("a valid plaintext master has warnings");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("plaintext ws://"),
+            "the warning must name the plaintext transport: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].contains("secret"),
+            "the warning must not leak the token: {warnings:?}"
+        );
+
+        // A leftover flag on a TLS master is reported as inert, not as an
+        // active downgrade.
+        std::fs::write(
+            &path,
+            "config_version = 2\n\
+             [server]\n\
+             role = \"master\"\n\
+             [upstream]\n\
+             servers = [\"1.1.1.1\"]\n\
+             [ha]\n\
+             replication_port = 8953\n\
+             allow_insecure_ws = true\n\
+             cert = \"/etc/sito/master.crt\"\n\
+             key = \"/etc/sito/master.key\"\n\
+             pinned_slave_fingerprints = [\"blake3:abcdef0123456789\"]\n",
+        )
+        .unwrap();
+        let config = Config::from_toml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let warnings = ha_plaintext_warnings(&config).expect("a TLS master has a warning");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("inert"),
+            "the flag must be described as inert: {warnings:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

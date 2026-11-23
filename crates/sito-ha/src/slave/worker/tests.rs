@@ -2244,6 +2244,61 @@ async fn test_plaintext_slave_is_refused_before_any_socket_connect() {
     accept.abort();
 }
 
+/// The shared token is the only peer authentication over plaintext, so the
+/// runtime must refuse a tokenless slave even if validation was bypassed.
+#[tokio::test]
+async fn test_plaintext_slave_without_token_is_refused() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connected = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&connected);
+    let accept = tokio::spawn(async move {
+        if listener.accept().await.is_ok() {
+            observed.store(true, Ordering::SeqCst);
+        }
+    });
+
+    let ha_config = HaConfig {
+        master_url: Some(format!("ws://127.0.0.1:{port}")),
+        allow_insecure_ws: true,
+        master_pubkey: Some("00".repeat(32)),
+        slave_token: None,
+        ..Default::default()
+    };
+    let tracker = SlaveStatusTracker::new("slave-no-token".to_string(), 0, None);
+    let handles = test_handles(None).await;
+    let mut resync_rx = {
+        let (_tx, rx) = mpsc::channel(1);
+        rx
+    };
+    let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+    let err = connect_and_run(
+        ha_config.master_url.as_deref().unwrap(),
+        &ha_config,
+        &tracker,
+        &handles,
+        None,
+        &mut resync_rx,
+        &mut shutdown_rx,
+    )
+    .await
+    .expect_err("a tokenless plaintext slave must be refused");
+    assert!(
+        matches!(&err, HaError::Validation { field, .. } if field == "slave_token"),
+        "expected a slave_token validation error, got {err:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !connected.load(Ordering::SeqCst),
+        "the token requirement must be checked before connecting"
+    );
+    accept.abort();
+}
+
 /// The explicit opt-in is the only way to open a plaintext connection: it must
 /// actually reach the master instead of being refused by the guard above.
 #[tokio::test]
@@ -2265,6 +2320,7 @@ async fn test_plaintext_slave_opt_in_attempts_the_connection() {
         master_url: Some(format!("ws://127.0.0.1:{port}")),
         allow_insecure_ws: true,
         master_pubkey: Some("00".repeat(32)),
+        slave_token: Some("secret".to_string()),
         ..Default::default()
     };
     let tracker = SlaveStatusTracker::new("slave-plaintext-opt-in".to_string(), 0, None);
@@ -2372,6 +2428,7 @@ async fn test_stalled_websocket_handshake_times_out() {
     let ha_config = HaConfig {
         master_url: Some(format!("ws://127.0.0.1:{port}")),
         allow_insecure_ws: true,
+        slave_token: Some("secret".to_string()),
         ..Default::default()
     };
     let tracker = SlaveStatusTracker::new("slave-stall".to_string(), 0, None);
@@ -2481,6 +2538,7 @@ async fn test_degraded_state_survives_reconnect_attempts() {
     let ha_config = HaConfig {
         master_url: Some(format!("ws://127.0.0.1:{port}")),
         allow_insecure_ws: true,
+        slave_token: Some("secret".to_string()),
         ..Default::default()
     };
     let tracker = SlaveStatusTracker::new("slave-degraded".to_string(), 4, None);
@@ -2536,6 +2594,7 @@ async fn test_slave_rejects_oversized_push() {
         master_url: Some(format!("ws://127.0.0.1:{port}")),
         master_pubkey: Some(signing_key.public_key_hex()),
         allow_insecure_ws: true,
+        slave_token: Some("secret".to_string()),
         ..Default::default()
     };
     let tracker = SlaveStatusTracker::new("slave-oversize".to_string(), 0, None);
