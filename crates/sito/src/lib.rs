@@ -741,8 +741,9 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-        let server_task =
-            tokio::spawn(async move { run_server_with_shutdown(config, Some(shutdown_rx)).await });
+        let server_task = tokio::spawn(async move {
+            Box::pin(run_server_with_shutdown(config, Some(shutdown_rx))).await
+        });
 
         // Verify listener responds via UDP with retry loop (allowing server time to finish startup on busy CI runners)
         let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -950,7 +951,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server_config = config.clone();
         let server_task = tokio::spawn(async move {
-            run_server_with_shutdown(server_config, Some(shutdown_rx)).await
+            Box::pin(run_server_with_shutdown(server_config, Some(shutdown_rx))).await
         });
 
         // Wait for the initial listener to come up.

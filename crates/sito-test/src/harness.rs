@@ -183,8 +183,9 @@ impl TestServerInstance {
         let addr = SocketAddr::new("127.0.0.1".parse().unwrap(), port);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let mut server_task =
-            tokio::spawn(async move { run_server_with_shutdown(config, Some(shutdown_rx)).await });
+        let mut server_task = tokio::spawn(async move {
+            Box::pin(run_server_with_shutdown(config, Some(shutdown_rx))).await
+        });
 
         // Wait until the standard DNS listener is ready. The bound includes
         // debug-build Argon2 bootstrap hashing and is also used by the DoT/DoH
