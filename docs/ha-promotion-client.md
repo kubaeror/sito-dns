@@ -8,8 +8,9 @@ acquisition/quiesce/reconcile/publish state machine, durable self-fencing, the
 local `confirm-promotion`/`clear-fence` CLI.
 
 > **Status.** Automatic promotion is opt-in and default `false`. With
-> `ha.promotion.enabled = false` no witness client, promotion thread, file,
-> metric family or readiness gate is created; only the stable
+> `ha.promotion.enabled = false` no witness client, promotion thread, file or
+> readiness gate is created; the exposition contains only
+> `sito_ha_promotion_enabled 0` and the stable
 > `promotion.state = "disabled"` status object is exposed. Enabling it requires a
 > witness on a third host and a coordinated cluster upgrade.
 
@@ -134,7 +135,7 @@ needs to contact the engine or the witness. An enabled master looks like:
     "reason": null,
     "term": 8,
     "version": 128,
-    "bundle_hash": "blake3:9f2c...64-hex",
+    "bundle_hash": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c",
     "publication_state": "published",
     "published_version": 128,
     "lease_revision": 13,
@@ -194,14 +195,17 @@ keys or certificate material):
 ## CLI
 
 ```bash
-# On the candidate, after verifying master loss:
+# On the designated candidate, with require_manual_confirmation = true,
+# after verifying master loss:
 sudo -u sito sito ha confirm-promotion --confirm --config /etc/sito/config.toml
 
 # After verifying the current master/term:
 sudo -u sito sito ha clear-fence --confirm --config /etc/sito/config.toml
 ```
 
-`confirm-promotion` writes `data_dir/ha_promote.confirm` atomically (mode
+`confirm-promotion` is valid only on the designated `candidate = true` node with
+`require_manual_confirmation = true`; on any other node the file would be inert,
+so the CLI refuses. It writes `data_dir/ha_promote.confirm` atomically (mode
 `0600`) with `{protocol_version, cluster_id, node_id, requested_at_unix_ms,
 nonce}`. The candidate consumes it exactly once, after master loss, verifies the
 identity and age (no older than the effective heartbeat timeout), and removes
@@ -211,6 +215,9 @@ it. It never bypasses the witness and the slave API remains read-only.
 `clear-fence` removes `ha_fence.json` and `ha_fence.pending` for the configured
 cluster/node. It does not grant a lease; the node must still acquire a new term.
 A marker belonging to a different cluster/node is refused as a data-dir mix-up.
+On a **running** node the in-memory fenced state is not cleared by removing the
+files: restart the service after `clear-fence` so it re-reads the data
+directory.
 
 ## Hash normalization
 

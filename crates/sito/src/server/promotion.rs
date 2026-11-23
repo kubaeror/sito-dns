@@ -91,7 +91,7 @@ pub(super) fn initial_promotion_status(
         return sito_api::models::PromotionStatus::disabled();
     }
     let (state, reason) = match (role, promotion.candidate) {
-        (ConfiguredRole::Master, _) => ("unavailable", Some("witness_unavailable")),
+        (ConfiguredRole::Master, _) => ("acquiring", None),
         (ConfiguredRole::Slave, true) => ("waiting_for_master_loss", None),
         (ConfiguredRole::Slave, false) => ("aborted", Some("not_candidate")),
     };
@@ -107,12 +107,21 @@ pub(super) fn initial_promotion_status(
     }
 }
 
+/// Whether the promotion snapshot represents a live lease grant.
+///
+/// The grant is held from acquisition through quiescing, reconciliation and
+/// publishing, not only once the node is the writable master. A fence clears
+/// the revision, so this is false after fencing.
+fn promotion_lease_held(status: &sito_api::models::PromotionStatus) -> bool {
+    !status.fenced && status.lease_revision.is_some()
+}
+
 /// Publishes the engine snapshot to the API/metrics shared handles.
 fn publish_promotion_status(state: &PromotionRuntimeState, engine: &PromotionEngine) {
     let status = sito_api::models::PromotionStatus::from_snapshot(&engine.snapshot());
     state.metrics.observe_ha_promotion_status(
         status.enabled,
-        status.state == "master",
+        promotion_lease_held(&status),
         status.term,
         status.quiesce_remaining_secs,
         status.reconcile_remaining_secs,
@@ -265,6 +274,9 @@ async fn run_supervisor(state: Arc<PromotionRuntimeState>, mut shutdown_rx: watc
                 let seen_master = tracker.seconds_since_master_frame().is_some();
                 let master_alive = tracker.master_alive(heartbeat);
                 if master_alive || (!seen_master && started.elapsed() < heartbeat) {
+                    // Keep the public status truthful while the gate is blocked
+                    // for a live master; candidate_attempt is not called here.
+                    engine.note_waiting_for_master("master_alive");
                     state.write_gate.block("master_alive");
                     tokio::select! {
                         () = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -922,6 +934,46 @@ mod tests {
             known_secrets: Vec::new(),
             status: Default::default(),
         })
+    }
+
+    #[test]
+    fn lease_held_gauge_covers_the_whole_promotion_window() {
+        let base = sito_api::models::PromotionStatus {
+            enabled: true,
+            candidate: false,
+            lease_revision: Some(7),
+            ..sito_api::models::PromotionStatus::disabled()
+        };
+        for state in [
+            "acquiring",
+            "quiescing",
+            "reconciling",
+            "publishing",
+            "master",
+        ] {
+            let status = sito_api::models::PromotionStatus {
+                state: state.to_string(),
+                ..base.clone()
+            };
+            assert!(
+                promotion_lease_held(&status),
+                "{state} holds the grant and must report lease_held = 1"
+            );
+        }
+
+        let before_grant = sito_api::models::PromotionStatus {
+            state: "waiting_for_master_loss".to_string(),
+            lease_revision: None,
+            ..base.clone()
+        };
+        assert!(!promotion_lease_held(&before_grant));
+
+        let fenced = sito_api::models::PromotionStatus {
+            state: "fenced".to_string(),
+            fenced: true,
+            ..base
+        };
+        assert!(!promotion_lease_held(&fenced));
     }
 
     #[tokio::test]
@@ -1717,6 +1769,28 @@ mod integration_tests {
         assert_eq!(coordinator.get_current_term(), 2);
         assert_eq!(coordinator.get_current_version(), 6);
         assert!(gate.is_effective_master());
+
+        // The supervisor publishes the shared status snapshot and the
+        // lease-held gauge from the live grant, not from "state == master".
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = state.status.load();
+            if status.state == "master" {
+                assert_eq!(status.term, 2);
+                assert!(status.lease_revision.is_some());
+                assert!(!status.fenced);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "supervisor did not publish a master status: {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let rendered = state.metrics.render_prometheus();
+        assert!(rendered.contains("sito_ha_promotion_enabled 1"));
+        assert!(rendered.contains("sito_ha_promotion_lease_held 1"));
+        assert!(rendered.contains("sito_ha_promotion_term 2"));
 
         // Normal API publish through the shared context slot reaches a slave
         // and the running renewal loop advances the witness baseline.

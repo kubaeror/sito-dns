@@ -303,10 +303,12 @@ owns the decisions the witness cannot make. With `enabled = true` on every node:
    sudo -u sito sito ha confirm-promotion --confirm --config /etc/sito/config.toml
    ```
 
-   It writes `data_dir/ha_promote.confirm` (mode `0600`) and authorizes exactly
-   one acquisition. It expires after the effective heartbeat timeout, is
-   discarded if the master returns first, and is discarded on restart. It never
-   bypasses the witness.
+   It is accepted only on the designated candidate with
+   `require_manual_confirmation = true`; otherwise the file would be inert and
+   the CLI refuses. It writes `data_dir/ha_promote.confirm` (mode `0600`) and
+   authorizes exactly one acquisition. It expires after the effective heartbeat
+   timeout, is discarded if the master returns first, and is discarded on
+   restart. It never bypasses the witness.
 4. After fencing, the node stays read-only across restarts until the operator
    verifies the current master/term and clears the durable marker:
 
@@ -315,7 +317,8 @@ owns the decisions the witness cannot make. With `enabled = true` on every node:
    ```
 
    This removes `ha_fence.json` and `ha_fence.pending`; it does not grant a
-   lease. The node still has to acquire a new term.
+   lease. The node still has to acquire a new term. If the service is still
+   running, restart it after clearing so the in-memory fenced state is re-read.
 5. Watch `GET /api/v2/ha/status` (`promotion.state`/`reason`/`term`/`version`),
    the `sito_ha_promotion_*` metrics and the `ha.promotion.*` audit records.
    A witness outage is a single point of **availability**: the master fences

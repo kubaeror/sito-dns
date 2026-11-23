@@ -1651,6 +1651,18 @@ pub fn run_ha_confirm_promotion(config_path: &Path, confirm: bool) -> Result<(),
         ));
     }
     let (data_dir, ha) = promotion_cli_context(config_path, true)?;
+    if !ha.promotion.candidate {
+        return Err(anyhow::anyhow!(
+            "ha.promotion.candidate is false in '{}'; only the designated candidate can use a promotion confirmation",
+            config_path.display()
+        ));
+    }
+    if !ha.promotion.require_manual_confirmation {
+        return Err(anyhow::anyhow!(
+            "ha.promotion.require_manual_confirmation is false in '{}'; the confirmation file would be inert",
+            config_path.display()
+        ));
+    }
     let cluster_id = ha.promotion.cluster_id.clone().ok_or_else(|| {
         anyhow::anyhow!("ha.promotion.cluster_id is required to write a confirmation")
     })?;
@@ -1703,7 +1715,7 @@ pub fn run_ha_clear_fence(config_path: &Path, confirm: bool) -> Result<(), anyho
         .clear()
         .map_err(|e| anyhow::anyhow!("Failed to clear the fence marker: {e}"))?;
     println!(
-        "Removed '{}' and '{}'. This does not grant a lease; the node must acquire a new term from the witness.",
+        "Removed '{}' and '{}'. This does not grant a lease; the node must acquire a new term from the witness. If the server is running, restart it so the in-memory fence state is re-read.",
         store.marker_path().display(),
         store.pending_path().display()
     );
@@ -3297,13 +3309,14 @@ mod tests {
              cluster_id = \"home-dns\"\n\
              node_id = \"node-a\"\n\
              backend = \"witness\"\n\
+             require_manual_confirmation = true\n\
              [ha.promotion.witness]\n\
              url = \"https://witness.lan:8954\"\n\
              ca = \"/etc/sito/witness-ca.crt\"\n\
              token_file = \"/etc/sito/witness.token\"\n",
             data_dir.display()
         );
-        std::fs::write(&config_path, document).unwrap();
+        std::fs::write(&config_path, &document).unwrap();
 
         // Both CLIs refuse to act without the explicit confirmation flag.
         let error = run_ha_confirm_promotion(&config_path, false)
@@ -3312,6 +3325,28 @@ mod tests {
         let error = run_ha_clear_fence(&config_path, false)
             .expect_err("clear-fence without --confirm must refuse");
         assert!(error.to_string().contains("--confirm"));
+
+        let no_candidate = dir.join("no_candidate.toml");
+        std::fs::write(
+            &no_candidate,
+            document.replace("candidate = true", "candidate = false"),
+        )
+        .unwrap();
+        let error = run_ha_confirm_promotion(&no_candidate, true)
+            .expect_err("a non-candidate confirmation is inert and must be refused");
+        assert!(error.to_string().contains("candidate"));
+        let no_confirmation = dir.join("no_confirmation.toml");
+        std::fs::write(
+            &no_confirmation,
+            document.replace(
+                "require_manual_confirmation = true",
+                "require_manual_confirmation = false",
+            ),
+        )
+        .unwrap();
+        let error = run_ha_confirm_promotion(&no_confirmation, true)
+            .expect_err("without require_manual_confirmation the file is inert");
+        assert!(error.to_string().contains("require_manual_confirmation"));
 
         // confirm-promotion writes the exact identity and one-shot file.
         run_ha_confirm_promotion(&config_path, true).expect("write confirmation");

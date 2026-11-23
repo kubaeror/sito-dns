@@ -34,7 +34,9 @@ tag must not move. Use an explicit version/tag for evaluation.
 - Opt-in HA automatic promotion (ADR-0010, default `false`): witness lease,
   pre-publish quiesce, hello-only reconciliation, durable self-fencing,
   `promotion` status, bounded-label metrics/audit events and the local
-  `confirm-promotion`/`clear-fence` CLI.
+  `confirm-promotion`/`clear-fence` CLI. The witness is a single point of
+  availability: an outage fences the master after the TTL and blocks promotion
+  until it returns, while DNS keeps serving the last snapshot.
 - Self-service password/2FA for every role; session-bound re-authentication for
   sensitive Admin mutations; bounded Argon2 work.
 - OpenAPI security/tag/path coverage, fail-closed config apply, `no-store` API

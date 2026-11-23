@@ -377,7 +377,8 @@ pub struct PromotionSnapshot {
     pub reconcile_remaining_secs: u64,
     /// Witness-reported expiry of the current grant, Unix milliseconds.
     pub lease_expires_unix_ms: Option<i64>,
-    /// Seconds until `lease_expires_unix_ms`, computed at snapshot time.
+    /// Seconds until `lease_expires_unix_ms`, computed at snapshot time from
+    /// the local wall clock. Display-only; never a safety input.
     pub lease_expires_in_secs: Option<u64>,
     /// Unix milliseconds of the last acquisition/renewal attempt.
     pub last_attempt_unix_ms: Option<i64>,
@@ -596,13 +597,18 @@ impl PromotionEngine {
             .with_identity(cluster_id.clone(), node_id.clone());
         let fence = FenceStore::new(data_dir.clone(), cluster_id.clone(), node_id.clone());
         let confirm = ConfirmationStore::new(data_dir.clone(), cluster_id.clone(), node_id.clone());
+        let (initial_phase, initial_reason) = match (role, config.candidate) {
+            (ConfiguredRole::Master, _) => (PromotionPhase::Acquiring, None),
+            (ConfiguredRole::Slave, true) => (PromotionPhase::WaitingForMasterLoss, None),
+            (ConfiguredRole::Slave, false) => (PromotionPhase::Aborted, Some("not_candidate")),
+        };
         let snapshot = PromotionSnapshot {
             enabled: true,
             candidate: config.candidate,
             cluster_id: Some(cluster_id.clone()),
             node_id: Some(node_id.clone()),
-            phase: PromotionPhase::Unavailable,
-            reason: None,
+            phase: initial_phase,
+            reason: initial_reason.map(str::to_string),
             term: 0,
             version: 0,
             bundle_hash: "none".to_string(),
@@ -747,6 +753,13 @@ impl PromotionEngine {
         ))
     }
 
+    /// Updates the status-only waiting phase for a candidate whose master is
+    /// still alive. This does not acquire, discard a confirmation or touch the
+    /// write gate.
+    pub fn note_waiting_for_master(&self, reason: &str) {
+        self.set_phase(PromotionPhase::WaitingForMasterLoss, Some(reason));
+    }
+
     /// The per-process witness holder identity (`node_id/boot_uuid`).
     #[must_use]
     pub fn holder(&self) -> &str {
@@ -803,6 +816,25 @@ impl PromotionEngine {
         }
 
         let loaded = self.state.load()?;
+        // Copy the active bundle hash as well as its term/version. A restarted
+        // master with the witness down must not report `version = N` with
+        // `bundle_hash = "none"`; "none" is valid only at version 0.
+        let active_hash = match &loaded {
+            LoadedState::Missing => None,
+            LoadedState::Present { state, bookkeeping } => match bookkeeping {
+                Some(bookkeeping) => Some(if bookkeeping.has_pending_bundle() {
+                    bookkeeping
+                        .pending_hash
+                        .clone()
+                        .unwrap_or_else(|| bookkeeping.published_hash.clone())
+                } else {
+                    bookkeeping.published_hash.clone()
+                }),
+                // Legacy state without promotion bookkeeping: compute the
+                // signed-payload hash instead of assuming the bundle is absent.
+                None => self.host.hash_bundle(&state.bundle).ok(),
+            },
+        };
         let (phase, reason) = {
             let mut inner = self.lock();
             match &loaded {
@@ -815,6 +847,9 @@ impl PromotionEngine {
                     inner.bookkeeping.clone_from(bookkeeping);
                     inner.snapshot.term = state.bundle.term;
                     inner.snapshot.version = state.bundle.version;
+                    if let Some(hash) = active_hash.clone() {
+                        inner.snapshot.bundle_hash = hash;
+                    }
                     inner.snapshot.publication_state = bookkeeping
                         .as_ref()
                         .map_or(PublicationState::Published, |b| b.publication_state);
@@ -830,19 +865,18 @@ impl PromotionEngine {
             }
             match (self.role, self.config.candidate) {
                 (ConfiguredRole::Master, _) => {
-                    inner.snapshot.phase = PromotionPhase::Unavailable;
-                    inner.snapshot.reason = Some("witness_unavailable".to_string());
-                    (
-                        PromotionPhase::Unavailable,
-                        Some("witness_unavailable".to_string()),
-                    )
+                    // Do not claim the witness is unavailable before the first
+                    // probe; the supervisor immediately enters acquisition.
+                    inner.snapshot.phase = PromotionPhase::Acquiring;
+                    inner.snapshot.reason = None;
+                    (PromotionPhase::Acquiring, None)
                 }
                 (ConfiguredRole::Slave, true) => {
                     inner.snapshot.phase = PromotionPhase::WaitingForMasterLoss;
-                    inner.snapshot.reason = Some("not_candidate".to_string());
+                    inner.snapshot.reason = Some("master_alive".to_string());
                     (
                         PromotionPhase::WaitingForMasterLoss,
-                        Some("not_candidate".to_string()),
+                        Some("master_alive".to_string()),
                     )
                 }
                 (ConfiguredRole::Slave, false) => {
@@ -859,7 +893,7 @@ impl PromotionEngine {
         self.lock().booted = true;
         Ok(match phase {
             PromotionPhase::WaitingForMasterLoss => PromotionOutcome::Waiting,
-            PromotionPhase::Unavailable => PromotionOutcome::ReadOnly {
+            _ if self.role == ConfiguredRole::Master => PromotionOutcome::ReadOnly {
                 reason: "witness_unavailable".to_string(),
                 retryable: true,
             },
@@ -2677,6 +2711,12 @@ impl PromotionEngine {
             inner.snapshot.phase = PromotionPhase::Fenced;
             inner.snapshot.reason = Some(reason.code().to_string());
             inner.snapshot.term = marker.fenced_term;
+            // A fence means no live grant: do not keep advertising the old
+            // revision/expiry or a stale reachable witness.
+            inner.snapshot.lease_revision = None;
+            inner.snapshot.lease_expires_unix_ms = None;
+            inner.snapshot.lease_expires_in_secs = None;
+            inner.snapshot.witness_reachable = false;
             inner.grant = None;
             inner.deadline = None;
         }
@@ -2750,8 +2790,18 @@ impl PromotionEngine {
     }
 
     fn record_witness_request(&self, op: &str, result: &str) {
+        // The status field is a last-probe observation: only a successful call
+        // proves reachability. A transport/auth/5xx failure (and any other
+        // failed probe) clears it immediately instead of leaving a stale `true`
+        // until fencing.
+        self.lock().snapshot.witness_reachable = result == "success";
+        let bounded = if result == "error" {
+            "witness_error"
+        } else {
+            result
+        };
         if let Some(metrics) = self.metrics.as_ref() {
-            metrics.inc_ha_promotion_witness_request(op, result);
+            metrics.inc_ha_promotion_witness_request(op, bounded);
         }
     }
 

@@ -1008,12 +1008,15 @@ With promotion enabled, `state` is one of `disabled`,
 `candidate_diverged`, `candidate_term_ahead`, `candidate_identity_mismatch`,
 `master_state_behind`, `master_state_forked`, `master_term_ahead`,
 `manual_confirmation_required`, `lease_lost`, `lease_version_regression`,
-`fenced`, `fenced_until_reconciled`, `v1_state`, `promotion_interrupted` or
+`clock_step`, `state_write_failed`, `role_switch_failed`, `fenced`,
+`fenced_until_reconciled`, `v1_state`, `promotion_interrupted` or
 `endpoint_is_ip_literal`.
 
 `version`/`bundle_hash` are the active bundle (which may be pending during a
 promotion); `publication_state` and `published_version` identify the last
-bundle actually published. The top-level `ready`/`readiness_reason` remain
+bundle actually published. `lease_expires_in_secs` is display-only: it is
+computed from the node's local wall clock against the last witness-reported
+expiry and is never a safety input. The top-level `ready`/`readiness_reason` remain
 authoritative: a witness failure or a fence is not-ready, while merely being a
 candidate or waiting is not. `witness_reachable` is a last-probe observation,
 never a safety input. The object contains no tokens, private keys, certificate
@@ -1058,12 +1061,16 @@ sudo -u sito sito ha confirm-promotion --confirm --config /etc/sito/config.toml
 sudo -u sito sito ha clear-fence --confirm --config /etc/sito/config.toml
 ```
 
-`confirm-promotion` writes `<data_dir>/ha_promote.confirm` atomically (mode
+`confirm-promotion` is accepted only on the designated `candidate = true` node
+with `require_manual_confirmation = true`; otherwise the file would be inert, so
+the CLI refuses. It writes `<data_dir>/ha_promote.confirm` atomically (mode
 `0600`) for the configured `cluster_id`/`node_id`. The running candidate consumes
 it once, only after master loss, and only while it is no older than the effective
 heartbeat timeout; a restart discards an unconsumed file. It never bypasses the
-witness. `clear-fence` removes `ha_fence.json` and `ha_fence.pending`; it does not
-grant a lease, so the node still has to acquire a new term.
+witness. `clear-fence` removes `ha_fence.json` and `ha_fence.pending`; it does
+not grant a lease, so the node still has to acquire a new term. On a running
+node, restart the service after `clear-fence`: the in-memory fenced state is not
+cleared by deleting the files.
 
 The witness is a single point of **availability**, not safety: if it is
 unreachable, the current master fences after the TTL and no promotion happens

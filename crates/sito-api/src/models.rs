@@ -678,6 +678,8 @@ pub struct PromotionStatus {
     /// Witness revision of the current grant.
     pub lease_revision: Option<u64>,
     /// Seconds until the witness lease expires, from the last observation.
+    /// Display-only: computed from the node's local wall clock and never used
+    /// as a safety input.
     pub lease_expires_in_secs: Option<u64>,
     /// Last witness probe succeeded; observability only, not a safety input.
     pub witness_reachable: bool,

@@ -6277,7 +6277,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Seconds until the witness lease expires, from the last observation.",
+            "description": "Seconds until the witness lease expires, from the last observation.\nDisplay-only: computed from the node's local wall clock and never used\nas a safety input.",
             "minimum": 0
           },
           "lease_revision": {
