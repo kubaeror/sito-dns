@@ -751,6 +751,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promotion_refuses_plaintext_master_without_explicit_opt_in() {
+        let mut state = test_state("promotion_plaintext_refused");
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        {
+            let state = Arc::get_mut(&mut state).expect("unique test state");
+            state.ha_config.replication_port = 1;
+            state.ha_config.allow_insecure_ws = false;
+            state.ha_config.slave_token = Some("test-token".to_string());
+            state.ha_config.master_pubkey = Some(key.public_key_hex());
+            state.signing_key.lock().unwrap().replace(key);
+        }
+        let host = RuntimePromotionHost {
+            state: Arc::clone(&state),
+        };
+
+        let err = host
+            .switch_role(EffectiveRole::Master)
+            .await
+            .expect_err("a promoted master without TLS must not run plaintext");
+        assert!(err.contains("mTLS certificate/key"), "got: {err}");
+        assert!(
+            state.master_slot.lock().unwrap().is_none()
+                && state.coordinator.lock().unwrap().is_none(),
+            "a refused promotion must not install a coordinator or listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_plaintext_master_requires_the_explicit_opt_in() {
+        let mut state = test_state("promotion_plaintext_opted_in");
+        let port = sito_test_support::reserve_port_number().unwrap();
+        let key = Arc::new(Ed25519SigningKey::generate().unwrap());
+        {
+            let state = Arc::get_mut(&mut state).expect("unique test state");
+            state.ha_config.replication_port = port;
+            state.ha_config.listen_addr = "127.0.0.1".to_string();
+            state.ha_config.allow_insecure_ws = true;
+            state.ha_config.slave_token = Some("test-token".to_string());
+            state.ha_config.master_pubkey = Some(key.public_key_hex());
+            state.signing_key.lock().unwrap().replace(key);
+        }
+        let host = RuntimePromotionHost {
+            state: Arc::clone(&state),
+        };
+
+        host.switch_role(EffectiveRole::Master)
+            .await
+            .expect("an explicit plaintext opt-in must allow the promotion");
+        assert!(
+            state.master_slot.lock().unwrap().is_some(),
+            "the promoted master must be installed"
+        );
+        host.stop_publishing();
+    }
+
+    #[tokio::test]
     async fn role_switch_waits_for_the_slave_worker_to_exit() {
         let mut state = test_state("handoff_wait");
         let stopped = Arc::new(AtomicBool::new(false));

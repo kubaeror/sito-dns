@@ -2894,6 +2894,123 @@ fn test_slave_summary_flags_diverged_slave() {
 }
 
 #[tokio::test]
+async fn test_master_refuses_plaintext_without_opt_in() {
+    let port = sito_test_support::reserve_port_number().unwrap();
+    let coordinator = test_coordinator().with_token(Some("tok".to_string()));
+    let master_cfg = HaConfig {
+        replication_port: port,
+        listen_addr: "127.0.0.1".to_string(),
+        slave_token: Some("tok".to_string()),
+        allow_insecure_ws: false,
+        ..Default::default()
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = spawn_master_server(master_cfg, coordinator.clone(), shutdown_rx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let readiness = coordinator.readiness();
+    assert!(
+        !readiness.ready,
+        "a master without TLS must not report ready: {readiness:?}"
+    );
+    assert!(
+        readiness
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("allow_insecure_ws")),
+        "the readiness reason must name the opt-in: {readiness:?}"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "no listener (and therefore no plaintext port) may be opened"
+    );
+    assert!(
+        handle.is_finished(),
+        "the listener task must exit instead of waiting in plaintext mode"
+    );
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_master_refuses_plaintext_with_pins_even_when_opted_in() {
+    let port = sito_test_support::reserve_port_number().unwrap();
+    let coordinator = test_coordinator().with_token(Some("tok".to_string()));
+    let master_cfg = HaConfig {
+        replication_port: port,
+        listen_addr: "127.0.0.1".to_string(),
+        slave_token: Some("tok".to_string()),
+        pinned_slave_fingerprints: vec!["blake3:abc123".to_string()],
+        allow_insecure_ws: true,
+        ..Default::default()
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = spawn_master_server(master_cfg, coordinator.clone(), shutdown_rx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let readiness = coordinator.readiness();
+    assert!(!readiness.ready, "{readiness:?}");
+    assert!(
+        readiness
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("pin")),
+        "the refusal must name the unenforceable pin: {readiness:?}"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "the listener must not silently drop pin verification"
+    );
+    assert!(handle.is_finished());
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn test_master_with_tls_never_serves_plaintext_even_when_opted_in() {
+    let dir = std::env::temp_dir().join(format!(
+        "sito_ha_no_plaintext_downgrade_{}_{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    let certs = crate::generate_ha_certs(&dir, true, true).unwrap();
+    let port = sito_test_support::reserve_port_number().unwrap();
+    let coordinator = test_coordinator().with_token(Some("tok".to_string()));
+    let master_cfg = HaConfig {
+        replication_port: port,
+        listen_addr: "127.0.0.1".to_string(),
+        cert: certs.master_cert_path.clone(),
+        key: certs.master_key_path.clone(),
+        pinned_slave_fingerprints: vec![certs.slave_fingerprint.clone().unwrap()],
+        slave_token: Some("tok".to_string()),
+        // Even an explicit plaintext opt-in must not downgrade a TLS listener.
+        allow_insecure_ws: true,
+        ..Default::default()
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = spawn_master_server(master_cfg, coordinator.clone(), shutdown_rx);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(coordinator.readiness().ready);
+
+    let plaintext = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}")),
+    )
+    .await
+    .expect("the plaintext attempt must not hang");
+    assert!(
+        plaintext.is_err(),
+        "a TLS listener must not serve a plaintext WebSocket"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = handle.await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn test_master_rejects_v1_slave_and_keeps_listening() {
     let port = sito_test_support::reserve_port_number().unwrap();
     let coordinator = test_coordinator();

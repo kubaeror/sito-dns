@@ -214,6 +214,18 @@ pub(super) async fn connect_and_run(
     let (is_secure, host, port) = parse_ws_url(master_url)?;
     let addr_str = format!("{host}:{port}");
 
+    // Refuse a plaintext target before any socket is opened. The config
+    // validator already rejects this combination; keeping the runtime check
+    // fail-closed here means a config applied through another path cannot
+    // cause even an unauthenticated TCP probe (and never a plaintext
+    // handshake) without the explicit opt-in.
+    if !is_secure && !ha_config.allow_insecure_ws {
+        return Err(HaError::Validation {
+            field: "master_url".to_string(),
+            reason: "Plaintext ws:// replication is rejected by default. Use wss:// or explicitly set allow_insecure_ws = true".to_string(),
+        });
+    }
+
     // Resolve and connect with the host/port pair instead of formatting a
     // socket address: bracketed IPv6 literals (`[::1]`) must not become
     // `::1:8953`, and DNS names must still go through the resolver.
@@ -278,13 +290,6 @@ pub(super) async fn connect_and_run(
         )
         .await
     } else {
-        if !ha_config.allow_insecure_ws {
-            return Err(HaError::Validation {
-                field: "master_url".to_string(),
-                reason: "Plaintext ws:// replication is rejected by default. Use wss:// or explicitly set allow_insecure_ws = true".to_string(),
-            });
-        }
-
         let (ws_stream, _) = tokio::time::timeout(
             SLAVE_HANDSHAKE_TIMEOUT,
             tokio_tungstenite::client_async_with_config(master_url, tcp_stream, Some(ws_config())),

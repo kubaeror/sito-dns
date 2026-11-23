@@ -780,6 +780,12 @@ The HA replication channel synchronizes entire server configuration bundles, cus
 - **Plaintext WebSocket (`allow_insecure_ws = true`)**:
   > [!CAUTION]
   > Plaintext `ws://` connections are refused by default. Setting `allow_insecure_ws = true` transmits replication data without TLS encryption. Do NOT enable `allow_insecure_ws` across untrusted or public networks, as configuration details, network topology, and client tokens will be exposed in cleartext. Only use for local loopback debugging.
+  - The flag is the **only** way to permit plaintext. A master without `cert`/`key` refuses to start the replication listener (readiness reason names `allow_insecure_ws`), and a slave refuses a `ws://` `master_url` during configuration load and again before the runtime opens a socket. There is no "try TLS, then plaintext" path.
+  - Plaintext still requires a non-empty `slave_token`; it is the only peer authentication available without TLS. Never leave the replication port reachable from an untrusted network.
+  - `pinned_slave_fingerprints`, `ca` and a slave-side `master_fingerprint` are TLS-only controls. Combining them with plaintext is rejected by `sito check-config`/startup instead of being silently ignored, so a configured pin or CA is always enforced ([residual R-10](phase3-security-review.md#13-residual-risk-register)).
+  - `wss://` always performs the TLS handshake and honors pin, CA, SNI/server name and client certificate. A TLS failure is reported as a failure and never downgraded.
+  - Automatic promotion reuses this transport policy: a promoted master inherits `allow_insecure_ws`, so do not rely on promotion to upgrade an insecure link. `sito check-config` and startup log the risk (or report that the flag is inert because TLS is configured).
+
 
 ### 2. Slave Authentication Handshake (`slave_token`)
 To prevent unauthorized nodes from connecting to the master replication port and receiving signed configuration bundles:

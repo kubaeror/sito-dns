@@ -187,7 +187,8 @@ anonymize_querylog = false
 # ping_interval_secs = 15
 # stats_interval_secs = 30
 # slave_token = "change-me"          # required for plaintext ws:// only
-# allow_insecure_ws = false          # plaintext ws:// (token still required)
+# allow_insecure_ws = false          # explicit plaintext opt-in (never implicit; token required;
+#                                    # incompatible with pins/CA; trusted/private/loopback links only)
 # allow_unpinned_tls = false         # accept any server cert (testing only)
 # require_slaves = false             # master readiness needs >= 1 synced slave
 # require_all_slaves = false         # master readiness needs every slave synced

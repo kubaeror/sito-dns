@@ -64,6 +64,19 @@ pub fn spawn_master_server(
                 );
                 return;
             }
+            // A pin or CA is only enforceable inside the TLS handshake. If
+            // either is configured, serving plaintext would silently drop the
+            // control, so refuse instead of downgrading. Configuration
+            // validation rejects this too; this is the runtime guard.
+            if !ha_config.pinned_slave_fingerprints.is_empty() || ha_config.ca.is_some() {
+                coordinator.mark_replication_failed(
+                    "master replication refused plaintext while pin/CA material is configured",
+                );
+                error!(
+                    "Master HA replication has pinned_slave_fingerprints or ca configured without a TLS cert/key. Refusing to serve plaintext and silently ignore them."
+                );
+                return;
+            }
             None
         };
 
