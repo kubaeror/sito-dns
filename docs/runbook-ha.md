@@ -380,11 +380,13 @@ acquires the lease; otherwise disable promotion everywhere first (section 7).
      sequence monotonic and the term unchanged. If the loaded
      `ha_signing.key` no longer matches that recorded identity, startup fails
      with an actionable error instead of silently re-signing the persisted
-     state with a new key. If it is missing or corrupt,
-     the promoted master **must not** adopt a counter from its peers: it starts
-     a fresh sequence and detects any replica that is ahead (same term) or in a
-     newer term, marks itself `diverged`, and refuses to overwrite the cluster.
-     Promote it explicitly (see below) before pointing anything at it.
+     state with a new key. A missing file starts a fresh sequence; a
+     **corrupt, v1, foreign or partial** file is moved aside and fails closed —
+     the master never resets the sequence silently. Restore a backup or
+     explicitly re-seed the state (see below). A promoted master must not adopt
+     a counter from its peers: it detects any replica that is ahead (same term)
+     or in a newer term, marks itself `diverged`, and refuses to overwrite the
+     cluster. Promote it explicitly before pointing anything at it.
 
      To promote a node explicitly, stop the service and create or edit
      `ha_state.toml` (JSON, mode `0600`) so that:

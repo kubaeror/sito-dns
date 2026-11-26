@@ -36,9 +36,6 @@ pub enum HaError {
     #[error("Configuration rollback error: {0}")]
     Rollback(String),
 
-    #[error("Slave degraded: {0}")]
-    Degraded(String),
-
     #[error("Connection error: {0}")]
     Connection(String),
 
