@@ -716,7 +716,8 @@ impl PromotionHost for RuntimePromotionHost {
             .with_slave_requirements(
                 self.state.ha_config.require_slaves,
                 self.state.ha_config.require_all_slaves,
-            );
+            )
+            .with_promotion_enabled(true);
             coordinator.set_serving(false);
             coordinator.deny_sessions("read_only");
             let (master_shutdown_tx, master_shutdown_rx) = watch::channel(false);

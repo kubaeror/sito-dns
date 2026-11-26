@@ -56,6 +56,7 @@ impl MasterCoordinator {
             require_slaves: Arc::new(AtomicBool::new(false)),
             require_all_slaves: Arc::new(AtomicBool::new(false)),
             acl_enforcement: Arc::new(AtomicBool::new(false)),
+            promotion_enabled: Arc::new(AtomicBool::new(false)),
             promotion_bookkeeping: Arc::new(Mutex::new(None)),
             fenced: Arc::new(AtomicBool::new(false)),
             accepting_sessions: Arc::new(AtomicBool::new(true)),
@@ -392,6 +393,9 @@ impl MasterCoordinator {
         if let Some(reason) = self.acl_capability_violation() {
             return HaReadiness::not_ready(reason);
         }
+        if let Some(reason) = self.promotion_capability_violation() {
+            return HaReadiness::not_ready(reason);
+        }
         listener
     }
 
@@ -414,6 +418,39 @@ impl MasterCoordinator {
     pub fn with_acl_enforcement(self, enforced: bool) -> Self {
         self.acl_enforcement.store(enforced, Ordering::SeqCst);
         self
+    }
+
+    /// Applies the opt-in promotion policy to readiness checks.
+    ///
+    /// A promotion-enabled master needs every connected v2 peer to report
+    /// `have_bundle_hash`; legacy v2 peers omit it and must be upgraded before
+    /// promotion is enabled.
+    #[must_use]
+    pub fn with_promotion_enabled(self, enabled: bool) -> Self {
+        self.promotion_enabled.store(enabled, Ordering::SeqCst);
+        self
+    }
+
+    /// Returns `promotion_peer_capability_missing` while promotion is enabled
+    /// and a connected slave omitted `have_bundle_hash`.
+    pub(crate) fn promotion_capability_violation(&self) -> Option<String> {
+        if !self.promotion_enabled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let slaves = sito_core::sync::lock_or_recover(&self.slaves);
+        let missing: Vec<&str> = slaves
+            .values()
+            .filter(|slave| slave.have_bundle_hash.is_none())
+            .map(|slave| slave.instance.as_str())
+            .collect();
+        if missing.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "promotion_peer_capability_missing: connected slave(s) did not report have_bundle_hash ({}); upgrade every DNS-serving node before enabling automatic promotion",
+                missing.join(", ")
+            ))
+        }
     }
 
     /// Returns `acl_capability_missing` while a deny-enforcing master has a

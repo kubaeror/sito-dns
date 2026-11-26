@@ -71,6 +71,12 @@ pub struct SlaveSummary {
     pub last_ping_secs_ago: u64,
     pub connected_at: String,
     pub last_stats: Option<SlaveStatsSummary>,
+    /// True when the peer advertised `have_bundle_hash` in its Hello.
+    ///
+    /// Promotion-enabled clusters require this capability during candidate
+    /// reconciliation; legacy v2 peers omit it and must be upgraded first.
+    #[serde(default)]
+    pub bundle_hash_known: bool,
 }
 
 /// Aggregated stats snapshot reported by a slave node for its last reporting

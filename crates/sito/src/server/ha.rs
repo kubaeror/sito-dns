@@ -116,7 +116,8 @@ pub(super) fn init_ha(
         )
         .with_state_path(config.server.data_dir.join("ha_state.toml"))
         .with_slave_requirements(ha_config.require_slaves, ha_config.require_all_slaves)
-        .with_acl_enforcement(acl_deny_effective(config));
+        .with_acl_enforcement(acl_deny_effective(config))
+        .with_promotion_enabled(promotion_enabled);
 
         if ha_config.replication_port == 0 {
             coordinator.mark_replication_disabled();

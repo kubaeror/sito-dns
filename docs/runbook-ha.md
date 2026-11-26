@@ -76,8 +76,10 @@ publish transition is made). Upgrade every DNS-serving node before enabling
 deny; a mixed-version cluster must stay on `default_policy = "allow"`. Legacy v2
 peers that cannot report `have_bundle_hash` also cannot participate in promotion
 candidate reconciliation: reconciliation aborts with `candidate_hash_unknown`
-rather than overwrite a possible fork. Upgrade every peer before enabling
-promotion.
+rather than overwrite a possible fork. While promotion is enabled, such a peer
+also makes master readiness report `promotion_peer_capability_missing` and
+`/api/v2/ha/slaves` shows `bundle_hash_known: false`. Upgrade every peer before
+enabling promotion.
 
 **Promotion.** Automatic promotion is governed by ADR-0010. A node that has
 already applied the bundle keeps that shared ACL if a promotion flow runs. An

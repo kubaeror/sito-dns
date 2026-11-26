@@ -349,6 +349,7 @@ mod tests {
             last_ping_secs_ago: 0,
             connected_at: "2026-01-01T00:00:00Z".to_string(),
             last_stats: None,
+            bundle_hash_known: true,
         };
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["diverged"], true);

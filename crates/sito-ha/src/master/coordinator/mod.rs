@@ -291,6 +291,11 @@ pub struct MasterCoordinator {
     /// A connected slave that does not advertise `client_acl` makes readiness
     /// report `acl_capability_missing`; an allow-policy cluster is unaffected.
     acl_enforcement: Arc<AtomicBool>,
+    /// True when automatic promotion is enabled for this cluster.
+    /// A connected v2 peer that omits `have_bundle_hash` makes readiness report
+    /// `promotion_peer_capability_missing`; promotion-disabled clusters are
+    /// unaffected.
+    promotion_enabled: Arc<AtomicBool>,
     /// ADR-0010 publish-baseline bookkeeping preserved across state writes.
     ///
     /// `None` means the node has not enabled promotion; the state file then

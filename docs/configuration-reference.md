@@ -886,12 +886,16 @@ per-node ACL override and no node-local allow file.
 - **Invalid bundle:** any ACL validation error (bad enum, CIDR, duplicate,
   allow/deny conflict, over-cap list) rejects the whole bundle atomically. The
   slave keeps its previous ACL/runtime generation and reports `Degraded`.
-- **Mixed versions:** a slave advertises the `client_acl` capability in its HA
-  `Hello`. While the published configuration has `default_policy = "deny"`, a
-  connected slave that does not advertise it makes master readiness report
-  `acl_capability_missing` and logs a warning (on the Hello and on the
-  allow→deny publish transition). Upgrade every DNS-serving node before enabling
-  deny; a mixed-version cluster must stay on allow.
+- **Mixed versions:** a slave advertises the `client_acl` capability and
+  `have_bundle_hash` in its HA `Hello`. While the published configuration has
+  `default_policy = "deny"`, a connected slave that does not advertise
+  `client_acl` makes master readiness report `acl_capability_missing` and logs
+  a warning (on the Hello and on the allow→deny publish transition). While
+  automatic promotion is enabled, a peer that omits `have_bundle_hash` makes
+  readiness report `promotion_peer_capability_missing`; `/api/v2/ha/slaves`
+  shows `bundle_hash_known: false`. Upgrade every DNS-serving node before
+  enabling deny or promotion; a mixed-version cluster must stay on allow and
+  leave promotion disabled.
 - **Promotion:** automatic promotion is governed by ADR-0010. A promoted node
   keeps the shared ACL it last applied and requires that a candidate has applied
   a valid bundle (an unprovisioned or diverged slave reports not-ready and is

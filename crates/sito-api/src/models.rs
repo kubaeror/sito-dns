@@ -833,6 +833,9 @@ pub struct HaSlaveSummary {
     pub connected_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_stats: Option<HaSlaveStatsSummary>,
+    /// True when the peer advertised `have_bundle_hash` in its Hello.
+    #[serde(default)]
+    pub bundle_hash_known: bool,
 }
 
 impl From<sito_ha_types::SlaveSummary> for HaSlaveSummary {
@@ -851,6 +854,7 @@ impl From<sito_ha_types::SlaveSummary> for HaSlaveSummary {
                 blocked: st.blocked,
                 upstreams_count: st.upstreams_count,
             }),
+            bundle_hash_known: s.bundle_hash_known,
         }
     }
 }

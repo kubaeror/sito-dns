@@ -939,6 +939,59 @@ fn test_mixed_version_acl_capability_is_required_only_for_deny() {
 }
 
 #[test]
+fn test_mixed_version_promotion_capability_is_required_only_when_enabled() {
+    // Promotion disabled: a legacy v2 peer without `have_bundle_hash` is fine.
+    let off = test_coordinator().with_promotion_enabled(false);
+    off.mark_replication_ready();
+    install_slave(&off, "legacy-slave", off.get_current_version());
+    assert!(
+        off.readiness().ready,
+        "promotion-disabled clusters may keep legacy peers"
+    );
+
+    // Promotion enabled: the peer must advertise the hash capability.
+    let on = test_coordinator().with_promotion_enabled(true);
+    on.mark_replication_ready();
+    install_slave(&on, "legacy-slave", on.get_current_version());
+    let readiness = on.readiness();
+    assert!(!readiness.ready);
+    let reason = readiness.reason.unwrap_or_default();
+    assert!(
+        reason.contains("promotion_peer_capability_missing") && reason.contains("legacy-slave"),
+        "promotion must name the missing peer capability: {reason}"
+    );
+    let summary = on
+        .slaves
+        .lock()
+        .unwrap()
+        .get("legacy-slave")
+        .expect("installed slave")
+        .to_summary(on.get_current_version(), false);
+    assert!(!summary.bundle_hash_known);
+
+    // Advertising the hash clears both the readiness reason and the summary flag.
+    {
+        let mut slaves = sito_core::sync::lock_or_recover(&on.slaves);
+        slaves
+            .get_mut("legacy-slave")
+            .expect("installed slave")
+            .have_bundle_hash = Some("ab".repeat(32));
+    }
+    assert!(
+        on.readiness().ready,
+        "a hash-capable peer satisfies the promotion readiness gate"
+    );
+    let summary = on
+        .slaves
+        .lock()
+        .unwrap()
+        .get("legacy-slave")
+        .expect("installed slave")
+        .to_summary(on.get_current_version(), false);
+    assert!(summary.bundle_hash_known);
+}
+
+#[test]
 fn test_require_all_slaves_implies_require_slaves() {
     // Only require_all_slaves is set: with no slaves it must still fail, so
     // the stricter flag cannot be satisfied by the laxer default.

@@ -59,6 +59,7 @@ impl ActiveSlave {
             last_ping_secs_ago: self.last_ping.elapsed().as_secs(),
             connected_at: self.connected_at.to_rfc3339(),
             last_stats: self.last_stats.clone(),
+            bundle_hash_known: self.have_bundle_hash.is_some(),
         }
     }
 }
