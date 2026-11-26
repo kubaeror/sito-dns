@@ -197,8 +197,8 @@ pub fn shared_config_diff(current: &str, candidate: &str) -> Vec<String> {
 /// that are harmless in a bundle because the slave merge overwrites them
 /// before persisting (`dns.bind`, `[web] bind/TLS`, `server.data_dir`, ...).
 /// Removing them here keeps the edit-time decision aligned with the merge,
-/// while `server.role` and logging stay node-local identity because the
-/// sanitizer rewrites the role for every replica.
+/// while identity and logging are node-local because the merge restores the
+/// local values (and the sanitizer rewrites the role for every replica).
 fn shared_config_projection(document: &str) -> Result<toml::Table, HaError> {
     let sanitized = sanitize_config_for_bundle(document)?;
     let mut table: toml::Table = toml::from_str(&sanitized).map_err(|e| HaError::Validation {

@@ -2715,6 +2715,88 @@ client_id_secrets = { "kids-tablet" = "client_shared_secret_9876" }
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
 
+/// Logging is node-local: a local log-level/log-format edit must survive the
+/// next master push, and the applied watermark digest must still match the
+/// persisted document (no spurious drift).
+#[tokio::test]
+async fn test_push_preserves_node_local_logging_and_watermark_digest() {
+    let signing_key = crate::crypto::Ed25519SigningKey::generate().unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "sito_ha_local_logging_{}_{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let config_path = dir.join("config.toml");
+    let local_doc = r#"config_version = 2
+[server]
+role = "slave"
+instance_name = "slave-logging"
+log_level = "debug"
+log_format = "pretty"
+
+[upstream]
+servers = ["9.9.9.9"]
+"#;
+    tokio::fs::write(&config_path, local_doc).await.unwrap();
+    let handles = test_handles(Some(config_path.clone())).await;
+    assert_eq!(
+        handles.runtime.snapshot().config.server.log_level,
+        "debug",
+        "the test must start from the node-local log level"
+    );
+
+    let tracker = SlaveStatusTracker::new("slave-logging".to_string(), 0, None)
+        .with_watermark_path(dir.join("ha_watermark.toml"))
+        .unwrap();
+
+    let master_doc = r#"config_version = 2
+[server]
+role = "master"
+instance_name = "master-logging"
+log_level = "info"
+log_format = "json"
+
+[upstream]
+servers = ["1.1.1.1"]
+"#;
+    let push = build_and_sign_push(&test_bundle(1, master_doc, None, None), &signing_key).unwrap();
+    apply_config_push(&push, &tracker, &handles, &signing_key.public_key())
+        .await
+        .expect("push applies with the node-local logging preserved");
+
+    let persisted = tokio::fs::read_to_string(&config_path).await.unwrap();
+    let parsed = Config::from_toml_str(&persisted).expect("restart document parses");
+    assert_eq!(
+        parsed.server.log_level, "debug",
+        "a local log-level edit must survive a master push"
+    );
+    assert_eq!(
+        parsed.server.log_format, "pretty",
+        "a local log-format edit must survive a master push"
+    );
+    assert_eq!(
+        parsed.upstream.servers,
+        vec!["1.1.1.1".to_string()],
+        "shared fields still come from the push"
+    );
+    assert_eq!(
+        handles.runtime.snapshot().config.server.log_level,
+        "debug",
+        "the applied runtime must keep the local logging"
+    );
+    assert!(
+        !tracker
+            .verify_applied_config(&persisted)
+            .expect("digest check"),
+        "the preserved node-local logging must not look like shared drift"
+    );
+    assert!(!tracker.requires_full_apply());
+    assert_eq!(tracker.get_state(), SlaveState::Synced);
+
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
 /// `bundle.lists` is authoritative: the runtime filter engine and the
 /// persisted file both get the metadata carried by the bundle.
 #[tokio::test]

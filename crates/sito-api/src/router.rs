@@ -67,12 +67,12 @@ pub async fn slave_read_only_middleware(
     // `/ha/resync` stays reachable to report a precise 409/503; the handler
     // itself refuses to broadcast on a gated effective/configured master.
     let gate_allowed = auth_allowed || path == "/api/v2/ha/resync" || path == "/ha/resync";
-    // The full-config apply endpoint may carry node-local settings (identity,
-    // `[ha]`, DNS bind/TLS, web bind/TLS/ACME, integration credentials and
-    // per-client secrets). Let it reach the handler; the apply pipeline
-    // rejects any shared-field change with `urn:sito:ha:shared_config_read_only`
-    // before persist/apply. Every shared-resource endpoint stays blocked here.
-    let config_apply_allowed = path == "/config" || path == "/api/v2/config";
+    // `PUT /config` may carry node-local settings (identity, `[ha]`, DNS
+    // bind/TLS, web bind/TLS/ACME, integration credentials and per-client
+    // secrets). Let it reach the handler; the apply pipeline rejects any
+    // shared-field change with `urn:sito:ha:shared_config_read_only` before
+    // persist/apply. Every shared-resource endpoint stays blocked here.
+    let config_apply_allowed = *method == Method::PUT && path == "/config";
     let slave_allowed = path.starts_with("/api/v2/auth")
         || path == "/api/v2/ha/resync"
         || path == "/ha/resync"
@@ -564,7 +564,6 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    #[cfg(feature = "ha")]
     use std::sync::Arc;
 
     async fn health_body(ctx: ServerContext) -> (StatusCode, serde_json::Value) {
@@ -597,6 +596,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_promoted_effective_master_is_healthy() {
         let temp_dir = crate::test_support::temp_dir("sito_health_promoted_master");
@@ -622,6 +622,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_health_not_ready_while_promotion_gate_is_blocked() {
         let temp_dir = crate::test_support::temp_dir("sito_health_promotion_gate");
@@ -1335,6 +1336,7 @@ mod tests {
     /// node-local settings), which then rejects a shared edit with
     /// `urn:sito:ha:shared_config_read_only`; shared-resource endpoints stay
     /// blocked by the middleware.
+    #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_slave_config_put_reaches_the_shared_apply_gate() {
         use axum::body::Body;
@@ -1415,6 +1417,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[cfg(feature = "ha")]
     async fn app_blocked_config_reload(
         ctx: &ServerContext,
         token: &str,

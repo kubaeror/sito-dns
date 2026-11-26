@@ -1153,10 +1153,14 @@ reject a shared-field change with `409 Conflict`,
 `type = "urn:sito:ha:shared_config_read_only"`, and a `shared_config_fields`
 array of the changed dotted paths. A hot-applied node-local-only edit is
 applied and persisted locally; a slave never publishes to the master and the
-watermark is not extended by a local edit. Restart-only node-local fields keep
-their D11 `409 restart_required` response and require editing `config.toml` and
-restarting that node. `server.log_level` and `server.log_format` are node-local
-(logging is per node), while `[auth]` policy remains shared.
+watermark is not extended by a local edit. Restart-only fields keep their D11
+`409 restart_required` response (`server.role`, `server.instance_name`,
+`server.data_dir`, `server.log_format`, `[auth]`, `[web]` enabled/bind/port,
+`[tls]`, `[acme]`, `[ha]`, `[integrations]`); node-local restart-only fields
+require editing `config.toml` and restarting, while shared restart-only fields
+(`[auth]`, non-MikroTik `[integrations]`) must come from the master.
+`server.log_level` and `server.log_format` are node-local (logging is per node)
+and preserved by every push, while `[auth]` policy remains shared.
 Protocol v2 refuses v1 `ha_state.toml`/`ha_watermark.toml`; before the first v2
 start, back them up and move them aside on the master and every slave (see the
 [HA runbook §7.2](runbook-ha.md#72-upgrade-v1-cluster--v2)). This intentionally

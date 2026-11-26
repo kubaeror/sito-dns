@@ -995,10 +995,15 @@ running document before persist/apply:
 
 - a hot-applied node-local-only change (or a formatting-only rewrite) is
   applied and persisted locally; the slave never publishes to the master and
-  the HA watermark is untouched. Restart-only node-local fields keep their
-  existing D11 `409 restart_required` response: edit `config.toml` and restart
-  that node (for example `[web] bind/port`, `[tls]`, `[acme]`,
-  `server.data_dir`);
+  the HA watermark is untouched. Restart-only fields keep their existing D11
+  `409 restart_required` response (`server.role`, `server.instance_name`,
+  `server.data_dir`, `server.log_format`, `[auth]`, `[web]` enabled/bind/port,
+  `[tls]`, `[acme]`, `[ha]`, `[integrations]`). Node-local restart-only fields
+  (`server.*`, `[ha]`, `[web]`, `[tls]`, `[acme]`, `[integrations.mikrotik]`)
+  require editing `config.toml` and restarting that node; shared restart-only
+  fields (`[auth]`, non-MikroTik `[integrations]`) must be changed on the
+  master and pushed, and a slave rejects the push until it has been restarted
+  with the intended restart-only values;
 - any shared-field change is rejected atomically with `409 Conflict`,
   `type = "urn:sito:ha:shared_config_read_only"`, a `title` of
   `HA Shared Configuration Read-Only`, and a `shared_config_fields` array of
@@ -1012,13 +1017,21 @@ fields to the master and let replication converge the node. An unparseable
 document fails closed with `<unparseable-config>` rather than being treated as
 node-local.
 
-Other config mutation routes stay blocked by the slave middleware with
+The edit-time guarantee covers the API/UI **apply handlers** only. Other config
+mutation routes stay blocked by the slave middleware with
 `urn:sito:ha:read-only`: `POST /api/v2/config/reload`, `/api/v2/config/restore*`,
 the filtering/clients/rewrites/upstream/settings UI actions and the system
-reload action. Hand-editing a shared field in `config.toml` directly cannot be
-prevented by an API gate; the watcher/restart drift check still marks the node
-`Degraded` and the next master push overwrites it. The Settings and System UI
-pages render shared controls read-only on a replica with a “Managed by the
-master” explanation and the configured master URL; the filtering, clients,
-rewrites and upstreams pages still rely on the middleware 409 (UI row-level
-residual, tracked in the 2.0 claim matrix).
+reload action. A direct hand edit of `config.toml` bypasses both gates: the
+file-watcher/restart drift check is the only protection for that path and
+overwrites the edit on the next push. The shared projection excludes
+`server.role`/logging and the sanitizer-stripped legacy `[auth]` secret keys
+(`admin_password_hash`, `tokens`), so direct edits to those are not
+drift-detected; role/logging are node-local/restart-only and the legacy auth
+keys are inert. A watermark written by an older build (whose projection
+included logging) may be seen as drifted **once** after the upgrade and force a
+full apply; this is safe and self-heals on the next push/restart.
+
+The Settings and System UI pages render shared controls read-only on a replica
+with a “Managed by the master” explanation and the configured master URL; the
+filtering, clients, rewrites and upstreams pages still rely on the middleware
+409 (UI row-level residual, tracked in the 2.0 claim matrix).

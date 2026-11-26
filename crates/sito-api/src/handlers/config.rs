@@ -663,6 +663,7 @@ laptop = "node-secret"
         ctx
     }
 
+    #[cfg(feature = "ha")]
     fn slave_edit(base: &str, old: &str, new: &str) -> String {
         assert!(base.contains(old), "test edit target must exist: {old}");
         base.replace(old, new)
@@ -671,6 +672,7 @@ laptop = "node-secret"
     /// C1: a slave edit that changes shared configuration is rejected with
     /// `urn:sito:ha:shared_config_read_only`, names the changed paths, and
     /// persists/applies nothing.
+    #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_slave_shared_config_edit_is_409_and_not_persisted() {
         let temp_dir = crate::test_support::temp_dir("sito_cfg_slave_shared");
@@ -715,6 +717,7 @@ laptop = "node-secret"
 
     /// C1: a node-local-only edit is accepted, applied and persisted, and the
     /// slave does not publish anything to the master or return an HA report.
+    #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_slave_node_local_config_edit_succeeds_without_ha_publish() {
         let temp_dir = crate::test_support::temp_dir("sito_cfg_slave_local");
@@ -749,6 +752,7 @@ laptop = "node-secret"
 
     /// C1: a mixed edit is rejected and only the shared paths are named; the
     /// node-local part is not persisted either.
+    #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_slave_mixed_config_edit_names_only_shared_paths() {
         let temp_dir = crate::test_support::temp_dir("sito_cfg_slave_mixed");
@@ -812,6 +816,7 @@ laptop = "node-secret"
     }
 
     /// C1: a promoted effective master is no longer a read-only replica.
+    #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_effective_master_shared_config_edit_is_allowed() {
         let temp_dir = crate::test_support::temp_dir("sito_cfg_effective_master");
@@ -871,6 +876,85 @@ laptop = "node-secret"
         let restarted = Config::from_toml_str(&persisted).expect("restart document parses");
         assert_eq!(restarted.server.log_level, "debug");
         assert_eq!(restarted.upstream.servers, vec!["9.9.9.9".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// C1: the locked apply variant used by UI handlers enforces the same
+    /// shared boundary as the REST wrapper.
+    #[cfg(feature = "ha")]
+    #[tokio::test]
+    async fn test_locked_apply_path_rejects_shared_edit_on_slave() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_slave_locked");
+        let ctx = slave_context(&temp_dir, SLAVE_BASE).await;
+        let _guard = ctx.lock_config_apply().await;
+        let mut candidate = (**ctx.config.load()).clone();
+        candidate.upstream.servers = vec!["1.1.1.1".to_string()];
+
+        let err = crate::config_apply::apply_and_persist_config_locked(
+            &ctx,
+            &candidate,
+            crate::config_apply::FilterApply::Deferred,
+            None,
+        )
+        .await
+        .expect_err("the UI/locked apply path must reject shared changes");
+        assert_eq!(err.status, 409, "{err:?}");
+        assert_eq!(err.error_type, "urn:sito:ha:shared_config_read_only");
+        assert_eq!(
+            err.shared_config_fields.as_deref().map(Vec::as_slice),
+            Some(["upstream.servers".to_string()].as_slice())
+        );
+        assert_eq!(
+            ctx.config.load().upstream.servers,
+            vec!["9.9.9.9".to_string()]
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            SLAVE_BASE
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// C1: a node-local API edit is local-only and must not create or advance
+    /// the HA watermark.
+    #[cfg(feature = "ha")]
+    #[tokio::test]
+    async fn test_slave_node_local_edit_does_not_write_ha_watermark() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_slave_watermark");
+        let mut ctx = slave_context(&temp_dir, SLAVE_BASE).await;
+        let watermark_path = temp_dir.join("ha_watermark.toml");
+        ctx.slave_tracker = Some(
+            sito_ha::SlaveStatusTracker::new("slave-a".to_string(), 0, None)
+                .with_watermark_path(watermark_path.clone())
+                .expect("watermark path"),
+        );
+
+        let Json(_) = update_config(
+            admin(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(UpdateConfigRequest {
+                config_toml: slave_edit(
+                    SLAVE_BASE,
+                    "log_level = \"info\"",
+                    "log_level = \"debug\"",
+                ),
+            }),
+        )
+        .await
+        .expect("a node-local edit applies locally");
+
+        assert!(
+            !watermark_path.exists(),
+            "a node-local edit must not create the HA watermark"
+        );
+        assert_eq!(
+            ctx.slave_tracker.as_ref().expect("tracker").get_version(),
+            0,
+            "a node-local edit must not advance the applied HA version"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

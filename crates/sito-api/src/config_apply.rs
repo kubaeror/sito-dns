@@ -514,6 +514,8 @@ pub async fn apply_and_persist_config(
 /// nothing. A promoted effective master is no longer a replica and is
 /// unaffected. A no-HA build has no replica workers and always allows the
 /// write (validation still rejects `role = "slave"`).
+// The no-HA branch is deliberately infallible while the callers stay generic.
+#[cfg_attr(not(feature = "ha"), allow(clippy::unnecessary_wraps))]
 fn ensure_slave_shared_config_unchanged(
     ctx: &ServerContext,
     current: &Config,
@@ -552,9 +554,13 @@ fn ensure_slave_shared_config_unchanged(
 fn shared_config_read_only(changed: Vec<String>) -> ProblemDetails {
     let mut problem = ProblemDetails::conflict(format!(
         "HA replica slaves cannot change master-managed (shared) configuration. Rejected fields: {}. \
-         Submit these changes to the master node; only node-local settings (identity, [ha], DNS bind/TLS, \
-         web bind/TLS/ACME, MikroTik credentials and clients.client_id_secrets) may be edited locally. \
-         Nothing was applied or persisted.",
+         Submit these changes to the master node. Only node-local settings (identity, logging, [ha], \
+         DNS bind/TLS, web bind/TLS/ACME, MikroTik credentials and clients.client_id_secrets) may be \
+         edited locally. Restart-only fields (server.role, server.instance_name, server.data_dir, \
+         server.log_format, auth, web enabled/bind/port, tls, acme, ha, integrations) are not \
+         hot-applied: node-local ones require editing config.toml and restarting this node, while \
+         shared ones must be changed on the master and pushed before restarting. Nothing was applied \
+         or persisted.",
         changed.join(", ")
     ));
     problem.error_type = "urn:sito:ha:shared_config_read_only".to_string();
