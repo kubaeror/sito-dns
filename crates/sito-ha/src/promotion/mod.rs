@@ -12,6 +12,7 @@
 //! [`PromotionEngine::fence_store`]) are exposed here.
 
 pub mod acquisition;
+pub mod audit;
 pub mod clock;
 pub mod confirm;
 pub mod engine;
@@ -30,6 +31,7 @@ pub use acquisition::{
     AcquirePlan, AcquisitionDecision, AcquisitionRole, LocalContent, PromotionRefusal,
     decide_acquisition,
 };
+pub use audit::PromotionAudit;
 pub use clock::{
     BoxFuture, ManualMonotonicClock, ManualTimers, MonotonicClock, PromotionTimers,
     SystemMonotonicClock, SystemTimers,

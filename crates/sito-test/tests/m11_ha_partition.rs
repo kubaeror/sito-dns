@@ -738,6 +738,7 @@ async fn publish_context(dir: &Path, config_path: &Path) -> ServerContext {
         start_time: Instant::now(),
         restore_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
         ha_write_gate: std::sync::Arc::new(sito_api::state::HaWriteGate::new()),
+        promotion_status: Default::default(),
         promoted_master_coordinator: std::sync::Arc::new(std::sync::Mutex::new(None)),
         master_coordinator: Some(coordinator),
         slave_tracker: None,

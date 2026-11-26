@@ -42,6 +42,8 @@ pub(super) struct PromotionRuntimeState {
     pub(super) master_slot: Arc<Mutex<Option<MasterCoordinator>>>,
     pub(super) initial_toml: Mutex<Option<String>>,
     pub(super) known_secrets: Vec<String>,
+    /// Shared ADR-0010 status snapshot read by `GET /api/v2/ha/status`.
+    pub(super) status: sito_api::PromotionStatusHandle,
 }
 
 impl PromotionRuntimeState {
@@ -76,6 +78,61 @@ impl PromotionRuntimeState {
     }
 }
 
+/// Builds the initial status snapshot for an enabled promotion node.
+///
+/// The supervisor replaces it as soon as the engine boots, but the API must
+/// never report `disabled` for a node that configured `enabled = true`.
+pub(super) fn initial_promotion_status(
+    ha_config: &HaConfig,
+    role: ConfiguredRole,
+) -> sito_api::models::PromotionStatus {
+    let promotion = &ha_config.promotion;
+    if !promotion.enabled {
+        return sito_api::models::PromotionStatus::disabled();
+    }
+    let (state, reason) = match (role, promotion.candidate) {
+        (ConfiguredRole::Master, _) => ("acquiring", None),
+        (ConfiguredRole::Slave, true) => ("waiting_for_master_loss", None),
+        (ConfiguredRole::Slave, false) => ("aborted", Some("not_candidate")),
+    };
+    sito_api::models::PromotionStatus {
+        enabled: true,
+        candidate: promotion.candidate,
+        backend: promotion.backend.clone(),
+        cluster_id: promotion.cluster_id.clone(),
+        node_id: promotion.node_id.clone(),
+        state: state.to_string(),
+        reason: reason.map(str::to_string),
+        ..sito_api::models::PromotionStatus::disabled()
+    }
+}
+
+/// Publishes a terminal construction/config failure instead of leaving the
+/// seeded `acquiring` status forever.
+fn publish_unavailable_status(state: &PromotionRuntimeState, reason: &str) {
+    let mut status = initial_promotion_status(&state.ha_config, state.role);
+    status.state = "unavailable".to_string();
+    status.reason = Some(reason.to_string());
+    state
+        .metrics
+        .observe_ha_promotion_status(status.enabled, false, status.term, 0, 0);
+    state.status.store(status);
+}
+
+/// Publishes the engine snapshot to the API/metrics shared handles.
+fn publish_promotion_status(state: &PromotionRuntimeState, engine: &PromotionEngine) {
+    let snapshot = engine.snapshot();
+    let status = sito_api::models::PromotionStatus::from_snapshot(&snapshot);
+    state.metrics.observe_ha_promotion_status(
+        status.enabled,
+        snapshot.lease_held,
+        status.term,
+        status.quiesce_remaining_secs,
+        status.reconcile_remaining_secs,
+    );
+    state.status.store(status);
+}
+
 /// Starts the promotion supervisor. It never exits the process on witness
 /// failure: the node stays read-only and retries.
 pub(super) fn spawn_promotion_supervisor(
@@ -102,6 +159,7 @@ async fn run_supervisor(state: Arc<PromotionRuntimeState>, mut shutdown_rx: watc
                 state
                     .write_gate
                     .block(format!("witness_config_invalid: {error}"));
+                publish_unavailable_status(&state, "witness_config_invalid");
                 warn!(error = %error, "Promotion witness client is not usable yet; staying read-only");
                 tokio::select! {
                     () = tokio::time::sleep(backoff.next_delay()) => {}
@@ -120,15 +178,43 @@ async fn run_supervisor(state: Arc<PromotionRuntimeState>, mut shutdown_rx: watc
         backend,
         host.clone(),
     ) {
-        Ok(engine) => {
-            Arc::new(engine.with_heartbeat_timeout_secs(state.heartbeat_timeout().as_secs()))
-        }
+        Ok(engine) => Arc::new(
+            engine
+                .with_heartbeat_timeout_secs(state.heartbeat_timeout().as_secs())
+                .with_metrics(state.metrics.clone()),
+        ),
         Err(error) => {
             state.write_gate.block("promotion_config_invalid");
+            publish_unavailable_status(&state, "promotion_config_invalid");
             error!(error = %error, "Automatic promotion configuration failed at runtime");
             return;
         }
     };
+
+    // Publish the status snapshot independently of the supervisor's return
+    // paths: a fenced/aborted supervisor stops, but the API must keep reporting
+    // the terminal state until the process exits.
+    {
+        let status_state = Arc::clone(&state);
+        let status_engine = Arc::clone(&engine);
+        let mut status_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                publish_promotion_status(&status_state, &status_engine);
+                if *status_shutdown.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = status_shutdown.changed() => {
+                        if *status_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     match engine.boot() {
         Ok(PromotionOutcome::Fenced) => {
@@ -194,6 +280,13 @@ async fn run_supervisor(state: Arc<PromotionRuntimeState>, mut shutdown_rx: watc
                 let seen_master = tracker.seconds_since_master_frame().is_some();
                 let master_alive = tracker.master_alive(heartbeat);
                 if master_alive || (!seen_master && started.elapsed() < heartbeat) {
+                    // Keep the public status truthful while the gate is blocked
+                    // for a live master; candidate_attempt is not called here.
+                    // Without a master frame yet the boot reason (`not_candidate`)
+                    // is left alone: there is no evidence the master is alive.
+                    if master_alive {
+                        engine.note_waiting_for_master("master_alive");
+                    }
                     state.write_gate.block("master_alive");
                     tokio::select! {
                         () = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -849,7 +942,27 @@ mod tests {
             master_slot: Arc::new(Mutex::new(None)),
             initial_toml: Mutex::new(None),
             known_secrets: Vec::new(),
+            status: Default::default(),
         })
+    }
+
+    #[test]
+    fn construction_failure_publishes_a_terminal_unavailable_status() {
+        let mut state = test_state("construction_failure");
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .ha_config
+            .promotion
+            .enabled = true;
+        publish_unavailable_status(&state, "witness_config_invalid");
+
+        let status = state.status.load();
+        assert!(status.enabled);
+        assert_eq!(status.state, "unavailable");
+        assert_eq!(status.reason.as_deref(), Some("witness_config_invalid"));
+        let rendered = state.metrics.render_prometheus();
+        assert!(rendered.contains("sito_ha_promotion_enabled 1"));
+        assert!(rendered.contains("sito_ha_promotion_lease_held 0"));
     }
 
     #[tokio::test]
@@ -1624,6 +1737,7 @@ mod integration_tests {
             master_slot: master_slot.clone(),
             initial_toml: Mutex::new(Some(toml::to_string_pretty(&config).unwrap())),
             known_secrets: Vec::new(),
+            status: Default::default(),
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         spawn_promotion_supervisor(state.clone(), shutdown_rx);
@@ -1644,6 +1758,28 @@ mod integration_tests {
         assert_eq!(coordinator.get_current_term(), 2);
         assert_eq!(coordinator.get_current_version(), 6);
         assert!(gate.is_effective_master());
+
+        // The supervisor publishes the shared status snapshot and the
+        // lease-held gauge from the live grant, not from "state == master".
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = state.status.load();
+            if status.state == "master" {
+                assert_eq!(status.term, 2);
+                assert!(status.lease_revision.is_some());
+                assert!(!status.fenced);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "supervisor did not publish a master status: {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let rendered = state.metrics.render_prometheus();
+        assert!(rendered.contains("sito_ha_promotion_enabled 1"));
+        assert!(rendered.contains("sito_ha_promotion_lease_held 1"));
+        assert!(rendered.contains("sito_ha_promotion_term 2"));
 
         // Normal API publish through the shared context slot reaches a slave
         // and the running renewal loop advances the witness baseline.
@@ -1867,6 +2003,7 @@ mod integration_tests {
             master_slot: Arc::new(Mutex::new(None)),
             initial_toml: Mutex::new(Some(toml::to_string_pretty(&config).unwrap())),
             known_secrets: Vec::new(),
+            status: Default::default(),
         });
         let host = Arc::new(RuntimePromotionHost {
             state: Arc::clone(&state),
@@ -2017,6 +2154,7 @@ mod integration_tests {
             master_slot: Arc::new(Mutex::new(None)),
             initial_toml: Mutex::new(Some(toml_doc)),
             known_secrets: Vec::new(),
+            status: Default::default(),
         });
         let host = Arc::new(RuntimePromotionHost {
             state: Arc::clone(&state),
@@ -2152,6 +2290,7 @@ mod integration_tests {
             master_slot: Arc::new(Mutex::new(None)),
             initial_toml: Mutex::new(Some(toml_doc)),
             known_secrets: Vec::new(),
+            status: Default::default(),
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         spawn_promotion_supervisor(Arc::clone(&state), shutdown_rx);

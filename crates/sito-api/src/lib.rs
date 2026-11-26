@@ -36,7 +36,8 @@ pub use readiness::{
 };
 pub use router::{create_router, create_router_with_hooks};
 pub use state::{
-    ServerContext, publish_bundle, refresh_tls_certificate_readiness, tls_certificate_readiness,
+    PromotionStatusHandle, ServerContext, publish_bundle, refresh_tls_certificate_readiness,
+    tls_certificate_readiness,
 };
 
 #[cfg(test)]

@@ -70,6 +70,10 @@ pub(super) fn init_ha(
 
     let write_gate = Arc::new(sito_api::state::HaWriteGate::new());
     let promoted_master = Arc::new(Mutex::new(None));
+    // ADR-0010 metrics are configured even when promotion is disabled: the
+    // exposition then truthfully reports only `sito_ha_promotion_enabled 0`
+    // instead of inventing lease/term series for a cluster that never opted in.
+    metrics.init_ha_promotion_metrics(ha_config.promotion.enabled);
     if ha_config.promotion.enabled {
         write_gate.block("ha_promotion_starting");
     }
@@ -275,6 +279,10 @@ pub(super) fn init_ha(
                 master_slot: Arc::clone(&promoted_master),
                 initial_toml: Mutex::new(Some(initial_toml.clone())),
                 known_secrets: known_secrets.iter().map(|s| (*s).to_string()).collect(),
+                status: sito_api::PromotionStatusHandle::new(initial_promotion_status(
+                    &ha_config,
+                    sito_ha::ConfiguredRole::Master,
+                )),
             })
         });
 
@@ -324,6 +332,10 @@ pub(super) fn init_ha(
                 master_slot: Arc::clone(&promoted_master),
                 initial_toml: Mutex::new(None),
                 known_secrets: Vec::new(),
+                status: sito_api::PromotionStatusHandle::new(initial_promotion_status(
+                    &ha_config,
+                    sito_ha::ConfiguredRole::Slave,
+                )),
             })
         });
         (
@@ -348,6 +360,18 @@ pub(super) fn init_ha(
 }
 
 impl HaRuntime {
+    /// Shared promotion status handle for the API context.
+    ///
+    /// A disabled or non-HA node gets the stable disabled shape.
+    #[must_use]
+    pub(super) fn promotion_status_handle(&self) -> sito_api::PromotionStatusHandle {
+        self.promotion
+            .as_ref()
+            .map_or_else(sito_api::PromotionStatusHandle::default, |promotion| {
+                promotion.status.clone()
+            })
+    }
+
     /// Starts the master promotion supervisor after the live config handle
     /// exists. Candidate promotion is started by the slave worker bootstrap.
     pub(super) fn start_master_promotion(

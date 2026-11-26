@@ -24,6 +24,7 @@ use crate::crypto::Ed25519SigningKey;
 use crate::witness::clock::ManualClock;
 use crate::witness::record::{AcquireRequest, LeaseInfo, LeaseRecord, RenewRequest};
 use crate::witness::server::{WitnessConfig, WitnessHandle, start_witness_server};
+use sito_stats::MetricsRegistry;
 
 const CLUSTER: &str = "home-dns";
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -314,6 +315,121 @@ impl LeaseBackend for ToggleBackend {
                     detail: "injected transport renewal failure".to_string(),
                 })
             });
+        }
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.renew(&request).await })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InjectedWitnessError {
+    Transport,
+    Auth,
+    Server,
+}
+
+impl InjectedWitnessError {
+    fn build(self) -> WitnessClientError {
+        match self {
+            Self::Transport => WitnessClientError::Unavailable {
+                detail: "injected transport failure".to_string(),
+            },
+            Self::Auth => WitnessClientError::Auth {
+                detail: "injected 401".to_string(),
+            },
+            Self::Server => WitnessClientError::Server {
+                status: 503,
+                error: Some("unavailable".to_string()),
+                reason: None,
+                detail: Some("injected 5xx".to_string()),
+            },
+        }
+    }
+}
+
+struct ErrorBackend {
+    kind: InjectedWitnessError,
+}
+impl LeaseBackend for ErrorBackend {
+    fn info(&self) -> super::clock::BoxFuture<'_, Result<LeaseInfo, WitnessClientError>> {
+        let kind = self.kind;
+        Box::pin(async move { Err(kind.build()) })
+    }
+
+    fn lease(
+        &self,
+    ) -> super::clock::BoxFuture<'_, Result<Option<LeaseRecord>, WitnessClientError>> {
+        let kind = self.kind;
+        Box::pin(async move { Err(kind.build()) })
+    }
+
+    fn acquire(
+        &self,
+        _request: AcquireRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        let kind = self.kind;
+        Box::pin(async move { Err(kind.build()) })
+    }
+
+    fn renew(
+        &self,
+        _request: RenewRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        let kind = self.kind;
+        Box::pin(async move { Err(kind.build()) })
+    }
+}
+
+/// A real witness client whose whole endpoint can be taken offline.
+struct OutageBackend {
+    inner: Arc<WitnessClient>,
+    fail: Arc<AtomicBool>,
+}
+
+impl OutageBackend {
+    fn error() -> WitnessClientError {
+        WitnessClientError::Unavailable {
+            detail: "injected witness outage".to_string(),
+        }
+    }
+}
+
+impl LeaseBackend for OutageBackend {
+    fn info(&self) -> super::clock::BoxFuture<'_, Result<LeaseInfo, WitnessClientError>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Box::pin(async { Err(OutageBackend::error()) });
+        }
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.info().await })
+    }
+
+    fn lease(
+        &self,
+    ) -> super::clock::BoxFuture<'_, Result<Option<LeaseRecord>, WitnessClientError>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Box::pin(async { Err(OutageBackend::error()) });
+        }
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.lease().await })
+    }
+
+    fn acquire(
+        &self,
+        request: AcquireRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Box::pin(async { Err(OutageBackend::error()) });
+        }
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.acquire(&request).await })
+    }
+
+    fn renew(
+        &self,
+        request: RenewRequest,
+    ) -> super::clock::BoxFuture<'_, Result<LeaseRecord, WitnessClientError>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Box::pin(async { Err(OutageBackend::error()) });
         }
         let inner = Arc::clone(&self.inner);
         Box::pin(async move { inner.renew(&request).await })
@@ -974,6 +1090,14 @@ async fn reconciliation_aborts_on_ahead_peer_and_publishes_nothing() {
     assert!(!harness.host.writable.load(Ordering::SeqCst));
     assert!(harness.event_index("publish:").is_none());
     assert!(!engine.snapshot().fenced);
+    let snapshot = engine.snapshot();
+    assert!(
+        !snapshot.lease_held,
+        "a terminal abort must not keep advertising a held lease"
+    );
+    assert_eq!(snapshot.lease_revision, None);
+    assert_eq!(snapshot.lease_expires_unix_ms, None);
+    assert_eq!(snapshot.lease_expires_in_secs, None);
     let record = harness
         .fixture
         .client("node-a")
@@ -1051,6 +1175,179 @@ async fn reconciliation_aborts_on_same_version_fork_and_unknown_hash() {
 }
 
 #[tokio::test]
+async fn promotion_records_metrics_from_a_successful_acquisition() {
+    let harness = Harness::new("metrics", "node-a").await;
+    let metrics = MetricsRegistry::new("2.0.0", "test");
+    metrics.init_ha_promotion_metrics(true);
+    let engine = harness
+        .engine("node-a", ConfiguredRole::Master)
+        .with_metrics(metrics.clone());
+    assert_eq!(engine.start_master().await, PromotionOutcome::Master);
+
+    let rendered = metrics.render_prometheus();
+    assert!(rendered.contains(r#"sito_ha_promotion_attempts_total{result="success"} 1"#));
+    assert!(
+        rendered.contains(
+            r#"sito_ha_promotion_witness_requests_total{op="acquire",result="success"} 1"#
+        )
+    );
+    assert!(
+        rendered
+            .contains(r#"sito_ha_promotion_witness_requests_total{op="lease",result="success"}"#)
+    );
+    assert!(rendered.contains("sito_ha_promotion_last_success_timestamp_seconds"));
+    assert!(
+        !rendered.contains("sito_ha_promotion_last_success_timestamp_seconds 0"),
+        "a successful acquisition must publish a non-zero success timestamp"
+    );
+    // Bounded labels only: no node, holder, token or cluster labels.
+    for forbidden in ["node_id=", "holder=", "token=", "cluster_id="] {
+        assert!(
+            !rendered.contains(forbidden),
+            "{forbidden} must not be a label"
+        );
+    }
+}
+
+#[tokio::test]
+async fn witness_failures_clear_reachability_and_use_the_witness_error_label() {
+    for kind in [
+        InjectedWitnessError::Transport,
+        InjectedWitnessError::Auth,
+        InjectedWitnessError::Server,
+    ] {
+        let harness = Harness::new("witness_error_metric", "node-a").await;
+        let metrics = MetricsRegistry::new("2.0.0", "test");
+        metrics.init_ha_promotion_metrics(true);
+        let config = harness.fixture.config("node-a");
+        let clock: Arc<dyn MonotonicClock> = harness.clock.clone();
+        let engine = PromotionEngine::with_runtime(
+            config,
+            ConfiguredRole::Master,
+            harness.data_dir("node-a"),
+            Arc::new(ErrorBackend { kind }),
+            {
+                let host: Arc<dyn PromotionHost> = harness.host.clone();
+                host
+            },
+            clock,
+            Arc::new(ManualTimers::new(Arc::clone(&harness.clock))),
+        )
+        .unwrap()
+        .with_metrics(metrics.clone());
+
+        let _ = engine.start_master().await;
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(
+                r#"sito_ha_promotion_witness_requests_total{op="lease",result="witness_error"} 1"#
+            ),
+            "{kind:?} must appear as witness_error, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"result="error""#),
+            "the unbounded 'error' label must never be emitted"
+        );
+        assert!(
+            !engine.snapshot().witness_reachable,
+            "a failed probe must clear witness_reachable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn witness_outage_after_acquire_clears_reachability() {
+    let harness = Harness::new("reachability", "node-a").await;
+    let fail = Arc::new(AtomicBool::new(false));
+    let config = harness.fixture.config("node-a");
+    let clock: Arc<dyn MonotonicClock> = harness.clock.clone();
+    let backend = Arc::new(OutageBackend {
+        inner: Arc::new(harness.fixture.client("node-a")),
+        fail: Arc::clone(&fail),
+    });
+    let engine = PromotionEngine::with_runtime(
+        config,
+        ConfiguredRole::Master,
+        harness.data_dir("node-a"),
+        backend,
+        {
+            let host: Arc<dyn PromotionHost> = harness.host.clone();
+            host
+        },
+        clock,
+        Arc::new(ManualTimers::new(Arc::clone(&harness.clock))),
+    )
+    .unwrap();
+    assert_eq!(engine.start_master().await, PromotionOutcome::Master);
+    assert!(engine.snapshot().witness_reachable);
+
+    fail.store(true, Ordering::SeqCst);
+    assert!(engine.renew_once().await.is_err());
+    assert!(
+        !engine.snapshot().witness_reachable,
+        "a failed renewal probe must clear witness_reachable"
+    );
+}
+
+#[tokio::test]
+async fn candidate_boot_has_no_master_evidence_until_a_frame_arrives() {
+    let harness = Harness::new("candidate_boot", "node-a").await;
+    let engine = harness.engine("node-a", ConfiguredRole::Slave);
+    engine.boot().unwrap();
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.phase, PromotionPhase::WaitingForMasterLoss);
+    assert_eq!(
+        snapshot.reason.as_deref(),
+        Some("not_candidate"),
+        "boot must not claim a live master before any frame is observed"
+    );
+    assert!(snapshot.candidate);
+
+    // Once the supervisor sees a live master frame it publishes master_alive.
+    engine.note_waiting_for_master("master_alive");
+    assert_eq!(engine.snapshot().reason.as_deref(), Some("master_alive"));
+}
+
+#[tokio::test]
+async fn boot_copies_the_active_bundle_hash() {
+    let harness = Harness::new("boot_hash", "node-a").await;
+    let published = hash(0xab);
+    seed_state(
+        &harness.data_dir("node-a"),
+        4,
+        128,
+        PublicationState::Published,
+        (128, &published),
+        None,
+        (128, &published),
+    );
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    engine.boot().unwrap();
+    let snapshot = engine.snapshot();
+    assert_eq!(snapshot.version, 128);
+    assert_eq!(snapshot.bundle_hash, published);
+    assert_ne!(snapshot.bundle_hash, "none");
+}
+
+#[tokio::test]
+async fn runtime_fence_reasons_use_stable_documented_codes() {
+    use super::fence::FenceReason;
+
+    let harness = Harness::new("fence_codes", "node-a").await;
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    for (reason, code) in [
+        (FenceReason::ClockAnomaly, "clock_step"),
+        (FenceReason::StateWriteFailed, "state_write_failed"),
+        (FenceReason::RoleSwitchFailed, "role_switch_failed"),
+    ] {
+        engine.fence(reason, "test").unwrap();
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.phase, PromotionPhase::Fenced);
+        assert_eq!(snapshot.reason.as_deref(), Some(code));
+    }
+}
+
+#[tokio::test]
 async fn self_fence_persists_and_a_restart_refuses_to_acquire() {
     let harness = Harness::new("self_fence", "node-a").await;
     let engine = harness.engine("node-a", ConfiguredRole::Master);
@@ -1081,6 +1378,22 @@ async fn self_fence_persists_and_a_restart_refuses_to_acquire() {
         record.term, term,
         "a fenced node must not acquire a new term"
     );
+
+    // `sito ha clear-fence --confirm` removes both markers locally; the next
+    // start is no longer refused and may acquire a fresh term.
+    restarted.fence_store().clear().unwrap();
+    assert!(restarted.fence_store().load().unwrap().is_none());
+    // Expire the old holder's witness record: clearing the fence only removes
+    // the durable no-reacquire marker, it does not grant a lease.
+    harness.fixture.clock.advance(5_000);
+    let cleared = harness.engine("node-a", ConfiguredRole::Master);
+    assert_ne!(cleared.boot().unwrap(), PromotionOutcome::Fenced);
+    assert_eq!(
+        cleared.start_master().await,
+        PromotionOutcome::Master,
+        "after clearing the fence the node may acquire a new term"
+    );
+    assert!(cleared.snapshot().term > term);
 }
 
 #[tokio::test]

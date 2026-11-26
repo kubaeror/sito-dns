@@ -639,6 +639,134 @@ pub struct ChangePasswordRequest {
     pub new_password: String,
 }
 
+/// ADR-0010 automatic-promotion status exposed by `GET /api/v2/ha/status`.
+///
+/// The object is always present. With promotion disabled every field keeps a
+/// stable, secret-free default and `state = "disabled"` /
+/// `reason = "promotion_disabled"`. `version`/`bundle_hash` describe the active
+/// bundle (which may be pending during a promotion); `publication_state` and
+/// `published_version` identify the last bundle actually published, which is the
+/// only witness baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PromotionStatus {
+    /// `ha.promotion.enabled`.
+    pub enabled: bool,
+    /// Designated candidate node.
+    pub candidate: bool,
+    /// Lease backend; always `"witness"` in 2.0.
+    pub backend: String,
+    /// Stable cluster identifier, when configured.
+    pub cluster_id: Option<String>,
+    /// Stable node identifier, when configured.
+    pub node_id: Option<String>,
+    /// `disabled`, `waiting_for_master_loss`, `manual_confirmation_required`,
+    /// `acquiring`, `quiescing`, `reconciling`, `publishing`, `master`,
+    /// `fenced`, `aborted` or `unavailable`.
+    pub state: String,
+    /// Stable reason code, or `null`.
+    pub reason: Option<String>,
+    /// Term held or attempted.
+    pub term: u64,
+    /// Active bundle version.
+    pub version: u64,
+    /// Active bundle signed-payload hash, or `"none"`.
+    pub bundle_hash: String,
+    /// `pending`, `publishing` or `published`.
+    pub publication_state: String,
+    /// Last published version (the witness baseline).
+    pub published_version: u64,
+    /// Witness revision of the current grant.
+    pub lease_revision: Option<u64>,
+    /// Seconds until the witness lease expires, from the last observation.
+    /// Display-only: computed from the node's local wall clock and never used
+    /// as a safety input.
+    pub lease_expires_in_secs: Option<u64>,
+    /// Last witness probe succeeded; observability only, not a safety input.
+    pub witness_reachable: bool,
+    /// Remaining pre-publish quiesce window.
+    pub quiesce_remaining_secs: u64,
+    /// Remaining reconciliation window.
+    pub reconcile_remaining_secs: u64,
+    /// Unix milliseconds of the last acquisition or renewal attempt.
+    pub last_attempt_unix_ms: Option<i64>,
+    /// Unix milliseconds at which this promotion started.
+    pub promoted_at_unix_ms: Option<i64>,
+    /// A durable fence marker is present.
+    pub fenced: bool,
+}
+
+impl Default for PromotionStatus {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[cfg(feature = "ha")]
+impl PromotionStatus {
+    /// Builds the public status object from the engine's internal snapshot.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &sito_ha::PromotionSnapshot) -> Self {
+        use sito_ha_types::status::PublicationState;
+
+        let publication_state = match snapshot.publication_state {
+            PublicationState::Pending => "pending",
+            PublicationState::Publishing => "publishing",
+            PublicationState::Published => "published",
+        };
+        Self {
+            enabled: snapshot.enabled,
+            candidate: snapshot.candidate,
+            backend: "witness".to_string(),
+            cluster_id: snapshot.cluster_id.clone(),
+            node_id: snapshot.node_id.clone(),
+            state: snapshot.phase.as_str().to_string(),
+            reason: snapshot.reason.clone(),
+            term: snapshot.term,
+            version: snapshot.version,
+            bundle_hash: snapshot.bundle_hash.clone(),
+            publication_state: publication_state.to_string(),
+            published_version: snapshot.published_version,
+            lease_revision: snapshot.lease_revision,
+            lease_expires_in_secs: snapshot.lease_expires_in_secs,
+            witness_reachable: snapshot.witness_reachable,
+            quiesce_remaining_secs: snapshot.quiesce_remaining_secs,
+            reconcile_remaining_secs: snapshot.reconcile_remaining_secs,
+            last_attempt_unix_ms: snapshot.last_attempt_unix_ms,
+            promoted_at_unix_ms: snapshot.promoted_at_unix_ms,
+            fenced: snapshot.fenced,
+        }
+    }
+}
+
+impl PromotionStatus {
+    /// The stable object returned when automatic promotion is disabled.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            candidate: false,
+            backend: "witness".to_string(),
+            cluster_id: None,
+            node_id: None,
+            state: "disabled".to_string(),
+            reason: Some("promotion_disabled".to_string()),
+            term: 0,
+            version: 0,
+            bundle_hash: "none".to_string(),
+            publication_state: "published".to_string(),
+            published_version: 0,
+            lease_revision: None,
+            lease_expires_in_secs: None,
+            witness_reachable: false,
+            quiesce_remaining_secs: 0,
+            reconcile_remaining_secs: 0,
+            last_attempt_unix_ms: None,
+            promoted_at_unix_ms: None,
+            fenced: false,
+        }
+    }
+}
+
 /// HA cluster status response for `GET /api/v2/ha/status`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HaStatusResponse {
@@ -675,6 +803,10 @@ pub struct HaStatusResponse {
     /// bundles. Slaves must list it as `master_pubkey`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_pubkey: Option<String>,
+    /// ADR-0010 automatic-promotion status. Always present; disabled clusters
+    /// get the stable `state = "disabled"` shape.
+    #[serde(default)]
+    pub promotion: PromotionStatus,
 }
 
 /// Statistics reported by a replica slave.
@@ -736,4 +868,130 @@ pub struct HaResyncResponse {
     /// Master only: connected slaves for which a push was queued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slaves_notified: Option<usize>,
+}
+
+#[cfg(test)]
+mod promotion_status_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_status_has_the_exact_adr_shape_and_no_secrets() {
+        let status = PromotionStatus::disabled();
+        let json = serde_json::to_value(&status).unwrap();
+        for key in [
+            "enabled",
+            "candidate",
+            "backend",
+            "cluster_id",
+            "node_id",
+            "state",
+            "reason",
+            "term",
+            "version",
+            "bundle_hash",
+            "publication_state",
+            "published_version",
+            "lease_revision",
+            "lease_expires_in_secs",
+            "witness_reachable",
+            "quiesce_remaining_secs",
+            "reconcile_remaining_secs",
+            "last_attempt_unix_ms",
+            "promoted_at_unix_ms",
+            "fenced",
+        ] {
+            assert!(json.get(key).is_some(), "missing status field {key}");
+        }
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["state"], "disabled");
+        assert_eq!(json["reason"], "promotion_disabled");
+        assert_eq!(json["backend"], "witness");
+        assert_eq!(json["bundle_hash"], "none");
+        assert_eq!(json["publication_state"], "published");
+        assert_eq!(json["lease_revision"], serde_json::Value::Null);
+
+        let serialized = json.to_string().to_ascii_lowercase();
+        for forbidden in [
+            "token",
+            "private_key",
+            "certificate",
+            "password",
+            "secret",
+            "url",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "status must not expose {forbidden}: {serialized}"
+            );
+        }
+    }
+
+    #[cfg(feature = "ha")]
+    #[test]
+    fn snapshot_maps_master_and_fenced_states() {
+        let master = PromotionStatus::from_snapshot(&test_snapshot(
+            sito_ha::promotion::PromotionPhase::Master,
+            None,
+            false,
+        ));
+        assert_eq!(master.state, "master");
+        assert_eq!(master.reason, None);
+        assert!(master.enabled);
+        assert_eq!(master.publication_state, "published");
+        assert_eq!(master.lease_expires_in_secs, Some(22));
+        assert_eq!(master.last_attempt_unix_ms, Some(1_760_000_000_000));
+
+        let fenced = PromotionStatus::from_snapshot(&test_snapshot(
+            sito_ha::promotion::PromotionPhase::Fenced,
+            Some("lease_lost"),
+            true,
+        ));
+        assert_eq!(fenced.state, "fenced");
+        assert_eq!(fenced.reason.as_deref(), Some("lease_lost"));
+        assert!(fenced.fenced);
+
+        let mut candidate_snapshot = test_snapshot(
+            sito_ha::promotion::PromotionPhase::WaitingForMasterLoss,
+            Some("master_alive"),
+            false,
+        );
+        candidate_snapshot.candidate = true;
+        let candidate = PromotionStatus::from_snapshot(&candidate_snapshot);
+        assert_eq!(candidate.state, "waiting_for_master_loss");
+        assert_eq!(candidate.reason.as_deref(), Some("master_alive"));
+        assert!(candidate.candidate);
+        assert!(!candidate.fenced);
+    }
+
+    #[cfg(feature = "ha")]
+    fn test_snapshot(
+        phase: sito_ha::promotion::PromotionPhase,
+        reason: Option<&str>,
+        fenced: bool,
+    ) -> sito_ha::PromotionSnapshot {
+        sito_ha::PromotionSnapshot {
+            enabled: true,
+            candidate: false,
+            cluster_id: Some("home-dns".to_string()),
+            node_id: Some("sito-node-a".to_string()),
+            phase,
+            reason: reason.map(str::to_string),
+            term: 8,
+            version: 129,
+            bundle_hash: "ab".repeat(32),
+            publication_state: sito_ha_types::status::PublicationState::Published,
+            published_version: 128,
+            published_hash: "cd".repeat(32),
+            lease_revision: Some(13),
+            lease_held: true,
+            witness_reachable: true,
+            quiesce_remaining_secs: 0,
+            reconcile_remaining_secs: 0,
+            lease_expires_unix_ms: Some(1_760_000_022_000),
+            lease_expires_in_secs: Some(22),
+            last_attempt_unix_ms: Some(1_760_000_000_000),
+            promoted_at_unix_ms: Some(1_760_000_000_000),
+            fenced,
+        }
+    }
 }

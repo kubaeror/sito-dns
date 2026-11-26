@@ -24,11 +24,16 @@ use std::time::Duration;
 use sito_ha_types::bundle::{AppliedWatermark, ConfigBundle};
 use sito_ha_types::config::PromotionConfig;
 use sito_ha_types::status::PublicationState;
+use sito_stats::MetricsRegistry;
 use tracing::{info, warn};
 
 use crate::error::HaError;
 use crate::witness::{AcquireRequest, LeaseInfo, LeaseRecord, RenewRequest};
 
+use super::audit::{
+    COMPLETED, FENCED, LEASE_ACQUIRED, LEASE_LOST, LEASE_RENEWED, MANUAL_CONFIRMATION_CONFIRMED,
+    MANUAL_CONFIRMATION_REQUIRED, PUBLISH_ABORTED, PromotionAudit, QUIESCED, RECONCILED, REFUSED,
+};
 use super::witness_client::{WITNESS_REQUEST_TIMEOUT, WitnessClient, WitnessClientError};
 
 use super::acquisition::{AcquisitionDecision, AcquisitionRole, LocalContent, decide_acquisition};
@@ -370,6 +375,19 @@ pub struct PromotionSnapshot {
     pub quiesce_remaining_secs: u64,
     /// Remaining reconcile time.
     pub reconcile_remaining_secs: u64,
+    /// Witness-reported expiry of the current grant, Unix milliseconds.
+    pub lease_expires_unix_ms: Option<i64>,
+    /// Seconds until `lease_expires_unix_ms`, computed at snapshot time from
+    /// the local wall clock. Display-only; never a safety input.
+    pub lease_expires_in_secs: Option<u64>,
+    /// Unix milliseconds of the last acquisition/renewal attempt.
+    pub last_attempt_unix_ms: Option<i64>,
+    /// Whether this node currently holds a live lease grant.
+    ///
+    /// Computed from the in-memory grant plus the self-fence deadline, not from
+    /// the last status phase: a terminal read-only/abort must report false even
+    /// while the supervisor is still shutting down.
+    pub lease_held: bool,
     /// Promotion start timestamp.
     pub promoted_at_unix_ms: Option<i64>,
     /// Durable fence present.
@@ -395,6 +413,10 @@ impl PromotionSnapshot {
             witness_reachable: false,
             quiesce_remaining_secs: 0,
             reconcile_remaining_secs: 0,
+            lease_expires_unix_ms: None,
+            lease_expires_in_secs: None,
+            last_attempt_unix_ms: None,
+            lease_held: false,
             promoted_at_unix_ms: None,
             fenced: false,
         }
@@ -465,6 +487,8 @@ pub struct PromotionEngine {
     confirm: ConfirmationStore,
     clock: Arc<dyn MonotonicClock>,
     timers: Arc<dyn PromotionTimers>,
+    /// Optional ADR-0010 metrics sink owned by the runtime.
+    metrics: Option<MetricsRegistry>,
     inner: Mutex<EngineInner>,
     data_dir: std::path::PathBuf,
     /// Effective candidate heartbeat timeout from `ha.ping_interval_secs`.
@@ -533,6 +557,7 @@ impl PromotionEngine {
                 confirm: ConfirmationStore::with_path(data_dir.join("ha_promote.confirm"), "", ""),
                 clock,
                 timers,
+                metrics: None,
                 inner: Mutex::new(EngineInner {
                     snapshot: PromotionSnapshot::disabled(),
                     loaded: None,
@@ -579,13 +604,20 @@ impl PromotionEngine {
             .with_identity(cluster_id.clone(), node_id.clone());
         let fence = FenceStore::new(data_dir.clone(), cluster_id.clone(), node_id.clone());
         let confirm = ConfirmationStore::new(data_dir.clone(), cluster_id.clone(), node_id.clone());
+        let (initial_phase, initial_reason) = match (role, config.candidate) {
+            (ConfiguredRole::Master, _) => (PromotionPhase::Acquiring, None),
+            (ConfiguredRole::Slave, true) => {
+                (PromotionPhase::WaitingForMasterLoss, Some("not_candidate"))
+            }
+            (ConfiguredRole::Slave, false) => (PromotionPhase::Aborted, Some("not_candidate")),
+        };
         let snapshot = PromotionSnapshot {
             enabled: true,
             candidate: config.candidate,
             cluster_id: Some(cluster_id.clone()),
             node_id: Some(node_id.clone()),
-            phase: PromotionPhase::Unavailable,
-            reason: None,
+            phase: initial_phase,
+            reason: initial_reason.map(str::to_string),
             term: 0,
             version: 0,
             bundle_hash: "none".to_string(),
@@ -596,6 +628,10 @@ impl PromotionEngine {
             witness_reachable: false,
             quiesce_remaining_secs: 0,
             reconcile_remaining_secs: 0,
+            lease_expires_unix_ms: None,
+            lease_expires_in_secs: None,
+            last_attempt_unix_ms: None,
+            lease_held: false,
             promoted_at_unix_ms: None,
             fenced: false,
         };
@@ -612,6 +648,7 @@ impl PromotionEngine {
             confirm,
             clock,
             timers,
+            metrics: None,
             inner: Mutex::new(EngineInner {
                 snapshot,
                 loaded: None,
@@ -643,6 +680,13 @@ impl PromotionEngine {
     #[must_use]
     pub fn with_heartbeat_timeout_secs(mut self, secs: u64) -> Self {
         self.heartbeat_timeout_secs = secs.max(1);
+        self
+    }
+
+    /// Attaches the runtime metrics registry for the ADR-0010 families.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsRegistry) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -685,7 +729,20 @@ impl PromotionEngine {
     /// Current internal snapshot.
     #[must_use]
     pub fn snapshot(&self) -> PromotionSnapshot {
-        self.lock().snapshot.clone()
+        let (mut snapshot, grant_present, deadline_safe) = {
+            let inner = self.lock();
+            let deadline_safe = inner.deadline.as_ref().is_some_and(|deadline| {
+                matches!(deadline.check(self.clock.as_ref()), SelfFenceCheck::Safe)
+            });
+            (inner.snapshot.clone(), inner.grant.is_some(), deadline_safe)
+        };
+        snapshot.lease_expires_in_secs = snapshot.lease_expires_unix_ms.map(|expires| {
+            let now = self.clock.wall_unix_ms();
+            let remaining_ms = expires.saturating_sub(now);
+            u64::try_from(remaining_ms / 1_000).unwrap_or(0)
+        });
+        snapshot.lease_held = !snapshot.fenced && grant_present && deadline_safe;
+        snapshot
     }
 
     /// Test-only: the armed self-fence deadline in monotonic milliseconds.
@@ -711,6 +768,13 @@ impl PromotionEngine {
             Arc::clone(&self.clock),
             deadline_millis,
         ))
+    }
+
+    /// Updates the status-only waiting phase for a candidate whose master is
+    /// still alive. This does not acquire, discard a confirmation or touch the
+    /// write gate.
+    pub fn note_waiting_for_master(&self, reason: &str) {
+        self.set_phase(PromotionPhase::WaitingForMasterLoss, Some(reason));
     }
 
     /// The per-process witness holder identity (`node_id/boot_uuid`).
@@ -769,6 +833,25 @@ impl PromotionEngine {
         }
 
         let loaded = self.state.load()?;
+        // Copy the active bundle hash as well as its term/version. A restarted
+        // master with the witness down must not report `version = N` with
+        // `bundle_hash = "none"`; "none" is valid only at version 0.
+        let active_hash = match &loaded {
+            LoadedState::Missing => None,
+            LoadedState::Present { state, bookkeeping } => match bookkeeping {
+                Some(bookkeeping) => Some(if bookkeeping.has_pending_bundle() {
+                    bookkeeping
+                        .pending_hash
+                        .clone()
+                        .unwrap_or_else(|| bookkeeping.published_hash.clone())
+                } else {
+                    bookkeeping.published_hash.clone()
+                }),
+                // Legacy state without promotion bookkeeping: compute the
+                // signed-payload hash instead of assuming the bundle is absent.
+                None => self.host.hash_bundle(&state.bundle).ok(),
+            },
+        };
         let (phase, reason) = {
             let mut inner = self.lock();
             match &loaded {
@@ -781,6 +864,9 @@ impl PromotionEngine {
                     inner.bookkeeping.clone_from(bookkeeping);
                     inner.snapshot.term = state.bundle.term;
                     inner.snapshot.version = state.bundle.version;
+                    if let Some(hash) = active_hash.clone() {
+                        inner.snapshot.bundle_hash = hash;
+                    }
                     inner.snapshot.publication_state = bookkeeping
                         .as_ref()
                         .map_or(PublicationState::Published, |b| b.publication_state);
@@ -796,12 +882,11 @@ impl PromotionEngine {
             }
             match (self.role, self.config.candidate) {
                 (ConfiguredRole::Master, _) => {
-                    inner.snapshot.phase = PromotionPhase::Unavailable;
-                    inner.snapshot.reason = Some("witness_unavailable".to_string());
-                    (
-                        PromotionPhase::Unavailable,
-                        Some("witness_unavailable".to_string()),
-                    )
+                    // Do not claim the witness is unavailable before the first
+                    // probe; the supervisor immediately enters acquisition.
+                    inner.snapshot.phase = PromotionPhase::Acquiring;
+                    inner.snapshot.reason = None;
+                    (PromotionPhase::Acquiring, None)
                 }
                 (ConfiguredRole::Slave, true) => {
                     inner.snapshot.phase = PromotionPhase::WaitingForMasterLoss;
@@ -825,7 +910,7 @@ impl PromotionEngine {
         self.lock().booted = true;
         Ok(match phase {
             PromotionPhase::WaitingForMasterLoss => PromotionOutcome::Waiting,
-            PromotionPhase::Unavailable => PromotionOutcome::ReadOnly {
+            _ if self.role == ConfiguredRole::Master => PromotionOutcome::ReadOnly {
                 reason: "witness_unavailable".to_string(),
                 retryable: true,
             },
@@ -881,6 +966,8 @@ impl PromotionEngine {
         }
         if self.role != ConfiguredRole::Slave || !self.config.candidate {
             self.set_phase(PromotionPhase::Aborted, Some("not_candidate"));
+            self.record_refusal("not_candidate");
+            self.audit(REFUSED, "refused", Some("not_candidate"), 0, 0, None);
             return PromotionOutcome::ReadOnly {
                 reason: "not_candidate".to_string(),
                 retryable: false,
@@ -914,6 +1001,15 @@ impl PromotionEngine {
         let eligibility = self.host.eligibility();
         if eligibility.identity_mismatch {
             self.set_phase(PromotionPhase::Aborted, Some("candidate_identity_mismatch"));
+            self.record_refusal("candidate_identity_mismatch");
+            self.audit(
+                REFUSED,
+                "refused",
+                Some("candidate_identity_mismatch"),
+                0,
+                0,
+                None,
+            );
             return PromotionOutcome::ReadOnly {
                 reason: "candidate_identity_mismatch".to_string(),
                 retryable: false,
@@ -926,6 +1022,8 @@ impl PromotionEngine {
         {
             let reason = "candidate_diverged";
             self.set_phase(PromotionPhase::Aborted, Some(reason));
+            self.record_refusal(reason);
+            self.audit(REFUSED, "refused", Some(reason), 0, 0, None);
             return PromotionOutcome::ReadOnly {
                 reason: reason.to_string(),
                 retryable: false,
@@ -938,12 +1036,16 @@ impl PromotionEngine {
             // witness confirms master loss; a stale file is age-limited.
             let now = match self.backend.info().await {
                 Ok(info) => {
+                    self.record_witness_request("info", "success");
                     self.lock().last_witness_now_unix_ms = Some(info.now_unix_ms);
                     Some(info.now_unix_ms)
                 }
                 Err(error) => {
+                    self.record_witness_request("info", "error");
                     let reason = error.reason_code();
                     self.set_phase(PromotionPhase::Unavailable, Some(reason));
+                    self.record_refusal(reason);
+                    self.audit(REFUSED, "witness_error", Some(reason), 0, 0, None);
                     return PromotionOutcome::ReadOnly {
                         reason: reason.to_string(),
                         retryable: error.is_retryable(),
@@ -955,6 +1057,7 @@ impl PromotionEngine {
                     if record.holder != self.holder
                         && now.is_some_and(|now| !record.is_expired(now)) =>
                 {
+                    self.record_witness_request("lease", "success");
                     self.set_phase(
                         PromotionPhase::WaitingForMasterLoss,
                         Some("lease_held_by_other"),
@@ -964,8 +1067,11 @@ impl PromotionEngine {
                         retryable: true,
                     };
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    self.record_witness_request("lease", "success");
+                }
                 Err(error) => {
+                    self.record_witness_request("lease", "error");
                     let reason = error.reason_code();
                     self.set_phase(PromotionPhase::Unavailable, Some(reason));
                     return PromotionOutcome::ReadOnly {
@@ -983,11 +1089,27 @@ impl PromotionEngine {
                         node_id = %self.node_id,
                         "manual promotion confirmation consumed"
                     );
+                    self.audit(
+                        MANUAL_CONFIRMATION_CONFIRMED,
+                        "confirmed",
+                        None,
+                        self.lock().snapshot.term,
+                        0,
+                        Some(&self.holder),
+                    );
                 }
                 Err(error) => {
                     self.set_phase(
                         PromotionPhase::ManualConfirmationRequired,
                         Some("manual_confirmation_required"),
+                    );
+                    self.audit(
+                        MANUAL_CONFIRMATION_REQUIRED,
+                        "waiting",
+                        Some("manual_confirmation_required"),
+                        self.lock().snapshot.term,
+                        0,
+                        Some(&self.holder),
                     );
                     let _ = error;
                     return PromotionOutcome::ManualConfirmationRequired;
@@ -1014,6 +1136,10 @@ impl PromotionEngine {
     ///   re-armed only by an actual successful renewal ACK;
     /// * a successful ACK observed after the deadline is not accepted.
     pub async fn renew_once(&self) -> Result<u64, HaError> {
+        {
+            let mut inner = self.lock();
+            inner.snapshot.last_attempt_unix_ms = Some(self.clock.wall_unix_ms());
+        }
         let grant = {
             let inner = self.lock();
             inner.grant.clone()
@@ -1078,11 +1204,22 @@ impl PromotionEngine {
             // `start + TTL`, so a local deadline derived from the start cannot
             // outlive the witness record even when the response is slow.
             let boot_before = self.current_boot_millis("lease renewal start")?;
-            let result = self
+            let result = match self
                 .bounded_witness_call("lease renewal", self.backend.renew(request))
-                .await?;
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    self.record_witness_request("renew", "error");
+                    if let Some(metrics) = self.metrics.as_ref() {
+                        metrics.inc_ha_promotion_lease_renew_failure();
+                    }
+                    return Err(error);
+                }
+            };
             match result {
                 Ok(record) => {
+                    self.record_witness_request("renew", "success");
                     // Never accept an ACK that only arrives after the local
                     // deadline: a slow witness call must not extend the gate.
                     if self.check_self_fence()? {
@@ -1091,9 +1228,27 @@ impl PromotionEngine {
                         ));
                     }
                     self.record_successful_renewal(record.revision, boot_before)?;
+                    self.lock().snapshot.lease_expires_unix_ms = Some(record.expires_unix_ms);
+                    self.record_last_success();
+                    let (term, version) = {
+                        let inner = self.lock();
+                        (inner.snapshot.term, inner.snapshot.published_version)
+                    };
+                    self.audit(
+                        LEASE_RENEWED,
+                        "renewed",
+                        None,
+                        term,
+                        version,
+                        Some(&record.holder),
+                    );
                     return Ok(record.revision);
                 }
                 Err(error) => {
+                    self.record_witness_request("renew", "error");
+                    if let Some(metrics) = self.metrics.as_ref() {
+                        metrics.inc_ha_promotion_lease_renew_failure();
+                    }
                     // Re-read the witness clock at classification time; a
                     // timestamp captured before the request can be stale by
                     // more than the TTL on a slow/retried renewal.
@@ -1181,15 +1336,16 @@ impl PromotionEngine {
     /// the witness clock. A transport failure is returned as `None`; a missing
     /// deadline/timeout fences and returns an error.
     async fn refresh_witness_now(&self) -> Result<Option<i64>, HaError> {
-        match self
+        if let Ok(info) = self
             .bounded_witness_call("witness info", self.backend.info())
             .await?
         {
-            Ok(info) => {
-                self.lock().last_witness_now_unix_ms = Some(info.now_unix_ms);
-                Ok(Some(info.now_unix_ms))
-            }
-            Err(_) => Ok(None),
+            self.record_witness_request("info", "success");
+            self.lock().last_witness_now_unix_ms = Some(info.now_unix_ms);
+            Ok(Some(info.now_unix_ms))
+        } else {
+            self.record_witness_request("info", "error");
+            Ok(None)
         }
     }
 
@@ -1412,6 +1568,18 @@ impl PromotionEngine {
         {
             self.lock().snapshot.quiesce_remaining_secs = 0;
         }
+        let (term, version) = {
+            let inner = self.lock();
+            (inner.snapshot.term, inner.snapshot.published_version)
+        };
+        self.audit(
+            QUIESCED,
+            "quiesced",
+            None,
+            term,
+            version,
+            Some(&self.holder),
+        );
         #[cfg(test)]
         self.run_quiesce_complete_hook();
         Ok(())
@@ -1442,10 +1610,34 @@ impl PromotionEngine {
     ) -> PromotionOutcome {
         self.host.set_writable(false, Some(reason.to_string()));
         self.set_phase(phase, Some(reason));
+        if !retryable {
+            // A terminal read-only/abort will not renew this term. Do not keep
+            // advertising a grant/revision/expiry the node is no longer using.
+            self.clear_lease_diagnostics();
+        }
+        self.record_refusal(reason);
+        let (term, version) = {
+            let inner = self.lock();
+            (inner.snapshot.term, inner.snapshot.published_version)
+        };
+        self.audit(REFUSED, "read_only", Some(reason), term, version, None);
         PromotionOutcome::ReadOnly {
             reason: reason.to_string(),
             retryable,
         }
+    }
+
+    /// Clears the in-memory grant and its diagnostic lease fields.
+    ///
+    /// Callers use this only on a terminal path that will not renew the term.
+    fn clear_lease_diagnostics(&self) {
+        let mut inner = self.lock();
+        inner.grant = None;
+        inner.deadline = None;
+        inner.snapshot.lease_revision = None;
+        inner.snapshot.lease_expires_unix_ms = None;
+        inner.snapshot.lease_expires_in_secs = None;
+        inner.snapshot.lease_held = false;
     }
 
     async fn reconcile_and_publish(&self) -> PromotionOutcome {
@@ -1540,6 +1732,7 @@ impl PromotionEngine {
             Ok(peers) => peers,
             Err(error) => {
                 warn!(error = %error, "reconciliation report collection failed");
+                self.record_publish_abort("candidate_hash_unknown");
                 return self.transition_read_only(
                     PromotionPhase::Aborted,
                     "candidate_hash_unknown",
@@ -1550,8 +1743,12 @@ impl PromotionEngine {
         self.lock().snapshot.reconcile_remaining_secs = 0;
 
         let witness = match self.backend.lease().await {
-            Ok(Some(record)) => record,
+            Ok(Some(record)) => {
+                self.record_witness_request("lease", "success");
+                record
+            }
             Ok(None) => {
+                self.record_witness_request("lease", "success");
                 let _ = self.fence(
                     FenceReason::LeaseRecordMissing,
                     "witness record disappeared",
@@ -1559,6 +1756,7 @@ impl PromotionEngine {
                 return PromotionOutcome::Fenced;
             }
             Err(error) => {
+                self.record_witness_request("lease", "error");
                 return self.transition_read_only(
                     PromotionPhase::Unavailable,
                     error.reason_code(),
@@ -1568,12 +1766,13 @@ impl PromotionEngine {
         };
 
         let proof_hash = self.lock().reconcile_proof_hash.clone();
-        let live_now = match self.backend.info().await {
-            Ok(info) => {
-                self.lock().last_witness_now_unix_ms = Some(info.now_unix_ms);
-                Some(info.now_unix_ms)
-            }
-            Err(_) => None,
+        let live_now = if let Ok(info) = self.backend.info().await {
+            self.record_witness_request("info", "success");
+            self.lock().last_witness_now_unix_ms = Some(info.now_unix_ms);
+            Some(info.now_unix_ms)
+        } else {
+            self.record_witness_request("info", "error");
+            None
         };
         if !lease_is_live(&witness, &grant, live_now) {
             let _ = self.fence(
@@ -1592,6 +1791,20 @@ impl PromotionEngine {
             pending_hash: proof_hash,
             peers,
         });
+        if !matches!(&decision, ReconcileDecision::Abort(_)) {
+            let (term, version) = {
+                let inner = self.lock();
+                (inner.snapshot.term, inner.snapshot.published_version)
+            };
+            self.audit(
+                RECONCILED,
+                "reconciled",
+                None,
+                term,
+                version,
+                Some(&self.holder),
+            );
+        }
 
         match decision {
             ReconcileDecision::Abort(reason) => {
@@ -1601,6 +1814,19 @@ impl PromotionEngine {
                 // writable in this term.
                 self.lock().grant = None;
                 self.lock().deadline = None;
+                self.record_publish_abort(reason.code());
+                let (term, version) = {
+                    let inner = self.lock();
+                    (inner.snapshot.term, inner.snapshot.published_version)
+                };
+                self.audit(
+                    PUBLISH_ABORTED,
+                    "aborted",
+                    Some(reason.code()),
+                    term,
+                    version,
+                    Some(&self.holder),
+                );
                 self.transition_read_only(PromotionPhase::Aborted, reason.code(), false)
             }
             ReconcileDecision::AlreadyPublished => self.complete_already_published().await,
@@ -1806,6 +2032,7 @@ impl PromotionEngine {
                 if self.check_self_fence().unwrap_or(false) {
                     return PromotionOutcome::Fenced;
                 }
+                self.record_publish_abort("promotion_interrupted");
                 return self.transition_read_only(
                     PromotionPhase::Aborted,
                     "promotion_interrupted",
@@ -1825,6 +2052,7 @@ impl PromotionEngine {
             // The ADR is explicit: do not renew the witness with the new
             // version if the durable "published" state write failed.
             warn!(error = %error, "published state write failed after the first push");
+            self.record_publish_abort("promotion_interrupted");
             return self.transition_read_only(
                 PromotionPhase::Aborted,
                 "promotion_interrupted",
@@ -1859,20 +2087,30 @@ impl PromotionEngine {
             version,
             "automatic promotion complete; node is the writable master"
         );
+        self.audit(COMPLETED, "master", None, term, version, Some(&self.holder));
         PromotionOutcome::Master
     }
 
     async fn acquire(&self, role: AcquisitionRole, origin: &str) -> AcquireOutcome {
         self.set_phase(PromotionPhase::Acquiring, None);
+        {
+            let mut inner = self.lock();
+            inner.snapshot.last_attempt_unix_ms = Some(self.clock.wall_unix_ms());
+        }
         let record = match self.backend.lease().await {
             Ok(record) => {
+                self.record_witness_request("lease", "success");
                 self.lock().snapshot.witness_reachable = true;
                 record
             }
             Err(error) => {
+                self.record_witness_request("lease", "error");
                 self.lock().snapshot.witness_reachable = false;
                 let reason = error.reason_code();
                 self.set_phase(PromotionPhase::Unavailable, Some(reason));
+                self.record_attempt("witness_error");
+                self.record_refusal(reason);
+                self.audit(REFUSED, "witness_error", Some(reason), 0, 0, None);
                 if self.role == ConfiguredRole::Master {
                     self.host.set_writable(false, Some(reason.to_string()));
                 }
@@ -1890,12 +2128,13 @@ impl PromotionEngine {
             // An own-holder record may have expired while this process was
             // paused. Expiry is judged with the witness clock; without it the
             // engine must not assume the grant is still live.
-            match self.backend.info().await {
-                Ok(info) => {
-                    self.lock().last_witness_now_unix_ms = Some(info.now_unix_ms);
-                    Some(info.now_unix_ms)
-                }
-                Err(_) => None,
+            if let Ok(info) = self.backend.info().await {
+                self.record_witness_request("info", "success");
+                self.lock().last_witness_now_unix_ms = Some(info.now_unix_ms);
+                Some(info.now_unix_ms)
+            } else {
+                self.record_witness_request("info", "error");
+                None
             }
         } else {
             None
@@ -1910,6 +2149,10 @@ impl PromotionEngine {
                     AcquisitionRole::Master => refusal.master_code(),
                 };
                 self.set_phase(PromotionPhase::Aborted, Some(reason));
+                self.clear_lease_diagnostics();
+                self.record_attempt("refused");
+                self.record_refusal(reason);
+                self.audit(REFUSED, "refused", Some(reason), 0, 0, None);
                 if role == AcquisitionRole::Master {
                     self.host.set_writable(false, Some(reason.to_string()));
                 }
@@ -1969,12 +2212,25 @@ impl PromotionEngine {
                         ttl_secs: self.config.lease_ttl_secs,
                     };
                     match self.backend.acquire(request).await {
-                        Ok(record) => record,
+                        Ok(record) => {
+                            self.record_witness_request("acquire", "success");
+                            record
+                        }
                         Err(WitnessClientError::Conflict { .. }) => {
+                            self.record_witness_request("acquire", "conflict");
                             self.lock().last_acquire_conflict = true;
                             self.set_phase(
                                 PromotionPhase::WaitingForMasterLoss,
                                 Some("lease_held_by_other"),
+                            );
+                            self.record_attempt("conflict");
+                            self.audit(
+                                REFUSED,
+                                "conflict",
+                                Some("lease_held_by_other"),
+                                0,
+                                0,
+                                None,
                             );
                             return AcquireOutcome::Outcome(PromotionOutcome::ReadOnly {
                                 reason: "lease_held_by_other".to_string(),
@@ -1982,8 +2238,12 @@ impl PromotionEngine {
                             });
                         }
                         Err(error) => {
+                            self.record_witness_request("acquire", "error");
                             let reason = error.reason_code();
                             self.set_phase(PromotionPhase::Unavailable, Some(reason));
+                            self.record_attempt("witness_error");
+                            self.record_refusal(reason);
+                            self.audit(REFUSED, "witness_error", Some(reason), 0, 0, None);
                             if role == AcquisitionRole::Master {
                                 self.host.set_writable(false, Some(reason.to_string()));
                             }
@@ -2058,9 +2318,20 @@ impl PromotionEngine {
                         .published_hash
                         .clone_from(&plan.baseline.hash);
                     inner.snapshot.lease_revision = Some(record.revision);
+                    inner.snapshot.lease_expires_unix_ms = Some(record.expires_unix_ms);
                     inner.snapshot.witness_reachable = true;
                     inner.snapshot.promoted_at_unix_ms = Some(self.clock.wall_unix_ms());
                 }
+                self.record_attempt("success");
+                self.record_last_success();
+                self.audit(
+                    LEASE_ACQUIRED,
+                    "acquired",
+                    Some(origin),
+                    record.term,
+                    plan.publish_version,
+                    Some(&record.holder),
+                );
                 // ADR-0010: stop the slave worker / start the master listener
                 // immediately after acquisition, and keep the listener
                 // hello-only through quiesce and reconciliation. The node must
@@ -2476,6 +2747,13 @@ impl PromotionEngine {
             inner.snapshot.phase = PromotionPhase::Fenced;
             inner.snapshot.reason = Some(reason.code().to_string());
             inner.snapshot.term = marker.fenced_term;
+            // A fence means no live grant: do not keep advertising the old
+            // revision/expiry or a stale reachable witness.
+            inner.snapshot.lease_revision = None;
+            inner.snapshot.lease_expires_unix_ms = None;
+            inner.snapshot.lease_expires_in_secs = None;
+            inner.snapshot.lease_held = false;
+            inner.snapshot.witness_reachable = false;
             inner.grant = None;
             inner.deadline = None;
         }
@@ -2484,6 +2762,36 @@ impl PromotionEngine {
             reason = reason.code(),
             detail,
             "HA promotion self-fenced; a restart stays read-only until an operator clears the marker"
+        );
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.inc_ha_promotion_fenced(reason.code());
+        }
+        let (term, version) = {
+            let inner = self.lock();
+            (inner.snapshot.term, inner.snapshot.published_version)
+        };
+        if matches!(
+            reason,
+            FenceReason::LeaseLost
+                | FenceReason::LeaseRecordMissing
+                | FenceReason::LeaseVersionRegression
+        ) {
+            self.audit(
+                LEASE_LOST,
+                "lost",
+                Some(reason.code()),
+                term,
+                version,
+                Some(&self.holder),
+            );
+        }
+        self.audit(
+            FENCED,
+            "fenced",
+            Some(reason.code()),
+            term,
+            version,
+            Some(&self.holder),
         );
         match outcome {
             FencePersistOutcome::Durable | FencePersistOutcome::PendingOnly => Ok(()),
@@ -2510,6 +2818,68 @@ impl PromotionEngine {
         let mut inner = self.lock();
         inner.snapshot.phase = phase;
         inner.snapshot.reason = reason.map(str::to_string);
+    }
+
+    fn record_attempt(&self, result: &str) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.inc_ha_promotion_attempt(result);
+        }
+    }
+
+    fn record_witness_request(&self, op: &str, result: &str) {
+        // The status field is a last-probe observation: only a successful call
+        // proves reachability. A transport/auth/5xx failure (and any other
+        // failed probe) clears it immediately instead of leaving a stale `true`
+        // until fencing. A CAS conflict (409) is a real witness answer and
+        // therefore still reachable.
+        self.lock().snapshot.witness_reachable = matches!(result, "success" | "conflict");
+        let bounded = if result == "error" {
+            "witness_error"
+        } else {
+            result
+        };
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.inc_ha_promotion_witness_request(op, bounded);
+        }
+    }
+
+    fn record_refusal(&self, reason: &str) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.inc_ha_promotion_refusal(reason);
+        }
+    }
+
+    fn record_publish_abort(&self, reason: &str) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.inc_ha_promotion_publish_abort(reason);
+        }
+    }
+
+    fn record_last_success(&self) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            let now = self.clock.wall_unix_ms().max(0);
+            metrics.set_ha_promotion_last_success_seconds(u64::try_from(now / 1_000).unwrap_or(0));
+        }
+    }
+
+    fn audit(
+        &self,
+        event: &'static str,
+        outcome: &str,
+        reason: Option<&str>,
+        term: u64,
+        version: u64,
+        holder: Option<&str>,
+    ) {
+        let mut record =
+            PromotionAudit::new(event, &self.node_id, outcome).with_bundle(term, version);
+        if let Some(reason) = reason {
+            record = record.with_reason(reason);
+        }
+        if let Some(holder) = holder {
+            record = record.with_holder(holder);
+        }
+        record.emit();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, EngineInner> {

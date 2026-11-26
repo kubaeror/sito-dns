@@ -971,7 +971,7 @@ The manual runbook (§2) remains the operator escape hatch:
     "reason": null,
     "term": 8,
     "version": 128,
-    "bundle_hash": "blake3:9f2c...64-hex",
+    "bundle_hash": "9f2c...64-hex",
     "publication_state": "published",
     "published_version": 128,
     "lease_revision": 13,
@@ -999,7 +999,8 @@ The manual runbook (§2) remains the operator escape hatch:
   `master_term_ahead`, `manual_confirmation_required`, `lease_lost`,
   `lease_version_regression`,
   `fenced`, `fenced_until_reconciled`, `v1_state`, `promotion_interrupted`,
-  `endpoint_is_ip_literal`.
+  `endpoint_is_ip_literal`, `clock_step`, `state_write_failed`,
+  `role_switch_failed`.
 - `version`/`bundle_hash` describe the **active** bundle (which may be pending
   during a promotion); `publication_state`/`published_version` show whether
   that active bundle is pending, publishing or published. The published baseline
