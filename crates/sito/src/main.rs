@@ -175,6 +175,21 @@ async fn main() -> anyhow::Result<()> {
                     }
                     return Ok(());
                 }
+                sito::cli::HaCommands::RotateSigningKey {
+                    config,
+                    confirm,
+                    term,
+                    version,
+                } => {
+                    let config_path = config.unwrap_or(default_config_path.clone());
+                    if let Err(e) =
+                        sito::cli::run_ha_rotate_signing_key(&config_path, confirm, term, version)
+                    {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
             },
             Commands::Config { command } => match command {
                 sito::cli::ConfigCommands::Migrate {

@@ -1126,6 +1126,35 @@ readiness is reported by the admin web listener, keep `[web] enabled = true`
 (the default) on HA nodes; with the web listener disabled the healthcheck
 fails closed rather than assuming replication is healthy.
 
+#### Offline Ed25519 signing-key rotation
+
+The master's `data_dir/ha_signing.key` (mode `0600`) is recorded in
+`ha_state.toml` as `signing_key_pubkey`; slaves trust exactly one key in
+`[ha] master_pubkey`. Losing or replacing the key outside this command makes
+startup fail closed rather than silently re-sign the persisted bundle. There is
+no dual-key protocol and no hot rotation; every slave must be updated and
+reconnected after the master rotates.
+
+```bash
+# Stop the service first; the command refuses while the lease is held.
+sudo -u sito sito ha rotate-signing-key \
+  --config /etc/sito/config.toml \
+  --confirm \
+  [--term N] [--version V]
+```
+
+The command is offline: it backs up the old key and `ha_state.toml` (mode
+`0600`), generates a new `0600` key at the same path, re-seals `ha_state.toml`
+with the new `signing_key_pubkey` and a strictly higher term/version, and prints
+the new `master_pubkey` plus the restart/verification steps. A requested
+`--term`/`--version` must be strictly greater than the current state; omitted
+values default to `current + 1`. Choose explicit values above every slave's
+applied term/version when the master's state is behind a replica. It does not
+contact the witness, acquire a witness lease or publish a bundle. Update
+`[ha] master_pubkey` on **every** slave and restart the master, then each
+slave. Full procedure and recovery:
+[HA runbook §8](runbook-ha.md#8-ed25519-signing-key-rotation-offline).
+
 Slaves persist the last successfully applied bundle identity to
 `<data_dir>/ha_watermark.toml` (JSON, mode `0600`, written atomically, wrapped
 v2 shape with a required `protocol_version`) after the configuration is applied

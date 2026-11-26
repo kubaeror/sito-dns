@@ -14,6 +14,7 @@ pub mod master;
 pub mod promotion;
 pub mod protocol;
 pub mod readiness;
+pub mod rotation;
 pub mod session;
 pub mod slave;
 pub mod transport;
@@ -44,6 +45,9 @@ pub use promotion::{
 };
 pub use protocol::{AckConflict, HaMessage, PROTOCOL_VERSION, UpstreamReport};
 pub use readiness::{HaReadiness, HaReadinessState};
+pub use rotation::{
+    HA_STATE_FILE, SIGNING_KEY_FILE, SigningKeyRotation, rotate_master_signing_key,
+};
 pub use slave::{
     SlaveAppHandles, SlaveConfigApplier, SlaveState, SlaveStatusTracker, apply_config_push,
     spawn_slave_worker,

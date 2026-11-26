@@ -394,6 +394,28 @@ pub enum HaCommands {
         #[arg(long)]
         confirm: bool,
     },
+    /// Offline rotation of the HA master Ed25519 signing key
+    ///
+    /// Refuses while the service lease is held. Backs up the key and
+    /// `ha_state.toml` (mode 0600), writes a new key, re-seals the state with a
+    /// strictly higher term/version, and prints the new `master_pubkey` for
+    /// every slave. It does not contact the witness or publish a bundle.
+    RotateSigningKey {
+        /// Optional path to configuration file (defaults to the main --config)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Required confirmation; the old key and state are backed up first
+        #[arg(long)]
+        confirm: bool,
+        /// New cluster term; must be strictly greater than the current state
+        /// (default: current + 1)
+        #[arg(long)]
+        term: Option<u64>,
+        /// New configuration version; must be strictly greater than the
+        /// current state (default: current + 1)
+        #[arg(long)]
+        version: Option<u64>,
+    },
 }
 
 /// Offline witness lease administration.
@@ -1720,6 +1742,155 @@ pub fn run_ha_clear_fence(config_path: &Path, confirm: bool) -> Result<(), anyho
         store.pending_path().display()
     );
     Ok(())
+}
+
+/// Executes `sito ha rotate-signing-key`.
+///
+/// This is an offline operator action: it refuses while the service lease is
+/// held, backs up the current key and state, generates a new Ed25519 key,
+/// re-seals `ha_state.toml` with a strictly higher term/version, and prints the
+/// new `master_pubkey` that every slave must configure before the master is
+/// restarted. It never contacts the witness, acquires a witness lease or
+/// publishes a bundle.
+#[cfg(feature = "ha")]
+pub fn run_ha_rotate_signing_key(
+    config_path: &Path,
+    confirm: bool,
+    term: Option<u64>,
+    version: Option<u64>,
+) -> Result<sito_ha::SigningKeyRotation, anyhow::Error> {
+    if !confirm {
+        return Err(anyhow::anyhow!(
+            "Refusing to rotate the HA signing key without --confirm. Stop the service, verify a backup exists, then re-run `sito ha rotate-signing-key --confirm`."
+        ));
+    }
+
+    let content = std::fs::read_to_string(config_path).map_err(|error| {
+        anyhow::anyhow!(
+            "Failed to read configuration file '{}': {error}. Refusing to guess a data directory for key rotation.",
+            config_path.display()
+        )
+    })?;
+    let config = Config::from_toml_str(&content).map_err(|error| {
+        anyhow::anyhow!(
+            "Configuration validation failed for '{}': {error}",
+            config_path.display()
+        )
+    })?;
+    if config.server.role != "master" {
+        return Err(anyhow::anyhow!(
+            "Refusing to rotate the HA signing key: '{}' sets server.role = \"{}\"; only an HA master owns ha_signing.key",
+            config_path.display(),
+            config.server.role
+        ));
+    }
+    let data_dir = config.server.data_dir.clone();
+    if !data_dir.is_absolute() {
+        return Err(anyhow::anyhow!(
+            "Refusing to rotate the HA signing key: server.data_dir '{}' is relative. The running server resolves it against its own working directory, so the CLI could rotate a different directory.",
+            data_dir.display()
+        ));
+    }
+    if !data_dir.is_dir() {
+        return Err(anyhow::anyhow!(
+            "Refusing to rotate the HA signing key: data directory '{}' does not exist",
+            data_dir.display()
+        ));
+    }
+
+    match crate::service_lock::status(&data_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "Refusing to rotate the HA signing key: cannot inspect the service lease in '{}': {error}",
+            data_dir.display()
+        )
+    })? {
+        crate::service_lock::ServiceStatus::Stopped => {}
+        crate::service_lock::ServiceStatus::Running { pid } => {
+            return Err(service_running_error(&data_dir, pid));
+        }
+    }
+    // Hold the same lease the server uses for the whole mutation so a server
+    // cannot start between the status check and the key replacement.
+    let lease = crate::service_lock::ServiceLease::acquire(&data_dir).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            service_running_error(&data_dir, None)
+        } else {
+            anyhow::anyhow!(
+                "Refusing to rotate the HA signing key: cannot acquire the service lease in '{}': {error}",
+                data_dir.display()
+            )
+        }
+    })?;
+
+    let rotation = sito_ha::rotate_master_signing_key(&data_dir, term, version)
+        .map_err(|error| anyhow::anyhow!("HA signing-key rotation failed: {error}"))?;
+
+    println!(
+        "Rotated the HA master signing key in '{}'.",
+        data_dir.display()
+    );
+    println!(
+        "Previous key backed up to '{}' (mode 0600).",
+        rotation.key_backup.display()
+    );
+    println!(
+        "Previous state backed up to '{}' (mode 0600).",
+        rotation.state_backup.display()
+    );
+    println!(
+        "Re-sealed state at term {} version {} (was term {} version {}); the new key file is mode 0600.",
+        rotation.term, rotation.version, rotation.previous_term, rotation.previous_version
+    );
+    println!();
+    println!("New master_pubkey (configure this on every slave):");
+    println!("  {}", rotation.master_pubkey);
+    println!("  (Base64 form: {})", rotation.master_pubkey_b64);
+    println!();
+    println!("Next steps:");
+    println!(
+        "1. On EVERY slave, edit [ha] master_pubkey in its config.toml:\n     master_pubkey = \"{}\"",
+        rotation.master_pubkey
+    );
+    println!(
+        "   Leave master_fingerprint unchanged: it pins the TLS certificate, not the signing key."
+    );
+    println!(
+        "2. Restart the master:\n     systemctl restart sito\n     # Docker: docker compose restart sito"
+    );
+    println!(
+        "3. Restart each slave (or let it reconnect). A slave still configured with the old key rejects the new signed bundle with a signature-verification failure; it keeps its last applied configuration."
+    );
+    println!(
+        "4. Verify on the master: GET /api/v2/ha/status must report master_pubkey {} and version {}; GET /api/v2/ha/slaves must show every slave synced at that version.",
+        rotation.master_pubkey, rotation.version
+    );
+    if sito_ha::config_from_unvalidated(&config).is_ok_and(|ha| ha.promotion.enabled) {
+        println!(
+            "5. [ha.promotion] is enabled: this command did not contact the witness. Raise its record offline (sito ha lease-admin set) above the previous applied term before restarting the master, or it refuses to acquire a lease below the rotated term. See docs/runbook-witness.md."
+        );
+    }
+    println!();
+    println!(
+        "No witness request, witness lease or bundle publish was performed by this command. Keep '{}' and '{}' until every node reports synced.",
+        rotation.key_backup.display(),
+        rotation.state_backup.display()
+    );
+
+    drop(lease);
+    Ok(rotation)
+}
+
+/// Shared live-service refusal wording for `rotate-signing-key`.
+#[cfg(feature = "ha")]
+fn service_running_error(data_dir: &Path, pid: Option<u32>) -> anyhow::Error {
+    let holder = pid.map_or_else(
+        || "a live server".to_string(),
+        |pid| format!("a live server (pid {pid})"),
+    );
+    anyhow::anyhow!(
+        "Refusing to rotate the HA signing key: {holder} holds the service lease in '{}'. Stop the service first (systemctl stop sito, or docker compose stop sito), then re-run with --confirm.",
+        data_dir.display()
+    )
 }
 
 /// Reads and validates the configuration `sito update` needs to run.
@@ -3406,6 +3577,211 @@ mod tests {
             }) => assert!(confirm),
             other => panic!("expected clear-fence, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Creates a stopped master data dir with a v2 `ha_state.toml` signed by a
+    /// fresh key, plus a matching config file.
+    #[cfg(feature = "ha")]
+    fn ha_rotation_fixture(label: &str) -> (PathBuf, PathBuf, PathBuf, String) {
+        let dir = temp_config_dir(label);
+        let data_dir = dir.join("state");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let key_path = data_dir.join("ha_signing.key");
+        let key = sito_ha::Ed25519SigningKey::load_or_create(&key_path).unwrap();
+        let mut bundle = sito_ha::ConfigBundle {
+            version: 4,
+            term: 2,
+            timestamp: 1,
+            config_toml: "config_version = 2\n[server]\nrole = \"slave\"\n".to_string(),
+            ..sito_ha::ConfigBundle::default()
+        };
+        sito_ha::seal_bundle_identity(&mut bundle, &key.public_key());
+        let push = sito_ha::build_and_sign_push(&bundle, &key).unwrap();
+        let hash = sito_ha::push_payload_hash(&push).unwrap();
+        let state = serde_json::json!({
+            "protocol_version": sito_ha::PROTOCOL_VERSION,
+            "bundle": bundle,
+            "signing_key_pubkey": key.public_key_hex(),
+            "publication_state": "published",
+            "published_version": 4,
+            "published_hash": hash,
+            "last_applied_version": 4,
+            "last_applied_hash": hash,
+        });
+        std::fs::write(
+            data_dir.join("ha_state.toml"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "config_version = 2\n\
+                 [server]\n\
+                 role = \"master\"\n\
+                 data_dir = \"{}\"\n\
+                 [upstream]\n\
+                 servers = [\"1.1.1.1\"]\n\
+                 [ha]\n\
+                 replication_port = 0\n",
+                data_dir.display()
+            ),
+        )
+        .unwrap();
+        (dir, config_path, data_dir, key.public_key_hex())
+    }
+
+    #[cfg(feature = "ha")]
+    #[test]
+    fn test_cli_rotate_signing_key_flags_confirm_and_live_service() {
+        // The flag surface is exactly the documented command.
+        let cli = Cli::try_parse_from([
+            "sito",
+            "ha",
+            "rotate-signing-key",
+            "--confirm",
+            "--term",
+            "9",
+            "--version",
+            "20",
+        ])
+        .expect("parse rotate-signing-key");
+        match cli.command {
+            Some(Commands::Ha {
+                command:
+                    HaCommands::RotateSigningKey {
+                        confirm,
+                        term,
+                        version,
+                        ..
+                    },
+            }) => {
+                assert!(confirm);
+                assert_eq!(term, Some(9));
+                assert_eq!(version, Some(20));
+            }
+            other => panic!("expected ha rotate-signing-key, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["sito", "ha", "rotate-signing-key"]).expect("parse");
+        match cli.command {
+            Some(Commands::Ha {
+                command:
+                    HaCommands::RotateSigningKey {
+                        confirm,
+                        term,
+                        version,
+                        ..
+                    },
+            }) => {
+                assert!(!confirm);
+                assert_eq!(term, None);
+                assert_eq!(version, None);
+            }
+            other => panic!("expected ha rotate-signing-key, got {other:?}"),
+        }
+
+        // Without --confirm the command refuses before reading any file.
+        let error = run_ha_rotate_signing_key(Path::new("/nonexistent"), false, None, None)
+            .expect_err("rotation without --confirm must refuse");
+        assert!(error.to_string().contains("--confirm"), "{error}");
+
+        let (dir, config_path, data_dir, old_pubkey) = ha_rotation_fixture("rotate_live");
+        let old_key = std::fs::read(data_dir.join("ha_signing.key")).unwrap();
+
+        // A held service lease refuses the rotation and changes nothing.
+        let lease = crate::service_lock::ServiceLease::acquire(&data_dir).unwrap();
+        let error = run_ha_rotate_signing_key(&config_path, true, None, None)
+            .expect_err("a live service must refuse rotation");
+        let message = error.to_string();
+        assert!(message.contains("service lease"), "{message}");
+        assert!(message.contains("systemctl stop sito"), "{message}");
+        assert_eq!(
+            std::fs::read(data_dir.join("ha_signing.key")).unwrap(),
+            old_key
+        );
+        drop(lease);
+
+        // The same fixture rotates successfully while stopped, with the
+        // operator-provided monotonic values.
+        let rotation = run_ha_rotate_signing_key(&config_path, true, Some(9), Some(20)).unwrap();
+        assert_eq!(rotation.term, 9);
+        assert_eq!(rotation.version, 20);
+        assert_ne!(rotation.master_pubkey, old_pubkey);
+        assert_eq!(rotation.previous_pubkey, old_pubkey);
+        assert!(rotation.key_backup.exists());
+        assert!(rotation.state_backup.exists());
+        assert!(
+            !data_dir.join("sito.pid").exists(),
+            "the offline rotation must release the temporary service lease"
+        );
+        let new_key = sito_ha::Ed25519SigningKey::from_pkcs8(
+            &std::fs::read(data_dir.join("ha_signing.key")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(new_key.public_key_hex(), rotation.master_pubkey);
+        assert_eq!(
+            sito_ha::HaStateStore::new(data_dir.join("ha_state.toml"))
+                .load()
+                .unwrap()
+                .bundle()
+                .unwrap()
+                .version,
+            20
+        );
+
+        // A non-master role is refused before the lease is touched.
+        let slave_config = dir.join("slave.toml");
+        std::fs::write(
+            &slave_config,
+            format!(
+                "config_version = 2\n\
+                 [server]\n\
+                 role = \"slave\"\n\
+                 data_dir = \"{}\"\n\
+                 [upstream]\n\
+                 servers = [\"1.1.1.1\"]\n\
+                 [ha]\n\
+                 master_url = \"wss://127.0.0.1:8953\"\n\
+                 master_pubkey = \"{}\"\n\
+                 slave_token = \"secret\"\n",
+                data_dir.display(),
+                "00".repeat(32)
+            ),
+        )
+        .unwrap();
+        let error = run_ha_rotate_signing_key(&slave_config, true, None, None)
+            .expect_err("a slave must never rotate a master key");
+        assert!(error.to_string().contains("only an HA master"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "ha")]
+    #[test]
+    fn test_cli_rotate_signing_key_refuses_missing_state_and_relative_data_dir() {
+        let (dir, config_path, data_dir, _) = ha_rotation_fixture("rotate_errors");
+        std::fs::remove_file(data_dir.join("ha_state.toml")).unwrap();
+        let error = run_ha_rotate_signing_key(&config_path, true, None, None)
+            .expect_err("missing state must refuse rotation");
+        assert!(error.to_string().contains("no '"), "{error}");
+        assert!(
+            !data_dir.join("sito.pid").exists(),
+            "a refused rotation must release the lease"
+        );
+
+        let relative = dir.join("relative.toml");
+        std::fs::write(
+            &relative,
+            "config_version = 2\n[server]\nrole = \"master\"\ndata_dir = \"state\"\n[upstream]\nservers = [\"1.1.1.1\"]\n",
+        )
+        .unwrap();
+        let error = run_ha_rotate_signing_key(&relative, true, None, None)
+            .expect_err("a relative data_dir must refuse rotation");
+        assert!(error.to_string().contains("relative"), "{error}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

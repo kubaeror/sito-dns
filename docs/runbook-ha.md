@@ -985,3 +985,112 @@ A local edit to any other (shared) field is detected as drift on the next
 watcher/restart check, marks the node `Degraded`, and requires a full apply from
 the master. Slaves still detect shared-field drift after the write; edit-time
 read-only enforcement is a future API feature, not a v2 guarantee.
+
+---
+
+## 8. Ed25519 Signing-Key Rotation (offline)
+
+The master signs every HA bundle with `data_dir/ha_signing.key` (mode `0600`).
+`ha_state.toml` records the matching public key in `signing_key_pubkey`, and
+every slave trusts exactly one key in `[ha] master_pubkey`. A key/state mismatch
+fails closed: the master refuses to start instead of silently re-signing the
+persisted bundle with a different key.
+
+Rotate the key only for a planned re-enrollment or a suspected key compromise.
+A normal slave→master promotion should **copy** the old master's key and state
+instead (section 2). There is no dual-key trust and no rolling per-slave key
+migration: until a slave's `master_pubkey` is updated and it reconnects, the
+slave rejects the new signature and keeps its last applied configuration.
+
+### 8.1 Procedure
+
+1. **Stop the master.** The command refuses while the service lease is held.
+   ```bash
+   sudo systemctl stop sito
+   # Docker: docker compose stop sito
+   ```
+2. **Verify a data-directory backup** (the command also writes its own
+   mode-`0600` key/state backups before mutating anything).
+   ```bash
+   sudo -u sito ls -l /var/lib/sito/ha_signing.key /var/lib/sito/ha_state.toml
+   ```
+3. **Run the rotation** as the service user. The defaults are `current + 1` for
+   both term and version; an explicit value must be strictly greater than the
+   current state. If any slave reports a higher applied term/version than this
+   master's state (for example after a failed promotion), pass explicit values
+   above **every** replica's applied term and version, not only this master's.
+   ```bash
+   sudo -u sito sito ha rotate-signing-key \
+     --config /etc/sito/config.toml \
+     --confirm \
+     [--term  N] \
+     [--version V]
+   ```
+   The command refuses without `--confirm`, refuses while the service is
+   running, and refuses a non-master role, a relative data directory, a missing
+   or corrupt key/state, a key/state identity mismatch, and a non-monotonic
+   term/version. It writes `<data_dir>/ha_signing.key.bak.<timestamp>` and
+   `<data_dir>/ha_state.toml.bak.<timestamp>` (both `0600`), generates a new
+   `ha_signing.key` (`0600`), and re-seals `ha_state.toml` with:
+   - the new `signing_key_pubkey` and signed-bundle fingerprint;
+   - a term and version strictly above the previous state (one bump is
+     mandatory so every slave treats the new key as an explicit promotion);
+   - the previous published baseline preserved, with the rotated bundle marked
+     pending (it is not published by this command).
+
+   It performs **no** witness request, witness lease acquisition, network I/O
+   or bundle publish.
+4. **Record the printed `master_pubkey`** (hex, plus a Base64 form). Example:
+   ```
+   New master_pubkey (configure this on every slave):
+     9f2c...64-hex-chars
+   ```
+5. **Update every slave** before or while restarting:
+   ```toml
+   [ha]
+   master_pubkey = "9f2c...64-hex-chars"   # the new value from step 3
+   ```
+   Leave `master_fingerprint` unchanged unless the TLS certificate also
+   changed: it pins the certificate, not the signing key.
+6. **Restart the master, then each slave.**
+   ```bash
+   sudo systemctl restart sito            # master
+   sudo systemctl restart sito            # every slave, one at a time
+   # Docker: docker compose restart sito
+   ```
+7. **Verify** on the master:
+   ```bash
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://127.0.0.1:8080/api/v2/ha/status | jq '{version, term, master_pubkey}'
+   curl -s -H "Authorization: Bearer $TOKEN" \
+     http://127.0.0.1:8080/api/v2/ha/slaves | jq .
+   ```
+   `master_pubkey` must equal the value from step 3, the master version must be
+   the re-sealed version, and every slave must reach `synced` at that version.
+   `ready` must be `true`. A slave with the old key reports a signature
+   verification failure and stays on its previous configuration; fix its
+   `master_pubkey` and reconnect it.
+
+### 8.2 Failure handling
+
+- **The command fails before mutation:** nothing changed; correct the reported
+  precondition and retry.
+- **The command fails while re-sealing:** it restores the previous key from the
+  backup and reports both backup paths. If it could not restore automatically,
+  copy `ha_signing.key.bak.<timestamp>` over `ha_signing.key` and
+  `ha_state.toml.bak.<timestamp>` over `ha_state.toml`, then start the old
+  configuration.
+- **The master was started with the old key after rotation:** startup fails
+  closed with an actionable `ha_signing_key` error. Do **not** delete
+  `ha_state.toml` to force a start; restore the matching backup or finish the
+  rotation deliberately.
+- **A slave still has the old `master_pubkey`:** it cannot verify the new
+  bundle and keeps serving its last applied configuration. Update its key and
+  reconnect it; no master-side resync can bypass the signature check.
+- **`[ha.promotion] enabled = true`:** the rotation is still local and never
+  contacts the witness. The re-sealed term can be ahead of the witness record,
+  so raise the witness record offline with `sito ha lease-admin set` (witness
+  stopped) above the previous applied term before restarting the master. Follow
+  the [witness runbook](runbook-witness.md#5-offline-recovery-lease-admin-set);
+  a master that cannot acquire a lease below the rotated term stays read-only
+  and reports the reason in `GET /api/v2/ha/status`.
