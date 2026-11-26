@@ -660,8 +660,36 @@ mod tests {
             min_ttl: 60,
             dnssec_enabled: true,
             rate_limit: 20,
+            ha_replica: false,
+            ha_master_url: String::new(),
         };
-        assert!(settings_tmpl.render().is_ok());
+        let settings_html = settings_tmpl.render().expect("render settings page");
+        assert!(!settings_html.contains("Managed by the master"));
+
+        // C1: on a slave, shared engine settings render read-only with the
+        // master explanation and no editable save control.
+        let slave_settings = SettingsTemplate {
+            csrf_token: "",
+            is_authenticated: true,
+            username: "admin",
+            user_role: "admin",
+            active_tab: "settings",
+            version: "1.2.1",
+            cache_size_mb: 64,
+            min_ttl: 60,
+            dnssec_enabled: true,
+            rate_limit: 20,
+            ha_replica: true,
+            ha_master_url: "https://master.sito.lan:3000".to_string(),
+        };
+        let slave_settings_html = slave_settings.render().expect("render slave settings");
+        assert!(slave_settings_html.contains("Managed by the master"));
+        assert!(slave_settings_html.contains("https://master.sito.lan:3000"));
+        assert!(
+            slave_settings_html.contains("name=\"cache_size_mb\"")
+                && slave_settings_html.contains("disabled"),
+            "shared engine inputs must render disabled on a slave"
+        );
 
         let status = StatusResponse {
             version: "1.2.1".to_string(),
@@ -681,13 +709,29 @@ mod tests {
             version: "1.2.1",
             status: &status,
             uptime_str: "2m 0s".to_string(),
+            ha_replica: false,
+            ha_master_url: String::new(),
         };
-        assert!(
-            sys_tmpl
-                .render()
-                .unwrap()
-                .contains("HTMX + Askama + Alpine.js")
-        );
+        let system_html = sys_tmpl.render().unwrap();
+        assert!(system_html.contains("HTMX + Askama + Alpine.js"));
+        assert!(!system_html.contains("Managed by the master"));
+
+        let slave_sys_tmpl = SystemTemplate {
+            csrf_token: "",
+            is_authenticated: true,
+            username: "admin",
+            user_role: "admin",
+            active_tab: "system",
+            version: "1.2.1",
+            status: &status,
+            uptime_str: "2m 0s".to_string(),
+            ha_replica: true,
+            ha_master_url: "https://master.sito.lan:3000".to_string(),
+        };
+        let slave_system_html = slave_sys_tmpl.render().unwrap();
+        assert!(slave_system_html.contains("Managed by the master"));
+        assert!(slave_system_html.contains("/ui/system/reload"));
+        assert!(slave_system_html.contains("Shared configuration is managed by the HA master"));
 
         let wiz_tmpl = WizardTemplate {
             is_authenticated: false,

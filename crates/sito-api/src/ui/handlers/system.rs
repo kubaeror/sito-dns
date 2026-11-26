@@ -15,6 +15,13 @@ pub async fn system_page(State(ctx): State<ServerContext>, headers: HeaderMap) -
 
     let status = get_status_response(&ctx).await;
     let uptime_str = format_duration(status.uptime_seconds);
+    let configured_role = ctx.config.load().server.role.clone();
+    let ha_replica = configured_role == "slave" && !ctx.ha_write_gate.is_effective_master();
+    let ha_master_url = if ha_replica {
+        ctx.resolve_master_url()
+    } else {
+        String::new()
+    };
 
     HtmlTemplate(SystemTemplate {
         csrf_token: &csrf,
@@ -25,6 +32,8 @@ pub async fn system_page(State(ctx): State<ServerContext>, headers: HeaderMap) -
         version: env!("CARGO_PKG_VERSION"),
         status: &status,
         uptime_str,
+        ha_replica,
+        ha_master_url,
     })
     .into_response()
 }

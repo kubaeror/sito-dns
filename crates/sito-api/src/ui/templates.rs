@@ -401,6 +401,11 @@ pub struct SettingsTemplate<'a> {
     pub min_ttl: u32,
     pub dnssec_enabled: bool,
     pub rate_limit: u32,
+    /// True on an HA replica: engine settings are master-managed and the form
+    /// is rendered read-only.
+    pub ha_replica: bool,
+    /// Configured master URL, shown in the read-only explanation.
+    pub ha_master_url: String,
 }
 
 #[derive(Template)]
@@ -414,6 +419,11 @@ pub struct SystemTemplate<'a> {
     pub version: &'a str,
     pub status: &'a StatusResponse,
     pub uptime_str: String,
+    /// True on an HA replica: shared configuration is master-managed and the
+    /// on-disk reload action is not a local editing surface for shared state.
+    pub ha_replica: bool,
+    /// Configured master URL, shown in the read-only explanation.
+    pub ha_master_url: String,
 }
 
 #[derive(Template)]

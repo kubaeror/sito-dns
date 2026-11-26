@@ -6978,3 +6978,44 @@ async fn test_wizard_page_omits_acl_step_for_setup_token_recovery() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+/// C1: the Settings page renders shared engine controls read-only on an HA
+/// replica and keeps them editable on a master.
+#[tokio::test]
+async fn test_settings_page_is_read_only_on_a_replica_slave() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("sito_ui_slave_settings_{}", rand::random::<u64>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let ctx = mock_context(&temp_dir).await;
+
+    let login_res = ctx.auth_mgr.login("admin", "adminadmin", "127.0.0.1").await;
+    let crate::auth::LoginResult::Success(session) = login_res else {
+        panic!("admin login failed");
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        COOKIE,
+        format!("sito_session={}", session.id).parse().unwrap(),
+    );
+
+    let master_html = response_body(settings_page(State(ctx.clone()), headers.clone()).await).await;
+    assert!(
+        !master_html.contains("Managed by the master"),
+        "a master settings page must stay editable"
+    );
+
+    let mut config = (*ctx.config.load_full()).clone();
+    config.server.role = "slave".to_string();
+    ctx.config.store(Arc::new(config));
+    let slave_html = response_body(settings_page(State(ctx.clone()), headers).await).await;
+    assert!(
+        slave_html.contains("Managed by the master"),
+        "a replica must explain that shared settings are master-managed"
+    );
+    assert!(
+        slave_html.contains("name=\"cache_size_mb\"") && slave_html.contains("disabled"),
+        "shared engine controls must render disabled on a replica: {slave_html}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

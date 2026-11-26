@@ -642,6 +642,239 @@ token = "ha-token"
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    const SLAVE_BASE: &str = r#"config_version = 2
+[server]
+role = "slave"
+instance_name = "slave-a"
+log_level = "info"
+
+[upstream]
+servers = ["9.9.9.9"]
+
+[clients.client_id_secrets]
+laptop = "node-secret"
+"#;
+
+    /// Seeds a slave context whose file and live configuration match `base`.
+    async fn slave_context(temp_dir: &std::path::Path, base: &str) -> ServerContext {
+        let ctx = crate::test_support::mock_context(temp_dir).await;
+        tokio::fs::write(&ctx.config_path, base).await.unwrap();
+        ctx.set_config(Config::from_toml_str(base).unwrap());
+        ctx
+    }
+
+    fn slave_edit(base: &str, old: &str, new: &str) -> String {
+        assert!(base.contains(old), "test edit target must exist: {old}");
+        base.replace(old, new)
+    }
+
+    /// C1: a slave edit that changes shared configuration is rejected with
+    /// `urn:sito:ha:shared_config_read_only`, names the changed paths, and
+    /// persists/applies nothing.
+    #[tokio::test]
+    async fn test_slave_shared_config_edit_is_409_and_not_persisted() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_slave_shared");
+        let ctx = slave_context(&temp_dir, SLAVE_BASE).await;
+
+        let err = update_config(
+            admin(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(UpdateConfigRequest {
+                config_toml: slave_edit(SLAVE_BASE, "9.9.9.9", "1.1.1.1"),
+            }),
+        )
+        .await
+        .expect_err("a shared-field edit on a slave must be rejected");
+
+        assert_eq!(err.status, 409, "{err:?}");
+        assert_eq!(err.error_type, "urn:sito:ha:shared_config_read_only");
+        assert_eq!(err.title, "HA Shared Configuration Read-Only");
+        assert_eq!(
+            err.shared_config_fields.as_deref().map(Vec::as_slice),
+            Some(["upstream.servers".to_string()].as_slice())
+        );
+        assert!(
+            err.detail.contains("upstream.servers"),
+            "the detail must name the rejected field: {}",
+            err.detail
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            SLAVE_BASE,
+            "a rejected shared edit must not be persisted"
+        );
+        assert_eq!(
+            ctx.config.load().upstream.servers,
+            vec!["9.9.9.9".to_string()],
+            "a rejected shared edit must not be applied"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// C1: a node-local-only edit is accepted, applied and persisted, and the
+    /// slave does not publish anything to the master or return an HA report.
+    #[tokio::test]
+    async fn test_slave_node_local_config_edit_succeeds_without_ha_publish() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_slave_local");
+        let ctx = slave_context(&temp_dir, SLAVE_BASE).await;
+
+        let Json(report) = update_config(
+            admin(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(UpdateConfigRequest {
+                config_toml: slave_edit(
+                    SLAVE_BASE,
+                    "log_level = \"info\"",
+                    "log_level = \"debug\"",
+                ),
+            }),
+        )
+        .await
+        .expect("a node-local-only edit must be accepted on a slave");
+
+        assert!(report.ha_publish.is_none(), "a slave must never publish");
+        assert_eq!(ctx.config.load().server.log_level, "debug");
+        let persisted = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+        assert!(persisted.contains("log_level = \"debug\""));
+        assert!(
+            persisted.contains("9.9.9.9"),
+            "the shared upstream list must be preserved: {persisted}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// C1: a mixed edit is rejected and only the shared paths are named; the
+    /// node-local part is not persisted either.
+    #[tokio::test]
+    async fn test_slave_mixed_config_edit_names_only_shared_paths() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_slave_mixed");
+        let ctx = slave_context(&temp_dir, SLAVE_BASE).await;
+
+        let mixed = slave_edit(SLAVE_BASE, "9.9.9.9", "1.1.1.1")
+            .replace("log_level = \"info\"", "log_level = \"trace\"");
+
+        let err = update_config(
+            admin(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(UpdateConfigRequest { config_toml: mixed }),
+        )
+        .await
+        .expect_err("a mixed edit must be rejected as a whole");
+
+        assert_eq!(err.status, 409);
+        assert_eq!(
+            err.shared_config_fields.as_deref().map(Vec::as_slice),
+            Some(["upstream.servers".to_string()].as_slice()),
+            "only the shared part may be reported"
+        );
+        assert_eq!(ctx.config.load().server.log_level, "info");
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            SLAVE_BASE
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// C1: a configured master accepts the same shared edit.
+    #[tokio::test]
+    async fn test_master_shared_config_edit_is_allowed() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_master_shared");
+        let master_base = SLAVE_BASE.replace("role = \"slave\"", "role = \"master\"");
+        let ctx = slave_context(&temp_dir, &master_base).await;
+
+        let Json(report) = update_config(
+            admin(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(UpdateConfigRequest {
+                config_toml: master_base.replace("9.9.9.9", "1.1.1.1"),
+            }),
+        )
+        .await
+        .expect("a master may change shared configuration");
+
+        assert!(report.ha_publish.is_none(), "no coordinator in this test");
+        assert_eq!(ctx.config.load().upstream.servers, vec!["1.1.1.1"]);
+        assert!(
+            tokio::fs::read_to_string(&ctx.config_path)
+                .await
+                .unwrap()
+                .contains("1.1.1.1")
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// C1: a promoted effective master is no longer a read-only replica.
+    #[tokio::test]
+    async fn test_effective_master_shared_config_edit_is_allowed() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_effective_master");
+        let ctx = slave_context(&temp_dir, SLAVE_BASE).await;
+        ctx.ha_write_gate.mark_effective_master();
+        ctx.ha_write_gate.allow();
+
+        let Json(_) = update_config(
+            admin(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(UpdateConfigRequest {
+                config_toml: slave_edit(SLAVE_BASE, "9.9.9.9", "1.1.1.1"),
+            }),
+        )
+        .await
+        .expect("a promoted effective master may change shared configuration");
+        assert_eq!(ctx.config.load().upstream.servers, vec!["1.1.1.1"]);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// C1: a node-local edit leaves the shared bundle projection intact, so a
+    /// restart preserves both the master's shared state and the local change.
+    #[cfg(feature = "ha")]
+    #[tokio::test]
+    async fn test_slave_node_local_edit_preserves_shared_bundle_across_restart() {
+        let temp_dir = crate::test_support::temp_dir("sito_cfg_slave_restart");
+        let ctx = slave_context(&temp_dir, SLAVE_BASE).await;
+        // The persisted document is the canonical serialization of the parsed
+        // configuration, so compare the shared projection of that form.
+        let shared_before = sito_ha::shared_config_digest(
+            &toml::to_string_pretty(&**ctx.config.load()).expect("serialize live config"),
+        );
+
+        let Json(_) = update_config(
+            admin(),
+            State(ctx.clone()),
+            Extension(ApplyHooks::default()),
+            Json(UpdateConfigRequest {
+                config_toml: slave_edit(
+                    SLAVE_BASE,
+                    "log_level = \"info\"",
+                    "log_level = \"debug\"",
+                ),
+            }),
+        )
+        .await
+        .expect("node-local edit");
+
+        let persisted = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+        assert_eq!(
+            sito_ha::shared_config_digest(&persisted),
+            shared_before,
+            "the shared bundle projection must survive a node-local edit"
+        );
+        let restarted = Config::from_toml_str(&persisted).expect("restart document parses");
+        assert_eq!(restarted.server.log_level, "debug");
+        assert_eq!(restarted.upstream.servers, vec!["9.9.9.9".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     /// A no-HA build must reject an HA config write with the feature message,
     /// not a 409 that tells the operator to restart into an unloadable config.
     #[cfg(not(feature = "ha"))]

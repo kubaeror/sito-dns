@@ -11,7 +11,7 @@ This runbook provides step-by-step operational procedures for managing, maintain
 - **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce the cluster epoch (a bundle from an older term is rejected even when its version is higher) and strict monotonic version ordering within a term, and apply configuration snapshots atomically. The last applied term, version, signed payload hash, digest of the **shared projection** of the applied `config.toml`, signing-key fingerprint and timestamp are persisted to `data_dir/ha_watermark.toml` (atomic, mode `0600`) before the push is acknowledged, so a restart cannot replay an older bundle, accept same-version content with a different hash, or early-ACK a locally edited shared configuration. Protocol v2 refuses a v1 watermark; back it up and move it aside before the first v2 start (see §7). A slave that receives no frame for `3 × ping_interval_secs` leaves `Synced` and reports not-ready. A corrupt or v1 watermark fails startup; delete it only after backup to force a full resync.
 - **Admission limits**: the replication listener accepts at most 64 concurrent slave sessions and at most 8 concurrent sessions per source IP; a 10 s timeout bounds TLS/WebSocket handshakes and one WebSocket write. A NAT deployment with more than eight simultaneous HA peers from one address must be split across source addresses.
 - **Continuous Resolution**: Slaves serve DNS queries continuously without downtime. If an invalid or unparsable configuration bundle is received, the slave performs an automatic rollback to its last known good snapshot and enters a `Degraded` state.
-- **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master.
+- **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master. The full-config apply endpoint `PUT /api/v2/config` is the exception: it reaches the handler so node-local edits can be applied, and the apply pipeline rejects any shared-field change with `409` and `type = "urn:sito:ha:shared_config_read_only"` (see §7.5).
 - **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master stores the latest report per slave and exposes it through `GET /api/v2/ha/slaves`; replica counters are **not** merged into the master's own Prometheus registry. Scrape each replica's `/metrics` endpoint separately (labels such as `sito_ha_config_version{instance="..."}` identify the node).
 
 ### Witness server for automatic promotion
@@ -966,14 +966,17 @@ not a supported downgrade.
   signing key is also owner-only. A key owned by another user fails the mTLS
   listener even though DNS keeps answering.
 
-### 7.5 Node-local vs shared fields
+### 7.5 Node-local vs shared fields and edit-time enforcement
 
-Slaves persist the pushed document with node-local values merged back in. The
-applied watermark stores a digest of the **shared projection** only, so a local
-edit to one of these fields does not force a full apply:
+Slaves persist the pushed document with node-local values merged back in. Both
+the applied-watermark digest and the edit-time read-only gate use the same
+**shared projection** (`sito_ha::shared_config_diff` /
+`shared_config_digest`), so they cannot disagree about the boundary. A local
+edit to one of these fields is node-local and does not force a full apply:
 
 - `[ha]`;
-- `server.instance_name`, `server.data_dir`;
+- `server.role`, `server.instance_name`, `server.data_dir`,
+  `server.log_level`, `server.log_format`;
 - `[dns] bind` and `[dns.tls]`;
 - the complete `[tls]` and `[acme]` sections;
 - `[web] enabled`, `bind`, `port`, `trusted_proxies`, `metrics_auth`,
@@ -981,7 +984,41 @@ edit to one of these fields does not force a full apply:
 - the complete `[integrations.mikrotik]` section;
 - `[clients] client_id_secrets`.
 
-A local edit to any other (shared) field is detected as drift on the next
-watcher/restart check, marks the node `Degraded`, and requires a full apply from
-the master. Slaves still detect shared-field drift after the write; edit-time
-read-only enforcement is a future API feature, not a v2 guarantee.
+Everything else survives HA sanitization (`[filtering]`, `[rewrites]`,
+`[clients]` groups/entries/ACL, `[upstream]`, `[dns.cache]`,
+`[dns.dnssec]`, `[privacy]`, `[stats]`, `[auth]` policy and the cluster-shared
+`[web]` legacy ACME aliases) and is **master-managed shared configuration**.
+
+**Editing a slave through the API/UI.** `PUT /api/v2/config` is allowed through
+the slave middleware and the apply pipeline compares the candidate with the
+running document before persist/apply:
+
+- a hot-applied node-local-only change (or a formatting-only rewrite) is
+  applied and persisted locally; the slave never publishes to the master and
+  the HA watermark is untouched. Restart-only node-local fields keep their
+  existing D11 `409 restart_required` response: edit `config.toml` and restart
+  that node (for example `[web] bind/port`, `[tls]`, `[acme]`,
+  `server.data_dir`);
+- any shared-field change is rejected atomically with `409 Conflict`,
+  `type = "urn:sito:ha:shared_config_read_only"`, a `title` of
+  `HA Shared Configuration Read-Only`, and a `shared_config_fields` array of
+  the changed dotted paths (for example `["upstream.servers"]`). Nothing is
+  applied or persisted, including the node-local part of a mixed edit;
+- a promoted effective master (`ha_write_gate` effective master) is no longer a
+  replica and is not subject to the gate; a configured master is unaffected.
+
+`shared_config_fields` replaces guessing from an opaque error: submit the named
+fields to the master and let replication converge the node. An unparseable
+document fails closed with `<unparseable-config>` rather than being treated as
+node-local.
+
+Other config mutation routes stay blocked by the slave middleware with
+`urn:sito:ha:read-only`: `POST /api/v2/config/reload`, `/api/v2/config/restore*`,
+the filtering/clients/rewrites/upstream/settings UI actions and the system
+reload action. Hand-editing a shared field in `config.toml` directly cannot be
+prevented by an API gate; the watcher/restart drift check still marks the node
+`Degraded` and the next master push overwrites it. The Settings and System UI
+pages render shared controls read-only on a replica with a “Managed by the
+master” explanation and the configured master URL; the filtering, clients,
+rewrites and upstreams pages still rely on the middleware 409 (UI row-level
+residual, tracked in the 2.0 claim matrix).

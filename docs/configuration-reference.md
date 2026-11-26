@@ -1147,6 +1147,16 @@ last applied configuration. The watermark also records a BLAKE3 digest of the
 **shared projection** of the applied `config.toml` and the master signing-key
 fingerprint; a local edit to a shared field marks the node `Degraded` and forces
 a full apply before it can report `Synced` again, while node-local edits do not.
+The same projection backs the edit-time read-only gate: `PUT /api/v2/config`
+and every UI apply path compare the candidate with the running document and
+reject a shared-field change with `409 Conflict`,
+`type = "urn:sito:ha:shared_config_read_only"`, and a `shared_config_fields`
+array of the changed dotted paths. A hot-applied node-local-only edit is
+applied and persisted locally; a slave never publishes to the master and the
+watermark is not extended by a local edit. Restart-only node-local fields keep
+their D11 `409 restart_required` response and require editing `config.toml` and
+restarting that node. `server.log_level` and `server.log_format` are node-local
+(logging is per node), while `[auth]` policy remains shared.
 Protocol v2 refuses v1 `ha_state.toml`/`ha_watermark.toml`; before the first v2
 start, back them up and move them aside on the master and every slave (see the
 [HA runbook §7.2](runbook-ha.md#72-upgrade-v1-cluster--v2)). This intentionally
@@ -1163,8 +1173,9 @@ Replication preserves node-local identity. The master does not overwrite a
 slave's `dns.bind`, `[dns.tls]`/`[tls]` certificate paths, `[acme]` account and
 cache settings, the `[web]` admin identity (`enabled`, `bind`, `port`,
 `trusted_proxies`, `metrics_auth`, `public_url`, `tls_terminated_by_proxy`),
-`[ha]`, `server.instance_name`, `server.data_dir`,
-`[integrations.mikrotik]` or `clients.client_id_secrets`. Web identity is
+`[ha]`, `server.role`, `server.instance_name`, `server.data_dir`,
+`server.log_level`, `server.log_format`, `[integrations.mikrotik]` or
+`clients.client_id_secrets`. Web identity is
 node-local: a slave may disable the admin listener or reach it through a
 different bind/proxy/URL than the master, and those differences do not make a
 push fail. `dns.port` and the other listener ports are shared configuration;
