@@ -283,6 +283,10 @@ fn rotate_signing_key_cli_prints_witness_term_floor_and_published_baseline() {
         "{stdout}"
     );
     assert!(
+        stdout.contains("--allow-equal-version --confirm"),
+        "the printed term-only witness command must be operable at the preserved baseline: {stdout}"
+    );
+    assert!(
         stdout.contains("never the staged pending version 20"),
         "{stdout}"
     );
@@ -299,5 +303,84 @@ fn rotate_signing_key_cli_prints_witness_term_floor_and_published_baseline() {
     assert!(stdout.contains(&old_pubkey), "{stdout}");
 
     assert!(!data_dir.join("sito.pid").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rotate_signing_key_cli_term_only_witness_command_works_on_a_fixture_witness() {
+    let (dir, _config_path, _data_dir, _old_pubkey, published_hash) = fixture("witness_term_only");
+    let witness_dir = dir.join("witness");
+    std::fs::create_dir_all(&witness_dir).unwrap();
+    // Steady state: the witness record version equals the cluster's published
+    // baseline, which is exactly the state a rotation preserves.
+    let record = sito_ha::LeaseRecord {
+        schema: sito_ha::witness::LEASE_SCHEMA,
+        cluster_id: "home-dns".to_string(),
+        holder: "node-a/boot".to_string(),
+        node_id: "node-a".to_string(),
+        term: 3,
+        revision: 5,
+        version: 4,
+        bundle_hash: published_hash.clone(),
+        acquired_unix_ms: 1,
+        expires_unix_ms: 1,
+    };
+    std::fs::write(
+        witness_dir.join("lease.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+
+    // The old strict path refuses the unchanged published version.
+    let strict = sito()
+        .args(["ha", "lease-admin", "set", "--state-dir"])
+        .arg(&witness_dir)
+        .args([
+            "--term",
+            "9",
+            "--version",
+            "4",
+            "--bundle-hash",
+            &published_hash,
+            "--confirm",
+        ])
+        .output()
+        .unwrap();
+    assert!(!strict.status.success());
+    assert!(
+        stderr_of(&strict).contains("version_not_raised"),
+        "{}",
+        stderr_of(&strict)
+    );
+
+    // The term-only mode the rotation CLI prints succeeds on the same record.
+    let output = sito()
+        .args(["ha", "lease-admin", "set", "--state-dir"])
+        .arg(&witness_dir)
+        .args([
+            "--term",
+            "9",
+            "--version",
+            "4",
+            "--bundle-hash",
+            &published_hash,
+            "--allow-equal-version",
+            "--confirm",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "term-only bump failed: {}",
+        stderr_of(&output)
+    );
+    let updated: sito_ha::LeaseRecord =
+        serde_json::from_slice(&std::fs::read(witness_dir.join("lease.json")).unwrap()).unwrap();
+    assert_eq!(updated.term, 9);
+    assert_eq!(updated.version, 4);
+    assert_eq!(updated.bundle_hash, published_hash);
+    assert_eq!(updated.revision, record.revision + 1);
+    assert_eq!(updated.expires_unix_ms, 0);
+
     let _ = std::fs::remove_dir_all(&dir);
 }

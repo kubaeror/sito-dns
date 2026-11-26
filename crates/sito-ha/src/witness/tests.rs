@@ -13,7 +13,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
-use super::admin::lease_admin_set_with_clock;
+use super::admin::{lease_admin_set_term_only_with_clock, lease_admin_set_with_clock};
 use super::clock::{Clock, ManualClock};
 use super::normalize_hash;
 use super::record::{LEASE_PROTOCOL_VERSION, LeaseRecord};
@@ -1095,6 +1095,97 @@ async fn lease_admin_set_refuses_while_the_witness_holds_the_lock_and_on_lower_v
     )
     .unwrap_err();
     assert_eq!(version_error.code(), "version_not_raised");
+}
+
+#[tokio::test]
+async fn lease_admin_term_only_raises_the_term_on_an_equal_version_and_hash() {
+    let mut witness = TestWitness::start().await;
+    let published = hash(0xab);
+    let first = witness
+        .post(
+            "/v1/lease/acquire",
+            &acquire(&holder("node-a"), "node-a", None, 1, 7, &published, TTL),
+        )
+        .await
+        .record();
+    assert_eq!(first.term, 1);
+    assert_eq!(first.version, 7);
+
+    witness.stop().await;
+
+    // The strict recovery path still refuses an equal version.
+    let strict =
+        lease_admin_set_with_clock(&witness.state_dir, 2, 7, &published, witness.clock.clone())
+            .unwrap_err();
+    assert_eq!(strict.code(), "version_not_raised");
+
+    // Term-only mode accepts the same published version/hash and bumps only
+    // the term; the record is immediately expired for the next acquire.
+    let outcome = lease_admin_set_term_only_with_clock(
+        &witness.state_dir,
+        2,
+        7,
+        &published,
+        witness.clock.clone(),
+    )
+    .unwrap();
+    assert_eq!(outcome.record.term, 2);
+    assert_eq!(outcome.record.version, 7);
+    assert_eq!(outcome.record.bundle_hash, published);
+    assert_eq!(outcome.record.revision, first.revision + 1);
+    assert!(outcome.record.expires_unix_ms <= outcome.record.acquired_unix_ms);
+
+    // A different hash at the equal version is not a term-only update.
+    let mismatch = lease_admin_set_term_only_with_clock(
+        &witness.state_dir,
+        3,
+        7,
+        &hash(0xcd),
+        witness.clock.clone(),
+    )
+    .unwrap_err();
+    assert_eq!(mismatch.code(), "bundle_hash_mismatch");
+
+    // Neither a lower version nor an equal/lower term is accepted.
+    let lower_version = lease_admin_set_term_only_with_clock(
+        &witness.state_dir,
+        3,
+        6,
+        &hash(0xcd),
+        witness.clock.clone(),
+    )
+    .unwrap_err();
+    assert_eq!(lower_version.code(), "version_not_raised");
+    let lower_term = lease_admin_set_term_only_with_clock(
+        &witness.state_dir,
+        2,
+        7,
+        &published,
+        witness.clock.clone(),
+    )
+    .unwrap_err();
+    assert_eq!(lower_term.code(), "term_not_raised");
+
+    // The next acquire takes over at term + 1 with the unchanged published
+    // baseline, so the rotated master can acquire and publish its pending
+    // version.
+    witness.restart().await;
+    let acquired = witness
+        .post(
+            "/v1/lease/acquire",
+            &acquire(
+                &holder("node-b"),
+                "node-b",
+                Some((outcome.record.term, outcome.record.revision)),
+                3,
+                7,
+                &published,
+                TTL,
+            ),
+        )
+        .await;
+    assert_eq!(acquired.status, 200);
+    assert_eq!(acquired.record().term, 3);
 }
 
 #[tokio::test]

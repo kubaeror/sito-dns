@@ -1158,7 +1158,10 @@ It does not contact the witness, acquire a witness lease or publish a bundle.
 On a promotion-enabled cluster the witness record term must be at least the
 rotated state term (`max(applied_term, state_term)`), and `lease-admin set`
 must use the preserved `published_version`/`published_hash`, never the rotated
-pending version/hash. Update `[ha] master_pubkey` on **every** slave (and
+pending version/hash. In the usual steady state the witness already records
+that published version, so pass `--allow-equal-version` (alias `--term-only`)
+to raise only the term; the strict default still refuses an equal version.
+Update `[ha] master_pubkey` on **every** slave (and
 update or remove it in the master's own config if present) and restart the
 master, then each slave. Full procedure and recovery:
 [HA runbook §8](runbook-ha.md#8-ed25519-signing-key-rotation-offline).

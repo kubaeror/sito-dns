@@ -1071,8 +1071,9 @@ slave rejects the new signature and keeps its last applied configuration.
    ```
    `master_pubkey` must equal the value from step 3 and the master version must
    be **at least** the re-sealed version. If `config.toml` changed while the
-   service was stopped, the master republishes once more and reports `version +
-   1`; every slave must then reach `synced` at the master's reported version.
+   service was stopped, the master republishes once more and reports a higher
+   version (it may reuse the staged version rather than skip it); every slave
+   must then reach `synced` at the master's reported version.
    `ready` must be `true`. A slave with the old key reports a signature
    verification failure and stays on its previous configuration; fix its
    `master_pubkey` and reconnect it.
@@ -1081,10 +1082,11 @@ slave rejects the new signature and keeps its last applied configuration.
 
 - **The command fails before mutation:** nothing changed; correct the reported
   precondition and retry.
-- **The command fails while re-sealing:** it restores the previous key from the
-  backup and reports both backup paths. If it could not restore automatically,
-  copy `ha_signing.key.bak.<timestamp>` over `ha_signing.key` and
-  `ha_state.toml.bak.<timestamp>` over `ha_state.toml`, then start the old
+- **The command fails while re-sealing (including an ownership-transfer
+  failure after the state write):** it restores both the previous key and the
+  previous state from backups and reports both paths. If it could not restore
+  automatically, copy `ha_signing.key.bak.<timestamp>` over `ha_signing.key`
+  and `ha_state.toml.bak.<timestamp>` over `ha_state.toml`, then start the old
   configuration.
 - **The master was started with the old key after rotation:** startup fails
   closed with an actionable `ha_signing_key` error. Do **not** delete
@@ -1108,8 +1110,14 @@ slave rejects the new signature and keeps its last applied configuration.
     --term <TERM >= ROTATED_TERM> \
     --version <PRESERVED_PUBLISHED_VERSION> \
     --bundle-hash <PRESERVED_PUBLISHED_HASH> \
+    --allow-equal-version \
     --confirm
   ```
+
+  `--allow-equal-version` is required in the normal steady state because the
+  witness already records the published version; it accepts the unchanged
+  version only with the identical hash. The strict path still refuses an equal
+  version and remains the default for ordinary recovery.
 
   Follow the [witness runbook](runbook-witness.md#5-offline-recovery-lease-admin-set);
   a master whose state term is above the witness record stays read-only and

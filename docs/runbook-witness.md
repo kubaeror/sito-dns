@@ -246,14 +246,53 @@ accepts equality with the same hash. If the cluster has actually published
 The tool:
 
 - requires `--confirm`;
-- refuses a term or version that is not **strictly greater** than the current
-  record (`term_not_raised`/`version_not_raised`);
+- refuses a term that is not **strictly greater** than the current record
+  (`term_not_raised`) and, by default, a version that is not strictly greater
+  (`version_not_raised`);
 - backs up the previous `lease.json` (to `lease.json.bak` or
   `lease.json.bak.<unix_ms>`) before writing;
 - writes an immediately expired record with the cluster id from the existing
   record, so the next acquire takes over at `term + 1`.
 
 4. Start the witness and let the current/next master acquire.
+
+### Term-only recovery after an offline signing-key rotation
+
+An offline `sito ha rotate-signing-key` keeps the witness **published**
+version/hash but raises the master's state term. In steady state the witness
+record already has that same published version, so the strict path above fails
+`version_not_raised`. Raising the witness version to the rotated pending version
+is wrong: acquisition then reports `master_state_behind` because the witness is
+above the cluster's published baseline.
+
+Use the explicit term-only mode instead. It requires a strictly higher term and
+the **same** current version and the **exact** current bundle hash:
+
+```bash
+sudo sito ha lease-admin set \
+  --state-dir /var/lib/sito-lease \
+  --term <TERM >= ROTATED_TERM> \
+  --version <PRESERVED_PUBLISHED_VERSION> \
+  --bundle-hash <PRESERVED_PUBLISHED_HASH> \
+  --allow-equal-version \
+  --confirm
+```
+
+- `--allow-equal-version` (alias `--term-only`) accepts `version == current`
+  only when `bundle_hash` is identical. It still refuses an equal/lower term, a
+  lower version, and an equal version with a different hash
+  (`term_not_raised`, `version_not_raised`, `bundle_hash_mismatch`).
+- A version **higher** than the record still follows the normal strict-rise
+  rule; a lower version is always refused.
+- The record is expired and revision-bumped exactly like the strict path. The
+  next acquire takes over at `term + 1` with the unchanged published baseline,
+  then publishes the rotated pending bundle version.
+- The rotation CLI prints this exact command with the preserved values; do not
+  substitute the rotated pending version/hash.
+
+The strict `sito ha lease-admin set` without `--allow-equal-version` remains
+unchanged for normal recovery where the witness version is genuinely behind the
+cluster baseline.
 
 > **The tool only raises.** It cannot lower a version. If the witness was set
 > above the cluster's published baseline, restore the state backup; do not try

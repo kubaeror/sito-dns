@@ -437,6 +437,11 @@ pub enum LeaseAdminCommands {
         /// Published bundle hash (64 hex characters, with or without blake3:)
         #[arg(long)]
         bundle_hash: String,
+        /// Raise only the term and keep the current version/hash (required after
+        /// an offline signing-key rotation). The version must match the current
+        /// record and the hash must be identical.
+        #[arg(long, alias = "term-only")]
+        allow_equal_version: bool,
         /// Required confirmation; the previous record is backed up first
         #[arg(long)]
         confirm: bool,
@@ -1606,6 +1611,7 @@ pub fn run_ha_lease_admin_set(
     term: u64,
     version: u64,
     bundle_hash: &str,
+    allow_equal_version: bool,
     confirm: bool,
 ) -> Result<(), anyhow::Error> {
     if !confirm {
@@ -1614,8 +1620,12 @@ pub fn run_ha_lease_admin_set(
             state_dir.display()
         ));
     }
-    let outcome = sito_ha::lease_admin_set(state_dir, term, version, bundle_hash)
-        .map_err(|e| anyhow::anyhow!("Failed to raise witness lease record: {e}"))?;
+    let outcome = if allow_equal_version {
+        sito_ha::lease_admin_set_term_only(state_dir, term, version, bundle_hash)
+    } else {
+        sito_ha::lease_admin_set(state_dir, term, version, bundle_hash)
+    }
+    .map_err(|e| anyhow::anyhow!("Failed to raise witness lease record: {e}"))?;
     if let Some(backup) = &outcome.backup_path {
         println!("Previous lease record backed up to '{}'.", backup.display());
     }
@@ -1884,7 +1894,7 @@ pub fn run_ha_rotate_signing_key(
             );
             match rotation.published_baseline.as_ref() {
                 Some(baseline) => println!(
-                    "   Use the preserved published baseline, never the staged pending version {}. With the witness stopped:\n     sito ha lease-admin set --state-dir <WITNESS_STATE_DIR> --term <TERM >= {}> --version {} --bundle-hash {} --confirm\n   Then restart the master. See docs/runbook-witness.md.",
+                    "   Use the preserved published baseline, never the staged pending version {}. `--allow-equal-version` raises only the term and keeps the same published version/hash; the strict lease-admin path refuses that equal version. With the witness stopped:\n     sito ha lease-admin set --state-dir <WITNESS_STATE_DIR> --term <TERM >= {}> --version {} --bundle-hash {} --allow-equal-version --confirm\n   Then restart the master. See docs/runbook-witness.md.",
                     rotation.version, rotation.term, baseline.version, baseline.hash
                 ),
                 None => println!(
@@ -3451,6 +3461,7 @@ mod tests {
             "128",
             "--bundle-hash",
             &"ab".repeat(32),
+            "--allow-equal-version",
             "--confirm",
         ])
         .expect("parse lease-admin set");
@@ -3462,6 +3473,7 @@ mod tests {
                             LeaseAdminCommands::Set {
                                 term,
                                 version,
+                                allow_equal_version,
                                 confirm,
                                 ..
                             },
@@ -3469,12 +3481,13 @@ mod tests {
             }) => {
                 assert_eq!(term, 9);
                 assert_eq!(version, 128);
+                assert!(allow_equal_version);
                 assert!(confirm);
             }
             other => panic!("expected ha lease-admin set command, got {other:?}"),
         }
 
-        let error = run_ha_lease_admin_set(Path::new("/nonexistent"), 9, 128, "none", false)
+        let error = run_ha_lease_admin_set(Path::new("/nonexistent"), 9, 128, "none", false, false)
             .expect_err("without --confirm the tool must refuse before touching disk");
         assert!(error.to_string().contains("--confirm"));
     }

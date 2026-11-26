@@ -144,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
                         term,
                         version,
                         bundle_hash,
+                        allow_equal_version,
                         confirm,
                     } => {
                         if let Err(e) = sito::cli::run_ha_lease_admin_set(
@@ -151,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
                             term,
                             version,
                             &bundle_hash,
+                            allow_equal_version,
                             confirm,
                         ) {
                             eprintln!("{e}");

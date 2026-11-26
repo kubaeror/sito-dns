@@ -263,31 +263,41 @@ pub fn rotate_master_signing_key(
         )
     })?;
 
-    let save_result = match take_injected_failure(FAILURE_STATE_WRITE) {
-        Some(error) => Err(error),
-        None => store
-            .save(&state)
-            .and_then(|()| apply_owner(&state_path, state_owner, "ha_state")),
+    let save_result = if let Some(error) = take_injected_failure(FAILURE_STATE_WRITE) {
+        Err(error)
+    } else {
+        match store.save(&state) {
+            Ok(()) => match take_injected_failure(FAILURE_STATE_OWNER) {
+                Some(error) => Err(error),
+                None => apply_owner(&state_path, state_owner, "ha_state"),
+            },
+            Err(error) => Err(error),
+        }
     };
     if let Err(error) = save_result {
-        let rollback = restore_backup(&key_path, &key_backup, key_owner);
+        // The state file may already have been replaced by `store.save` even
+        // when ownership transfer failed. Restore both files so the key and
+        // state cannot be left as a mismatched pair.
+        let key_rollback = restore_backup(&key_path, &key_backup, key_owner);
+        let state_rollback = restore_backup(&state_path, &state_backup, state_owner);
         return Err(validation(
             "ha_state",
-            match rollback {
-                Ok(()) => format!(
-                    "failed to re-seal '{}': {error}. The previous key was restored from '{}' and the previous state is at '{}'; no rotation was applied",
+            if key_rollback.is_ok() && state_rollback.is_ok() {
+                format!(
+                    "failed to re-seal '{}': {error}. Both previous files were restored from '{}' and '{}'; no rotation was applied",
                     state_path.display(),
                     key_backup.display(),
                     state_backup.display()
-                ),
-                Err(rollback_error) => format!(
-                    "failed to re-seal '{}': {error}. Rolling the key back also failed: {rollback_error}. Restore '{}' over '{}' and '{}' over '{}' manually before restarting",
+                )
+            } else {
+                format!(
+                    "failed to re-seal '{}': {error}. Automatic restore failed; restore '{}' over '{}' and '{}' over '{}' manually before restarting",
                     state_path.display(),
                     key_backup.display(),
                     key_path.display(),
                     state_backup.display(),
                     state_path.display()
-                ),
+                )
             },
         ));
     }
@@ -689,6 +699,7 @@ fn apply_owner_io(path: &Path, owner: FileOwner) -> std::io::Result<()> {
 
 const FAILURE_STATE_WRITE: u8 = 1;
 const FAILURE_VERIFY: u8 = 2;
+const FAILURE_STATE_OWNER: u8 = 3;
 
 #[cfg(test)]
 thread_local! {
@@ -1191,6 +1202,30 @@ mod tests {
             !entries.iter().any(|name| name.contains(".new.")),
             "no temporary key may be left behind: {entries:?}"
         );
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[test]
+    fn test_state_owner_failure_restores_both_files() {
+        let fixture = fixture("state_owner_failure");
+        let old_key = std::fs::read(&fixture.key_path).unwrap();
+        let old_state = std::fs::read(&fixture.state_path).unwrap();
+
+        // The state save succeeds, then ownership transfer fails. The rollback
+        // must restore the state as well as the key, not leave the new state
+        // paired with the old key.
+        inject_failure(FAILURE_STATE_OWNER);
+        let error = rotate_master_signing_key(&fixture.dir, None, None)
+            .expect_err("the injected ownership failure must fail the rotation");
+        assert!(error.to_string().contains("failed to re-seal"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Both previous files were restored"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&fixture.key_path).unwrap(), old_key);
+        assert_eq!(std::fs::read(&fixture.state_path).unwrap(), old_state);
         let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 

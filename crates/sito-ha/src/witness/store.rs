@@ -462,6 +462,37 @@ impl LeaseStore {
         version: u64,
         bundle_hash: &str,
     ) -> Result<(LeaseRecord, Option<PathBuf>), WitnessError> {
+        self.set_high_water_inner(term, version, bundle_hash, false)
+    }
+
+    /// Term-only recovery: raise the term while keeping the current version
+    /// and bundle hash.
+    ///
+    /// This is required after an offline signing-key rotation. The rotation
+    /// keeps the witness's **published** version/hash but raises the master's
+    /// state term, so a strict version raise would either fail
+    /// `version_not_raised` (same version) or push the witness above the
+    /// cluster's published baseline (`master_state_behind` on acquisition).
+    ///
+    /// An equal version is accepted only with the exact current bundle hash;
+    /// a lower term/version is still refused, as is an equal version with a
+    /// different hash.
+    pub fn set_high_water_allow_equal_version(
+        &self,
+        term: u64,
+        version: u64,
+        bundle_hash: &str,
+    ) -> Result<(LeaseRecord, Option<PathBuf>), WitnessError> {
+        self.set_high_water_inner(term, version, bundle_hash, true)
+    }
+
+    fn set_high_water_inner(
+        &self,
+        term: u64,
+        version: u64,
+        bundle_hash: &str,
+        allow_equal_version: bool,
+    ) -> Result<(LeaseRecord, Option<PathBuf>), WitnessError> {
         let bundle_hash = normalize_bundle_hash(version, bundle_hash)?;
         let mut inner = self.lock_inner();
         let Some(old) = inner.record.clone() else {
@@ -479,7 +510,7 @@ impl LeaseStore {
                 ),
             ));
         }
-        if version <= old.version {
+        if version < old.version {
             return Err(WitnessError::new(
                 "version_not_raised",
                 format!(
@@ -487,6 +518,26 @@ impl LeaseStore {
                     old.version
                 ),
             ));
+        }
+        if version == old.version {
+            if !allow_equal_version {
+                return Err(WitnessError::new(
+                    "version_not_raised",
+                    format!(
+                        "--version {version} must be greater than the current version {} unless --allow-equal-version is used to raise only the term",
+                        old.version
+                    ),
+                ));
+            }
+            let expected = normalize_bundle_hash(old.version, &old.bundle_hash)?;
+            if bundle_hash != expected {
+                return Err(WitnessError::new(
+                    "bundle_hash_mismatch",
+                    format!(
+                        "--allow-equal-version requires the current bundle hash {expected} at version {version}, not {bundle_hash}"
+                    ),
+                ));
+            }
         }
 
         let backup_path = self.backup_record()?;

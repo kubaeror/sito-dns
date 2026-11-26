@@ -59,8 +59,8 @@ pub use transport::{
 pub use witness::{
     AcquireRequest, Clock, LeaseAdminOutcome, LeaseInfo, LeaseOpError, LeaseRecord, LeaseStore,
     ManualClock, RenewRequest, SystemClock, WitnessConfig, WitnessError, WitnessHandle,
-    lease_admin_set, normalize_bundle_hash, normalize_hash, read_token_file, start_witness_server,
-    validate_token_file,
+    lease_admin_set, lease_admin_set_term_only, normalize_bundle_hash, normalize_hash,
+    read_token_file, start_witness_server, validate_token_file,
 };
 
 #[cfg(test)]
