@@ -992,6 +992,34 @@ fn test_mixed_version_promotion_capability_is_required_only_when_enabled() {
 }
 
 #[test]
+fn test_per_slave_ack_history_is_bounded_and_exposed() {
+    let coordinator = test_coordinator();
+    coordinator.mark_replication_ready();
+    install_slave(&coordinator, "slave-1", 0);
+
+    for version in 1..=10 {
+        let ack = HaMessage::Ack {
+            version,
+            term: 0,
+            applied: true,
+            conflict: None,
+            error: None,
+        }
+        .to_json()
+        .unwrap();
+        assert!(coordinator.process_slave_msg("slave-1", 1, &ack));
+    }
+
+    let slaves = coordinator.list_slaves();
+    assert_eq!(slaves.len(), 1);
+    let history = &slaves[0].recent_acks;
+    assert_eq!(history.len(), 8, "history must be bounded");
+    assert_eq!(history.first().unwrap().version, 3);
+    assert_eq!(history.last().unwrap().version, 10);
+    assert!(history.iter().all(|record| record.applied));
+}
+
+#[test]
 fn test_require_all_slaves_implies_require_slaves() {
     // Only require_all_slaves is set: with no slaves it must still fail, so
     // the stricter flag cannot be satisfied by the laxer default.

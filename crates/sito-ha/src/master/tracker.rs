@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::protocol::HaMessage;
 
-pub use sito_ha_types::status::{SlaveStatsSummary, SlaveSummary};
+pub use sito_ha_types::status::{SlaveAckRecord, SlaveStatsSummary, SlaveSummary};
 
 /// Full tracking state of an active slave connection on the master.
 pub struct ActiveSlave {
@@ -60,6 +60,7 @@ impl ActiveSlave {
             connected_at: self.connected_at.to_rfc3339(),
             last_stats: self.last_stats.clone(),
             bundle_hash_known: self.have_bundle_hash.is_some(),
+            recent_acks: Vec::new(),
         }
     }
 }

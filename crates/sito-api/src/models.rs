@@ -836,6 +836,22 @@ pub struct HaSlaveSummary {
     /// True when the peer advertised `have_bundle_hash` in its Hello.
     #[serde(default)]
     pub bundle_hash_known: bool,
+    /// Bounded recent ACK history, newest last.
+    #[serde(default)]
+    pub recent_acks: Vec<HaSlaveAckRecord>,
+}
+
+/// One bounded per-slave ACK/publish record.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct HaSlaveAckRecord {
+    pub version: u64,
+    pub term: u64,
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub at: String,
 }
 
 impl From<sito_ha_types::SlaveSummary> for HaSlaveSummary {
@@ -855,6 +871,18 @@ impl From<sito_ha_types::SlaveSummary> for HaSlaveSummary {
                 upstreams_count: st.upstreams_count,
             }),
             bundle_hash_known: s.bundle_hash_known,
+            recent_acks: s
+                .recent_acks
+                .into_iter()
+                .map(|ack| HaSlaveAckRecord {
+                    version: ack.version,
+                    term: ack.term,
+                    applied: ack.applied,
+                    conflict: ack.conflict,
+                    error: ack.error,
+                    at: ack.at,
+                })
+                .collect(),
         }
     }
 }

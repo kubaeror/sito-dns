@@ -3,7 +3,33 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+const MAX_SLAVE_ACK_HISTORY: usize = 8;
+
 impl MasterCoordinator {
+    fn record_ack_history(
+        &self,
+        slave_instance: &str,
+        version: u64,
+        term: u64,
+        applied: bool,
+        conflict: Option<AckConflict>,
+        error: Option<&String>,
+    ) {
+        let mut history = sito_core::sync::lock_or_recover(&self.ack_history);
+        let entries = history.entry(slave_instance.to_string()).or_default();
+        entries.push_back(SlaveAckRecord {
+            version,
+            term,
+            applied,
+            conflict: conflict.map(|value| format!("{value:?}")),
+            error: error.cloned(),
+            at: Utc::now().to_rfc3339(),
+        });
+        while entries.len() > MAX_SLAVE_ACK_HISTORY {
+            entries.pop_front();
+        }
+    }
+
     /// Parses one incoming frame and dispatches it to a classified handler.
     pub(super) fn process_slave_msg(
         &self,
@@ -82,6 +108,8 @@ impl MasterCoordinator {
         if !owned {
             return true;
         }
+
+        self.record_ack_history(slave_instance, version, term, applied, conflict, error);
 
         let current = self.get_current_version();
         let current_term = self.get_current_term();

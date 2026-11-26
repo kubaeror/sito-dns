@@ -29,7 +29,7 @@ use crate::bundle::{ConfigBundle, build_and_sign_push, seal_bundle_identity};
 use crate::config::HaConfig;
 use crate::crypto::Ed25519SigningKey;
 use crate::error::HaError;
-use crate::master::tracker::{ActiveSlave, SlaveStatsSummary, SlaveSummary};
+use crate::master::tracker::{ActiveSlave, SlaveAckRecord, SlaveStatsSummary, SlaveSummary};
 use crate::protocol::{AckConflict, HaMessage};
 use crate::readiness::{HaReadiness, HaReadinessState};
 use crate::session::{frame_text, send_frame, send_ha_message, wire_size};
@@ -269,6 +269,8 @@ pub struct MasterCoordinator {
     /// Bounded, coordinator-wide history of published envelopes used to bind
     /// delayed ACKs (including forks reported by multiple slaves).
     active_push_history: Arc<Mutex<VecDeque<PublishedEnvelope>>>,
+    /// Bounded per-slave ACK history, keyed by the stable slave instance name.
+    ack_history: Arc<Mutex<HashMap<String, VecDeque<SlaveAckRecord>>>>,
     /// Bytes currently queued per slave session.
     queued_bytes: Arc<Mutex<HashMap<SessionKey, usize>>>,
     /// Most recent publish failure, surfaced through HA readiness.

@@ -49,6 +49,7 @@ impl MasterCoordinator {
             before_broadcast_hook: Arc::new(Mutex::new(None)),
             diverged: Arc::new(Mutex::new(HashMap::new())),
             active_push_history: Arc::new(Mutex::new(VecDeque::new())),
+            ack_history: Arc::new(Mutex::new(HashMap::new())),
             queued_bytes: Arc::new(Mutex::new(HashMap::new())),
             last_publish_error: Arc::new(Mutex::new(None)),
             publish_retry_running: Arc::new(AtomicBool::new(false)),

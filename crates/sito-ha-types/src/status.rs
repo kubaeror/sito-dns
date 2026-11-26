@@ -77,6 +77,22 @@ pub struct SlaveSummary {
     /// reconciliation; legacy v2 peers omit it and must be upgraded first.
     #[serde(default)]
     pub bundle_hash_known: bool,
+    /// Bounded recent ACK history for this slave, newest last.
+    #[serde(default)]
+    pub recent_acks: Vec<SlaveAckRecord>,
+}
+
+/// One bounded per-slave ACK/publish record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlaveAckRecord {
+    pub version: u64,
+    pub term: u64,
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub at: String,
 }
 
 /// Aggregated stats snapshot reported by a slave node for its last reporting

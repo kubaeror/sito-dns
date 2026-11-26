@@ -970,9 +970,17 @@ impl MasterCoordinator {
         let cur_v = self.get_current_version();
         let slaves = sito_core::sync::lock_or_recover(&self.slaves);
         let diverged = sito_core::sync::lock_or_recover(&self.diverged);
+        let history = sito_core::sync::lock_or_recover(&self.ack_history);
         slaves
             .values()
-            .map(|s| s.to_summary(cur_v, diverged.contains_key(&s.instance)))
+            .map(|s| {
+                let mut summary = s.to_summary(cur_v, diverged.contains_key(&s.instance));
+                summary.recent_acks = history
+                    .get(&s.instance)
+                    .map(|entries| entries.iter().cloned().collect())
+                    .unwrap_or_default();
+                summary
+            })
             .collect()
     }
 
