@@ -1090,6 +1090,14 @@ async fn reconciliation_aborts_on_ahead_peer_and_publishes_nothing() {
     assert!(!harness.host.writable.load(Ordering::SeqCst));
     assert!(harness.event_index("publish:").is_none());
     assert!(!engine.snapshot().fenced);
+    let snapshot = engine.snapshot();
+    assert!(
+        !snapshot.lease_held,
+        "a terminal abort must not keep advertising a held lease"
+    );
+    assert_eq!(snapshot.lease_revision, None);
+    assert_eq!(snapshot.lease_expires_unix_ms, None);
+    assert_eq!(snapshot.lease_expires_in_secs, None);
     let record = harness
         .fixture
         .client("node-a")
@@ -1203,8 +1211,6 @@ async fn promotion_records_metrics_from_a_successful_acquisition() {
 
 #[tokio::test]
 async fn witness_failures_clear_reachability_and_use_the_witness_error_label() {
-    use super::fence::FenceReason;
-
     for kind in [
         InjectedWitnessError::Transport,
         InjectedWitnessError::Auth,
@@ -1246,15 +1252,6 @@ async fn witness_failures_clear_reachability_and_use_the_witness_error_label() {
             !engine.snapshot().witness_reachable,
             "a failed probe must clear witness_reachable"
         );
-
-        // The fence path must also clear the diagnostic lease fields.
-        engine.fence(FenceReason::LeaseLost, "test").unwrap();
-        let fenced = engine.snapshot();
-        assert!(fenced.fenced);
-        assert_eq!(fenced.lease_revision, None);
-        assert_eq!(fenced.lease_expires_unix_ms, None);
-        assert_eq!(fenced.lease_expires_in_secs, None);
-        assert!(!fenced.witness_reachable);
     }
 }
 
@@ -1293,14 +1290,22 @@ async fn witness_outage_after_acquire_clears_reachability() {
 }
 
 #[tokio::test]
-async fn candidate_boot_reports_master_alive_not_not_candidate() {
+async fn candidate_boot_has_no_master_evidence_until_a_frame_arrives() {
     let harness = Harness::new("candidate_boot", "node-a").await;
     let engine = harness.engine("node-a", ConfiguredRole::Slave);
     engine.boot().unwrap();
     let snapshot = engine.snapshot();
     assert_eq!(snapshot.phase, PromotionPhase::WaitingForMasterLoss);
-    assert_eq!(snapshot.reason.as_deref(), Some("master_alive"));
+    assert_eq!(
+        snapshot.reason.as_deref(),
+        Some("not_candidate"),
+        "boot must not claim a live master before any frame is observed"
+    );
     assert!(snapshot.candidate);
+
+    // Once the supervisor sees a live master frame it publishes master_alive.
+    engine.note_waiting_for_master("master_alive");
+    assert_eq!(engine.snapshot().reason.as_deref(), Some("master_alive"));
 }
 
 #[tokio::test]

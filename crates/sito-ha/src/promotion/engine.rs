@@ -382,6 +382,12 @@ pub struct PromotionSnapshot {
     pub lease_expires_in_secs: Option<u64>,
     /// Unix milliseconds of the last acquisition/renewal attempt.
     pub last_attempt_unix_ms: Option<i64>,
+    /// Whether this node currently holds a live lease grant.
+    ///
+    /// Computed from the in-memory grant plus the self-fence deadline, not from
+    /// the last status phase: a terminal read-only/abort must report false even
+    /// while the supervisor is still shutting down.
+    pub lease_held: bool,
     /// Promotion start timestamp.
     pub promoted_at_unix_ms: Option<i64>,
     /// Durable fence present.
@@ -410,6 +416,7 @@ impl PromotionSnapshot {
             lease_expires_unix_ms: None,
             lease_expires_in_secs: None,
             last_attempt_unix_ms: None,
+            lease_held: false,
             promoted_at_unix_ms: None,
             fenced: false,
         }
@@ -599,7 +606,9 @@ impl PromotionEngine {
         let confirm = ConfirmationStore::new(data_dir.clone(), cluster_id.clone(), node_id.clone());
         let (initial_phase, initial_reason) = match (role, config.candidate) {
             (ConfiguredRole::Master, _) => (PromotionPhase::Acquiring, None),
-            (ConfiguredRole::Slave, true) => (PromotionPhase::WaitingForMasterLoss, None),
+            (ConfiguredRole::Slave, true) => {
+                (PromotionPhase::WaitingForMasterLoss, Some("not_candidate"))
+            }
             (ConfiguredRole::Slave, false) => (PromotionPhase::Aborted, Some("not_candidate")),
         };
         let snapshot = PromotionSnapshot {
@@ -622,6 +631,7 @@ impl PromotionEngine {
             lease_expires_unix_ms: None,
             lease_expires_in_secs: None,
             last_attempt_unix_ms: None,
+            lease_held: false,
             promoted_at_unix_ms: None,
             fenced: false,
         };
@@ -719,12 +729,19 @@ impl PromotionEngine {
     /// Current internal snapshot.
     #[must_use]
     pub fn snapshot(&self) -> PromotionSnapshot {
-        let mut snapshot = self.lock().snapshot.clone();
+        let (mut snapshot, grant_present, deadline_safe) = {
+            let inner = self.lock();
+            let deadline_safe = inner.deadline.as_ref().is_some_and(|deadline| {
+                matches!(deadline.check(self.clock.as_ref()), SelfFenceCheck::Safe)
+            });
+            (inner.snapshot.clone(), inner.grant.is_some(), deadline_safe)
+        };
         snapshot.lease_expires_in_secs = snapshot.lease_expires_unix_ms.map(|expires| {
             let now = self.clock.wall_unix_ms();
             let remaining_ms = expires.saturating_sub(now);
             u64::try_from(remaining_ms / 1_000).unwrap_or(0)
         });
+        snapshot.lease_held = !snapshot.fenced && grant_present && deadline_safe;
         snapshot
     }
 
@@ -873,10 +890,10 @@ impl PromotionEngine {
                 }
                 (ConfiguredRole::Slave, true) => {
                     inner.snapshot.phase = PromotionPhase::WaitingForMasterLoss;
-                    inner.snapshot.reason = Some("master_alive".to_string());
+                    inner.snapshot.reason = Some("not_candidate".to_string());
                     (
                         PromotionPhase::WaitingForMasterLoss,
-                        Some("master_alive".to_string()),
+                        Some("not_candidate".to_string()),
                     )
                 }
                 (ConfiguredRole::Slave, false) => {
@@ -1593,6 +1610,11 @@ impl PromotionEngine {
     ) -> PromotionOutcome {
         self.host.set_writable(false, Some(reason.to_string()));
         self.set_phase(phase, Some(reason));
+        if !retryable {
+            // A terminal read-only/abort will not renew this term. Do not keep
+            // advertising a grant/revision/expiry the node is no longer using.
+            self.clear_lease_diagnostics();
+        }
         self.record_refusal(reason);
         let (term, version) = {
             let inner = self.lock();
@@ -1603,6 +1625,19 @@ impl PromotionEngine {
             reason: reason.to_string(),
             retryable,
         }
+    }
+
+    /// Clears the in-memory grant and its diagnostic lease fields.
+    ///
+    /// Callers use this only on a terminal path that will not renew the term.
+    fn clear_lease_diagnostics(&self) {
+        let mut inner = self.lock();
+        inner.grant = None;
+        inner.deadline = None;
+        inner.snapshot.lease_revision = None;
+        inner.snapshot.lease_expires_unix_ms = None;
+        inner.snapshot.lease_expires_in_secs = None;
+        inner.snapshot.lease_held = false;
     }
 
     async fn reconcile_and_publish(&self) -> PromotionOutcome {
@@ -2114,6 +2149,7 @@ impl PromotionEngine {
                     AcquisitionRole::Master => refusal.master_code(),
                 };
                 self.set_phase(PromotionPhase::Aborted, Some(reason));
+                self.clear_lease_diagnostics();
                 self.record_attempt("refused");
                 self.record_refusal(reason);
                 self.audit(REFUSED, "refused", Some(reason), 0, 0, None);
@@ -2716,6 +2752,7 @@ impl PromotionEngine {
             inner.snapshot.lease_revision = None;
             inner.snapshot.lease_expires_unix_ms = None;
             inner.snapshot.lease_expires_in_secs = None;
+            inner.snapshot.lease_held = false;
             inner.snapshot.witness_reachable = false;
             inner.grant = None;
             inner.deadline = None;
@@ -2793,8 +2830,9 @@ impl PromotionEngine {
         // The status field is a last-probe observation: only a successful call
         // proves reachability. A transport/auth/5xx failure (and any other
         // failed probe) clears it immediately instead of leaving a stale `true`
-        // until fencing.
-        self.lock().snapshot.witness_reachable = result == "success";
+        // until fencing. A CAS conflict (409) is a real witness answer and
+        // therefore still reachable.
+        self.lock().snapshot.witness_reachable = matches!(result, "success" | "conflict");
         let bounded = if result == "error" {
             "witness_error"
         } else {

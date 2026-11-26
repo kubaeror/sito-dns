@@ -107,21 +107,25 @@ pub(super) fn initial_promotion_status(
     }
 }
 
-/// Whether the promotion snapshot represents a live lease grant.
-///
-/// The grant is held from acquisition through quiescing, reconciliation and
-/// publishing, not only once the node is the writable master. A fence clears
-/// the revision, so this is false after fencing.
-fn promotion_lease_held(status: &sito_api::models::PromotionStatus) -> bool {
-    !status.fenced && status.lease_revision.is_some()
+/// Publishes a terminal construction/config failure instead of leaving the
+/// seeded `acquiring` status forever.
+fn publish_unavailable_status(state: &PromotionRuntimeState, reason: &str) {
+    let mut status = initial_promotion_status(&state.ha_config, state.role);
+    status.state = "unavailable".to_string();
+    status.reason = Some(reason.to_string());
+    state
+        .metrics
+        .observe_ha_promotion_status(status.enabled, false, status.term, 0, 0);
+    state.status.store(status);
 }
 
 /// Publishes the engine snapshot to the API/metrics shared handles.
 fn publish_promotion_status(state: &PromotionRuntimeState, engine: &PromotionEngine) {
-    let status = sito_api::models::PromotionStatus::from_snapshot(&engine.snapshot());
+    let snapshot = engine.snapshot();
+    let status = sito_api::models::PromotionStatus::from_snapshot(&snapshot);
     state.metrics.observe_ha_promotion_status(
         status.enabled,
-        promotion_lease_held(&status),
+        snapshot.lease_held,
         status.term,
         status.quiesce_remaining_secs,
         status.reconcile_remaining_secs,
@@ -155,6 +159,7 @@ async fn run_supervisor(state: Arc<PromotionRuntimeState>, mut shutdown_rx: watc
                 state
                     .write_gate
                     .block(format!("witness_config_invalid: {error}"));
+                publish_unavailable_status(&state, "witness_config_invalid");
                 warn!(error = %error, "Promotion witness client is not usable yet; staying read-only");
                 tokio::select! {
                     () = tokio::time::sleep(backoff.next_delay()) => {}
@@ -180,6 +185,7 @@ async fn run_supervisor(state: Arc<PromotionRuntimeState>, mut shutdown_rx: watc
         ),
         Err(error) => {
             state.write_gate.block("promotion_config_invalid");
+            publish_unavailable_status(&state, "promotion_config_invalid");
             error!(error = %error, "Automatic promotion configuration failed at runtime");
             return;
         }
@@ -276,7 +282,11 @@ async fn run_supervisor(state: Arc<PromotionRuntimeState>, mut shutdown_rx: watc
                 if master_alive || (!seen_master && started.elapsed() < heartbeat) {
                     // Keep the public status truthful while the gate is blocked
                     // for a live master; candidate_attempt is not called here.
-                    engine.note_waiting_for_master("master_alive");
+                    // Without a master frame yet the boot reason (`not_candidate`)
+                    // is left alone: there is no evidence the master is alive.
+                    if master_alive {
+                        engine.note_waiting_for_master("master_alive");
+                    }
                     state.write_gate.block("master_alive");
                     tokio::select! {
                         () = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -937,43 +947,22 @@ mod tests {
     }
 
     #[test]
-    fn lease_held_gauge_covers_the_whole_promotion_window() {
-        let base = sito_api::models::PromotionStatus {
-            enabled: true,
-            candidate: false,
-            lease_revision: Some(7),
-            ..sito_api::models::PromotionStatus::disabled()
-        };
-        for state in [
-            "acquiring",
-            "quiescing",
-            "reconciling",
-            "publishing",
-            "master",
-        ] {
-            let status = sito_api::models::PromotionStatus {
-                state: state.to_string(),
-                ..base.clone()
-            };
-            assert!(
-                promotion_lease_held(&status),
-                "{state} holds the grant and must report lease_held = 1"
-            );
-        }
+    fn construction_failure_publishes_a_terminal_unavailable_status() {
+        let mut state = test_state("construction_failure");
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .ha_config
+            .promotion
+            .enabled = true;
+        publish_unavailable_status(&state, "witness_config_invalid");
 
-        let before_grant = sito_api::models::PromotionStatus {
-            state: "waiting_for_master_loss".to_string(),
-            lease_revision: None,
-            ..base.clone()
-        };
-        assert!(!promotion_lease_held(&before_grant));
-
-        let fenced = sito_api::models::PromotionStatus {
-            state: "fenced".to_string(),
-            fenced: true,
-            ..base
-        };
-        assert!(!promotion_lease_held(&fenced));
+        let status = state.status.load();
+        assert!(status.enabled);
+        assert_eq!(status.state, "unavailable");
+        assert_eq!(status.reason.as_deref(), Some("witness_config_invalid"));
+        let rendered = state.metrics.render_prometheus();
+        assert!(rendered.contains("sito_ha_promotion_enabled 1"));
+        assert!(rendered.contains("sito_ha_promotion_lease_held 0"));
     }
 
     #[tokio::test]

@@ -983,6 +983,7 @@ mod promotion_status_tests {
             published_version: 128,
             published_hash: "cd".repeat(32),
             lease_revision: Some(13),
+            lease_held: true,
             witness_reachable: true,
             quiesce_remaining_secs: 0,
             reconcile_remaining_secs: 0,
