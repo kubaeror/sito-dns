@@ -615,37 +615,10 @@ impl MasterCoordinator {
         }
     }
 
-    /// Writes `payload` to `path` atomically (0600 temp file, fsync, rename).
+    /// Writes `payload` to `path` atomically through the shared 0600 writer
+    /// (temp file, fsync, rename, directory fsync when supported).
     pub(super) fn write_state_file(path: &std::path::Path, payload: &[u8]) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("tmp");
-        #[cfg(unix)]
-        {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            file.write_all(payload)?;
-            file.sync_all()?;
-        }
-        #[cfg(not(unix))]
-        {
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)?;
-            file.write_all(payload)?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)
+        crate::promotion::state::write_atomic_private(path, payload)
     }
 
     /// Serializes `bundle` for the state file, if a state path exists.
@@ -726,9 +699,9 @@ impl MasterCoordinator {
 
     /// Restores the persisted version/bundle, if any.
     ///
-    /// A corrupt state file is moved aside and treated as absent so a master
-    /// never silently publishes a rollback; the sequence then restarts from a
-    /// fresh v1 only when no state can be recovered.
+    /// Corrupt, v1, foreign or partial state fails closed. The file may be
+    /// moved aside for recovery, but it is never treated as absent: resetting
+    /// the configuration sequence would silently publish a rollback.
     pub fn restore_state(&self) -> Result<Option<u64>, HaError> {
         let path = sito_core::sync::lock_or_recover(&self.state_path).clone();
         let Some(path) = path else {
@@ -779,9 +752,16 @@ impl MasterCoordinator {
                 warn!(
                     error = %e,
                     backup = %backup.display(),
-                    "Corrupt HA state detected; backing up and starting fresh"
+                    "Corrupt HA state detected; refusing to reset the configuration sequence"
                 );
-                return Ok(None);
+                return Err(HaError::Validation {
+                    field: "ha_state".to_string(),
+                    reason: format!(
+                        "corrupt HA state at {}: {e}; backup at {}. Refusing to reset the configuration sequence; restore a backup or re-seed explicitly.",
+                        path.display(),
+                        backup.display()
+                    ),
+                });
             }
         };
         if state.protocol_version != crate::protocol::PROTOCOL_VERSION {

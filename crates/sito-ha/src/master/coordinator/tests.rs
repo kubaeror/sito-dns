@@ -117,7 +117,8 @@ fn test_state_persists_and_restores_across_restart() {
     assert!(second.update_bundle(test_bundle(2)).is_err());
     assert_eq!(second.update_bundle(test_bundle(3)).unwrap(), 3);
 
-    // Corrupt state is moved aside and treated as absent.
+    // Corrupt state is moved aside and refused; the sequence is never reset
+    // silently. The operator must restore a backup or re-seed explicitly.
     std::fs::write(&state_path, "not-json").unwrap();
     let third = MasterCoordinator::new(
         "test-master".to_string(),
@@ -126,7 +127,13 @@ fn test_state_persists_and_restores_across_restart() {
         sito_stats::MetricsRegistry::new("test", "test"),
     )
     .with_state_path(state_path.clone());
-    assert_eq!(third.restore_state().unwrap(), None);
+    let error = third
+        .restore_state()
+        .expect_err("corrupt state must fail closed, not reset the sequence");
+    assert!(
+        error.to_string().contains("corrupt HA state"),
+        "unexpected corrupt-state error: {error}"
+    );
     let corrupt_backups: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(Result::ok)
@@ -142,7 +149,11 @@ fn test_state_persists_and_restores_across_restart() {
         1,
         "corrupt state must be moved aside instead of deleted"
     );
-    assert_eq!(third.update_bundle(test_bundle(1)).unwrap(), 1);
+    assert_eq!(
+        third.get_current_version(),
+        0,
+        "a failed restore must not install a reset sequence"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
