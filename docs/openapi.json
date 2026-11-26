@@ -5900,6 +5900,46 @@
           }
         }
       },
+      "HaSlaveAckRecord": {
+        "type": "object",
+        "description": "One bounded per-slave ACK/publish record.",
+        "required": [
+          "version",
+          "term",
+          "applied",
+          "at"
+        ],
+        "properties": {
+          "applied": {
+            "type": "boolean"
+          },
+          "at": {
+            "type": "string"
+          },
+          "conflict": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "term": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "HaSlaveStatsSummary": {
         "type": "object",
         "description": "Statistics reported by a replica slave.",
@@ -5943,6 +5983,10 @@
           "connected_at"
         ],
         "properties": {
+          "bundle_hash_known": {
+            "type": "boolean",
+            "description": "True when the peer advertised `have_bundle_hash` in its Hello."
+          },
           "connected_at": {
             "type": "string"
           },
@@ -5972,6 +6016,13 @@
                 "type": "null"
               }
             ]
+          },
+          "recent_acks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HaSlaveAckRecord"
+            },
+            "description": "Bounded recent ACK history, newest last."
           },
           "remote_addr": {
             "type": "string"
