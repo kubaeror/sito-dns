@@ -412,7 +412,8 @@ pub enum HaCommands {
         #[arg(long)]
         term: Option<u64>,
         /// New configuration version; must be strictly greater than the
-        /// current state (default: current + 1)
+        /// current state (default: max(bundle version, published baseline
+        /// version) + 1)
         #[arg(long)]
         version: Option<u64>,
     },
@@ -1861,13 +1862,37 @@ pub fn run_ha_rotate_signing_key(
         "3. Restart each slave (or let it reconnect). A slave still configured with the old key rejects the new signed bundle with a signature-verification failure; it keeps its last applied configuration."
     );
     println!(
-        "4. Verify on the master: GET /api/v2/ha/status must report master_pubkey {} and version {}; GET /api/v2/ha/slaves must show every slave synced at that version.",
+        "4. Verify on the master: GET /api/v2/ha/status must report master_pubkey {} and a version >= {}. If config.toml changed while the service was stopped, the master republishes once more and the reported version will be higher; GET /api/v2/ha/slaves must show every slave synced at the master's reported version.",
         rotation.master_pubkey, rotation.version
     );
-    if sito_ha::config_from_unvalidated(&config).is_ok_and(|ha| ha.promotion.enabled) {
-        println!(
-            "5. [ha.promotion] is enabled: this command did not contact the witness. Raise its record offline (sito ha lease-admin set) above the previous applied term before restarting the master, or it refuses to acquire a lease below the rotated term. See docs/runbook-witness.md."
-        );
+    if let Ok(ha) = sito_ha::config_from_unvalidated(&config) {
+        if let Some(configured) = ha.master_pubkey.as_deref() {
+            let matches = sito_ha::parse_public_key(configured)
+                .ok()
+                .zip(sito_ha::parse_public_key(&rotation.master_pubkey).ok())
+                .is_some_and(|(configured, new)| configured == new);
+            if !matches {
+                println!(
+                    "WARNING: this master's own [ha] master_pubkey still names '{configured}'. It is inert for role = \"master\", but update or remove it so a future role change cannot trust the old signing key."
+                );
+            }
+        }
+        if ha.promotion.enabled {
+            println!(
+                "5. [ha.promotion] is enabled: this command did not contact the witness. Its record term must be at least {} (the re-sealed state term); acquisition refuses a record below max(applied_term, state_term).",
+                rotation.term
+            );
+            match rotation.published_baseline.as_ref() {
+                Some(baseline) => println!(
+                    "   Use the preserved published baseline, never the staged pending version {}. With the witness stopped:\n     sito ha lease-admin set --state-dir <WITNESS_STATE_DIR> --term <TERM >= {}> --version {} --bundle-hash {} --confirm\n   Then restart the master. See docs/runbook-witness.md.",
+                    rotation.version, rotation.term, baseline.version, baseline.hash
+                ),
+                None => println!(
+                    "   This legacy state has no stored published baseline. Reconcile it before restarting, or set the witness record manually (term >= {}, with the true last published version and hash) while the witness is stopped. See docs/runbook-witness.md.",
+                    rotation.term
+                ),
+            }
+        }
     }
     println!();
     println!(

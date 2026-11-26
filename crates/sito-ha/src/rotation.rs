@@ -26,7 +26,7 @@ use crate::bundle::{build_and_sign_push, push_payload_hash, seal_bundle_identity
 use crate::crypto::Ed25519SigningKey;
 use crate::crypto::signing::write_private_exclusive;
 use crate::error::HaError;
-use crate::promotion::state::{HaStateStore, LoadedState};
+use crate::promotion::state::{HaStateStore, LoadedState, PublicationBaseline};
 
 use sito_ha_types::status::PublicationState;
 
@@ -64,17 +64,29 @@ pub struct SigningKeyRotation {
     /// already carried promotion bookkeeping. `None` for a legacy state file
     /// that never had it.
     pub pending_hash: Option<String>,
+    /// Published baseline preserved from the old state. `None` for a legacy
+    /// state that never carried promotion bookkeeping. A promotion-enabled
+    /// cluster must give these exact values to its offline witness update;
+    /// they are never the rotated pending version/hash.
+    pub published_baseline: Option<PublicationBaseline>,
 }
 
 /// Rotates the master signing key and re-seals `ha_state.toml` offline.
 ///
 /// `requested_term`/`requested_version` are the operator's explicit values.
-/// When omitted, the corresponding value is `current + 1`. Both values must be
-/// strictly greater than the current state; equal or lower values are refused
-/// so a slave's same-term key-change guard can never be bypassed.
+/// When omitted, the term is `current + 1` and the version is
+/// `max(active bundle version, published baseline version) + 1`. Both values
+/// must be strictly greater than those floors; equal or lower values are
+/// refused so a slave's same-term key-change guard can never be bypassed.
 ///
-/// The caller is responsible for refusing while a server owns the data
-/// directory. This function performs no witness or network I/O.
+/// # Caller contract
+///
+/// This library entry point does not inspect the service lease and does not
+/// require a confirmation flag; those are operator-UX guards enforced by
+/// `sito ha rotate-signing-key`. A direct caller must stop the HA master and
+/// exclude every running server from `data_dir` for the whole call, and must
+/// invoke it only after an explicit operator decision. The function performs
+/// no witness or network I/O.
 pub fn rotate_master_signing_key(
     data_dir: &Path,
     requested_term: Option<u64>,
@@ -90,6 +102,7 @@ pub fn rotate_master_signing_key(
             "cannot read the current signing key to back it up; restore it from backup or re-enroll every slave before rotating",
         )
     })?;
+    let key_owner = capture_owner(&key_path, "ha_signing_key")?;
     let old_key = Ed25519SigningKey::from_pkcs8(&old_key_bytes).map_err(|error| {
         HaError::Validation {
             field: "ha_signing_key".to_string(),
@@ -120,6 +133,7 @@ pub fn rotate_master_signing_key(
             ),
         ));
     };
+    let state_owner = capture_owner(&state_path, "ha_state")?;
     let mut state = *state;
 
     let recorded_pubkey = state.signing_key_pubkey.as_deref().ok_or_else(|| {
@@ -184,6 +198,10 @@ pub fn rotate_master_signing_key(
 
     let previous_term = state.bundle.term;
     let previous_version = state.bundle.version;
+    let published_baseline = bookkeeping.as_ref().map(|bookkeeping| PublicationBaseline {
+        version: bookkeeping.published_version,
+        hash: bookkeeping.published_hash.clone(),
+    });
     // Never move the version below a published baseline that is ahead of the
     // active bundle. The witness/promotion baseline is part of the current
     // state even when a crash/recovery left the bundle behind it.
@@ -223,11 +241,18 @@ pub fn rotate_master_signing_key(
     state.signing_key_pubkey = Some(new_pubkey.clone());
 
     let backup_stamp = now_unix_ms();
-    let key_backup = backup_private(&key_path, data_dir, backup_stamp, "ha_signing_key")?;
-    let state_backup = backup_private(&state_path, data_dir, backup_stamp, "ha_state")?;
+    let key_backup = backup_private(
+        &key_path,
+        data_dir,
+        backup_stamp,
+        "ha_signing_key",
+        key_owner,
+    )?;
+    let state_backup =
+        backup_private(&state_path, data_dir, backup_stamp, "ha_state", state_owner)?;
 
     // From here on the old key/state are recoverable from the two backups.
-    replace_private_atomic(&key_path, new_key.pkcs8_bytes()).map_err(|error| {
+    replace_private_atomic(&key_path, new_key.pkcs8_bytes(), key_owner).map_err(|error| {
         validation(
             "ha_signing_key",
             format!(
@@ -238,8 +263,14 @@ pub fn rotate_master_signing_key(
         )
     })?;
 
-    if let Err(error) = store.save(&state) {
-        let rollback = restore_backup(&key_path, &key_backup);
+    let save_result = match take_injected_failure(FAILURE_STATE_WRITE) {
+        Some(error) => Err(error),
+        None => store
+            .save(&state)
+            .and_then(|()| apply_owner(&state_path, state_owner, "ha_state")),
+    };
+    if let Err(error) = save_result {
+        let rollback = restore_backup(&key_path, &key_backup, key_owner);
         return Err(validation(
             "ha_state",
             match rollback {
@@ -263,10 +294,19 @@ pub fn rotate_master_signing_key(
 
     // Read everything back from disk: the command must not report success for
     // a key/state pair that the next startup would reject.
-    let verify = verify_rotated_files(&key_path, &state_path, previous_version);
+    let verify = match take_injected_failure(FAILURE_VERIFY) {
+        Some(error) => Err(error),
+        None => verify_rotated_files(
+            &key_path,
+            &state_path,
+            previous_version,
+            key_owner,
+            state_owner,
+        ),
+    };
     if let Err(error) = verify {
-        let key_rollback = restore_backup(&key_path, &key_backup);
-        let state_rollback = restore_backup(&state_path, &state_backup);
+        let key_rollback = restore_backup(&key_path, &key_backup, key_owner);
+        let state_rollback = restore_backup(&state_path, &state_backup, state_owner);
         return Err(validation(
             "ha_signing_key",
             if key_rollback.is_ok() && state_rollback.is_ok() {
@@ -298,6 +338,7 @@ pub fn rotate_master_signing_key(
         term,
         version,
         pending_hash,
+        published_baseline,
     })
 }
 
@@ -340,7 +381,12 @@ fn verify_rotated_files(
     key_path: &Path,
     state_path: &Path,
     have_version: u64,
+    key_owner: FileOwner,
+    state_owner: FileOwner,
 ) -> Result<(), HaError> {
+    // A root-run rotation must not leave a file the service user cannot read.
+    apply_owner(key_path, key_owner, "ha_signing_key")?;
+    apply_owner(state_path, state_owner, "ha_state")?;
     let key_bytes = std::fs::read(key_path).map_err(|error| {
         validation(
             "ha_signing_key",
@@ -375,6 +421,9 @@ fn verify_rotated_files(
         ));
     }
     let push = build_and_sign_push(&state.bundle, &key)?;
+    // The next startup would refuse an oversized push. Fail the rotation now,
+    // while both previous files are still recoverable from backup.
+    crate::master::MasterCoordinator::ensure_push_fits(&push)?;
     crate::bundle::verify_and_unpack_push(&push, have_version, &key.public_key()).map_err(
         |error| {
             validation(
@@ -418,16 +467,102 @@ fn key_io_error(path: &Path, error: &std::io::Error, context: &str) -> HaError {
     }
 }
 
+/// Owner of an existing HA file, preserved across a root-run rotation.
+///
+/// The server usually runs as an unprivileged service user. Running the CLI
+/// with `sudo` must not leave a root-owned key, state or backup that the
+/// service can no longer read.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileOwner {
+    uid: u32,
+    gid: u32,
+}
+
+/// Owner placeholder for platforms without Unix ownership.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileOwner;
+
+fn capture_owner(path: &Path, field: &str) -> Result<FileOwner, HaError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            validation(
+                field,
+                format!("cannot read the ownership of '{}': {error}", path.display()),
+            )
+        })?;
+        Ok(FileOwner {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, field);
+        Ok(FileOwner)
+    }
+}
+
+/// Applies `owner` to `path`, refusing a privileged mismatch.
+fn apply_owner(path: &Path, owner: FileOwner, field: &str) -> Result<(), HaError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            validation(
+                field,
+                format!("cannot read the ownership of '{}': {error}", path.display()),
+            )
+        })?;
+        if metadata.uid() == owner.uid && metadata.gid() == owner.gid {
+            return Ok(());
+        }
+        // SAFETY: geteuid has no preconditions and does not dereference memory.
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            return Err(validation(
+                field,
+                format!(
+                    "'{}' is owned by {}:{} but this command runs as uid {euid}; run it as root or as the service user so the server can still read its key/state",
+                    path.display(),
+                    owner.uid,
+                    owner.gid
+                ),
+            ));
+        }
+        std::os::unix::fs::chown(path, Some(owner.uid), Some(owner.gid)).map_err(|error| {
+            validation(
+                field,
+                format!(
+                    "cannot restore ownership {}:{} on '{}': {error}",
+                    owner.uid,
+                    owner.gid,
+                    path.display()
+                ),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, owner, field);
+        Ok(())
+    }
+}
+
 /// Copies `source` to a new mode-`0600` backup next to the data directory.
 ///
 /// `create_new` is used so an existing backup is never overwritten; a
-/// timestamp collision gets a numeric suffix. A failed copy aborts the
-/// rotation before any source file is mutated.
+/// timestamp collision gets a numeric suffix. A failed copy (including
+/// ownership transfer) aborts the rotation before any source file is mutated.
 fn backup_private(
     source: &Path,
     data_dir: &Path,
     stamp: u64,
     field: &str,
+    owner: FileOwner,
 ) -> Result<PathBuf, HaError> {
     let bytes = std::fs::read(source).map_err(|error| {
         key_io_error(
@@ -448,7 +583,18 @@ fn backup_private(
         };
         let candidate = data_dir.join(format!("{name}.{suffix}"));
         match write_private_exclusive(&candidate, &bytes) {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => {
+                if let Err(error) = apply_owner(&candidate, owner, field) {
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(validation(
+                        field,
+                        format!(
+                            "{error}. The rotation was aborted before any source file was changed"
+                        ),
+                    ));
+                }
+                return Ok(candidate);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(validation(
@@ -472,7 +618,7 @@ fn backup_private(
 
 /// Replaces `path` with `bytes` using a mode-`0600` temporary file, fsync and
 /// rename, so the key is never briefly world-readable or half-written.
-fn replace_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn replace_private_atomic(path: &Path, bytes: &[u8], owner: FileOwner) -> std::io::Result<()> {
     let tmp = match path.parent() {
         Some(parent) => parent.join(format!(
             "{}.new.{}.{}",
@@ -487,6 +633,7 @@ fn replace_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     };
     let result = (|| {
         write_private_exclusive(&tmp, bytes)?;
+        apply_owner_io(&tmp, owner)?;
         std::fs::rename(&tmp, path)?;
         if let Some(parent) = path.parent()
             && let Ok(dir) = std::fs::File::open(parent)
@@ -504,9 +651,77 @@ fn replace_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Restores `path` from a previously written private backup.
-fn restore_backup(path: &Path, backup: &Path) -> std::io::Result<()> {
+fn restore_backup(path: &Path, backup: &Path, owner: FileOwner) -> std::io::Result<()> {
     let bytes = std::fs::read(backup)?;
-    replace_private_atomic(path, &bytes)
+    replace_private_atomic(path, &bytes, owner)
+}
+
+/// Unix implementation of [`apply_owner`] for the atomic-write path.
+fn apply_owner_io(path: &Path, owner: FileOwner) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(path)?;
+        if metadata.uid() == owner.uid && metadata.gid() == owner.gid {
+            return Ok(());
+        }
+        // SAFETY: geteuid has no preconditions and does not dereference memory.
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "'{}' is owned by {}:{} but this command runs as uid {euid}",
+                    path.display(),
+                    owner.uid,
+                    owner.gid
+                ),
+            ));
+        }
+        std::os::unix::fs::chown(path, Some(owner.uid), Some(owner.gid))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, owner);
+        Ok(())
+    }
+}
+
+const FAILURE_STATE_WRITE: u8 = 1;
+const FAILURE_VERIFY: u8 = 2;
+
+#[cfg(test)]
+thread_local! {
+    static INJECTED_FAILURE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only fault injection at a named rotation step. Production builds
+/// always return `None`.
+fn take_injected_failure(point: u8) -> Option<HaError> {
+    #[cfg(test)]
+    {
+        INJECTED_FAILURE.with(|cell| {
+            if cell.get() == Some(point) {
+                cell.set(None);
+                Some(validation(
+                    "ha_test_failure",
+                    format!("injected rotation failure at step {point}"),
+                ))
+            } else {
+                None
+            }
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = point;
+        None
+    }
+}
+
+#[cfg(test)]
+fn inject_failure(point: u8) {
+    INJECTED_FAILURE.with(|cell| cell.set(Some(point)));
 }
 
 #[cfg(test)]
@@ -621,6 +836,8 @@ mod tests {
         let fixture = fixture("happy");
         let old_key_bytes = std::fs::read(&fixture.key_path).unwrap();
         let old_state_bytes = std::fs::read(&fixture.state_path).unwrap();
+        let old_key_owner = capture_owner(&fixture.key_path, "ha_signing_key").unwrap();
+        let old_state_owner = capture_owner(&fixture.state_path, "ha_state").unwrap();
 
         let rotated = rotate_master_signing_key(&fixture.dir, None, None).expect("rotate the key");
 
@@ -631,6 +848,18 @@ mod tests {
         assert_eq!(rotated.version, fixture.version + 1);
         assert_eq!(rotated.term, fixture.term + 1);
         assert!(rotated.pending_hash.is_some());
+        assert_eq!(
+            rotated.published_baseline,
+            Some(PublicationBaseline {
+                version: fixture.version,
+                hash: fixture.old_hash.clone(),
+            })
+        );
+        assert_ne!(
+            rotated.published_baseline.as_ref().unwrap().hash,
+            rotated.pending_hash.clone().unwrap(),
+            "the witness baseline must stay the published hash, never the pending rotation hash"
+        );
 
         // The old key/state are byte-for-byte recoverable from the backups.
         assert_eq!(std::fs::read(&rotated.key_backup).unwrap(), old_key_bytes);
@@ -640,6 +869,22 @@ mod tests {
         );
         assert_eq!(unix_mode(&rotated.key_backup), 0o600);
         assert_eq!(unix_mode(&rotated.state_backup), 0o600);
+        assert_eq!(
+            capture_owner(&rotated.key_backup, "ha_signing_key").unwrap(),
+            old_key_owner
+        );
+        assert_eq!(
+            capture_owner(&rotated.state_backup, "ha_state").unwrap(),
+            old_state_owner
+        );
+        assert_eq!(
+            capture_owner(&rotated.key_path, "ha_signing_key").unwrap(),
+            old_key_owner
+        );
+        assert_eq!(
+            capture_owner(&rotated.state_path, "ha_state").unwrap(),
+            old_state_owner
+        );
 
         // The new key and re-sealed state are 0600, and the key is the only
         // private key at the canonical path.
@@ -911,6 +1156,77 @@ mod tests {
             "the rotated version must stay above the published baseline"
         );
         assert_eq!(rotated.previous_version, fixture.version);
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[test]
+    fn test_state_write_failure_restores_the_old_key_and_state() {
+        let fixture = fixture("state_write_failure");
+        let old_key = std::fs::read(&fixture.key_path).unwrap();
+        let old_state = std::fs::read(&fixture.state_path).unwrap();
+
+        inject_failure(FAILURE_STATE_WRITE);
+        let error = rotate_master_signing_key(&fixture.dir, None, None)
+            .expect_err("the injected state write must fail the rotation");
+        assert!(error.to_string().contains("failed to re-seal"), "{error}");
+        assert_eq!(std::fs::read(&fixture.key_path).unwrap(), old_key);
+        assert_eq!(std::fs::read(&fixture.state_path).unwrap(), old_state);
+        let entries: Vec<_> = std::fs::read_dir(&fixture.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|name| name.starts_with("ha_signing.key.bak.")),
+            "the key backup must remain available: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|name| name.starts_with("ha_state.toml.bak.")),
+            "the state backup must remain available: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|name| name.contains(".new.")),
+            "no temporary key may be left behind: {entries:?}"
+        );
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[test]
+    fn test_verification_failure_restores_both_files() {
+        let fixture = fixture("verify_failure");
+        let old_key = std::fs::read(&fixture.key_path).unwrap();
+        let old_state = std::fs::read(&fixture.state_path).unwrap();
+
+        inject_failure(FAILURE_VERIFY);
+        let error = rotate_master_signing_key(&fixture.dir, None, None)
+            .expect_err("the injected verification failure must fail the rotation");
+        assert!(
+            error
+                .to_string()
+                .contains("post-rotation verification failed"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&fixture.key_path).unwrap(), old_key);
+        assert_eq!(std::fs::read(&fixture.state_path).unwrap(), old_state);
+        let entries: Vec<_> = std::fs::read_dir(&fixture.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|name| name.starts_with("ha_signing.key.bak.")),
+            "{entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|name| name.starts_with("ha_state.toml.bak.")),
+            "{entries:?}"
+        );
         let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 

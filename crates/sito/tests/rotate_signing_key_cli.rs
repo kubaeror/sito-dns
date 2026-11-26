@@ -7,6 +7,7 @@
 
 #![cfg(feature = "ha")]
 
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use sito_ha::{
     push_payload_hash, seal_bundle_identity,
 };
 
-fn fixture(label: &str) -> (PathBuf, PathBuf, PathBuf, String) {
+fn fixture(label: &str) -> (PathBuf, PathBuf, PathBuf, String, String) {
     let dir = std::env::temp_dir().join(format!(
         "sito_rotate_cli_{label}_{}_{}",
         std::process::id(),
@@ -46,7 +47,7 @@ fn fixture(label: &str) -> (PathBuf, PathBuf, PathBuf, String) {
         "signing_key_pubkey": key.public_key_hex(),
         "publication_state": "published",
         "published_version": 4,
-        "published_hash": hash,
+        "published_hash": hash.clone(),
     });
     std::fs::write(
         data_dir.join("ha_state.toml"),
@@ -70,7 +71,7 @@ fn fixture(label: &str) -> (PathBuf, PathBuf, PathBuf, String) {
         ),
     )
     .unwrap();
-    (dir, config_path, data_dir, key.public_key_hex())
+    (dir, config_path, data_dir, key.public_key_hex(), hash)
 }
 
 /// Acquires the same advisory lease a running server holds.
@@ -105,7 +106,7 @@ fn stdout_of(output: &std::process::Output) -> String {
 
 #[test]
 fn rotate_signing_key_cli_refuses_without_confirm_and_while_running() {
-    let (dir, config_path, data_dir, old_pubkey) = fixture("refusals");
+    let (dir, config_path, data_dir, old_pubkey, _) = fixture("refusals");
     let old_key = std::fs::read(data_dir.join("ha_signing.key")).unwrap();
     let old_state = std::fs::read(data_dir.join("ha_state.toml")).unwrap();
 
@@ -230,5 +231,73 @@ fn rotate_signing_key_cli_refuses_without_confirm_and_while_running() {
         assert_eq!(mode, 0o600);
     }
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rotate_signing_key_cli_prints_witness_term_floor_and_published_baseline() {
+    let (dir, config_path, data_dir, old_pubkey, published_hash) = fixture("promotion_output");
+    let mut document = std::fs::read_to_string(&config_path).unwrap();
+    write!(
+        document,
+        "master_pubkey = \"{old_pubkey}\"\n\
+         [ha.promotion]\n\
+         enabled = true\n\
+         cluster_id = \"home-dns\"\n\
+         node_id = \"node-a\"\n\
+         backend = \"witness\"\n\
+         [ha.promotion.witness]\n\
+         url = \"https://witness.lan:8954\"\n\
+         ca = \"/etc/sito/witness-ca.crt\"\n\
+         token_file = \"/etc/sito/witness.token\"\n"
+    )
+    .unwrap();
+    std::fs::write(&config_path, document).unwrap();
+
+    let output = sito()
+        .args(["ha", "rotate-signing-key", "--config"])
+        .arg(&config_path)
+        .args(["--confirm", "--term", "9", "--version", "20"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "rotation failed: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+
+    // The witness term floor is the rotated state term, not merely "above the
+    // previous applied term".
+    assert!(
+        stdout.contains("record term must be at least 9"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("--term <TERM >= 9>"), "{stdout}");
+
+    // The witness update uses the preserved published baseline, never the
+    // rotated pending version/hash.
+    assert!(stdout.contains("--version 4"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("--bundle-hash {published_hash}")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("never the staged pending version 20"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("--version 20"),
+        "the pending version must not be suggested to the witness: {stdout}"
+    );
+
+    // The master's own stale [ha] master_pubkey is called out.
+    assert!(
+        stdout.contains("WARNING: this master's own [ha] master_pubkey"),
+        "{stdout}"
+    );
+    assert!(stdout.contains(&old_pubkey), "{stdout}");
+
+    assert!(!data_dir.join("sito.pid").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }

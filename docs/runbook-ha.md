@@ -1014,11 +1014,12 @@ slave rejects the new signature and keeps its last applied configuration.
    ```bash
    sudo -u sito ls -l /var/lib/sito/ha_signing.key /var/lib/sito/ha_state.toml
    ```
-3. **Run the rotation** as the service user. The defaults are `current + 1` for
-   both term and version; an explicit value must be strictly greater than the
-   current state. If any slave reports a higher applied term/version than this
-   master's state (for example after a failed promotion), pass explicit values
-   above **every** replica's applied term and version, not only this master's.
+3. **Run the rotation** as the service user. The default term is `current + 1`;
+   the default version is `max(active bundle version, published baseline
+   version) + 1`. An explicit value must be strictly greater than those
+   floors. If any slave reports a higher applied term/version than this master's
+   state (for example after a failed promotion), pass explicit values above
+   **every** replica's applied term and version, not only this master's.
    ```bash
    sudo -u sito sito ha rotate-signing-key \
      --config /etc/sito/config.toml \
@@ -1050,8 +1051,11 @@ slave rejects the new signature and keeps its last applied configuration.
    [ha]
    master_pubkey = "9f2c...64-hex-chars"   # the new value from step 3
    ```
-   Leave `master_fingerprint` unchanged unless the TLS certificate also
-   changed: it pins the certificate, not the signing key.
+   If the master's own config still has an `[ha] master_pubkey`, update or
+   remove it as well. It is inert for `role = "master"`, but a future role
+   change must not keep trusting the old key. Leave `master_fingerprint`
+   unchanged unless the TLS certificate also changed: it pins the certificate,
+   not the signing key.
 6. **Restart the master, then each slave.**
    ```bash
    sudo systemctl restart sito            # master
@@ -1065,8 +1069,10 @@ slave rejects the new signature and keeps its last applied configuration.
    curl -s -H "Authorization: Bearer $TOKEN" \
      http://127.0.0.1:8080/api/v2/ha/slaves | jq .
    ```
-   `master_pubkey` must equal the value from step 3, the master version must be
-   the re-sealed version, and every slave must reach `synced` at that version.
+   `master_pubkey` must equal the value from step 3 and the master version must
+   be **at least** the re-sealed version. If `config.toml` changed while the
+   service was stopped, the master republishes once more and reports `version +
+   1`; every slave must then reach `synced` at the master's reported version.
    `ready` must be `true`. A slave with the old key reports a signature
    verification failure and stays on its previous configuration; fix its
    `master_pubkey` and reconnect it.
@@ -1088,9 +1094,29 @@ slave rejects the new signature and keeps its last applied configuration.
   bundle and keeps serving its last applied configuration. Update its key and
   reconnect it; no master-side resync can bypass the signature check.
 - **`[ha.promotion] enabled = true`:** the rotation is still local and never
-  contacts the witness. The re-sealed term can be ahead of the witness record,
-  so raise the witness record offline with `sito ha lease-admin set` (witness
-  stopped) above the previous applied term before restarting the master. Follow
-  the [witness runbook](runbook-witness.md#5-offline-recovery-lease-admin-set);
-  a master that cannot acquire a lease below the rotated term stays read-only
-  and reports the reason in `GET /api/v2/ha/status`.
+  contacts the witness. Acquisition requires the witness record term to be at
+  least `max(applied_term, state_term)`, i.e. **at least the rotated term**;
+  raising it only "above the previous applied term" or using an explicit
+  `--term 10` with a lower witness record still leaves the master read-only.
+  The `lease-admin set` record must also carry the **preserved published
+  baseline** (`published_version`/`published_hash` printed by the command), not
+  the rotated pending version/hash. With the witness stopped:
+
+  ```bash
+  sudo -u sito sito ha lease-admin set \
+    --state-dir /var/lib/sito-lease \
+    --term <TERM >= ROTATED_TERM> \
+    --version <PRESERVED_PUBLISHED_VERSION> \
+    --bundle-hash <PRESERVED_PUBLISHED_HASH> \
+    --confirm
+  ```
+
+  Follow the [witness runbook](runbook-witness.md#5-offline-recovery-lease-admin-set);
+  a master whose state term is above the witness record stays read-only and
+  reports the reason in `GET /api/v2/ha/status`.
+
+- **Library/API callers:** only the `sito ha rotate-signing-key` CLI enforces
+  `--confirm` and the service lease. A direct caller of
+  `sito_ha::rotate_master_signing_key` must stop the master and exclude every
+  server from the data directory for the whole call; the library function
+  validates the key/state identity but does not inspect the service lease.

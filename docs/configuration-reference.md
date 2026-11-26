@@ -1147,13 +1147,26 @@ The command is offline: it backs up the old key and `ha_state.toml` (mode
 `0600`), generates a new `0600` key at the same path, re-seals `ha_state.toml`
 with the new `signing_key_pubkey` and a strictly higher term/version, and prints
 the new `master_pubkey` plus the restart/verification steps. A requested
-`--term`/`--version` must be strictly greater than the current state; omitted
-values default to `current + 1`. Choose explicit values above every slave's
-applied term/version when the master's state is behind a replica. It does not
-contact the witness, acquire a witness lease or publish a bundle. Update
-`[ha] master_pubkey` on **every** slave and restart the master, then each
-slave. Full procedure and recovery:
+`--term`/`--version` must be strictly greater than the current state; the
+default term is `current + 1` and the default version is
+`max(active bundle version, published baseline version) + 1`. Choose explicit
+values above every slave's applied term/version when the master's state is
+behind a replica. Ownership of the old key/state is preserved across a
+root-run rotation.
+
+It does not contact the witness, acquire a witness lease or publish a bundle.
+On a promotion-enabled cluster the witness record term must be at least the
+rotated state term (`max(applied_term, state_term)`), and `lease-admin set`
+must use the preserved `published_version`/`published_hash`, never the rotated
+pending version/hash. Update `[ha] master_pubkey` on **every** slave (and
+update or remove it in the master's own config if present) and restart the
+master, then each slave. Full procedure and recovery:
 [HA runbook §8](runbook-ha.md#8-ed25519-signing-key-rotation-offline).
+
+Only the CLI enforces `--confirm` and the service lease. A direct caller of
+`sito_ha::rotate_master_signing_key` must stop the master and exclude every
+server from the data directory for the whole call; the library validates the
+key/state identity but does not inspect the service lease.
 
 Slaves persist the last successfully applied bundle identity to
 `<data_dir>/ha_watermark.toml` (JSON, mode `0600`, written atomically, wrapped
