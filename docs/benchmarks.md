@@ -27,9 +27,10 @@ Current performance gates:
   while removing the flake from concurrent builds on the host; the nightly
   Criterion run adds `filter_compile::wildcard_set_3_batches` for the same
   compile workload. See [docs/ci.md](ci.md#load-robust-compile-timing).
-- The 24-hour fuzz run and a green benchmark comparison are release-checklist
-  items, not PR gates; see
-  [docs/release-verification.md](release-verification.md#fuzz-evidence-24-hour-release-checklist).
+- The H1 24-hour fuzz run is recorded green at `39ba6da`; a green thresholded
+  benchmark comparison remains a release-checklist item, not a PR gate. See
+  [docs/release-verification.md](release-verification.md#fuzz-evidence-24-hour-release-checklist)
+  and the [benchmark evidence](release-verification.md#benchmark-evidence-thresholded-gate).
 
 Re-run `cargo bench -p sito-test --bench pipeline_bench` (or the relevant
 package bench) on your own hardware before comparing.

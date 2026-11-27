@@ -14,29 +14,28 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 
 `sito` is designed as a modern, rock-solid alternative to AdGuard Home and Pi-hole. Engineered in Rust (edition 2024), it combines sub-millisecond p99 latency, comprehensive ad/tracker/malware blocking (using AdGuard/ABP rule syntax), multi-protocol encryption (DoT, DoH H2, DoQ, DoH3), and automated master/slave high availability.
 
-> **Development status:** the `main` line is the **2.0.0-rc.2 candidate**
-> (workspace version `2.0.0-rc.2`; Phase 2 core hardening and Phase 3
-> verification are delivered on this tree). The
-> latest stable release remains **1.9.5**; the quickstart below intentionally
-> pins the published stable installer and container image. Alpha/rc builds are
-> not published as stable artifacts.
->
-> Remaining release work is the rc.1 tag/publication; the 24-hour fuzz campaign
-> is explicitly deferred by the operator. The 2.0 administrative API is
-> `/api/v2` only; `/api/v1` was removed. The SQLite schema/PII migration
-> (`sito db migrate`) and installer/Docker database upgrades are delivered;
-> config auto-migration remains deferred. The ADR-0011 default-deny DNS client
-> ACL is delivered for fresh wizard installs (upgrades stay allow until opted
-> in). Other deferred work includes weighted upstream balancing, a second proof
-> for user/token deletion, edit-time read-only HA enforcement, and the optional
-> external parental/service data. The current evidence matrix is
-> [`docs/2.0-claim-matrix.md`](docs/2.0-claim-matrix.md).
+> **Development status:** the `main` line is the **2.0.0 final tree** (code
+> frozen at `39ba6da`; the workspace version remains `2.0.0-rc.2` until the
+> release-manager version bump). The latest stable release remains **1.9.5**;
+> the quickstart below intentionally pins the published stable installer and
+> container image. The `v2.0.0` tag/publication (H10) is pending, the tagged
+> release workflow has not run, and `latest` has not moved. The H1 24-hour fuzz
+> campaign is green (run 45922217501); the H2 7-day soak is in progress and is
+> not yet claimed. The 2.0 administrative API is `/api/v2` only; `/api/v1` was
+> removed. SQLite schema/PII migration (`sito db migrate`), weighted upstream
+> balancing, edit-time read-only HA enforcement and the ADR-0011 default-deny
+> ACL for fresh wizard installs are delivered. Genuinely deferred:
+> installer/container `config.toml` auto-migration, maintained external
+> parental/service data, per-domain upstream-weight UI/API, and per-client
+> weight scoping. The current evidence matrix is
+> [`docs/2.0-claim-matrix.md`](docs/2.0-claim-matrix.md), and the final
+> operator notes are [`docs/release-notes-2.0.0.md`](docs/release-notes-2.0.0.md).
 
 ---
 
 ## 📊 Feature Comparison: sito vs. AdGuard Home vs. Pi-hole
 
-| Feature / Capability | **sito** (2.0 rc) | **AdGuard Home** | **Pi-hole (FTL)** |
+| Feature / Capability | **sito** (2.0) | **AdGuard Home** | **Pi-hole (FTL)** |
 |---|---|---|---|
 | **Language & Runtime** | **Rust (edition 2024, zero GC, zero Node.js)** | Go (GC overhead under load) | C (FTL) + PHP Web UI |
 | **Max Cache Throughput** | **≥ 500,000 QPS** (v1.0 reference run: 584k) | ~100,000 QPS | ~50,000 QPS |
@@ -53,7 +52,7 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 
 > Throughput, latency, and memory figures are from the **v1.0.0**
 > reference-hardware run recorded in [docs/benchmarks.md](docs/benchmarks.md).
-> They are historical reference numbers, not a measurement of the 2.0 rc line.
+> They are historical reference numbers, not a measurement of the 2.0 line.
 > Pull requests only compile the Criterion benches; the nightly `bench.yml`
 > comparison is active on GitHub-hosted `ubuntu-24.04` against the committed
 > `github-ubuntu-24.04` baseline and fails above its tolerance. A local
@@ -72,7 +71,7 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 - **Zero-Consensus High Availability:** Real-time master/slave push replication over mTLS WebSockets with Ed25519 cryptographic signatures, a required certificate pin or CA validation (`allow_unpinned_tls` is the explicit no-verification opt-out when neither is configured), shared token authentication, master-loss heartbeat detection, and instant mutation push.
 - **Hardened Security & RBAC:** Audited security posture including setup wizard credential validation, default-authenticated Prometheus `/metrics` (`metrics_auth = true`), trusted proxy X-Forwarded-For verification, Argon2id passwords with BLAKE3-hashed TOTP backup codes and bounded auth maps with active background pruners, cosign-verified self-updates (`update_require_signature = true` by default; SHA-256 archives are still checked), constant-time authentication via `subtle`, parameterized SQL query builders, SSRF protection, ReDoS protection via dense DFA compilation bounds, and systemd sandbox directives.
 - **Robust Telemetry:** Non-blocking query logging to SQLite in WAL mode with real upstream identification and querylog privacy anonymization, Prometheus metrics exposition ([ADR-003](docs/adr/0003-log-store-sqlite-wal.md)), and Grafana dashboard.
-- **Unix & Linux Platform Support:** Engineered for Unix-based operating systems (Linux kernel 5.4+ strongly recommended for production; macOS supported for development) utilizing `SO_REUSEPORT`, `IP_PKTINFO`, and raw POSIX socket file descriptors. Windows is not supported natively.
+- **Unix & Linux Platform Support:** Linux is the supported production and test platform (kernel 5.4+ strongly recommended; CI/release artifacts cover `linux/amd64`, `linux/arm64` and `linux/arm/v7`) using `SO_REUSEPORT`, `IP_PKTINFO` and raw POSIX socket file descriptors. macOS is supported for development builds only: the `pktinfo` and wizard `getifaddrs` paths are compile-gated for Unix but are not CI-covered. Windows is not supported and the UDP/packet-info modules emit a compile error.
 
 ---
 
@@ -115,7 +114,8 @@ Client Query ──▶ [sito-transport] (UDP / TCP / DoT / DoH / DoQ / DoH3)
 
 ### Option 1: Automated One-Line Installer (Linux)
 The examples below install the latest **stable** release (1.9.5). The
-`2.0.0-rc.2` release-candidate line is not published as a stable artifact yet.
+`2.0.0` final tree (workspace version `2.0.0-rc.2`) is not published as a
+stable artifact until the `v2.0.0` tag is created.
 ```bash
 # Download and inspect the pinned installer, then run it for the same version.
 curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/v1.9.5/contrib/install.sh -o sito-install.sh
@@ -196,11 +196,11 @@ Docker can forward the port, and publish it only on loopback:
 `-p 127.0.0.1:8080:8080`. Use an SSH tunnel or a TLS reverse proxy for remote
 access. See [Docker Compose deployment](docs/installation.md#4-docker-compose-deployment).
 
-### Option 3: Manual Binary Build (2.0 rc)
-This builds the current `2.0.0-rc.2` release-candidate line, which uses config v2
-and rejects a v1 `config.toml` until it is migrated. For a stable production
-install, use the pinned 1.9.5 installer or image above and follow the
-[2.0 migration guide](docs/2.0-migration.md) when moving to 2.0.
+### Option 3: Manual Binary Build (2.0)
+This builds the current `2.0.0` final tree (workspace version `2.0.0-rc.2`),
+which uses config v2 and rejects a v1 `config.toml` until it is migrated. For a
+stable production install, use the pinned 1.9.5 installer or image above and
+follow the [2.0 migration guide](docs/2.0-migration.md) when moving to 2.0.
 
 ```bash
 # Build release binary with embedded Web UI, HA replication and mimalloc allocator
@@ -264,7 +264,8 @@ Swagger UI / OpenAPI documentation is available at `http://localhost:8080/api/do
 
 ## 📖 Comprehensive Documentation
 
-* **[2.0 Migration Guide](docs/2.0-migration.md):** Stable 1.9.5 → 2.0 rc upgrade, breaking-change IDs, config/API/DB/HA boundary, and rollback.
+* **[2.0.0 Release Notes](docs/release-notes-2.0.0.md):** Final feature set, BC-1..BC-12, upgrade/rollback, verification evidence status and accepted residuals.
+* **[2.0 Migration Guide](docs/2.0-migration.md):** Stable 1.9.5 → 2.0 upgrade, breaking-change IDs, config/API/DB/HA boundary, and rollback.
 * **[Installation Guide](docs/installation.md):** Step-by-step setup for Linux systemd, Docker, Docker Compose, and HA macvlan.
 * **[Configuration Reference](docs/configuration-reference.md):** Exhaustive documentation of every TOML configuration key, default and hot-reload/restart behavior. See also [Config v2](docs/config-v2.md) and the [2.0 public API diff](docs/2.0-public-api-diff.md).
 * **[Parental Controls](docs/parental-controls.md):** Per-client-group `adult`/`gambling` category blocking, bundled-data limits, manual catalog lists, `[integrations.lists]` coverage, and off-by-default/HA/audit rules.

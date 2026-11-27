@@ -161,8 +161,9 @@ git diff --check
 Results are recorded in the [review §12](phase3-security-review.md#12-verification-evidence).
 `cargo deny check` reports `advisories ok, bans ok, licenses ok, sources ok`,
 with the expected `advisory-not-detected` warning for the two reviewed
-suppressions. The 24-hour fuzz campaign and 7-day soak are release-checklist
-evidence (rows 12 and H2), not claims of this code review.
+suppressions. The H1 24-hour fuzz campaign is green at `39ba6da` (run
+45922217501, 25/25 jobs, zero crash artifacts); the H2 7-day live soak is
+release-checklist evidence still in progress and is not claimed by this review.
 
 ---
 
@@ -254,7 +255,8 @@ evidence (rows 12 and H2), not claims of this code review.
   GitHub-hosted `ubuntu-24.04`, compares against the committed
   `benches/baseline.json` and fails above the tolerance (default 10%). The
   checker fails closed on an environment mismatch.
-* The 24-hour fuzz campaign (five targets × five shards × 17,280 s) and the
-  7-day soak are release-checklist items with an owner. This review does not
-  claim a clean 24-hour run or a completed soak; they must be recorded before
-  the final tag.
+* The H1 24-hour fuzz campaign (five targets × five shards × 17,280 s) is green
+  at `39ba6da` (run 45922217501, 25/25 jobs, zero crash artifacts). The H2
+  7-day live soak started `2026-11-27T10:38+01:00` and is in progress; it is
+  release-checklist evidence with an owner, and this review does not claim a
+  completed soak before the accepted window is recorded.

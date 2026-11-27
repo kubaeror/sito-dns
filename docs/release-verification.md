@@ -8,6 +8,20 @@ candidate at which it must be green; the sections after it hold the exact
 commands and expected output. Releases are triggered by pushing a `v*` tag;
 `workflow_dispatch` publishing is intentionally not supported.
 
+## Current 2.0.0 evidence status (2026-11-27)
+
+| Evidence | Status | Record |
+|---|---|---|
+| Frozen workspace gate | **GREEN** at `39ba6da` | all-features 65 suites, **2,469 passed / 0 failed / 5 ignored**; default **2,229 / 0 / 5**; no-HA `sito-api` **371 passed**; fmt, clippy `-D warnings`, `cargo deny check`, docs/config/migration/test-matrix/catalog checks clean |
+| H1 24-hour fuzz | **GREEN** at `39ba6da` | [run 45922217501](https://github.com/kubaeror/sito-dns/actions/runs/45922217501): 25/25 jobs success, each shard `Done ... in 17281 second(s)`, zero crash artifacts; corpus in [Fuzz evidence](#fuzz-evidence-24-hour-release-checklist) |
+| H2 7-day live soak | **IN PROGRESS — not passed** | started `2026-11-27T10:38+01:00` on `sito-soak:39ba6da` (container `sito-soak-39ba6da`); minimum 3 days, target 7 days (~`2026-12-04T09:38Z`); evidence `/home/ubuntu/sito-soak/evidence/soak.csv` |
+| H10 tagged release workflow | **PENDING — not run** | no `v2.0.0` tag has been pushed; the workspace is still `2.0.0-rc.2`; `latest` remains on 1.9.5 |
+| E4 per-architecture image scan | **Implemented; tag-time run pending** | workflow and policy test are in the tree; the real release run is part of H10 |
+| E5 root-gated HA ownership lane | **Implemented; tag-time run pending** | `ha-ownership.yml` and its fail-closed policy test are in the tree; a real GitHub-hosted run is required on the final commit |
+
+The evidence above is the frozen-tree hand-off. Do not mark H2, H10 or the
+tag-time E4/E5 runs as complete until their transcripts are recorded here.
+
 ## Release gate order
 
 The workflow is a dependency chain, not a set of parallel publications. A
@@ -78,24 +92,24 @@ tag-push row leaves the release as a draft and blocks publication.
 
 | # | Gate | Workflow / command | Required evidence | Pass condition | Stage (owner) |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Tag matches the workspace version | `release.yml` → `verify-tag` | run URL, tag, `Cargo.toml` version | tag is `vX.Y.Z` or a prerelease of the workspace `X.Y.Z` | rc.3, rc.4, final (release manager) |
-| 2 | Release branch and checks | `release.yml` → `release-gate` (`scripts/verify-release-gate.sh`) | run URL, tagged SHA, `release checks are green for <sha>: ci-gate, cargo-deny` | tagged commit is an ancestor of `main`; `ci-gate` and `cargo-deny` are completed and successful; no failing legacy status | rc.3, rc.4, final (release manager) |
-| 3 | All-features and default test suites | `ci.yml` → `test` (`cargo test --workspace --all-features --locked`), `ha-matrix`; plus `cargo test --workspace --locked` on the candidate | green `ci-gate` run URL and the default-suite transcript | both suites green and the no-HA/HA matrix green | rc.3, rc.4, final (CI owner) |
-| 4 | Dependency policy after W0-DEPS | `security.yml` → `cargo-deny` (`deny.toml`) | check-run URL and `cargo deny check` summary | advisories, bans, licenses and sources pass with no unreviewed suppression | rc.3, rc.4, final (security reviewer) |
-| 5 | Docs truth | `docs.yml` → `meta` (`python3 scripts/check_test_matrix.py`) | run URL and command output | config reference, migration IDs, links and P0/P1 test-matrix names resolve; no stale 2.0 claim | rc.3, rc.4, final (docs owner) |
-| 6 | Installer E2E | `ci.yml` → `contrib` → `bash contrib/tests/test-installer.sh` | green `contrib` job log | fresh install, live upgrade, backup order and failed-health rollback pass | rc.4, final if S5 changed (ops owner) |
-| 7 | 1.9.5 → 2.0 migration and rollback | `bash scripts/test-migration-1.9.5.sh` | transcript ending `PASS: 1.9.5 data-dir migration and rollback acceptance` | v1.9.5 data dir migrates, v2 answers, users/TOTP/stats DB stay intact, rollback answers | rc.4, final if S2/S5 changed (ops owner) |
-| 7b | Archived installer E2E (E2) | `SITO_ARCHIVE_E2E=1 bash scripts/test-installer-archive-1.9.5.sh` (manual/weekly `archive-installer-e2e.yml`) | transcript ending `PASS: real archived 1.9.5 installer upgrade, migration and rollback` | the real v1.9.5 archive installs with its packaged installer, checksum/signature verification passes, the current installer runs `db migrate` with a 0600 backup, health/DNS/users/stats rows survive, and both the operator rollback and the failed-health pairing rollback restore 1.9.5 with v1 config | rc.4, final if S2/S5 changed (ops owner) |
-| 8 | Docker upgrade E2E | `bash scripts/test-docker-upgrade.sh` | transcript ending `docker upgrade E2E OK (...)` | 1.9.5 container upgrades to the candidate with healthy DNS + healthcheck, then the rollback serves again | rc.4, final if S2/S5 changed (ops owner) |
-| 9 | Per-architecture image scan (E4) | `release.yml` → `docker-build-push` → `Scan the published image for vulnerabilities` | run URL, digest, one `Scanning ...` and one `No HIGH/CRITICAL unfixed vulnerabilities on ...` line per platform | all three platforms are scanned from the published digest and no fixed HIGH/CRITICAL finding remains | rc.4 image, final (security reviewer) |
-| 10 | Image signature and attestations | `docker-build-push` cosign steps; [verify the published image](#verify-the-published-image) | digest, `cosign verify` output, provenance, SPDX SBOM, tag map | signature identity `release.yml@refs/tags/*`, provenance and SBOM present, tags point at the digest | rc.4 image, final (release manager) |
-| 11 | Root-gated HA ownership (E5) | `ha-ownership.yml` | run URL, SHA, non-root uid, `running 1 test`, `test result: ok. 1 passed` | the m8 ownership test runs under root and passes exactly once | rc.4, final if HA changed (HA owner) |
-| 12 | 24-hour fuzz | `fuzz.yml` with `fuzz_seconds=17280` and `shards=5` | run URL, SHA, five targets, per-target corpus size, empty `fuzz/artifacts/` | no crash, timeout or OOM | after rc.4 → final (ops owner) |
-| 13 | Thresholded benchmark | `bench.yml` | run URL, baseline environment `github-ubuntu-24.04`, tolerance | no `REGRESSION` line above the tolerance | rc.4 → final (performance owner) |
-| 14 | Live image smoke: DNS, health, API v2 and schema v2 | `docker-build-push` → `Smoke-test the published image` | log lines `release image answered smoke.test; healthcheck: healthy` and `release image API smoke: /api/v2/status=<200 or 401> (real auth response); /api/v1/status=404 (removed); fresh stats schema v2; healthcheck: healthy` | the attested digest answers a local rewrite, the image healthcheck turns healthy, API v2 is mounted (200/401, never 404), API v1 is 404, and the fresh data dir is schema v2 | rc.4 image, final (release manager) |
+| 1 | Tag matches the workspace version | `release.yml` → `verify-tag` | run URL, tag, `Cargo.toml` version | tag is `vX.Y.Z` or a prerelease of the workspace `X.Y.Z` | final (release manager) |
+| 2 | Release branch and checks | `release.yml` → `release-gate` (`scripts/verify-release-gate.sh`) | run URL, tagged SHA, `release checks are green for <sha>: ci-gate, cargo-deny` | tagged commit is an ancestor of `main`; `ci-gate` and `cargo-deny` are completed and successful; no failing legacy status | final (release manager) |
+| 3 | All-features and default test suites | `ci.yml` → `test` (`cargo test --workspace --all-features --locked`), `ha-matrix`; plus `cargo test --workspace --locked` on the candidate | green `ci-gate` run URL and the default-suite transcript | both suites green and the no-HA/HA matrix green | final (CI owner) |
+| 4 | Dependency policy after W0-DEPS | `security.yml` → `cargo-deny` (`deny.toml`) | check-run URL and `cargo deny check` summary | advisories, bans, licenses and sources pass with no unreviewed suppression | final (security reviewer) |
+| 5 | Docs truth | `docs.yml` → `meta` (`python3 scripts/check_test_matrix.py`) | run URL and command output | config reference, migration IDs, links and P0/P1 test-matrix names resolve; no stale 2.0 claim | final (docs owner) |
+| 6 | Installer E2E | `ci.yml` → `contrib` → `bash contrib/tests/test-installer.sh` | green `contrib` job log | fresh install, live upgrade, backup order and failed-health rollback pass | final if S5 changed (ops owner) |
+| 7 | 1.9.5 → 2.0 migration and rollback | `bash scripts/test-migration-1.9.5.sh` | transcript ending `PASS: 1.9.5 data-dir migration and rollback acceptance` | v1.9.5 data dir migrates, v2 answers, users/TOTP/stats DB stay intact, rollback answers | final if S2/S5 changed (ops owner) |
+| 7b | Archived installer E2E (E2) | `SITO_ARCHIVE_E2E=1 bash scripts/test-installer-archive-1.9.5.sh` (manual/weekly `archive-installer-e2e.yml`) | transcript ending `PASS: real archived 1.9.5 installer upgrade, migration and rollback` | the real v1.9.5 archive installs with its packaged installer, checksum/signature verification passes, the current installer runs `db migrate` with a 0600 backup, health/DNS/users/stats rows survive, and both the operator rollback and the failed-health pairing rollback restore 1.9.5 with v1 config | final if S2/S5 changed (ops owner) |
+| 8 | Docker upgrade E2E | `bash scripts/test-docker-upgrade.sh` | transcript ending `docker upgrade E2E OK (...)` | 1.9.5 container upgrades to the candidate with healthy DNS + healthcheck, then the rollback serves again | final if S2/S5 changed (ops owner) |
+| 9 | Per-architecture image scan (E4) | `release.yml` → `docker-build-push` → `Scan the published image for vulnerabilities` | run URL, digest, one `Scanning ...` and one `No HIGH/CRITICAL unfixed vulnerabilities on ...` line per platform | all three platforms are scanned from the published digest and no fixed HIGH/CRITICAL finding remains | final image (security reviewer) |
+| 10 | Image signature and attestations | `docker-build-push` cosign steps; [verify the published image](#verify-the-published-image) | digest, `cosign verify` output, provenance, SPDX SBOM, tag map | signature identity `release.yml@refs/tags/*`, provenance and SBOM present, tags point at the digest | final image (release manager) |
+| 11 | Root-gated HA ownership (E5) | `ha-ownership.yml` | run URL, SHA, non-root uid, `running 1 test`, `test result: ok. 1 passed` | the m8 ownership test runs under root and passes exactly once | final if HA changed (HA owner) |
+| 12 | 24-hour fuzz | `fuzz.yml` with `fuzz_seconds=17280` and `shards=5` | run URL, SHA, five targets, per-target corpus size, empty `fuzz/artifacts/` | no crash, timeout or OOM | final (ops owner) |
+| 13 | Thresholded benchmark | `bench.yml` | run URL, baseline environment `github-ubuntu-24.04`, tolerance | no `REGRESSION` line above the tolerance | final (performance owner) |
+| 14 | Live image smoke: DNS, health, API v2 and schema v2 | `docker-build-push` → `Smoke-test the published image` | log lines `release image answered smoke.test; healthcheck: healthy` and `release image API smoke: /api/v2/status=<200 or 401> (real auth response); /api/v1/status=404 (removed); fresh stats schema v2; healthcheck: healthy` | the attested digest answers a local rewrite, the image healthcheck turns healthy, API v2 is mounted (200/401, never 404), API v1 is 404, and the fresh data dir is schema v2 | final image (release manager) |
 | 15 | Security review | `docs/phase3-security-review.md`, `docs/security-audit.md` | review signed off against the final tree with the open P0/P1 list | no open P0; every open P1 accepted with an owner and review date | final (security reviewer) |
-| 16 | `latest` still on 1.9.5 | commands in [`latest` stays on 1.9.5](#latest-stays-on-195-until-the-final-tag) | `latest` image digest and GitHub latest release tag | both equal `v1.9.5` before the final tag; only `v2.0.0` moves them | rc.3, rc.4, final-before-tag (release manager) |
-| 17 | Catalog release-bound integrity (F2e) | `python3 scripts/generate-catalog.py --check`; focused `sito-clients`/`sito-api` catalog tests; CI `test` job step | `catalog check passed`, green focused tests, green `Verify the embedded catalog and pin are current` step | the committed catalog matches `CATALOG_SHA256`, canonical bytes are current, and the loader has no network path | rc.4, final (catalog owner) |
+| 16 | `latest` still on 1.9.5 | commands in [`latest` stays on 1.9.5](#latest-stays-on-195-until-the-final-tag) | `latest` image digest and GitHub latest release tag | both equal `v1.9.5` before the final tag; only `v2.0.0` moves them | final-before-tag (release manager) |
+| 17 | Catalog release-bound integrity (F2e) | `python3 scripts/generate-catalog.py --check`; focused `sito-clients`/`sito-api` catalog tests; CI `test` job step | `catalog check passed`, green focused tests, green `Verify the embedded catalog and pin are current` step | the committed catalog matches `CATALOG_SHA256`, canonical bytes are current, and the loader has no network path | final (catalog owner) |
 
 The E4 per-architecture scan, E5 root HA lane and E6 release-gate fallback are
 linked to their own policy tests and lanes above; this page records their
@@ -143,7 +157,7 @@ and cannot mark the GitHub release as a stable/latest release.
 
 ### `latest` stays on 1.9.5 until the final tag
 
-The rc.3 and rc.4 tags are prereleases. They may publish version-only Docker
+Prerelease tags such as `v2.0.0-rc.2` may publish version-only Docker
 tags and a prerelease GitHub release, but they must not move the repository's
 `latest` image tag or latest release pointer. Before creating the final
 `v2.0.0` tag, record:
@@ -168,6 +182,10 @@ must be reverted before proceeding (see the prerelease checks in
 [Verify the published image](#verify-the-published-image)).
 
 ## Verify the workflow run
+
+**Status 2026-11-27: H10 has not run.** No `v2.0.0` tag has been pushed, the
+workspace version is still `2.0.0-rc.2`, and this section is the procedure to
+follow after the H6 version bump and tag. `latest` remains on 1.9.5.
 
 After pushing a release tag:
 
@@ -345,7 +363,7 @@ platform coverage are owned by E4 and pinned by
 `bash scripts/test-release-workflow.sh`; this checklist records the evidence
 from the `Scan the published image for vulnerabilities` step.
 
-Record for the rc.4 and final runs:
+Record for the final tag run:
 
 - the run URL and the image digest;
 - one `Scanning ghcr.io/<owner>/<repo>@sha256:... for linux/<platform>` line
@@ -362,9 +380,10 @@ ignored, as documented in the workflow.
 
 ## Upgrade, installer and Docker E2E
 
-Four real upgrade paths must be green on the rc.4 candidate, and again on the
-final commit if S2 or S5 changed after rc.4. The installer and migration
-scripts are owned by E1/E2; this checklist records their evidence.
+Four real upgrade paths must be green on the frozen candidate tree (`39ba6da`,
+or the final commit if release-relevant code changed after it). The installer
+and migration scripts are owned by E1/E2; this checklist records their
+evidence.
 
 1. Installer E2E, run by the `contrib` job in CI:
 
@@ -496,7 +515,7 @@ release image API smoke: /api/v2/status=401 (real auth response); /api/v1/status
 Pass condition: the step is green, neither container exited early, the DNS
 rewrite answered, both healthchecks are `healthy`, `/api/v2/status` is `200` or
 `401`, `/api/v1/status` is `404`, and the dry run reports schema version 2.
-Repeat for the rc.4 image and the final image.
+Repeat on the final tagged image.
 
 Manual caveat: the smoke needs Docker with the published digest available (the
 release runner logs in to GHCR for the push, so the digest pull is local). To
@@ -578,6 +597,43 @@ A crash or timeout is a release blocker. Save the input and add it as a
 `seed-*` file only after the defect is fixed. `fuzz/README.md` documents the
 targets, corpus, dictionaries and exact local commands.
 
+### Recorded H1 result (2026-11-27)
+
+H1 ran on the pushed `feat/2.0.0` head `39ba6da` as
+[run 45922217501](https://github.com/kubaeror/sito-dns/actions/runs/45922217501):
+**25/25 fuzz jobs succeeded**, each shard reported
+`Done ... in 17281 second(s)`, and every target uploaded **zero crash
+artifacts**. Shard-0 corpus and coverage:
+
+| Target | Executions | Corpus | Coverage |
+|---|---:|---:|---:|
+| `abp_parser` | 81,024,699 | 5,667 inputs / 2,454 KiB | 3,909 |
+| `dns_wire` | 334,559,004 | 5,790 inputs / 1,032 KiB | 5,975 |
+| `dnssec_response` | 207,931,129 | 6,463 inputs / 1,451 KiB | 7,301 |
+| `config_toml` | 172,260,578 | 6,548 inputs / 1,879 KiB | 5,999 |
+| `ha_bundle` | 375,042,628 | 9,789 inputs / 3,301 KiB | 7,036 |
+
+## Soak evidence (7-day live soak, H2)
+
+H2 is a live runtime soak, separate from the gated B6 1M-row/90-day database
+capacity test. It runs the frozen image on a local host and probes DNS rewrite,
+`/health`, memory/CPU, restarts and error logs every 60 s.
+
+**Status as of 2026-11-27: IN PROGRESS — not passed.**
+
+- Start: `2026-11-27T10:38+01:00` (`09:38Z`).
+- Image/container: `sito-soak:39ba6da` / `sito-soak-39ba6da` (restart count 0,
+  healthy at the last check).
+- Evidence: `/home/ubuntu/sito-soak/evidence/soak.csv`.
+- Minimum acceptance: 3 days. Target: 7 days, about `2026-12-04T09:38Z`.
+
+Pass condition: the container stays healthy with no unexpected restart, the DNS
+rewrite and `/health` probes keep succeeding, and the CSV shows no sustained
+memory growth or error burst across the accepted window. Record the window,
+image digest/ID, restart count, probe success rate and memory trend in the
+release checklist. Do not mark H2 complete or claim a clean soak before the
+accepted window ends and the evidence is attached.
+
 ## Benchmark evidence (thresholded gate)
 
 `bench.yml` runs nightly and on demand. The 2.0 release checklist requires one
@@ -625,8 +681,8 @@ output with the release checklist, alongside the fuzz and benchmark evidence.
 
 ## Security review
 
-The final tag requires a security review of the final tree, not only the rc.2
-review recorded in
+The final tag requires a security review of the final tree; the H4 review at
+`39ba6da` is recorded in
 [`docs/phase3-security-review.md`](phase3-security-review.md). Before tagging:
 
 ```bash
@@ -654,8 +710,8 @@ release.
 
 ## Post-release monitoring (first 24–72 hours)
 
-A release candidate is not finished when the workflow turns green. Watch these
-signals after publishing `v2.0.0-rc.3`, `v2.0.0-rc.4` and the final `v2.0.0`,
+A release is not finished when the workflow turns green. Watch these
+signals after publishing `v2.0.0` (and any later 2.0.x release),
 and keep the previous stable binary/config backup ready for rollback:
 
 | Area | Signal | Where | Rollback trigger |

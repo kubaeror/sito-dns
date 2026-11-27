@@ -47,6 +47,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `[clients]` section logs a warning and skips pruning rather than failing an
   already-live apply.
 
+### Documentation
+- Final 2.0.0 operator documentation truth pass: added
+  [2.0.0 release notes](docs/release-notes-2.0.0.md), indexed BC-11 (stats
+  schema/PII migration) and BC-12 (fresh-install default-deny ACL), refreshed
+  the claim matrix and migration/config/installation truth, and recorded the
+  green H1 24-hour fuzz run (45922217501). The H2 7-day soak is still in
+  progress and the `v2.0.0` tag/publication (H10) has not run; this changelog
+  does not claim either.
+
 ---
 
 ## [2.0.0-rc.2] - 2026-11-22

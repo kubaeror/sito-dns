@@ -56,9 +56,10 @@ Start here:
   and release evidence.
 - [Test harness](../test-harness.md) — deterministic clock, ports and fixtures.
 - [Installation](../installation.md), [benchmarks](../benchmarks.md), the
-  [1.9.5 release notes](../release-notes-1.9.5.md) and the
+  [1.9.5 release notes](../release-notes-1.9.5.md), the
+  [2.0.0 release notes](../release-notes-2.0.0.md) and the
   [2.0.0-rc.2 release notes](../release-notes-2.0.0-rc.2.md) — operational
-  context for the stable line and the release candidate.
+  context for the stable line, the final tree and the release candidate.
 
 ## Historical documents
 

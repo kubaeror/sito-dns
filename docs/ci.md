@@ -323,8 +323,9 @@ on every code change. See `crates/sito-stats/tests/prometheus_exposition.rs`.
 Before Phase 3 the scheduled `fuzz.yml` matrix was invalid and scheduled runs
 did not execute. The workflow now builds a target × shard matrix in a
 `prepare` job; the nightly smoke uses one shard, and the 24-hour checklist uses
-`shards=5` with `fuzz_seconds=17280`. The 24-hour campaign is a 2.0 final-tag
-checklist item started after rc.4, not a PR gate.
+`shards=5` with `fuzz_seconds=17280`. The H1 24-hour campaign completed green
+on `39ba6da` (run 45922217501, 25/25 jobs); it remains a final-tag checklist
+item, not a PR gate.
 
 ### PR vs nightly/release split
 
@@ -541,10 +542,10 @@ stops the workflow before any asset is built. The order is deliberate:
 The `release-gate` step prefers `gh api --paginate --slurp` and falls back to
 plain `--paginate` only when the installed `gh` does not know `--slurp`; auth,
 network and API errors are fatal. Both pagination shapes are pinned by
-`bash scripts/test-verify-release-gate.sh`. The rc.3 and rc.4 tags are
-prereleases and must leave `latest` on 1.9.5; only the final `v2.0.0` tag moves
-it. [`docs/release-verification.md`](release-verification.md) is the gate
-checklist and records the required evidence for every row.
+`bash scripts/test-verify-release-gate.sh`. Prerelease tags such as
+`v2.0.0-rc.2` are prereleases and must leave `latest` on 1.9.5; only the final
+`v2.0.0` tag moves it. [`docs/release-verification.md`](release-verification.md)
+is the gate checklist and records the required evidence for every row.
 
 The GitHub release is not public until `publish-release` runs. A failure in
 `artifact-e2e` or `docker-build-push` leaves a recoverable draft instead of

@@ -1,6 +1,8 @@
 # Configuration Reference
 
-This document is the exhaustive configuration reference for **sito v2.0.0-rc.2**.
+This document is the exhaustive configuration reference for **sito v2.0.0**
+(the 2.0.0 final tree; the workspace version remains `2.0.0-rc.2` until the
+release-manager version bump).
 
 > **Config v2 is frozen at WP-1.3.** `config_version = 2` is the default and
 > the only version accepted by startup, `check-config`, API writes, restore and
@@ -488,7 +490,7 @@ IPv4-mapped IPv6 source is evaluated with the IPv4 rules.
 > built-in fallback**, not a maintained external dataset: it covers common
 > providers only and is not continuously curated or security-reviewed. External
 > curated data (licensed source, update pipeline, checksum/version manifest) is
-> deferred past WP-2.5; configure `[integrations.lists]` for broader coverage.
+> not shipped in 2.0; configure `[integrations.lists]` for broader coverage.
 >
 > Parental control is per group and **off by default**; `parental = true` alone
 > blocks nothing until `parental_categories` names `adult` and/or `gambling`.
@@ -1361,7 +1363,7 @@ until the first successful refresh.
 > The bundled parental/service lists are a **minimal built-in fallback**, not a
 > maintained external dataset. They cover common providers, are not
 > continuously curated, and are not a substitute for a licensed blocklist.
-> Shipping a maintained external dataset is deferred past WP-2.5; the bundled
+> Shipping a maintained external dataset is not part of 2.0; the bundled
 > entries and their manifest exist to make the fallback honest and
 > reproducible, not to claim upstream curation.
 

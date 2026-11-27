@@ -2,12 +2,23 @@
 
 This guide covers deploying **sito** on Linux hosts using the automated one-line installer, manual systemd service configuration, Docker, or Docker Compose.
 
-> **Development status:** the `main` line is the **2.0.0-rc.2 candidate**
-> (Phase 2 core hardening and Phase 3 verification are delivered). The published
-> stable release remains **1.9.5**, and the pinned examples below intentionally
-> target it. Pre-release builds are not published as stable artifacts. The
-> rc.1 tag is created after the final gate; deferred items are listed in the
-> [2.0 claim matrix](2.0-claim-matrix.md).
+> **Development status:** the `main` line is the **2.0.0 final tree** (code
+> frozen at `39ba6da`; the workspace version remains `2.0.0-rc.2` until the
+> release-manager version bump). The published stable release remains **1.9.5**,
+> and the pinned examples below intentionally target it. The `v2.0.0` tag and
+> publication (H10) are pending; prerelease/2.0 builds are not stable artifacts.
+> Deferred scope is listed in the [2.0 claim matrix](2.0-claim-matrix.md).
+
+## Platform Support
+
+**Linux is the supported production and test platform** (kernel 5.4+ strongly
+recommended; CI and release artifacts target `linux/amd64`, `linux/arm64` and
+`linux/arm/v7`). **macOS is supported for development builds only**: the
+`sito-transport::pktinfo` and wizard `getifaddrs` paths are compile-gated for
+Unix, but they are not CI-covered. **Windows is not supported**; the UDP
+listener and packet-info modules emit a compile error on non-Unix targets.
+The shipped command-line, daemon and container guidance in this guide is
+Linux-only.
 
 ---
 
@@ -15,12 +26,12 @@ This guide covers deploying **sito** on Linux hosts using the automated one-line
 
 **Read this before the host is reachable from an untrusted network.** These are
 LAN defaults, not internet-safe defaults. The stable 1.9.5 line and the 2.0
-release-candidate line differ in the admin default:
+line differ in the admin default:
 
 * **1.9.5 (stable):** `web.bind` defaults to `0.0.0.0`, the admin UI is served
   over plain HTTP, and port `8080` accepts setup and login requests from every
   reachable source. There is no TLS in the admin listener itself.
-* **2.0.0-rc.2 (release candidate):** `web.bind` defaults to `127.0.0.1` (the
+* **2.0.0 (final tree):** `web.bind` defaults to `127.0.0.1` (the
   config v2 safe default). Existing v1 configurations migrated without
   `--adopt-safe-defaults` keep their old bind, including `0.0.0.0`.
 * **Both lines:** `dns.bind` defaults to `["0.0.0.0", "::"]`. 2.0 adds the
@@ -136,11 +147,11 @@ The installer automatically:
    not open 8080, and points at the tunnel or a temporary LAN-scoped rule for
    first-time setup.
 
-### 1.1 The 2.0 release-candidate line
+### 1.1 The 2.0 line
 
 The one-line installer and published container tags above install the **stable
-1.9.5** release. The `2.0.0-rc.2` release-candidate line is built from source
-(or from a prerelease image when one is published):
+1.9.5** release. The 2.0.0 final line is built from source until the `v2.0.0`
+release is published (the workspace currently reports `2.0.0-rc.2`):
 
 ```bash
 cargo build --release --locked --features "embed-ui,ha,mimalloc"
@@ -523,7 +534,7 @@ policy. `server.data_dir` must be an absolute path so the shared update lock
 cannot depend on each process's working directory.
 
 When the update crosses the 1.9.x → 2.0 line, migrate the configuration first
-(see [§1.1](#11-the-20-release-candidate-line)); the installer does not rewrite
+(see [§1.1](#11-the-20-line)); the installer does not rewrite
 `config.toml` automatically. If the document is still v1, the installer leaves
 the new 2.0 binary installed, stops the service, and prints the exact
 `config migrate` command to run with that binary. For a 2.0 target, the
