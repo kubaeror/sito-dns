@@ -1186,12 +1186,16 @@ push fail. `dns.port` and the other listener ports are shared configuration;
 the runbook's master `bind = ["0.0.0.0", "::"]` and slave
 `bind = ["0.0.0.0"]` therefore coexist, including on hosts without IPv6.
 
-If a push changes a restart-only field that is **not** preserved as node-local
-(for example `server.log_format` or `[auth]`), the slave rejects the push before
-applying or persisting anything: it keeps its previous live configuration and
-file, enters `Degraded`, and ACKs `applied: false` with a `restart_required`
-reason naming the fields. Restart the slave with the intended configuration (or
-change those fields locally) before expecting the master to report it synced.
+If a push changes a **shared** restart-only field that is not preserved as
+node-local (for example `[auth]` policy or a non-MikroTik `[integrations]`
+section), the slave rejects the push before applying or persisting anything: it
+keeps its previous live configuration and file, enters `Degraded`, and ACKs
+`applied: false` with a `restart_required` reason naming the fields. Restart the
+slave with the intended configuration (or change those fields locally) before
+expecting the master to report it synced. Node-local restart-only fields
+(`server.role`, `server.instance_name`, `server.data_dir`, `server.log_format`,
+`[ha]`, `[web]` enabled/bind/port, `[tls]`, `[acme]`, `[integrations.mikrotik]`)
+are preserved from this node and never cause a push rejection.
 
 `[auth]` is compared as effective policy: an explicit table containing the
 default values is equivalent to omitting `[auth]`, and legacy keys already

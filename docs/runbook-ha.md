@@ -640,14 +640,18 @@ When a slave node fails or must be reprovisioned from bare metal:
    Deploy the `sito` binary or Docker container to the new host.
 2. **Obtain Cluster CA and Slave Cert**:
    Copy `/etc/sito/certs/ca.crt` from the master, along with a valid slave certificate and private key.
-3. **Configure Minimal Slave Configuration and align restart-only fields**:
-   Restart-only shared settings must already match the master's
+3. **Configure Minimal Slave Configuration and align shared restart-only
+   fields**:
+   Restart-only **shared** settings must already match the master's
    `config.toml` before the first push. The template below uses the shipped
-   `config.example.toml` values (the default `log_format = "json"` and the
-   default `[auth]` policy); copy the master's values if it overrides either. A
+   default `[auth]` policy; copy the master's policy if it overrides it. A
    mismatch makes the slave reject the push with `restart_required`, enter
    `Degraded`, and keep its previous configuration and file until it is
-   restarted with matching values.
+   restarted with matching values. Node-local restart-only values
+   (`server.role`, `server.instance_name`, `server.data_dir`,
+   `server.log_format`, `[ha]`, `[web]`, `[tls]`, `[acme]`,
+   `[integrations.mikrotik]`) are preserved from this node and do not need to
+   match the master.
 
    Create `/etc/sito/config.toml`. This branch uses **config v2**; if the
    source file is a v1 document, migrate it first with
@@ -706,7 +710,7 @@ When a slave node fails or must be reprovisioned from bare metal:
    curl -s -H "Authorization: Bearer $TOKEN" \
      http://localhost:8080/api/v2/ha/status | jq .
    ```
-   The slave will transition through `Connecting` -> `HelloSent` -> `Applying` -> `Synced` (or `HelloSent` -> `Synced` when it is already at the master's version) in under 2 seconds once the restart-only fields from step 3 match the master. If the first push is rejected with `restart_required`, align `server.log_format` and the `[auth]` policy with the master and restart the slave; the master keeps reporting it unsynced until then. Verify that custom rules, rewrites, and client lists match the master. `Degraded` is only cleared by a successful apply or an early ACK for the already-running version.
+   The slave will transition through `Connecting` -> `HelloSent` -> `Applying` -> `Synced` (or `HelloSent` -> `Synced` when it is already at the master's version) in under 2 seconds once the shared restart-only fields from step 3 match the master. If the first push is rejected with `restart_required`, align the `[auth]` policy (and any non-MikroTik `[integrations]` shared policy) with the master and restart the slave; node-local restart-only values such as `server.log_format` are preserved automatically. The master keeps reporting the slave unsynced until the restart-only mismatch is resolved. Verify that custom rules, rewrites, and client lists match the master. `Degraded` is only cleared by a successful apply or an early ACK for the already-running version.
 
    If `data_dir/ha_watermark.toml` is corrupt or restored from a different
    node, the slave refuses to start rather than dropping its replay guard.
@@ -723,7 +727,7 @@ When a slave node fails or must be reprovisioned from bare metal:
 | Symptom | Probable Cause | Action |
 |---|---|---|
 | Slave state is `Degraded` | Configuration apply failed, corrupted bundle, or an unresolvable `${SECRET:...}` placeholder | Check the service journal (`journalctl -u sito`) for `apply_config_push` errors. The slave keeps its last good snapshot and reports `Degraded`; fix the configuration on the master and re-push. The reason is exposed as `degraded_reason` in `GET /api/v2/ha/status`. |
-| Push rejected with `restart_required` | The master bundle changed a restart-only field that is not node-local (for example `server.log_format` or `[auth]`) | The slave kept its previous live configuration and file and ACKs `applied:false`. Restart the slave after setting the intended value locally, or change the shared setting only when a coordinated restart is acceptable. Node-local listener/TLS/`[web]`/MikroTik fields are preserved automatically and do not trigger this; web identity (including `enabled`) is node-local, so a slave may run with the admin listener disabled and still synchronize (the readiness healthcheck separately requires it). |
+| Push rejected with `restart_required` | The master bundle changed a **shared** restart-only field that is not node-local (for example `[auth]` policy or a non-MikroTik `[integrations]` section) | The slave kept its previous live configuration and file and ACKs `applied:false`. Change the shared policy on the master and restart the slave with the intended restart-only values (or accept a coordinated restart). Node-local restart-only fields (`server.role`, `server.instance_name`, `server.data_dir`, `server.log_format`, `[ha]`, `[web]`, `[tls]`, `[acme]`, `[integrations.mikrotik]`) and listener/web identity are preserved automatically and do not trigger this; web identity (including `enabled`) is node-local, so a slave may run with the admin listener disabled and still synchronize (the readiness healthcheck separately requires it). |
 | Slave state is `Connecting` in loop | Network unreachable, firewall blocking 8953, or mTLS handshake failed/timed out | Check `nc -zv 192.168.1.10 8953`. Check TLS certificate expiration or fingerprint mismatch in logs. `readiness_reason` carries the last connection/handshake error. |
 | `GET /api/v2/ha/status` reports `"ready": false` or the container healthcheck fails while DNS answers | The replication listener or slave worker is not operational: key/certificate unreadable by the runtime user, listener bind failure, or the slave has not reached `Synced` | Read `readiness_reason` and the service logs. Fixing certificate ownership (`chown sito:sito` or `65532:65532`, mode `0600`) and restarting restores the listener. A healthy DNS probe alone no longer marks the node healthy. |
 | Master reason is `HA requires at least one synced slave` or `HA requires all slaves synced` | `ha.require_slaves`/`ha.require_all_slaves` is enabled and a connected slave is behind the current version, latched as diverged, or (for `require_all_slaves`) there are no connected slaves | Inspect `GET /api/v2/ha/slaves` (`synced_version`, `lag`, `diverged`). Wait for the ACK, issue `POST /api/v2/ha/resync`, or resolve the divergence/staleness. If the requirement is not intended, remove the flag; both default to `false`. |
@@ -999,11 +1003,13 @@ running document before persist/apply:
   `409 restart_required` response (`server.role`, `server.instance_name`,
   `server.data_dir`, `server.log_format`, `[auth]`, `[web]` enabled/bind/port,
   `[tls]`, `[acme]`, `[ha]`, `[integrations]`). Node-local restart-only fields
-  (`server.*`, `[ha]`, `[web]`, `[tls]`, `[acme]`, `[integrations.mikrotik]`)
-  require editing `config.toml` and restarting that node; shared restart-only
-  fields (`[auth]`, non-MikroTik `[integrations]`) must be changed on the
-  master and pushed, and a slave rejects the push until it has been restarted
-  with the intended restart-only values;
+  (`server.role`, `server.instance_name`, `server.data_dir`,
+  `server.log_format`, `[ha]`, `[web]`, `[tls]`, `[acme]`,
+  `[integrations.mikrotik]`) require editing `config.toml` and restarting that
+  node; shared restart-only fields (`[auth]`, non-MikroTik `[integrations]`)
+  must be changed on the master and pushed, and a slave rejects the push until
+  it has been restarted with the intended restart-only values. `server.log_level`
+  is node-local but hot-applied, not restart-only;
 - any shared-field change is rejected atomically with `409 Conflict`,
   `type = "urn:sito:ha:shared_config_read_only"`, a `title` of
   `HA Shared Configuration Read-Only`, and a `shared_config_fields` array of
@@ -1024,10 +1030,11 @@ the filtering/clients/rewrites/upstream/settings UI actions and the system
 reload action. A direct hand edit of `config.toml` bypasses both gates: the
 file-watcher/restart drift check is the only protection for that path and
 overwrites the edit on the next push. The shared projection excludes
-`server.role`/logging and the sanitizer-stripped legacy `[auth]` secret keys
-(`admin_password_hash`, `tokens`), so direct edits to those are not
-drift-detected; role/logging are node-local/restart-only and the legacy auth
-keys are inert. A watermark written by an older build (whose projection
+`server.role`, `server.log_level`/`server.log_format` and the
+sanitizer-stripped legacy `[auth]` secret keys (`admin_password_hash`,
+`tokens`), so direct edits to those are not drift-detected; role and
+`server.log_format` are node-local restart-only, `server.log_level` is
+node-local and hot-applied, and the legacy auth keys are inert. A watermark written by an older build (whose projection
 included logging) may be seen as drifted **once** after the upgrade and force a
 full apply; this is safe and self-heals on the next push/restart.
 
