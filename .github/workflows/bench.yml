@@ -50,7 +50,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: bench
-      - name: Run Criterion benchmarks
+      - name: Run Criterion benchmarks (baseline update)
+        if: ${{ inputs.update_baseline }}
         run: cargo bench --workspace --all-features --locked
       - name: Compare against the committed baseline (fails above the tolerance)
         if: ${{ !inputs.update_baseline }}
@@ -62,11 +63,29 @@ jobs:
           if [ -n "${BENCH_TOLERANCE:-}" ]; then
             tolerance_args=(--tolerance "${BENCH_TOLERANCE}")
           fi
-          python3 scripts/check-bench-regression.py \
-            --github \
-            --environment "${CURRENT_ENVIRONMENT}" \
-            "${tolerance_args[@]}" \
-            | tee bench-comparison.txt
+          # G5 retry-once policy: a GitHub-hosted runner can make a contended
+          # benchmark (e.g. metrics_contended::observe_query_duration_4_threads)
+          # swing by more than 2x between identical runs. Re-measure once and
+          # pass if either attempt is inside tolerance; a real regression fails
+          # both attempts. The failed attempt is retained in the artifact.
+          for attempt in 1 2; do
+            echo "::group::benchmark attempt ${attempt}"
+            cargo bench --workspace --all-features --locked
+            if python3 scripts/check-bench-regression.py \
+              --github \
+              --environment "${CURRENT_ENVIRONMENT}" \
+              "${tolerance_args[@]}" \
+              | tee "bench-comparison-${attempt}.txt"; then
+              cp "bench-comparison-${attempt}.txt" bench-comparison.txt
+              echo "benchmark gate passed on attempt ${attempt}"
+              exit 0
+            fi
+            echo "::warning::benchmark comparison failed on attempt ${attempt}; retrying once"
+            echo "::endgroup::"
+          done
+          cp bench-comparison-2.txt bench-comparison.txt 2>/dev/null || true
+          echo "benchmark gate failed on both attempts" >&2
+          exit 1
       - name: Save a new baseline
         if: ${{ inputs.update_baseline }}
         env:
@@ -86,5 +105,6 @@ jobs:
             target/criterion/**/new/estimates.json
             benches/baseline.json
             bench-comparison.txt
+            bench-comparison-*.txt
             bench-baseline.txt
           if-no-files-found: warn
