@@ -391,17 +391,14 @@ acquires the lease; otherwise disable promotion everywhere first (section 7).
      silently re-signing the persisted state with a new key. A missing file
      starts a fresh sequence. A **corrupt, v1, partial or (with promotion
      enabled) foreign cluster/node** file fails closed and **never** resets the
-     sequence on that start. On the non-promotion coordinator path, an
-     unrecognized corrupt file is renamed to
-     `ha_state.corrupt.<unix-timestamp>` next to the original and retained
-     (the startup error names the path), and the process exits non-zero; stop
-     the service manager's restart loop before retrying, because a later start
-     with no `ha_state.toml` deliberately begins a fresh sequence. With
-     promotion enabled the engine refuses the corrupt file in place and stays
-     read-only instead of renaming it. The original bytes are retained in every
-     case (renamed for an unrecognized corrupt file on the coordinator path,
-     left in place otherwise). Restore a backup or explicitly re-seed the state
-     (see below); do not delete the file just to force a start. A
+     sequence. The file is left byte-for-byte in place (the startup error names
+     the path), and the process exits non-zero; every subsequent start keeps
+     failing closed on the same file, so a service-manager restart loop cannot
+     bypass the failure. With promotion enabled the engine refuses the corrupt
+     file in place and stays read-only. The original bytes are retained in
+     every case. Restore a matching backup, or explicitly move the file aside
+     and re-seed the state (see below); do not delete the file just to force a
+     start. A
      promoted master must not adopt a counter from its peers: it detects any
      replica that is ahead (same term) or in a newer term, marks itself
      `diverged`, and refuses to overwrite the cluster. Promote it explicitly
