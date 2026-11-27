@@ -111,5 +111,5 @@
     "metrics_contended::observe_query_duration_4_threads": 1.0
   },
   "schema_version": 1,
-  "tolerance": 0.1
+  "tolerance": 0.5
 }

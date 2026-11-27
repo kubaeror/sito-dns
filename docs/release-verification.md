@@ -650,13 +650,14 @@ gh run watch <run-id> --exit-status
 
 Record the run URL, the `BENCH_ENVIRONMENT` description
 (`github-ubuntu-24.04`), the tolerance (`BENCH_TOLERANCE` or the baseline's
-stored value, default `0.10`), and any `improved`/`new` lines. `bench.yml` runs
+stored value; default `0.10`, the 2.0.0 release baseline stores `0.50`), and
+any `improved`/`new` lines. `bench.yml` runs
 on GitHub-hosted `ubuntu-24.04` only; the committed baseline must be generated
 on that same runner class (`update_baseline=true`, download the artifact, commit
 it). The checker fails closed on an environment mismatch. A `REGRESSION` line
-above the tolerance fails the job and blocks the release until it is fixed or
-explicitly re-baselined on GitHub-hosted `ubuntu-24.04` with a reviewed reason.
-The checklist records the baseline environment.
+above the tolerance fails the job (after one retry) and blocks the release
+until it is fixed or explicitly re-baselined on GitHub-hosted `ubuntu-24.04`
+with a reviewed reason. The checklist records the baseline environment.
 
 ## Docs and migration evidence
 

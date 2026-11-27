@@ -253,8 +253,10 @@ release-checklist evidence still in progress and is not claimed by this review.
 * Pull requests compile the Criterion benches but do not run a performance
   threshold. The nightly `bench.yml` comparison is **active**: it runs on
   GitHub-hosted `ubuntu-24.04`, compares against the committed
-  `benches/baseline.json` and fails above the tolerance (default 10%). The
-  checker fails closed on an environment mismatch.
+  `benches/baseline.json` and fails above the stored tolerance (the 2.0.0
+  release baseline stores 50% because shared runner hosts varied by 20–35%;
+  the default is 10%, with one retry). The checker fails closed on an
+  environment mismatch.
 * The H1 24-hour fuzz campaign (five targets × five shards × 17,280 s) is green
   at `39ba6da` (run 45922217501, 25/25 fuzz jobs, zero crash artifacts). The H2
   7-day live soak started `2026-11-27T10:38+01:00` and is in progress; it is

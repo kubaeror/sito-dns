@@ -12,11 +12,13 @@ Current performance gates:
 - Pull requests only compile every Criterion target:
   `cargo bench --workspace --all-features --locked --no-run`.
 - The nightly `bench.yml` workflow runs the Criterion suite on GitHub-hosted
-  `ubuntu-24.04` and compares it with `benches/baseline.json`; more than 10%
-  slower fails, except for a named contended benchmark with a documented
-  `noise` allowance. A failed comparison is re-measured once (G5 retry-once)
-  because a shared runner can make a thread-contention benchmark swing by more
-  than 2x between identical runs. The committed baseline records
+  `ubuntu-24.04` and compares it with `benches/baseline.json`; more than the
+  committed tolerance fails, except for a named contended benchmark with a
+  documented `noise` allowance. The 2.0.0 baseline stores a **50%** tolerance
+  because shared GitHub-hosted hosts varied by 20–35% between identical runs
+  (a 10% absolute threshold produced false regressions); a failed comparison
+  is re-measured once (G5 retry-once). A real regression still fails both
+  attempts above the tolerance. The committed baseline records
   `environment: github-ubuntu-24.04`, so the nightly thresholded gate is
   **active**. The checker fails closed on an environment mismatch. A local
   comparison on different hardware must use `--reference-only` and is not the

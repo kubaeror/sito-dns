@@ -299,6 +299,33 @@ class Cli(unittest.TestCase):
             payload = json.loads(baseline.read_text(encoding="utf-8"))
             self.assertEqual(payload["noise"], {"metrics_contended::bench": 1.5})
 
+    def test_save_preserves_existing_tolerance_and_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            estimates = root / "criterion"
+            baseline = root / "baseline.json"
+            write_estimate(estimates, "group/one", 100.0)
+            write_baseline(
+                baseline,
+                {"group::one": 100.0},
+                tolerance=0.5,
+                noise={"group::one": 1.0},
+            )
+
+            saved = run_cli(
+                "--estimates-dir",
+                str(estimates),
+                "--baseline",
+                str(baseline),
+                "--save",
+                "--environment",
+                "unit-test",
+            )
+            self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+            payload = json.loads(baseline.read_text(encoding="utf-8"))
+            self.assertEqual(payload["tolerance"], 0.5)
+            self.assertEqual(payload["noise"], {"group::one": 1.0})
+
     def test_save_without_estimates_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

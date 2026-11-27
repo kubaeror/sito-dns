@@ -415,17 +415,24 @@ def main(argv: list[str] | None = None) -> int:
     try:
         estimates = collect_estimates(args.estimates_dir)
         if args.save:
-            tolerance = (
-                DEFAULT_TOLERANCE if args.tolerance is None else args.tolerance
-            )
+            saved_tolerance: float | None = None
             noise: dict[str, float] = {}
             if args.baseline.exists():
                 try:
-                    noise = load_baseline(args.baseline).noise
+                    existing = load_baseline(args.baseline)
+                    saved_tolerance = existing.tolerance
+                    noise = existing.noise
                 except BaselineError:
                     # A missing/invalid old baseline must not block the
                     # documented regeneration path.
+                    saved_tolerance = None
                     noise = {}
+            if args.tolerance is not None:
+                tolerance = args.tolerance
+            elif saved_tolerance is not None:
+                tolerance = saved_tolerance
+            else:
+                tolerance = DEFAULT_TOLERANCE
             environment = current_environment_label(args.environment)
             save_baseline(args.baseline, estimates, environment, tolerance, noise)
             print(
