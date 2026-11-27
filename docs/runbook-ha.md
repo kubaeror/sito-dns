@@ -966,14 +966,17 @@ not a supported downgrade.
   signing key is also owner-only. A key owned by another user fails the mTLS
   listener even though DNS keeps answering.
 
-### 7.5 Node-local vs shared fields
+### 7.5 Node-local vs shared fields and edit-time enforcement
 
-Slaves persist the pushed document with node-local values merged back in. The
-applied watermark stores a digest of the **shared projection** only, so a local
-edit to one of these fields does not force a full apply:
+Slaves persist the pushed document with node-local values merged back in. Both
+the applied-watermark digest and the edit-time read-only gate use the same
+**shared projection** (`sito_ha::shared_config_diff` /
+`shared_config_digest`), so they cannot disagree about the boundary. A local
+edit to one of these fields is node-local and does not force a full apply:
 
 - `[ha]`;
-- `server.instance_name`, `server.data_dir`;
+- `server.role`, `server.instance_name`, `server.data_dir`,
+  `server.log_level`, `server.log_format`;
 - `[dns] bind` and `[dns.tls]`;
 - the complete `[tls]` and `[acme]` sections;
 - `[web] enabled`, `bind`, `port`, `trusted_proxies`, `metrics_auth`,
@@ -994,8 +997,8 @@ running document before persist/apply:
   applied and persisted locally; the slave never publishes to the master and
   the HA watermark is untouched. Restart-only fields keep their existing D11
   `409 restart_required` response (`server.role`, `server.instance_name`,
-  `server.data_dir`, `server.log_format`, `[auth]`, `[web]` enabled/bind/port,
-  `[tls]`, `[acme]`, `[ha]`, `[integrations]`). Node-local restart-only fields
+  `server.data_dir`, `server.log_format`, `[web]` enabled/bind/port,
+  `[tls]`, `[acme]`, `[ha]`, `[integrations.mikrotik]`). Node-local restart-only fields
   (`server.role`, `server.instance_name`, `server.data_dir`,
   `server.log_format`, `[ha]`, `[web]`, `[tls]`, `[acme]`,
   `[integrations.mikrotik]`) require editing `config.toml` and restarting that
@@ -1027,9 +1030,10 @@ overwrites the edit on the next push. The shared projection excludes
 sanitizer-stripped legacy `[auth]` secret keys (`admin_password_hash`,
 `tokens`), so direct edits to those are not drift-detected; role and
 `server.log_format` are node-local restart-only, `server.log_level` is
-node-local and hot-applied, and the legacy auth keys are inert. A watermark written by an older build (whose projection
-included logging) may be seen as drifted **once** after the upgrade and force a
-full apply; this is safe and self-heals on the next push/restart.
+node-local and hot-applied, and the legacy auth keys are inert. A watermark
+written by an older build (whose projection included logging) may be seen as
+drifted **once** after the upgrade and force a full apply; this is safe and
+self-heals on the next push/restart.
 
 The Settings and System UI pages render shared controls read-only on a replica
 with a “Managed by the master” explanation and the configured master URL; the
