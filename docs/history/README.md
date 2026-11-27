@@ -36,7 +36,7 @@ tests at `HEAD` remain authoritative.
 Start here:
 
 - [2.0 migration guide](../2.0-migration.md) — upgrade steps, breaking-change
-  IDs, the Phase 2 delivered set and the rc.1 upgrade/rollback path.
+  IDs, the final delivered set and the 2.0 upgrade/rollback path.
 - [Config v2](../config-v2.md) — schema freeze, unknown-key policy, migration
   report and restart-only matrix.
 - [2.0 public API diff](../2.0-public-api-diff.md) — source-level changes and

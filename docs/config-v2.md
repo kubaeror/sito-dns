@@ -183,7 +183,7 @@ not supported in place.
 
 Automated migration of `config.toml` by the installer/container entrypoint
 (only when `config_version = 1`) remains unimplemented; it is deferred work, not
-part of the delivered Phase 2 tree. The installer's `--no-migrate` and the
+part of the delivered 2.0 tree. The installer's `--no-migrate` and the
 container's `SITO_NO_MIGRATE=1` apply only to the statistics database. The CLI
 above is the supported manual config path. The full narrative migration guide is
 [`docs/2.0-migration.md`](2.0-migration.md).
@@ -274,7 +274,7 @@ When you add a configuration field:
 Missing map entries fail CI; a field that is only in the map and not in the
 schema also fails the fixture test.
 
-## 10. Deferred fields
+## 10. Post-freeze additions and delivery notes
 
 - `clients.trust_arp` is an optional v2 field with default `false` (added after
   the schema freeze). It opts into MAC-only ARP identity: an ARP-resolved MAC

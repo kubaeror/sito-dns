@@ -13,14 +13,16 @@ commands and expected output. Releases are triggered by pushing a `v*` tag;
 | Evidence | Status | Record |
 |---|---|---|
 | Frozen workspace gate | **GREEN** at `39ba6da` | all-features 65 suites, **2,469 passed / 0 failed / 5 ignored**; default **2,229 / 0 / 5**; no-HA `sito-api` **371 passed**; fmt, clippy `-D warnings`, `cargo deny check`, docs/config/migration/test-matrix/catalog checks clean |
-| H1 24-hour fuzz | **GREEN** at `39ba6da` | [run 45922217501](https://github.com/kubaeror/sito-dns/actions/runs/45922217501): 25/25 jobs success, each shard `Done ... in 17281 second(s)`, zero crash artifacts; corpus in [Fuzz evidence](#fuzz-evidence-24-hour-release-checklist) |
+| H1 24-hour fuzz | **GREEN** at `39ba6da` | [run 45922217501](https://github.com/kubaeror/sito-dns/actions/runs/45922217501): 25/25 fuzz jobs success, each shard `Done ... in 17281 second(s)`, zero crash artifacts; corpus in [Fuzz evidence](#fuzz-evidence-24-hour-release-checklist) |
 | H2 7-day live soak | **IN PROGRESS — not passed** | started `2026-11-27T10:38+01:00` on `sito-soak:39ba6da` (container `sito-soak-39ba6da`); minimum 3 days, target 7 days (~`2026-12-04T09:38Z`); evidence `/home/ubuntu/sito-soak/evidence/soak.csv` |
 | H10 tagged release workflow | **PENDING — not run** | no `v2.0.0` tag has been pushed; the workspace is still `2.0.0-rc.2`; `latest` remains on 1.9.5 |
+| Thresholded benchmark gate | **PENDING — not recorded** | release-checklist row 13; one green `bench.yml` comparison against `benches/baseline.json` on GitHub-hosted `ubuntu-24.04` is still required before the final tag |
 | E4 per-architecture image scan | **Implemented; tag-time run pending** | workflow and policy test are in the tree; the real release run is part of H10 |
 | E5 root-gated HA ownership lane | **Implemented; tag-time run pending** | `ha-ownership.yml` and its fail-closed policy test are in the tree; a real GitHub-hosted run is required on the final commit |
 
-The evidence above is the frozen-tree hand-off. Do not mark H2, H10 or the
-tag-time E4/E5 runs as complete until their transcripts are recorded here.
+The evidence above is the frozen-tree hand-off. Do not mark H2, H10, the
+benchmark gate or the tag-time E4/E5 runs as complete until their transcripts
+are recorded here.
 
 ## Release gate order
 

@@ -145,17 +145,18 @@ The frozen-tree hand-off is recorded in
 | Evidence | Status |
 |---|---|
 | Frozen workspace gate at `39ba6da` | **GREEN** — all-features 65 suites, **2,469 passed / 0 failed / 5 ignored**; default **2,229 / 0 / 5**; no-HA `sito-api` **371 passed**; fmt, clippy `-D warnings`, `cargo deny`, docs/config/migration/test-matrix/catalog checks clean |
-| H1 24-hour fuzz at `39ba6da` | **GREEN** — [run 45922217501](https://github.com/kubaeror/sito-dns/actions/runs/45922217501), 25/25 jobs success, each shard `Done ... in 17281 second(s)`, zero crash artifacts; per-target corpus in [release verification](release-verification.md#recorded-h1-result-2026-11-27) |
+| H1 24-hour fuzz at `39ba6da` | **GREEN** — [run 45922217501](https://github.com/kubaeror/sito-dns/actions/runs/45922217501), 25/25 fuzz jobs success, each shard `Done ... in 17281 second(s)`, zero crash artifacts; per-target corpus in [release verification](release-verification.md#recorded-h1-result-2026-11-27) |
 | H2 7-day live soak | **IN PROGRESS — not passed** — started `2026-11-27T10:38+01:00` on `sito-soak:39ba6da`; minimum 3 days, target 7 days (~`2026-12-04T09:38Z`); evidence `/home/ubuntu/sito-soak/evidence/soak.csv` |
 | H10 tagged release workflow | **PENDING — not run** — no `v2.0.0` tag, no stable 2.0 image/release, `latest` still 1.9.5 |
+| Thresholded benchmark gate | **PENDING — not recorded** — one green `bench.yml` comparison against `benches/baseline.json` on GitHub-hosted `ubuntu-24.04` is still required before the final tag |
 | E4 per-architecture image scan | Implemented and policy-tested; the real scan runs in the tagged `docker-build-push` job (H10) |
 | E5 root-gated HA ownership lane | Implemented and policy-tested; a real GitHub-hosted run is required on the final commit (H10) |
 | OpenAPI snapshot | Committed `docs/openapi.json` matches the router; `SITO_UPDATE_OPENAPI=1 cargo test -p sito-api --features ha test_export_openapi_json` produced no diff |
 | Docs truth checks | Internal link check, config reference (188 keys), 12 BC IDs, 821 test-matrix names and the catalog check pass |
 
-A crash or timeout in H2, a red H10 release workflow, a missing E4/E5 run, or
-any stale claim above is a release blocker. Do not move `latest` or publish
-2.0.0 before those rows pass.
+A crash or timeout in H2, a red H10 release workflow, a missing E4/E5 run, a
+red or missing thresholded benchmark comparison, or any stale claim above is a
+release blocker. Do not move `latest` or publish 2.0.0 before those rows pass.
 
 ## Known issues and accepted residuals
 
@@ -185,8 +186,11 @@ any stale claim above is a release blocker. Do not move `latest` or publish
   Linux is the tested production platform.
 - **Image scanning** fails only on fixed HIGH/CRITICAL findings; unfixed
   findings are reported but non-blocking. The scan itself is per-architecture.
-- **In-app update locking** is process-wide; a cross-process file lock is
-  deferred.
+- **In-app and CLI updates share one lock.** The updater serializes applies
+  with an in-process mutex and a cross-process `flock` on a `0600`/`O_NOFOLLOW`
+  lock file in the data directory (`UpdateLock::acquire`), and both the API and
+  CLI `apply_update` acquire it before network work. A concurrent apply gets
+  `UpdateInProgress`/`409`; the CLI is serialized against a running server.
 - **The H2 soak is still running.** This note does not claim a clean soak, the
   `v2.0.0` tag, the published image, or the tagged release workflow.
 

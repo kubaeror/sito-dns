@@ -595,16 +595,17 @@ WP-2.13 secures the shipped deployment defaults and makes the installer and
 self-updater preserve the service's ability to bind privileged DNS ports. The
 static compose/systemd checks are shipped alongside the files; the installer E2E
 runs unprivileged against a temporary sandbox. Release-image vulnerability
-scanning remains linux/amd64-only and the root-gated HA ownership test remains a
-manual/weekly operator step. Phase 3 added a live DNS/health smoke of the
-attested release image to the release workflow before publication.
+scanning covers every release platform (`linux/amd64`, `linux/arm64`,
+`linux/arm/v7`) from the published digest (E4); the root-gated HA ownership test
+remains a manual/weekly operator step (E5). Phase 3 added a live DNS/health
+smoke of the attested release image to the release workflow before publication.
 
 | Finding / acceptance | Named test / check | Focused command |
 |---|---|---|
 | P2-67: single-node Compose binds the admin UI to loopback, keeps `/etc/sito` in the named `sito-config` volume, and ships a pinned non-local image | `scripts/test-compose-defaults.sh` (loopback/volume/image assertions) | `bash scripts/test-compose-defaults.sh` |
 | P2-68: HA Compose uses valid even-length DHCP Option 6 hex, parameterizes IP/subnet/gateway/parent with `SITO_HA_*`, and keeps the chown/key-mode requirements explicit | `scripts/test-compose-defaults.sh` (DHCP hex and topology assertions) | `bash scripts/test-compose-defaults.sh` |
 | P2-69: the installer has a behavioral fresh/upgrade/rollback/uninstall E2E, not just shellcheck | `contrib/tests/test-installer.sh`; CI `contrib` job | `bash contrib/tests/test-installer.sh` |
-| P2-70: release images are scanned for HIGH/CRITICAL and cosign-signed; scan coverage is linux/amd64 only (residual, WP-3.1) | `scripts/test-release-workflow.sh`, `scripts/test-release-attestation-gate.sh`, release workflow `docker-build-push` | `bash scripts/test-release-workflow.sh`; `bash scripts/test-release-attestation-gate.sh` |
+| P2-70: release images are scanned for HIGH/CRITICAL on every release platform (`linux/amd64`, `linux/arm64`, `linux/arm/v7`) from the published digest and cosign-signed (E4) | `scripts/test-release-workflow.sh`, `scripts/test-release-attestation-gate.sh`, release workflow `docker-build-push` | `bash scripts/test-release-workflow.sh`; `bash scripts/test-release-attestation-gate.sh` |
 | P2-82: systemd unit and installer fallback read `EnvironmentFile=-/etc/sito/sito.env` and apply `UMask=0077`, `PrivateTmp`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictSUIDSGID`, `LockPersonality`, `SystemCallArchitectures=native` | `scripts/test-systemd-hardening.sh`; `test_m9_release_configuration_and_systemd` | `bash scripts/test-systemd-hardening.sh`; `cargo test -p sito-test --test m9_acceptance test_m9_release_configuration_and_systemd` |
 | P2-83: `sito update` preserves the existing executable mode and extended attributes (including `security.capability`); 0755 is only the absent-target fallback; a failed rename restores the backup and removes the temporary files | `test_install_preserves_existing_mode_and_xattrs`, `test_install_preserves_security_capability_when_root`, `test_install_uses_0755_when_target_is_absent`, `test_replace_restores_backup_when_rename_fails` | `cargo test -p sito-api --lib updater` |
 | P3-20: uninstall removes installer-managed cosign (marker), keeps a pre-existing user cosign, warns without systemd, removes the unit unconditionally, and makes setcap/getcap outcomes visible | `contrib/tests/test-installer.sh` capability/no-systemd/cosign cases | `bash contrib/tests/test-installer.sh` |

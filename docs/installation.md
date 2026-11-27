@@ -351,7 +351,7 @@ sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito
 >   LAN-only firewall in this guide does not open 8080; use the SSH tunnel
 >   (`ssh -L 8080:127.0.0.1:8080 user@server`) or the temporary LAN-scoped rule
 >   while completing setup.
-> * **2.0 rc (config v2):** the safe default is
+> * **2.0 (config v2):** the safe default is
 >   `web.bind = "127.0.0.1"`, so the setup-pending wizard is **loopback-only too**.
 >   Use an SSH tunnel/port-forward (`ssh -L 8080:127.0.0.1:8080 user@server`),
 >   or explicitly configure a non-loopback `web.bind` for the setup window if
@@ -363,7 +363,7 @@ sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/sito
 > If you prefer to supply configuration up-front, create `/etc/sito/config.toml`:
 
 ```toml
-# Current 2.0 rc / config v2. A 1.9.x file is v1 and must be migrated:
+# Current 2.0 / config v2. A 1.9.x file is v1 and must be migrated:
 #   sito config migrate --from v1 --to v2 --backup
 config_version = 2
 

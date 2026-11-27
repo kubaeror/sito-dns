@@ -324,7 +324,7 @@ Before Phase 3 the scheduled `fuzz.yml` matrix was invalid and scheduled runs
 did not execute. The workflow now builds a target × shard matrix in a
 `prepare` job; the nightly smoke uses one shard, and the 24-hour checklist uses
 `shards=5` with `fuzz_seconds=17280`. The H1 24-hour campaign completed green
-on `39ba6da` (run 45922217501, 25/25 jobs); it remains a final-tag checklist
+on `39ba6da` (run 45922217501, 25/25 fuzz jobs); it remains a final-tag checklist
 item, not a PR gate.
 
 ### PR vs nightly/release split

@@ -162,7 +162,7 @@ Results are recorded in the [review §12](phase3-security-review.md#12-verificat
 `cargo deny check` reports `advisories ok, bans ok, licenses ok, sources ok`,
 with the expected `advisory-not-detected` warning for the two reviewed
 suppressions. The H1 24-hour fuzz campaign is green at `39ba6da` (run
-45922217501, 25/25 jobs, zero crash artifacts); the H2 7-day live soak is
+45922217501, 25/25 fuzz jobs, zero crash artifacts); the H2 7-day live soak is
 release-checklist evidence still in progress and is not claimed by this review.
 
 ---
@@ -256,7 +256,7 @@ release-checklist evidence still in progress and is not claimed by this review.
   `benches/baseline.json` and fails above the tolerance (default 10%). The
   checker fails closed on an environment mismatch.
 * The H1 24-hour fuzz campaign (five targets × five shards × 17,280 s) is green
-  at `39ba6da` (run 45922217501, 25/25 jobs, zero crash artifacts). The H2
+  at `39ba6da` (run 45922217501, 25/25 fuzz jobs, zero crash artifacts). The H2
   7-day live soak started `2026-11-27T10:38+01:00` and is in progress; it is
   release-checklist evidence with an owner, and this review does not claim a
   completed soak before the accepted window is recorded.

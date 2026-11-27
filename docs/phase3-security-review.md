@@ -504,7 +504,7 @@ These checks were green in the frozen gate; H4 reran the catalog check and
 
 **Residual risk.** Image scanning fails only on **fixed** HIGH/CRITICAL
 findings; unfixed findings are reported but do not block (R-4). The H1 24-hour
-fuzz campaign is green at `39ba6da` (run 45922217501, 25/25 jobs, zero crash
+fuzz campaign is green at `39ba6da` (run 45922217501, 25/25 fuzz jobs, zero crash
 artifacts); the H2 7-day live soak is in progress and is not claimed (R-2).
 The root-gated HA certificate-ownership lane remains a manual/weekly workflow.
 The Compose images stay pinned to `1.9.5` until the release manager moves them
@@ -930,8 +930,8 @@ Focused H4 reruns:
 | `cargo deny check` | `advisories ok, bans ok, licenses ok, sources ok` (expected `advisory-not-detected` warning for basic-toml) |
 | `python3 scripts/generate-catalog.py --check` | `catalog check passed` |
 | `python3 scripts/check_test_matrix.py` | 821 unique named tests/checks resolve |
-| `python3 scripts/check_markdown_links.py` | Internal Markdown links OK (81 files) |
-| `python3 scripts/check_migration_guide.py` | 10 breaking-change IDs each map to a migration step and affected doc/test |
+| `python3 scripts/check_markdown_links.py` | Internal Markdown links OK (82 files) |
+| `python3 scripts/check_migration_guide.py` | 12 breaking-change IDs each map to a migration step and affected doc/test |
 | `git diff --check` | Pass |
 
 ## 13. Residual risk register
@@ -939,7 +939,7 @@ Focused H4 reruns:
 | ID | Residual | Severity | Disposition |
 |---|---|---|---|
 | R-1 | DNAME decoded as `RData::Unknown`; validate/strict returns SERVFAIL, log-only returns AD=0 | P1 (availability/compatibility) | **Open P1, accepted for 2.0.0**; fail-closed test required; owner DNSSEC maintainer; re-review by 2027-01-31 or hickory upgrade |
-| R-2 | The H1 24-hour fuzz campaign is green at `39ba6da` (run 45922217501, 25/25 jobs, 17,281 s per shard, zero crash artifacts). The H2 7-day live soak started `2026-11-27T10:38+01:00` and is in progress; it is not recorded as complete for this SHA | Release evidence | H1 closed; soak remains an open release-checklist item; owner release manager; do not claim a clean soak until the accepted window and transcript are recorded |
+| R-2 | The H1 24-hour fuzz campaign is green at `39ba6da` (run 45922217501, 25/25 fuzz jobs, 17,281 s per shard, zero crash artifacts). The H2 7-day live soak started `2026-11-27T10:38+01:00` and is in progress; it is not recorded as complete for this SHA | Release evidence | H1 closed; soak remains an open release-checklist item; owner release manager; do not claim a clean soak until the accepted window and transcript are recorded |
 | R-3 | Installer/container `config.toml` auto-migration remains deferred; config v1→v2 and the SQLite schema/PII migration are delivered | Migration scope | Documented product scope; owner ops; the config migration command is the supported path |
 | R-4 | Image scan fails only on **fixed** HIGH/CRITICAL findings and depends on the scanner/runner | Release evidence | Accepted; owner release manager; unfixed findings are visible but non-blocking |
 | R-5 | DNS ACL typed default is `allow`; only fresh wizard installs write `deny`; `dns.bind` defaults to wildcard | Exposure | Accepted compatibility trade-off; owner security reviewer; firewall/bind restriction is defense in depth |
