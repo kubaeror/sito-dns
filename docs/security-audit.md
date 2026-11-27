@@ -1,8 +1,8 @@
 # Security Review and Threat Model (2.0.0 final)
 
 **Reviewed tree:** `39ba6da71f1068dd7da2ebf339909328bff2df26` (`39ba6da`, 2026-11-27)
-**Workspace version:** `2.0.0-rc.2`; the `v2.0.0` version bump and tag are the
-release-manager steps (H6/H9), not a code change. This page describes the
+**Workspace version:** `2.0.0`; the `v2.0.0` tag and publication are the
+release-manager steps (H10), not a code change. This page describes the
 frozen 2.0.0 release tree.
 **Reviewer:** security reviewer (H4), read-only review of the implementation,
 tests and release configuration.

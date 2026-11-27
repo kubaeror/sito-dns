@@ -3,7 +3,7 @@
 **Date:** 2026-11-27
 **Commit:** `39ba6da71f1068dd7da2ebf339909328bff2df26` (`39ba6da`)
 **Scope:** frozen 2.0.0 release tree on `feat/2.0.0` (workspace version
-`2.0.0-rc.2`; the `2.0.0` version bump and tag are release-manager steps);
+`2.0.0`; the `v2.0.0` tag and publication are release-manager steps);
 read-only code and release-configuration review
 **Companion documents:** [security audit and threat model](security-audit.md),
 [P0/P1 test matrix](audit6-test-matrix.md), [2.0 claim matrix](2.0-claim-matrix.md),

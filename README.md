@@ -15,8 +15,8 @@ runner-minute budget are documented in **[docs/ci.md](docs/ci.md)**.
 `sito` is designed as a modern, rock-solid alternative to AdGuard Home and Pi-hole. Engineered in Rust (edition 2024), it combines sub-millisecond p99 latency, comprehensive ad/tracker/malware blocking (using AdGuard/ABP rule syntax), multi-protocol encryption (DoT, DoH H2, DoQ, DoH3), and automated master/slave high availability.
 
 > **Development status:** the `main` line is the **2.0.0 final tree** (code
-> frozen at `39ba6da`; the workspace version remains `2.0.0-rc.2` until the
-> release-manager version bump). The latest stable release remains **1.9.5**;
+> frozen at `39ba6da`; the workspace version is `2.0.0`). The latest stable
+> release remains **1.9.5**;
 > the quickstart below intentionally pins the published stable installer and
 > container image. The `v2.0.0` tag/publication (H10) is pending, the tagged
 > release workflow has not run, and `latest` has not moved. The H1 24-hour fuzz
@@ -114,8 +114,8 @@ Client Query ──▶ [sito-transport] (UDP / TCP / DoT / DoH / DoQ / DoH3)
 
 ### Option 1: Automated One-Line Installer (Linux)
 The examples below install the latest **stable** release (1.9.5). The
-`2.0.0` final tree (workspace version `2.0.0-rc.2`) is not published as a
-stable artifact until the `v2.0.0` tag is created.
+`2.0.0` final tree (workspace version `2.0.0`) is not published as a stable
+artifact until the `v2.0.0` tag is created.
 ```bash
 # Download and inspect the pinned installer, then run it for the same version.
 curl -fsSL https://raw.githubusercontent.com/kubaeror/sito-dns/v1.9.5/contrib/install.sh -o sito-install.sh
@@ -197,7 +197,7 @@ Docker can forward the port, and publish it only on loopback:
 access. See [Docker Compose deployment](docs/installation.md#4-docker-compose-deployment).
 
 ### Option 3: Manual Binary Build (2.0)
-This builds the current `2.0.0` final tree (workspace version `2.0.0-rc.2`),
+This builds the current `2.0.0` final tree (workspace version `2.0.0`),
 which uses config v2 and rejects a v1 `config.toml` until it is migrated. For a
 stable production install, use the pinned 1.9.5 installer or image above and
 follow the [2.0 migration guide](docs/2.0-migration.md) when moving to 2.0.

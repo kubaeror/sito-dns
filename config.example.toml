@@ -1,4 +1,4 @@
-# sito config v2 (frozen at 2.0.0-rc.2). A v1 document must be migrated:
+# sito config v2 (frozen at 2.0.0). A v1 document must be migrated:
 #   sito config migrate --from v1 --to v2 --backup
 # Unknown keys are rejected. See docs/config-v2.md.
 config_version = 2

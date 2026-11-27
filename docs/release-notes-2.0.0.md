@@ -1,13 +1,15 @@
 # sito 2.0.0
 
+**Target release:** `2.0.0` (release date pending; the `v2.0.0` tag has not
+been created).
+
 **Status: final release-notes text for the frozen 2.0.0 tree; the `v2.0.0` tag
 is not created and no 2.0.0 stable artifact is published by this document.**
-The code is frozen at `39ba6da`; the workspace version is still `2.0.0-rc.2`
-until the release-manager version bump (H6). The tagged release workflow and
-`latest` move are the H10 step. The published stable line remains **1.9.5**
-until that tag is published.
+The code is frozen at `39ba6da`; the workspace version is `2.0.0`. The tagged
+release workflow and `latest` move are the H10 step. The published stable line
+remains **1.9.5** until that tag is published.
 
-- **Source:** `v2.0.0` (tag pending; workspace reports `2.0.0-rc.2`)
+- **Source:** `v2.0.0` (tag pending; workspace reports `2.0.0`)
 - **Config schema:** v2 only (`config_version = 2`); a v1 file must be migrated
 - **Database:** statistics schema v2; explicit/opt-in `sito db migrate`
 - **HA:** protocol v2; a coordinated cluster upgrade is required
@@ -151,7 +153,7 @@ The frozen-tree hand-off is recorded in
 | Thresholded benchmark gate | **PENDING — not recorded** — one green `bench.yml` comparison against `benches/baseline.json` on GitHub-hosted `ubuntu-24.04` is still required before the final tag |
 | E4 per-architecture image scan | Implemented and policy-tested; the real scan runs in the tagged `docker-build-push` job (H10) |
 | E5 root-gated HA ownership lane | Implemented and policy-tested; a real GitHub-hosted run is required on the final commit (H10) |
-| OpenAPI snapshot | Committed `docs/openapi.json` matches the router; `SITO_UPDATE_OPENAPI=1 cargo test -p sito-api --features ha test_export_openapi_json` produced no diff |
+| OpenAPI snapshot | Committed `docs/openapi.json` reports `info.version = 2.0.0` and matches the router; `SITO_UPDATE_OPENAPI=1 cargo test -p sito-api --features ha test_export_openapi_json` produced the version update and a normal rerun produced no diff |
 | Docs truth checks | Internal link check, config reference (188 keys), 12 BC IDs, 821 test-matrix names and the catalog check pass |
 
 A crash or timeout in H2, a red H10 release workflow, a missing E4/E5 run, a

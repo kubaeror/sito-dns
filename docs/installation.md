@@ -3,8 +3,8 @@
 This guide covers deploying **sito** on Linux hosts using the automated one-line installer, manual systemd service configuration, Docker, or Docker Compose.
 
 > **Development status:** the `main` line is the **2.0.0 final tree** (code
-> frozen at `39ba6da`; the workspace version remains `2.0.0-rc.2` until the
-> release-manager version bump). The published stable release remains **1.9.5**,
+> frozen at `39ba6da`; the workspace version is `2.0.0`). The published stable
+> release remains **1.9.5**,
 > and the pinned examples below intentionally target it. The `v2.0.0` tag and
 > publication (H10) are pending; prerelease/2.0 builds are not stable artifacts.
 > Deferred scope is listed in the [2.0 claim matrix](2.0-claim-matrix.md).
@@ -151,7 +151,7 @@ The installer automatically:
 
 The one-line installer and published container tags above install the **stable
 1.9.5** release. The 2.0.0 final line is built from source until the `v2.0.0`
-release is published (the workspace currently reports `2.0.0-rc.2`):
+release is published (the workspace reports `2.0.0`):
 
 ```bash
 cargo build --release --locked --features "embed-ui,ha,mimalloc"
