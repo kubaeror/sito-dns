@@ -15,9 +15,11 @@ use crate::error::HaError;
 ///
 /// * `[ha]` (master URL, certificates, pins, token) is slave-local and is
 ///   removed by `sanitize_config_for_bundle` on the master.
-/// * `server.role` is forced to `slave`; `server.instance_name` and
-///   `server.data_dir` identify this node and must not be replaced by the
-///   master's values.
+/// * `server.role` is forced to `slave`; `server.instance_name`,
+///   `server.data_dir`, `server.log_level` and `server.log_format` identify
+///   this node and must not be replaced by the master's values. Logging is
+///   part of the same node-local projection the edit-time shared gate uses, so
+///   a local log edit survives every push and does not count as shared drift.
 /// * `[integrations.mikrotik]` credentials are stripped from the replicated
 ///   configuration and restored from the live node-local configuration.
 ///
@@ -84,6 +86,18 @@ pub(super) async fn build_persisted_config(
     server.insert(
         "data_dir".to_string(),
         toml::Value::String(live.server.data_dir.to_string_lossy().into_owned()),
+    );
+    // Logging is node-local (`shared_config_diff` and `shared_config_digest`
+    // exclude it), so the local values must be preserved here too: otherwise a
+    // local log-level edit would be silently reverted by the next push and the
+    // digest would no longer flag that revert as drift.
+    server.insert(
+        "log_level".to_string(),
+        toml::Value::String(live.server.log_level.clone()),
+    );
+    server.insert(
+        "log_format".to_string(),
+        toml::Value::String(live.server.log_format.clone()),
     );
 
     // Node-local listener, TLS and ACME identity. The master's bind addresses

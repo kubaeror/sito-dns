@@ -150,6 +150,172 @@ pub fn sanitized_configs_equal(a: &str, b: &str) -> bool {
     }
 }
 
+/// Field paths reported when a document cannot be classified as shared or
+/// node-local.
+///
+/// Returned by [`shared_config_diff`] instead of an empty (node-local-only)
+/// result so an unparseable candidate can never be accepted as a local edit.
+pub const SHARED_DIFF_UNPARSEABLE: &str = "<unparseable-config>";
+
+/// Computes the semantic difference between the *shared* projections of two
+/// configuration documents.
+///
+/// This is the edit-time counterpart of [`shared_config_digest`]. Both
+/// documents are passed through [`sanitize_config_for_bundle`] (the HA
+/// shared-document source of truth) and then stripped of the fields the slave
+/// merge preserves node-locally (`[ha]`, identity/logging, `[dns] bind`/TLS,
+/// `[tls]`, `[acme]`, the `[web]` node-local keys, `[integrations.mikrotik]`
+/// and `clients.client_id_secrets`). The remaining tables are compared
+/// recursively; every differing leaf is reported as a dotted TOML path
+/// (arrays are reported at the array key rather than per index).
+///
+/// An empty result means the edit is node-local-only (or formatting-only) and
+/// may be applied locally on a slave. A non-empty result lists the shared
+/// fields a slave must not change locally.
+///
+/// An unparseable document fails closed with [`SHARED_DIFF_UNPARSEABLE`]:
+/// a slave never treats a document it cannot classify as node-local.
+#[must_use]
+pub fn shared_config_diff(current: &str, candidate: &str) -> Vec<String> {
+    let Ok(current) = shared_config_projection(current) else {
+        return vec![SHARED_DIFF_UNPARSEABLE.to_string()];
+    };
+    let Ok(candidate) = shared_config_projection(candidate) else {
+        return vec![SHARED_DIFF_UNPARSEABLE.to_string()];
+    };
+
+    let mut paths = Vec::new();
+    diff_toml_tables(&current, &candidate, &mut Vec::new(), &mut paths);
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Builds the shared projection used by [`shared_config_diff`].
+///
+/// Sanitization alone is not enough: the sanitizer keeps node-local values
+/// that are harmless in a bundle because the slave merge overwrites them
+/// before persisting (`dns.bind`, `[web] bind/TLS`, `server.data_dir`, ...).
+/// Removing them here keeps the edit-time decision aligned with the merge,
+/// while identity and logging are node-local because the merge restores the
+/// local values (and the sanitizer rewrites the role for every replica).
+fn shared_config_projection(document: &str) -> Result<toml::Table, HaError> {
+    let sanitized = sanitize_config_for_bundle(document)?;
+    let mut table: toml::Table = toml::from_str(&sanitized).map_err(|e| HaError::Validation {
+        field: "config_toml".to_string(),
+        reason: format!("Failed to parse the sanitized configuration for comparison: {e}"),
+    })?;
+    remove_node_local_fields(&mut table);
+    Ok(table)
+}
+
+/// Removes every field the slave merge preserves from the local node.
+///
+/// Keep in sync with `slave/worker/config_merge.rs` and
+/// [`NODE_LOCAL_WEB_KEYS`]; this is the edit-time node-local boundary.
+fn remove_node_local_fields(table: &mut toml::Table) {
+    table.remove("ha");
+    table.remove("tls");
+    table.remove("acme");
+
+    if let Some(server) = table.get_mut("server").and_then(toml::Value::as_table_mut) {
+        // Role is rewritten by the sanitizer and is restart-only; logging and
+        // identity describe this node, not the cluster.
+        for key in [
+            "role",
+            "instance_name",
+            "data_dir",
+            "log_level",
+            "log_format",
+        ] {
+            server.remove(key);
+        }
+    }
+    if let Some(dns) = table.get_mut("dns").and_then(toml::Value::as_table_mut) {
+        dns.remove("bind");
+        dns.remove("tls");
+    }
+    if let Some(web) = table.get_mut("web").and_then(toml::Value::as_table_mut) {
+        for key in NODE_LOCAL_WEB_KEYS {
+            web.remove(key);
+        }
+    }
+    let empty_integrations = table
+        .get_mut("integrations")
+        .and_then(toml::Value::as_table_mut)
+        .is_some_and(|integrations| {
+            integrations.remove("mikrotik");
+            integrations.is_empty()
+        });
+    if empty_integrations {
+        table.remove("integrations");
+    }
+    if let Some(clients) = table.get_mut("clients").and_then(toml::Value::as_table_mut) {
+        clients.remove("client_id_secrets");
+    }
+
+    // Removing node-local values can leave a section empty (for example a
+    // `[web]` that only set `bind`, or `[clients]` that only held
+    // `client_id_secrets`). An empty table carries no shared value, so treat
+    // "empty" and "absent" as equal instead of reporting the section itself as
+    // a shared change.
+    prune_empty_tables(table);
+}
+
+/// Recursively drops tables that have no keys left.
+fn prune_empty_tables(table: &mut toml::Table) {
+    table.retain(|_, value| match value {
+        toml::Value::Table(child) => {
+            prune_empty_tables(child);
+            !child.is_empty()
+        }
+        _ => true,
+    });
+}
+
+/// Recursively appends the dotted paths that differ between two tables.
+fn diff_toml_tables(
+    current: &toml::Table,
+    candidate: &toml::Table,
+    path: &mut Vec<String>,
+    out: &mut Vec<String>,
+) {
+    for (key, value) in current {
+        path.push(key.clone());
+        match candidate.get(key) {
+            Some(other) => diff_toml_values(value, other, path, out),
+            None => out.push(path.join(".")),
+        }
+        path.pop();
+    }
+    for key in candidate.keys() {
+        if !current.contains_key(key) {
+            path.push(key.clone());
+            out.push(path.join("."));
+            path.pop();
+        }
+    }
+}
+
+/// Recursively compares two values, reporting leaves and whole arrays.
+fn diff_toml_values(
+    current: &toml::Value,
+    candidate: &toml::Value,
+    path: &mut Vec<String>,
+    out: &mut Vec<String>,
+) {
+    match (current, candidate) {
+        (toml::Value::Table(current), toml::Value::Table(candidate)) => {
+            diff_toml_tables(current, candidate, path, out);
+        }
+        _ => {
+            if current != candidate {
+                out.push(path.join("."));
+            }
+        }
+    }
+}
+
 /// Scans a serialized bundle or string for accidental plaintext secret leakage.
 ///
 /// Asserts that none of `known_secrets` appear as substrings, and checks for PEM private key headers.
@@ -293,53 +459,27 @@ pub(crate) const NODE_LOCAL_WEB_KEYS: [&str; 7] = [
 /// Computes the digest of the *shared* projection of a persisted document.
 ///
 /// The applied document contains node-local settings merged back from this
-/// node (`[ha]`, identity/data_dir, listener/TLS/ACME identity, web bind
-/// settings, MikroTik credentials and per-client secrets). A local edit to
+/// node (`[ha]`, identity/data_dir/logging, listener/TLS/ACME identity, web
+/// bind settings, MikroTik credentials and per-client secrets). A local edit to
 /// those fields must not force a full re-apply; a change to shared state
 /// (upstreams, filtering, shared runtime policy) must. The watermark stores
 /// this projection digest instead of the raw document digest.
+///
+/// The projection is built by [`shared_config_projection`], the same function
+/// [`shared_config_diff`] uses, so the drift detector and the edit-time
+/// read-only gate cannot disagree about the shared/node-local boundary.
 ///
 /// An unparseable document falls back to the raw digest so a corrupt file still
 /// compares as drifted (and then fails validation on re-apply rather than being
 /// silently accepted).
 #[must_use]
 pub fn shared_config_digest(document: &str) -> String {
-    let Ok(mut table) = document.parse::<toml::Table>() else {
-        return config_digest(document);
-    };
-
-    table.remove("ha");
-    table.remove("tls");
-    table.remove("acme");
-
-    if let Some(server) = table.get_mut("server").and_then(toml::Value::as_table_mut) {
-        server.remove("instance_name");
-        server.remove("data_dir");
-    }
-    if let Some(dns) = table.get_mut("dns").and_then(toml::Value::as_table_mut) {
-        dns.remove("bind");
-        dns.remove("tls");
-    }
-    if let Some(web) = table.get_mut("web").and_then(toml::Value::as_table_mut) {
-        for key in NODE_LOCAL_WEB_KEYS {
-            web.remove(key);
+    match shared_config_projection(document) {
+        Ok(table) => {
+            toml::to_string(&table).map_or_else(|_| config_digest(document), |s| config_digest(&s))
         }
+        Err(_) => config_digest(document),
     }
-    let empty_integrations = table
-        .get_mut("integrations")
-        .and_then(toml::Value::as_table_mut)
-        .is_some_and(|integrations| {
-            integrations.remove("mikrotik");
-            integrations.is_empty()
-        });
-    if empty_integrations {
-        table.remove("integrations");
-    }
-    if let Some(clients) = table.get_mut("clients").and_then(toml::Value::as_table_mut) {
-        clients.remove("client_id_secrets");
-    }
-
-    toml::to_string(&table).map_or_else(|_| config_digest(document), |s| config_digest(&s))
 }
 
 /// Extracts the signed payload hash from a `ConfigPush` envelope.
@@ -906,6 +1046,7 @@ password = "mikrotik_secret_password"
 role = "slave"
 instance_name = "slave-a"
 data_dir = "/var/lib/sito"
+log_level = "info"
 
 [ha]
 master_url = "wss://master:8953"
@@ -932,10 +1073,12 @@ token = "node-token"
 "#;
         let digest = shared_config_digest(base);
 
-        // Node-local edits: identity, [ha], listener/TLS, web bind, MikroTik
-        // credentials and per-client secrets.
+        // Node-local edits: identity, role, logging, [ha], listener/TLS, web
+        // bind, MikroTik credentials and per-client secrets.
         let node_local = base
             .replace("slave-a", "slave-renamed")
+            .replace("role = \"slave\"", "role = \"master\"")
+            .replace("log_level = \"info\"", "log_level = \"debug\"")
             .replace("/var/lib/sito", "/srv/sito")
             .replace("wss://master:8953", "wss://other-master:8953")
             .replace("0.0.0.0:53", "127.0.0.1:5353")
@@ -953,7 +1096,6 @@ token = "node-token"
         // Shared-field edits must change the projection digest.
         for shared_edit in [
             base.replace("9.9.9.9", "1.1.1.1"),
-            base.replace("role = \"slave\"", "role = \"master\""),
             format!("{base}\n[filtering]\ncustom_rules = [\"||blocked.example^\"]\n"),
         ] {
             assert_ne!(
@@ -962,6 +1104,173 @@ token = "node-token"
                 "a shared-field edit must be detected as drift"
             );
         }
+    }
+
+    const SHARED_DIFF_BASE: &str = r#"config_version = 2
+[server]
+role = "slave"
+instance_name = "slave-a"
+data_dir = "/var/lib/sito"
+log_level = "info"
+
+[ha]
+master_url = "wss://master:8953"
+
+[upstream]
+servers = ["9.9.9.9"]
+
+[dns]
+bind = ["0.0.0.0:53"]
+
+[dns.tls]
+cert = "/node/local.crt"
+
+[web]
+bind = "127.0.0.1"
+port = 8080
+public_url = "https://dns-a.example"
+
+[tls]
+cert = "/node/cert.pem"
+key = "/node/key.pem"
+
+[acme]
+enabled = true
+email = "admin@example.com"
+
+[filtering]
+enabled = true
+custom_rules = ["||ads.example^"]
+
+[clients.client_id_secrets]
+laptop = "node-secret"
+
+[integrations.mikrotik]
+host = "192.168.88.1"
+token = "node-token"
+"#;
+
+    /// Formatting-only rewrites and node-local edits are not shared changes.
+    #[test]
+    fn test_shared_config_diff_is_empty_for_formatting_and_node_local_edits() {
+        assert!(
+            shared_config_diff(SHARED_DIFF_BASE, SHARED_DIFF_BASE).is_empty(),
+            "an identical document has no shared changes"
+        );
+
+        // Re-serialize with different whitespace/comments: still semantic.
+        let reformatted = SHARED_DIFF_BASE
+            .replace("role = \"slave\"", "role    =    \"slave\"")
+            .replace("[upstream]", "# a comment\n[upstream]");
+        assert!(
+            shared_config_diff(SHARED_DIFF_BASE, &reformatted).is_empty(),
+            "formatting-only differences must not count as shared changes"
+        );
+
+        let node_local = SHARED_DIFF_BASE
+            .replace("slave-a", "slave-renamed")
+            .replace("/var/lib/sito", "/srv/sito")
+            .replace("log_level = \"info\"", "log_level = \"debug\"")
+            .replace("wss://master:8953", "wss://other-master:8953")
+            .replace("0.0.0.0:53", "127.0.0.1:5353")
+            .replace("/node/local.crt", "/etc/other.crt")
+            .replace("127.0.0.1", "0.0.0.0")
+            .replace("8080", "9090")
+            .replace("https://dns-a.example", "https://dns-b.example")
+            .replace("/node/cert.pem", "/etc/other-cert.pem")
+            .replace("/node/key.pem", "/etc/other-key.pem")
+            .replace("admin@example.com", "other@example.com")
+            .replace("node-secret", "rotated-secret")
+            .replace("node-token", "rotated-token");
+        assert!(
+            shared_config_diff(SHARED_DIFF_BASE, &node_local).is_empty(),
+            "node-local edits must be allowed on a slave: {:?}",
+            shared_config_diff(SHARED_DIFF_BASE, &node_local)
+        );
+
+        // Removing a section that only contains node-local values must also be
+        // node-local (an emptied section is not a shared change).
+        let removed_sections = SHARED_DIFF_BASE
+            .replace("[dns.tls]\ncert = \"/node/local.crt\"\n\n", "")
+            .replace("[tls]\ncert = \"/node/cert.pem\"\nkey = \"/node/key.pem\"\n\n", "")
+            .replace("[acme]\nenabled = true\nemail = \"admin@example.com\"\n\n", "")
+            .replace(
+                "[web]\nbind = \"127.0.0.1\"\nport = 8080\npublic_url = \"https://dns-a.example\"\n\n",
+                "",
+            )
+            .replace(
+                "[clients.client_id_secrets]\nlaptop = \"node-secret\"\n\n",
+                "",
+            );
+        assert!(
+            shared_config_diff(SHARED_DIFF_BASE, &removed_sections).is_empty(),
+            "removing node-local-only sections must be allowed: {:?}",
+            shared_config_diff(SHARED_DIFF_BASE, &removed_sections)
+        );
+    }
+
+    /// Shared policy changes are reported by their dotted path, and a mixed
+    /// edit reports only the shared part.
+    #[test]
+    fn test_shared_config_diff_reports_shared_paths() {
+        let shared = SHARED_DIFF_BASE.replace("9.9.9.9", "1.1.1.1");
+        assert_eq!(
+            shared_config_diff(SHARED_DIFF_BASE, &shared),
+            vec!["upstream.servers".to_string()]
+        );
+
+        let filtering = SHARED_DIFF_BASE.replace(
+            "custom_rules = [\"||ads.example^\"]",
+            "custom_rules = [\"||ads.example^\", \"||tracker.example^\"]",
+        );
+        assert_eq!(
+            shared_config_diff(SHARED_DIFF_BASE, &filtering),
+            vec!["filtering.custom_rules".to_string()]
+        );
+
+        let mixed = shared
+            .replace("log_level = \"info\"", "log_level = \"trace\"")
+            .replace("9.9.9.9", "1.1.1.1");
+        assert_eq!(
+            shared_config_diff(SHARED_DIFF_BASE, &mixed),
+            vec!["upstream.servers".to_string()],
+            "mixed edits must name the shared paths only"
+        );
+
+        // A removed and an added shared table are both detected.
+        let removed = SHARED_DIFF_BASE
+            .lines()
+            .filter(|line| !line.starts_with("custom_rules"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            shared_config_diff(SHARED_DIFF_BASE, &removed)
+                .contains(&"filtering.custom_rules".to_string())
+        );
+
+        let added = SHARED_DIFF_BASE.replace(
+            "enabled = true\ncustom_rules = [\"||ads.example^\"]",
+            "enabled = true\ncustom_rules = [\"||ads.example^\"]\n\n[privacy]\nanonymize_querylog = true",
+        );
+        assert!(
+            shared_config_diff(SHARED_DIFF_BASE, &added).contains(&"privacy".to_string()),
+            "an added shared table must be reported: {:?}",
+            shared_config_diff(SHARED_DIFF_BASE, &added)
+        );
+    }
+
+    /// The diff is fail-closed: a document the sanitizer cannot parse is never
+    /// classified as node-local-only.
+    #[test]
+    fn test_shared_config_diff_fails_closed_on_unparseable_documents() {
+        assert_eq!(
+            shared_config_diff("not = [valid", SHARED_DIFF_BASE),
+            vec![SHARED_DIFF_UNPARSEABLE.to_string()]
+        );
+        assert_eq!(
+            shared_config_diff(SHARED_DIFF_BASE, "not = [valid"),
+            vec![SHARED_DIFF_UNPARSEABLE.to_string()]
+        );
     }
 
     #[test]

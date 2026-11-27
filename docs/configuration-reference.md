@@ -1192,6 +1192,20 @@ last applied configuration. The watermark also records a BLAKE3 digest of the
 **shared projection** of the applied `config.toml` and the master signing-key
 fingerprint; a local edit to a shared field marks the node `Degraded` and forces
 a full apply before it can report `Synced` again, while node-local edits do not.
+The same projection backs the edit-time read-only gate: `PUT /api/v2/config`
+and every UI apply path compare the candidate with the running document and
+reject a shared-field change with `409 Conflict`,
+`type = "urn:sito:ha:shared_config_read_only"`, and a `shared_config_fields`
+array of the changed dotted paths. A hot-applied node-local-only edit is
+applied and persisted locally; a slave never publishes to the master and the
+watermark is not extended by a local edit. Restart-only fields keep their D11
+`409 restart_required` response (`server.role`, `server.instance_name`,
+`server.data_dir`, `server.log_format`, `[auth]`, `[web]` enabled/bind/port,
+`[tls]`, `[acme]`, `[ha]`, `[integrations]`); node-local restart-only fields
+require editing `config.toml` and restarting, while shared restart-only fields
+(`[auth]`, non-MikroTik `[integrations]`) must come from the master.
+`server.log_level` and `server.log_format` are node-local (logging is per node)
+and preserved by every push, while `[auth]` policy remains shared.
 Protocol v2 refuses v1 `ha_state.toml`/`ha_watermark.toml`; before the first v2
 start, back them up and move them aside on the master and every slave (see the
 [HA runbook §7.2](runbook-ha.md#72-upgrade-v1-cluster--v2)). This intentionally
@@ -1208,20 +1222,25 @@ Replication preserves node-local identity. The master does not overwrite a
 slave's `dns.bind`, `[dns.tls]`/`[tls]` certificate paths, `[acme]` account and
 cache settings, the `[web]` admin identity (`enabled`, `bind`, `port`,
 `trusted_proxies`, `metrics_auth`, `public_url`, `tls_terminated_by_proxy`),
-`[ha]`, `server.instance_name`, `server.data_dir`,
-`[integrations.mikrotik]` or `clients.client_id_secrets`. Web identity is
+`[ha]`, `server.role`, `server.instance_name`, `server.data_dir`,
+`server.log_level`, `server.log_format`, `[integrations.mikrotik]` or
+`clients.client_id_secrets`. Web identity is
 node-local: a slave may disable the admin listener or reach it through a
 different bind/proxy/URL than the master, and those differences do not make a
 push fail. `dns.port` and the other listener ports are shared configuration;
 the runbook's master `bind = ["0.0.0.0", "::"]` and slave
 `bind = ["0.0.0.0"]` therefore coexist, including on hosts without IPv6.
 
-If a push changes a restart-only field that is **not** preserved as node-local
-(for example `server.log_format` or `[auth]`), the slave rejects the push before
-applying or persisting anything: it keeps its previous live configuration and
-file, enters `Degraded`, and ACKs `applied: false` with a `restart_required`
-reason naming the fields. Restart the slave with the intended configuration (or
-change those fields locally) before expecting the master to report it synced.
+If a push changes a **shared** restart-only field that is not preserved as
+node-local (for example `[auth]` policy or a non-MikroTik `[integrations]`
+section), the slave rejects the push before applying or persisting anything: it
+keeps its previous live configuration and file, enters `Degraded`, and ACKs
+`applied: false` with a `restart_required` reason naming the fields. Restart the
+slave with the intended configuration (or change those fields locally) before
+expecting the master to report it synced. Node-local restart-only fields
+(`server.role`, `server.instance_name`, `server.data_dir`, `server.log_format`,
+`[ha]`, `[web]` enabled/bind/port, `[tls]`, `[acme]`, `[integrations.mikrotik]`)
+are preserved from this node and never cause a push rejection.
 
 `[auth]` is compared as effective policy: an explicit table containing the
 default values is equivalent to omitting `[auth]`, and legacy keys already

@@ -13,7 +13,25 @@ pub async fn settings_page(State(ctx): State<ServerContext>, headers: HeaderMap)
     };
     let csrf = get_csrf_token(&ctx, &headers);
 
-    let cfg = ctx.config.load();
+    let (cache_size_mb, min_ttl, dnssec_enabled, rate_limit, configured_role) = {
+        let cfg = ctx.config.load();
+        (
+            cfg.dns.cache.size_mb,
+            cfg.dns.cache.min_ttl,
+            cfg.dns.dnssec.validate,
+            cfg.dns.rate_limit_per_ip,
+            cfg.server.role.clone(),
+        )
+    };
+    // On a replica slave every field on this page is shared, master-managed
+    // policy. Render the form read-only instead of letting the POST bounce off
+    // the slave middleware with a JSON 409.
+    let ha_replica = configured_role == "slave" && !ctx.ha_write_gate.is_effective_master();
+    let ha_master_url = if ha_replica {
+        ctx.resolve_master_url()
+    } else {
+        String::new()
+    };
 
     HtmlTemplate(SettingsTemplate {
         csrf_token: &csrf,
@@ -22,10 +40,12 @@ pub async fn settings_page(State(ctx): State<ServerContext>, headers: HeaderMap)
         user_role: &user.role.to_string(),
         active_tab: "settings",
         version: env!("CARGO_PKG_VERSION"),
-        cache_size_mb: cfg.dns.cache.size_mb,
-        min_ttl: cfg.dns.cache.min_ttl,
-        dnssec_enabled: cfg.dns.dnssec.validate,
-        rate_limit: cfg.dns.rate_limit_per_ip,
+        cache_size_mb,
+        min_ttl,
+        dnssec_enabled,
+        rate_limit,
+        ha_replica,
+        ha_master_url,
     })
     .into_response()
 }

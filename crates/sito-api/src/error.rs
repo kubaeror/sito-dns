@@ -34,6 +34,15 @@ pub struct ProblemDetails {
     /// setting that is read at process start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_required: Option<Box<Vec<String>>>,
+    /// Shared configuration field paths that caused a 409 Conflict on an HA
+    /// replica slave (`urn:sito:ha:shared_config_read_only`).
+    ///
+    /// Present only when a local write tried to change master-managed shared
+    /// configuration; the write persisted nothing.
+    // Boxed like `restart_required` to keep `ProblemDetails` small for
+    // `Result` returns (clippy `result_large_err`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_config_fields: Option<Box<Vec<String>>>,
     /// `Retry-After` seconds for a 429 response. Never serialized into the
     /// problem body; the response builder turns it into a header. `u16` keeps
     /// `ProblemDetails` small (the limiter windows are at most one minute).
@@ -51,6 +60,7 @@ impl ProblemDetails {
             detail: detail.into(),
             instance: None,
             restart_required: None,
+            shared_config_fields: None,
             retry_after_secs: None,
         }
     }

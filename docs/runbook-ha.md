@@ -981,10 +981,60 @@ edit to one of these fields does not force a full apply:
 - the complete `[integrations.mikrotik]` section;
 - `[clients] client_id_secrets`.
 
-A local edit to any other (shared) field is detected as drift on the next
-watcher/restart check, marks the node `Degraded`, and requires a full apply from
-the master. Slaves still detect shared-field drift after the write; edit-time
-read-only enforcement is a future API feature, not a v2 guarantee.
+Everything else survives HA sanitization (`[filtering]`, `[rewrites]`,
+`[clients]` groups/entries/ACL, `[upstream]`, `[dns.cache]`,
+`[dns.dnssec]`, `[privacy]`, `[stats]`, `[auth]` policy and the cluster-shared
+`[web]` legacy ACME aliases) and is **master-managed shared configuration**.
+
+**Editing a slave through the API/UI.** `PUT /api/v2/config` is allowed through
+the slave middleware and the apply pipeline compares the candidate with the
+running document before persist/apply:
+
+- a hot-applied node-local-only change (or a formatting-only rewrite) is
+  applied and persisted locally; the slave never publishes to the master and
+  the HA watermark is untouched. Restart-only fields keep their existing D11
+  `409 restart_required` response (`server.role`, `server.instance_name`,
+  `server.data_dir`, `server.log_format`, `[auth]`, `[web]` enabled/bind/port,
+  `[tls]`, `[acme]`, `[ha]`, `[integrations]`). Node-local restart-only fields
+  (`server.role`, `server.instance_name`, `server.data_dir`,
+  `server.log_format`, `[ha]`, `[web]`, `[tls]`, `[acme]`,
+  `[integrations.mikrotik]`) require editing `config.toml` and restarting that
+  node; shared restart-only fields (`[auth]`, non-MikroTik `[integrations]`)
+  must be changed on the master and pushed, and a slave rejects the push until
+  it has been restarted with the intended restart-only values. `server.log_level`
+  is node-local but hot-applied, not restart-only;
+- any shared-field change is rejected atomically with `409 Conflict`,
+  `type = "urn:sito:ha:shared_config_read_only"`, a `title` of
+  `HA Shared Configuration Read-Only`, and a `shared_config_fields` array of
+  the changed dotted paths (for example `["upstream.servers"]`). Nothing is
+  applied or persisted, including the node-local part of a mixed edit;
+- a promoted effective master (`ha_write_gate` effective master) is no longer a
+  replica and is not subject to the gate; a configured master is unaffected.
+
+`shared_config_fields` replaces guessing from an opaque error: submit the named
+fields to the master and let replication converge the node. An unparseable
+document fails closed with `<unparseable-config>` rather than being treated as
+node-local.
+
+The edit-time guarantee covers the API/UI **apply handlers** only. Other config
+mutation routes stay blocked by the slave middleware with
+`urn:sito:ha:read-only`: `POST /api/v2/config/reload`, `/api/v2/config/restore*`,
+the filtering/clients/rewrites/upstream/settings UI actions and the system
+reload action. A direct hand edit of `config.toml` bypasses both gates: the
+file-watcher/restart drift check is the only protection for that path and
+overwrites the edit on the next push. The shared projection excludes
+`server.role`, `server.log_level`/`server.log_format` and the
+sanitizer-stripped legacy `[auth]` secret keys (`admin_password_hash`,
+`tokens`), so direct edits to those are not drift-detected; role and
+`server.log_format` are node-local restart-only, `server.log_level` is
+node-local and hot-applied, and the legacy auth keys are inert. A watermark written by an older build (whose projection
+included logging) may be seen as drifted **once** after the upgrade and force a
+full apply; this is safe and self-heals on the next push/restart.
+
+The Settings and System UI pages render shared controls read-only on a replica
+with a “Managed by the master” explanation and the configured master URL; the
+filtering, clients, rewrites and upstreams pages still rely on the middleware
+409 (UI row-level residual, tracked in the 2.0 claim matrix).
 
 ---
 

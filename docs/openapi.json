@@ -6252,6 +6252,16 @@
             },
             "description": "Restart-only configuration fields that caused a 409 Conflict (D11).\n\nPresent only on configuration writes rejected because they change a\nsetting that is read at process start."
           },
+          "shared_config_fields": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Shared configuration field paths that caused a 409 Conflict on an HA\nreplica slave (`urn:sito:ha:shared_config_read_only`).\n\nPresent only when a local write tried to change master-managed shared\nconfiguration; the write persisted nothing."
+          },
           "status": {
             "type": "integer",
             "format": "int32",

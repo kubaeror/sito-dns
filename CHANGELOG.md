@@ -8,6 +8,19 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Added
+- Edit-time read-only enforcement for HA replica slaves. `PUT /api/v2/config`
+  now reaches the apply pipeline on a replica (the rest of the slave middleware
+  is unchanged); a semantic shared-projection diff
+  (`sito_ha::shared_config_diff`, the same boundary as the watermark digest)
+  rejects any master-managed shared change with `409 Conflict`,
+  `type = "urn:sito:ha:shared_config_read_only"` and a
+  `shared_config_fields` array of changed dotted paths, before anything is
+  applied or persisted. Node-local-only edits (identity/logging, `[ha]`, DNS
+  bind/TLS, web bind/TLS/ACME, integration credentials and
+  `clients.client_id_secrets`) are applied and persisted locally without an HA
+  publish or watermark change. Masters and promoted effective masters are
+  unaffected, and the Settings/System UI pages render shared controls read-only
+  on a replica with a "Managed by the master" explanation.
 - Parallel upstream races now report every launched candidate. A candidate
   that is still in flight when another candidate answers or the overall
   deadline fires is reported as a cancelled `UpstreamAttempt`
