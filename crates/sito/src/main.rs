@@ -144,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
                         term,
                         version,
                         bundle_hash,
+                        allow_equal_version,
                         confirm,
                     } => {
                         if let Err(e) = sito::cli::run_ha_lease_admin_set(
@@ -151,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
                             term,
                             version,
                             &bundle_hash,
+                            allow_equal_version,
                             confirm,
                         ) {
                             eprintln!("{e}");
@@ -170,6 +172,21 @@ async fn main() -> anyhow::Result<()> {
                 sito::cli::HaCommands::ClearFence { config, confirm } => {
                     let config_path = config.unwrap_or(default_config_path.clone());
                     if let Err(e) = sito::cli::run_ha_clear_fence(&config_path, confirm) {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+                sito::cli::HaCommands::RotateSigningKey {
+                    config,
+                    confirm,
+                    term,
+                    version,
+                } => {
+                    let config_path = config.unwrap_or(default_config_path.clone());
+                    if let Err(e) =
+                        sito::cli::run_ha_rotate_signing_key(&config_path, confirm, term, version)
+                    {
                         eprintln!("{e}");
                         std::process::exit(1);
                     }

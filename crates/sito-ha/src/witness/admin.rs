@@ -32,11 +32,12 @@ pub fn lease_admin_set(
     version: u64,
     bundle_hash: &str,
 ) -> Result<LeaseAdminOutcome, WitnessError> {
-    lease_admin_set_with_clock(
+    lease_admin_set_inner(
         state_dir,
         term,
         version,
         bundle_hash,
+        false,
         Arc::new(SystemClock::new()),
     )
 }
@@ -47,6 +48,53 @@ pub fn lease_admin_set_with_clock(
     term: u64,
     version: u64,
     bundle_hash: &str,
+    clock: Arc<dyn super::clock::Clock>,
+) -> Result<LeaseAdminOutcome, WitnessError> {
+    lease_admin_set_inner(state_dir, term, version, bundle_hash, false, clock)
+}
+
+/// Term-only recovery: raise the term while keeping the current published
+/// version and bundle hash.
+///
+/// Required after an offline signing-key rotation. The strict
+/// [`lease_admin_set`] path refuses an equal version, and raising the version
+/// above the cluster's published baseline makes acquisition fail
+/// `master_state_behind`. This mode accepts an equal version only with the
+/// exact current hash; it still refuses a lower term/version and a different
+/// hash.
+pub fn lease_admin_set_term_only(
+    state_dir: &std::path::Path,
+    term: u64,
+    version: u64,
+    bundle_hash: &str,
+) -> Result<LeaseAdminOutcome, WitnessError> {
+    lease_admin_set_inner(
+        state_dir,
+        term,
+        version,
+        bundle_hash,
+        true,
+        Arc::new(SystemClock::new()),
+    )
+}
+
+/// Like [`lease_admin_set_term_only`], with an explicit witness clock (tests).
+pub fn lease_admin_set_term_only_with_clock(
+    state_dir: &std::path::Path,
+    term: u64,
+    version: u64,
+    bundle_hash: &str,
+    clock: Arc<dyn super::clock::Clock>,
+) -> Result<LeaseAdminOutcome, WitnessError> {
+    lease_admin_set_inner(state_dir, term, version, bundle_hash, true, clock)
+}
+
+fn lease_admin_set_inner(
+    state_dir: &std::path::Path,
+    term: u64,
+    version: u64,
+    bundle_hash: &str,
+    allow_equal_version: bool,
     clock: Arc<dyn super::clock::Clock>,
 ) -> Result<LeaseAdminOutcome, WitnessError> {
     let record_path = state_dir.join(LEASE_FILE);
@@ -66,7 +114,11 @@ pub fn lease_admin_set_with_clock(
         )
     })?;
     let store = LeaseStore::open(state_dir, &existing.cluster_id, clock)?;
-    let (record, backup_path) = store.set_high_water(term, version, bundle_hash)?;
+    let (record, backup_path) = if allow_equal_version {
+        store.set_high_water_allow_equal_version(term, version, bundle_hash)?
+    } else {
+        store.set_high_water(term, version, bundle_hash)?
+    };
     Ok(LeaseAdminOutcome {
         record,
         backup_path,

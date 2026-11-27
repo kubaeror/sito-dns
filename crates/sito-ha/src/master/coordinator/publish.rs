@@ -124,7 +124,7 @@ impl MasterCoordinator {
     /// Rejects a signed envelope that cannot fit the WebSocket message limit
     /// before it is persisted or broadcast. An oversized bundle must be an
     /// apply error, not a config that every slave rejects forever.
-    pub(super) fn ensure_push_fits(push: &HaMessage) -> Result<(), HaError> {
+    pub(crate) fn ensure_push_fits(push: &HaMessage) -> Result<(), HaError> {
         // `wire_size` reports 0 for a message it cannot serialize; use the
         // fallible length here so an impossible serialization failure cannot
         // silently bypass the size guard.

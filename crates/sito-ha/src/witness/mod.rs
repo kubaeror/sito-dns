@@ -24,7 +24,10 @@ pub mod store;
 #[cfg(test)]
 mod tests;
 
-pub use admin::{LeaseAdminOutcome, lease_admin_set, lease_admin_set_with_clock};
+pub use admin::{
+    LeaseAdminOutcome, lease_admin_set, lease_admin_set_term_only,
+    lease_admin_set_term_only_with_clock, lease_admin_set_with_clock,
+};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use record::{AcquireRequest, LEASE_PROTOCOL_VERSION, LeaseInfo, LeaseRecord, RenewRequest};
 pub use server::{

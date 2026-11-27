@@ -801,6 +801,73 @@ impl PromotionEngine {
         &self.confirm
     }
 
+    /// Validates that persisted state and the runtime signing key are the same
+    /// identity.
+    ///
+    /// `MasterCoordinator::restore_state` performs this check on the normal
+    /// (non-promotion) startup path. A promotion-enabled master loads
+    /// `ha_state.toml` directly in [`Self::boot`], so it must apply the same
+    /// fail-closed rule before acquisition. A rotated state paired with the old
+    /// key (or vice versa) must never be signed or rewritten under a different
+    /// identity.
+    ///
+    /// A legacy state without `signing_key_pubkey` is allowed: there is no
+    /// recorded identity to compare. A configured master must expose its
+    /// runtime key when the state records one; a candidate that has not loaded
+    /// its key yet is checked again after eligibility loads it.
+    fn validate_persisted_signing_key(&self, loaded: &LoadedState) -> Result<(), HaError> {
+        let LoadedState::Present { state, .. } = loaded else {
+            return Ok(());
+        };
+        let Some(recorded) = state.signing_key_pubkey.as_deref() else {
+            return Ok(());
+        };
+        let Some(actual_hex) = self.host.signing_key_pubkey() else {
+            if self.role == ConfiguredRole::Master {
+                return Err(HaError::Validation {
+                    field: "ha_signing_key".to_string(),
+                    reason: format!(
+                        "HA state at {} records signing key {recorded}, but the runtime did not provide its signing key; refusing to acquire or re-sign state without verifying the identity",
+                        self.state.path().display()
+                    ),
+                });
+            }
+            return Ok(());
+        };
+        let recorded =
+            crate::crypto::parse_public_key(recorded).map_err(|error| HaError::Validation {
+                field: "ha_signing_key".to_string(),
+                reason: format!(
+                    "HA state at {} records an invalid signing key '{recorded}': {error}",
+                    self.state.path().display()
+                ),
+            })?;
+        let actual =
+            crate::crypto::parse_public_key(&actual_hex).map_err(|error| HaError::Validation {
+                field: "ha_signing_key".to_string(),
+                reason: format!("the runtime signing key '{actual_hex}' is invalid: {error}"),
+            })?;
+        if recorded != actual {
+            return Err(HaError::Validation {
+                field: "ha_signing_key".to_string(),
+                reason: format!(
+                    "HA state at {} was written by signing key {}, but the loaded key is {}. ha_signing.key was lost or replaced. Restore the original key from backup, or rotate/re-enroll explicitly after an offline signing-key rotation",
+                    self.state.path().display(),
+                    hex::encode(recorded),
+                    actual_hex
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Re-loads and validates the persisted signing-key identity.
+    fn reload_and_validate_signing_key(&self) -> Result<LoadedState, HaError> {
+        let loaded = self.state.load()?;
+        self.validate_persisted_signing_key(&loaded)?;
+        Ok(loaded)
+    }
+
     /// Boots the engine: fence/state inspection, read-only gating, and
     /// role-appropriate initial phase. Never touches the witness.
     pub fn boot(&self) -> Result<PromotionOutcome, HaError> {
@@ -833,6 +900,13 @@ impl PromotionEngine {
         }
 
         let loaded = self.state.load()?;
+        // Promotion-enabled masters load the state here instead of through
+        // `MasterCoordinator::restore_state`. Apply the same signing-key
+        // identity check the normal restore path performs before anything can
+        // acquire a lease, prepare a bundle or re-seal the state with the
+        // loaded key. Otherwise an old key paired with a rotated state would
+        // silently re-sign the rotated state with the old key.
+        self.validate_persisted_signing_key(&loaded)?;
         // Copy the active bundle hash as well as its term/version. A restarted
         // master with the witness down must not report `version = N` with
         // `bundle_hash = "none"`; "none" is valid only at version 0.
@@ -949,6 +1023,19 @@ impl PromotionEngine {
         if self.is_fenced() {
             return PromotionOutcome::Fenced;
         }
+        // Re-check immediately before acquisition. `boot` normally did this,
+        // but the files can change between boot and the first acquire (for
+        // example an operator restoring only one of the two rotation backups).
+        if let Err(error) = self.reload_and_validate_signing_key() {
+            self.host
+                .set_writable(false, Some("promotion_interrupted".to_string()));
+            self.set_phase(PromotionPhase::Aborted, Some("promotion_interrupted"));
+            warn!(error = %error, "Refusing master acquisition: persisted signing-key identity mismatch");
+            return PromotionOutcome::ReadOnly {
+                reason: format!("promotion_interrupted: {error}"),
+                retryable: false,
+            };
+        }
         match self.acquire(AcquisitionRole::Master, "restart").await {
             AcquireOutcome::Acquired => {}
             AcquireOutcome::Outcome(outcome) => return outcome,
@@ -1024,6 +1111,20 @@ impl PromotionEngine {
             self.set_phase(PromotionPhase::Aborted, Some(reason));
             self.record_refusal(reason);
             self.audit(REFUSED, "refused", Some(reason), 0, 0, None);
+            return PromotionOutcome::ReadOnly {
+                reason: reason.to_string(),
+                retryable: false,
+            };
+        }
+
+        // `eligibility` loads the candidate key (when one exists). Compare it
+        // with the identity recorded in any local state before acquiring.
+        if let Err(error) = self.reload_and_validate_signing_key() {
+            let reason = "candidate_identity_mismatch";
+            self.set_phase(PromotionPhase::Aborted, Some(reason));
+            self.record_refusal(reason);
+            self.audit(REFUSED, "refused", Some(reason), 0, 0, None);
+            warn!(error = %error, "Refusing candidate acquisition: persisted signing-key identity mismatch");
             return PromotionOutcome::ReadOnly {
                 reason: reason.to_string(),
                 retryable: false,

@@ -21,6 +21,7 @@ use super::witness_client::WitnessClient;
 use super::witness_client::WitnessClientError;
 use crate::bundle::{build_and_sign_push, push_payload_hash};
 use crate::crypto::Ed25519SigningKey;
+use crate::error::HaError;
 use crate::witness::clock::ManualClock;
 use crate::witness::record::{AcquireRequest, LeaseInfo, LeaseRecord, RenewRequest};
 use crate::witness::server::{WitnessConfig, WitnessHandle, start_witness_server};
@@ -909,6 +910,94 @@ async fn master_startup_runs_acquire_quiesce_reconcile_publish() {
     let bookkeeping = bookkeeping.unwrap();
     assert_eq!(bookkeeping.publication_state, PublicationState::Published);
     assert_eq!(bookkeeping.published_version, 1);
+}
+
+#[tokio::test]
+async fn promotion_master_refuses_old_key_with_rotated_state_before_acquisition() {
+    let harness = Harness::new("promotion_key_mismatch", "node-a").await;
+    let published = hash(0xab);
+    seed_state(
+        &harness.data_dir("node-a"),
+        4,
+        8,
+        PublicationState::Published,
+        (8, &published),
+        None,
+        (8, &published),
+    );
+    // Model the rotation rollback where the state was re-sealed to a new key
+    // but the old key file was restored (or the two backups were swapped).
+    let state_path = harness.data_dir("node-a").join("ha_state.toml");
+    let store = HaStateStore::new(state_path.clone());
+    let LoadedState::Present { mut state, .. } = store.load().unwrap() else {
+        panic!("state");
+    };
+    let rotated_key = Ed25519SigningKey::generate().unwrap();
+    state.signing_key_pubkey = Some(rotated_key.public_key_hex());
+    store.save(&state).unwrap();
+    let before = std::fs::read(&state_path).unwrap();
+
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    let error = engine
+        .boot()
+        .expect_err("old key + rotated state must fail closed");
+    assert!(
+        matches!(error, HaError::Validation { ref field, .. } if field == "ha_signing_key"),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("was written by signing key"),
+        "the error must be actionable: {error}"
+    );
+
+    // No acquisition, prepare, publish or state re-seal happened.
+    assert!(!harness.host.writable.load(Ordering::SeqCst));
+    assert!(harness.host.pushed.lock().unwrap().is_none());
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    let events = harness.events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("prepare:") || event.starts_with("publish:")),
+        "{events:?}"
+    );
+    assert!(
+        harness
+            .fixture
+            .client("node-a")
+            .lease()
+            .await
+            .unwrap()
+            .is_none(),
+        "boot must not acquire a witness lease"
+    );
+
+    // Calling `start_master` directly (without a prior boot) must also refuse
+    // before acquisition and remain read-only.
+    let engine = harness.engine("node-a", ConfiguredRole::Master);
+    let outcome = engine.start_master().await;
+    match outcome {
+        PromotionOutcome::ReadOnly {
+            reason,
+            retryable: false,
+        } => assert!(
+            reason.starts_with("promotion_interrupted:"),
+            "unexpected reason: {reason}"
+        ),
+        other => panic!("expected read-only refusal, got {other:?}"),
+    }
+    assert!(!harness.host.writable.load(Ordering::SeqCst));
+    assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    assert!(
+        harness
+            .fixture
+            .client("node-a")
+            .lease()
+            .await
+            .unwrap()
+            .is_none(),
+        "start_master must not acquire a witness lease"
+    );
 }
 
 #[tokio::test]
@@ -1852,10 +1941,14 @@ async fn restart_with_slave_role_is_a_candidate_and_never_writable_from_state() 
     let harness = Harness::new("role_restart", "node-a").await;
     let engine = harness.engine("node-a", ConfiguredRole::Master);
     assert_eq!(engine.start_master().await, PromotionOutcome::Master);
-    let host = Arc::new(TestHost::new(
+    let mut restarted_host = TestHost::new(
         &harness.data_dir("node-a"),
         Arc::new(Mutex::new(Vec::new())),
-    ));
+    );
+    // A process restart reuses the same key file; the promotion-enabled
+    // engine now validates that identity against ha_state.toml.
+    restarted_host.key = Ed25519SigningKey::from_pkcs8(harness.host.key.pkcs8_bytes()).unwrap();
+    let host = Arc::new(restarted_host);
     let restarted = harness.fixture.engine(
         "node-a",
         ConfiguredRole::Slave,

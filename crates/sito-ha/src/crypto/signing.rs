@@ -109,7 +109,7 @@ impl Ed25519SigningKey {
 /// Creates `path` with mode 0600 and writes `bytes`, failing if it already
 /// exists. On Unix the file is never observable with wider permissions (the
 /// mode is applied at creation time).
-fn write_private_exclusive(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_exclusive(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write as _;

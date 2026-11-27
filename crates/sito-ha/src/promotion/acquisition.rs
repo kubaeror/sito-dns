@@ -664,6 +664,54 @@ mod tests {
     }
 
     #[test]
+    fn term_only_witness_bump_unblocks_a_rotated_master() {
+        let published = "ab".repeat(32);
+        let pending = "cd".repeat(32);
+        let (bookkeeping, pending_version) = bookkeeping(
+            PublicationState::Pending,
+            (7, &published),
+            Some(&pending),
+            8,
+        );
+        let mut local = LocalContent::master(4, Some(bookkeeping), 7, Some(published.clone()));
+        local.state_version = 8;
+        local.state_hash = Some(pending.clone());
+        local.pending_version = pending_version;
+
+        // Before the term-only bump the witness is still at term 3, below the
+        // rotated state term 4, so acquisition refuses.
+        assert_eq!(
+            decide_acquisition(
+                AcquisitionRole::Master,
+                &local,
+                Some(&record(3, 12, 7, &published)),
+                "node-a/new-boot",
+                Some(1),
+            ),
+            AcquisitionDecision::Refuse(PromotionRefusal::MasterTermAhead)
+        );
+
+        // After `lease-admin set --allow-equal-version --term 4` the witness
+        // holds term 4 with the same published version/hash. The master can
+        // acquire term 5, publish the staged version 8 and keep 7/hash as its
+        // witness baseline.
+        let AcquisitionDecision::Acquire(plan) = decide_acquisition(
+            AcquisitionRole::Master,
+            &local,
+            Some(&record(4, 13, 7, &published)),
+            "node-a/new-boot",
+            Some(1),
+        ) else {
+            panic!("expected acquire after the term-only bump");
+        };
+        assert_eq!(plan.term, 5);
+        assert_eq!(plan.baseline.version, 7);
+        assert_eq!(plan.baseline.hash, published);
+        assert_eq!(plan.publish_version, 8);
+        assert!(plan.reusing_pending);
+    }
+
+    #[test]
     fn master_restart_publishes_a_new_version_without_a_config_change() {
         let hash = "ab".repeat(32);
         let mut master = LocalContent::master(3, None, 7, Some(hash.clone()));
