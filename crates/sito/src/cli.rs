@@ -431,15 +431,16 @@ pub enum LeaseAdminCommands {
         /// New term; must be greater than the current record term
         #[arg(long)]
         term: u64,
-        /// New published version; must be greater than the current record version
+        /// New published version; the default strict mode requires it to be
+        /// greater than the current record version
         #[arg(long)]
         version: u64,
         /// Published bundle hash (64 hex characters, with or without blake3:)
         #[arg(long)]
         bundle_hash: String,
-        /// Raise only the term and keep the current version/hash (required after
-        /// an offline signing-key rotation). The version must match the current
-        /// record and the hash must be identical.
+        /// Allow an equal version when the bundle hash exactly matches the
+        /// current record (required after an offline signing-key rotation). A
+        /// higher version still follows the normal strict-rise rule.
         #[arg(long, alias = "term-only")]
         allow_equal_version: bool,
         /// Required confirmation; the previous record is backed up first
@@ -3485,6 +3486,37 @@ mod tests {
                 assert!(confirm);
             }
             other => panic!("expected ha lease-admin set command, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "sito",
+            "ha",
+            "lease-admin",
+            "set",
+            "--state-dir",
+            "/var/lib/sito-lease",
+            "--term",
+            "9",
+            "--version",
+            "128",
+            "--bundle-hash",
+            &"ab".repeat(32),
+            "--term-only",
+            "--confirm",
+        ])
+        .expect("parse lease-admin set --term-only alias");
+        match cli.command {
+            Some(Commands::Ha {
+                command:
+                    HaCommands::LeaseAdmin {
+                        command:
+                            LeaseAdminCommands::Set {
+                                allow_equal_version,
+                                ..
+                            },
+                    },
+            }) => assert!(allow_equal_version),
+            other => panic!("expected ha lease-admin set alias, got {other:?}"),
         }
 
         let error = run_ha_lease_admin_set(Path::new("/nonexistent"), 9, 128, "none", false, false)

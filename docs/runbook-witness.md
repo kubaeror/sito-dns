@@ -266,7 +266,8 @@ is wrong: acquisition then reports `master_state_behind` because the witness is
 above the cluster's published baseline.
 
 Use the explicit term-only mode instead. It requires a strictly higher term and
-the **same** current version and the **exact** current bundle hash:
+the **exact** current bundle hash. The version may equal the current record (the
+normal steady state) or be strictly higher under the ordinary strict-rise rule:
 
 ```bash
 sudo sito ha lease-admin set \
