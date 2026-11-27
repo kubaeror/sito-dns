@@ -12,8 +12,8 @@ tag must not move. Use an explicit version/tag for evaluation.
 - **Database:** the 1.9.x SQLite schema remains readable/usable; there is no new
   schema migration command in this release
 - **HA:** protocol v2; a coordinated cluster upgrade is required
-- **API:** `/api/v1` remains canonical; `/api/v2` and a compatibility facade are
-  not part of this release
+- **API:** `/api/v1` was canonical for rc.2; the final 2.0 line mounts `/api/v2`
+  only (see the migration guide)
 
 ## Highlights
 
@@ -67,7 +67,7 @@ WebSocket `?token=` removal, and the updater/validation tightening.
    sudo sito check-config --config /etc/sito/config.toml
    ```
 
-4. Start 2.0 and verify DNS, `/health`, and authenticated `/api/v1/status`.
+4. Start 2.0 and verify DNS, `/health`, and authenticated `/api/v2/status`.
 5. HA only: follow the coordinated v1→v2 procedure in
    [`docs/runbook-ha.md`](runbook-ha.md#7-ha-protocol-v2-upgrade-and-downgrade).
    Move the v1 `ha_state.toml`/`ha_watermark.toml` aside after backing them up;
@@ -138,10 +138,12 @@ See [`docs/release-verification.md`](release-verification.md) and the
   full 24-hour checklist is not a blocker for this RC by operator decision.
 - **DNAME (P1-1)** remains a documented DNSSEC residual; the validator fails
   closed. See the security review for the risk acceptance.
-- **SQLite schema/PII migration and API v2** are deferred; `/api/v1` is
-  canonical and the 1.9.x schema is compatibility-only.
-- **Weighted upstream balancing**, edit-time read-only HA enforcement and
-  per-client upstream metric pruning are deferred.
+- **SQLite schema/PII migration and API v2** were deferred for rc.2; both
+  shipped in the final 2.0 line (`sito db migrate`, `/api/v2` only). The 1.9.x
+  schema remains compatibility-only.
+- **Weighted upstream balancing and edit-time read-only HA enforcement** were
+  deferred for rc.2 and shipped in the final 2.0 line. Per-client upstream
+  metric pruning also landed with the upstream metrics work.
 - **Query-log anonymization** is forward-only; historical rows are not rewritten.
 - **`stats_watermark` is diagnostic (B7, accepted residual).** Retention writes
   it for progress diagnostics and v1.9 schema compatibility but never reads it

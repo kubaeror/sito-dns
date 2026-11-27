@@ -11,7 +11,7 @@ This runbook provides step-by-step operational procedures for managing, maintain
 - **Slave Nodes**: Connect to the master over WebSocket + mTLS, verify the master's Ed25519 signature and certificate fingerprint, enforce the cluster epoch (a bundle from an older term is rejected even when its version is higher) and strict monotonic version ordering within a term, and apply configuration snapshots atomically. The last applied term, version, signed payload hash, digest of the **shared projection** of the applied `config.toml`, signing-key fingerprint and timestamp are persisted to `data_dir/ha_watermark.toml` (atomic, mode `0600`) before the push is acknowledged, so a restart cannot replay an older bundle, accept same-version content with a different hash, or early-ACK a locally edited shared configuration. Protocol v2 refuses a v1 watermark; back it up and move it aside before the first v2 start (see §7). A slave that receives no frame for `3 × ping_interval_secs` leaves `Synced` and reports not-ready. A corrupt or v1 watermark fails startup; delete it only after backup to force a full resync.
 - **Admission limits**: the replication listener accepts at most 64 concurrent slave sessions and at most 8 concurrent sessions per source IP; a 10 s timeout bounds TLS/WebSocket handshakes and one WebSocket write. A NAT deployment with more than eight simultaneous HA peers from one address must be split across source addresses.
 - **Continuous Resolution**: Slaves serve DNS queries continuously without downtime. If an invalid or unparsable configuration bundle is received, the slave performs an automatic rollback to its last known good snapshot and enters a `Degraded` state.
-- **Read-Only Enforcement**: Slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master.
+- **Read-Only Enforcement**: Replica slave REST API endpoints reject mutating operations (`POST`, `PUT`, `DELETE`, `PATCH`) with HTTP `409 Conflict` and return the `X-Dnsd-Master: <master_url>` header to redirect operators to the authoritative master. The config exception is `PUT /api/v2/config`: node-local listeners/TLS, `[web]`, `[ha]`, logging/identity and per-node credentials are accepted locally when hot-appliable (a node-local restart-only field still returns `409 restart_required` and must be changed in `config.toml` and followed by a restart), while a master-managed shared-field change is rejected with `409` `urn:sito:ha:shared_config_read_only` and a `shared_config_fields` array before anything is persisted (see §7.5).
 - **Statistics Aggregation**: Slaves report traffic and upstream metrics to the master every 30 seconds via `stats_report`. The master stores the latest report per slave and exposes it through `GET /api/v2/ha/slaves`; replica counters are **not** merged into the master's own Prometheus registry. Scrape each replica's `/metrics` endpoint separately (labels such as `sito_ha_config_version{instance="..."}` identify the node).
 
 ### Witness server for automatic promotion
@@ -322,11 +322,14 @@ owns the decisions the witness cannot make. With `enabled = true` on every node:
    lease. The node still has to acquire a new term. If the service is still
    running, restart it after clearing so the in-memory fenced state is re-read.
 5. Watch `GET /api/v2/ha/status` (`promotion.state`/`reason`/`term`/`version`),
-   the `sito_ha_promotion_*` metrics and the `ha.promotion.*` audit records.
-   A witness outage is a single point of **availability**: the master fences
-   after the TTL and no promotion happens until the witness returns. DNS keeps
-   serving from the last snapshot. Run the witness on a third failure domain and
-   monitor it.
+   the `sito_ha_promotion_*` metrics and the `ha.promotion.*` audit records;
+   [the promotion client guide](ha-promotion-client.md) tabulates every status
+   field, metric label and audit event. `promotion.lease_expires_in_secs` is
+   **display-only** (local wall clock, never a safety input), and
+   `promotion.witness_reachable` is a last-probe observation. A witness outage
+   is a single point of **availability**: the master fences after the TTL and no
+   promotion happens until the witness returns. DNS keeps serving from the last
+   snapshot. Run the witness on a third failure domain and monitor it.
 
 The manual procedure below remains the escape hatch, including when promotion
 is disabled. If promotion is enabled cluster-wide, prefer the automatic path or
@@ -374,53 +377,78 @@ acquires the lease; otherwise disable promotion everywhere first (section 7).
      Ed25519 key. If possible, copy the *old* master's key file to the promoted
      node (mode `0600`) so the remaining slaves keep trusting
      `master_pubkey` without changes. A key is generated automatically when
-     the file does not exist, but every slave must then be given the new
-     public key.
+     the file does not exist, but that is only safe with a fresh/missing state
+     (or after updating the state's `signing_key_pubkey`); every slave must then
+     be given the new public key. If you copy the old state, copy its matching
+     key too — a mismatch fails startup.
    - **State file** (`data_dir/ha_state.toml`): the persisted active bundle,
      version and cluster term, plus the Ed25519 public key that wrote it
-     (`signing_key_pubkey`). Restoring the old master's file keeps the
-     sequence monotonic and the term unchanged. If the loaded
-     `ha_signing.key` no longer matches that recorded identity, startup fails
-     with an actionable error instead of silently re-signing the persisted
-     state with a new key. A missing file starts a fresh sequence; a
-     **corrupt, v1, foreign or partial** file is moved aside and fails closed —
-     the master never resets the sequence silently. Restore a backup or
-     explicitly re-seed the state (see below). A promoted master must not adopt
-     a counter from its peers: it detects any replica that is ahead (same term)
-     or in a newer term, marks itself `diverged`, and refuses to overwrite the
-     cluster. Promote it explicitly before pointing anything at it.
+     (`signing_key_pubkey`). It is JSON behind the historical name, and uses
+     the v2 wrapper: a top-level `protocol_version` plus a nested `bundle`
+     object. Restoring the old master's file keeps the sequence monotonic and
+     the term unchanged. If the loaded `ha_signing.key` no longer matches that
+     recorded identity, startup fails with an actionable error instead of
+     silently re-signing the persisted state with a new key. A missing file
+     starts a fresh sequence. A **corrupt, v1, partial or (with promotion
+     enabled) foreign cluster/node** file fails closed and **never** resets the
+     sequence on that start. On the non-promotion coordinator path, an
+     unrecognized corrupt file is renamed to
+     `ha_state.corrupt.<unix-timestamp>` next to the original and retained
+     (the startup error names the path), and the process exits non-zero; stop
+     the service manager's restart loop before retrying, because a later start
+     with no `ha_state.toml` deliberately begins a fresh sequence. With
+     promotion enabled the engine refuses the corrupt file in place and stays
+     read-only instead of renaming it. The original bytes are retained in every
+     case (renamed for an unrecognized corrupt file on the coordinator path,
+     left in place otherwise). Restore a backup or explicitly re-seed the state
+     (see below); do not delete the file just to force a start. A
+     promoted master must not adopt a counter from its peers: it detects any
+     replica that is ahead (same term) or in a newer term, marks itself
+     `diverged`, and refuses to overwrite the cluster. Promote it explicitly
+     before pointing anything at it.
 
-     To promote a node explicitly, stop the service and create or edit
-     `ha_state.toml` (JSON, mode `0600`) so that:
-     - `term` is **one greater** than the highest term any replica has applied
-       (a first promotion from a term-0 cluster uses `1`), and
-     - `version` is greater than the highest version the remaining slaves have
-       applied (the previous cluster version `N` becomes `N+1`).
+     To promote a node explicitly, stop the service and edit the nested v2
+     `bundle` object in `ha_state.toml` (JSON, mode `0600`) so that:
+     - `bundle.term` is **one greater** than the highest term any replica has
+       applied (a first promotion from a term-0 cluster uses `1`), and
+     - `bundle.version` is greater than the highest version the remaining
+       slaves have applied (the previous cluster version `N` becomes `N+1`).
      A term increase alone is **not** accepted: slaves enforce version
      continuity across a promotion and reject a higher-term bundle whose
      version is not above their applied high-water mark. That prevents a
      promoted node with a stale state file from silently rolling the cluster
-     back.
+     back. Keep the top-level `protocol_version`, `signing_key_pubkey` and
+     every other field from the copied state; only the nested `bundle.term` and
+     `bundle.version` change, and startup re-seals the signed config identity
+     before publishing.
      ```json
      {
-       "version": 12,
-       "term": 1,
-       "timestamp": 1730000000000,
-       "config_toml": "...",
-       "custom_rules": [],
-       "lists": []
+       "protocol_version": 2,
+       "bundle": {
+         "protocol_version": 2,
+         "config_digest": "<64 lowercase hex>",
+         "signing_key_fingerprint": "<64 lowercase hex>",
+         "version": 12,
+         "term": 1,
+         "timestamp": 1730000000000,
+         "config_toml": "...",
+         "custom_rules": [],
+         "lists": []
+       },
+       "signing_key_pubkey": "<hex key matching ha_signing.key>"
      }
      ```
-     Keep the rest of a copy of the old master's state (or the last pushed
-     bundle) intact; only `version` and `term` need to change. Starting the
-     service then restores this state and publishes subsequent mutations with
-     the promoted term.
+     Starting the service then restores this state and publishes subsequent
+     mutations with the promoted term. Copy the old master's `ha_signing.key`
+     with the state when possible; if the node uses a different key, update
+     every slave's `master_pubkey` (section 8) before expecting a verified
+     bundle.
 
-     **Upgrade order:** upgrade every slave to a build that understands terms
-     and persists the term in `ha_watermark.toml` *before* promoting. A slave
-     that does not know about terms can still be overwritten by a stale
-     term-less master (it only compares versions), although its persisted
-     watermark still prevents rollback below what it has already applied.
+     **Upgrade order:** install the v2 build on every node, and upgrade every
+     slave *before* promoting. Protocol v2 refuses v1 peers and v1 state, so
+     there is no supported term-unaware mixed-version path; a v2 slave persists
+     the term and signed-payload identity in `ha_watermark.toml` before it ACKs
+     an apply.
 
    To obtain the master public key for the slave configs:
    ```bash
@@ -735,7 +763,7 @@ When a slave node fails or must be reprovisioned from bare metal:
 | Slave reports `"Degraded"` with `Local configuration drift` | A shared field in `config.toml` was edited or reverted locally after the last applied bundle | The persisted `ha_watermark.toml` stores the digest of the shared projection of the applied document. Wait for the master to push the current bundle (the slave forces a full apply even for the same version) or issue a resync. If the master is unreachable the node stays degraded and `/health` false until it reconnects. |
 | Slave reports a same-version payload fork | The master and slave hold different signed content for the same term and version (split brain) | The slave persists a fork latch in `ha_watermark.toml`, degrades, and rejects all same-term pushes; the master records divergence and stops showing the slave as synced. Do not retry the same version. Isolate the forked master and perform an explicit promotion with a strictly higher `term` **and** `version` (section 2); the promoted bundle clears the latch. |
 | Master `/health` stays false after an external `config.toml` edit, log says the HA bundle exceeds the replication limit | The file watcher rolled the live configuration back, but the oversized external file is left on disk; publication re-reads it on every attempt | Correct or replace `config.toml` with a document under the replication limit (or restore the previous file). Until then each republish/retry re-reads the oversized document and `/health` cannot recover. The `PUT /api/v2/config` path rolls the persisted document back and is not affected. |
-| API returns `409 Conflict` | Mutation attempted directly on a slave node | Perform configuration edits on the master node indicated in the `X-Dnsd-Master` header. |
+| API returns `409 Conflict` | A mutating route other than `PUT /api/v2/config` was attempted on a replica slave, or `PUT /api/v2/config` changed master-managed shared configuration | Node-local-only `PUT /api/v2/config` edits are accepted; perform shared configuration edits on the master indicated in the `X-Dnsd-Master` header. For the shared-field case the problem body names the rejected paths in `shared_config_fields`. |
 | `POST /api/v2/ha/resync` returns `503` | HA replication is inactive on the node, the slave worker stopped, or (master) a push could not be queued for any of the connected slaves | Check the node's role and `GET /api/v2/ha/status`. A `429` means a resync is already queued; retry shortly. With no connected slaves and no active bundle the master still returns `200` with `slaves_notified: 0`. |
 
 ### Diagnostic Commands
@@ -770,8 +798,8 @@ export TOKEN='sito_...'   # Admin token: all /api/v2/ha/* endpoints require Admi
    (with `window_s` — the measured interval since the previous report — and
    window-scoped `queries`, `blocked`, `upstreams_count`; upstream RTT/error
    figures in the report are also window deltas, not lifetime totals), and
-   `recent_acks` (the newest eight ACK records for that peer: `version`, `term`,
-   `applied`, `conflict`, `error`, `at`).
+   `recent_acks` (the newest eight ACK records for that peer, oldest first:
+   `version`, `term`, `applied`, `conflict`, `error`, `at`).
 3. **Trigger Manual Resynchronization**:
    ```bash
    # From the master (Admin token required):
@@ -997,10 +1025,10 @@ running document before persist/apply:
   applied and persisted locally; the slave never publishes to the master and
   the HA watermark is untouched. Restart-only fields keep their existing D11
   `409 restart_required` response (`server.role`, `server.instance_name`,
-  `server.data_dir`, `server.log_format`, `[web]` enabled/bind/port,
-  `[tls]`, `[acme]`, `[ha]`, `[integrations.mikrotik]`). Node-local restart-only fields
+  `server.data_dir`, `server.log_format`, `[auth]`, `[web]` enabled/bind/port,
+  `[tls]`, `[acme]`, `[ha]`, `[integrations]`). Node-local restart-only fields
   (`server.role`, `server.instance_name`, `server.data_dir`,
-  `server.log_format`, `[ha]`, `[web]`, `[tls]`, `[acme]`,
+  `server.log_format`, `[ha]`, `[web]` enabled/bind/port, `[tls]`, `[acme]`,
   `[integrations.mikrotik]`) require editing `config.toml` and restarting that
   node; shared restart-only fields (`[auth]`, non-MikroTik `[integrations]`)
   must be changed on the master and pushed, and a slave rejects the push until
@@ -1064,7 +1092,10 @@ slave rejects the new signature and keeps its last applied configuration.
    # Docker: docker compose stop sito
    ```
 2. **Verify a data-directory backup** (the command also writes its own
-   mode-`0600` key/state backups before mutating anything).
+   mode-`0600` key/state backups before mutating anything). If
+   `[ha.promotion] enabled = true`, also back up the witness state directory
+   before changing its record, so a completed rotation can be rolled back
+   ([witness runbook §3](runbook-witness.md#3-state-files-and-backuprestore)).
    ```bash
    sudo -u sito ls -l /var/lib/sito/ha_signing.key /var/lib/sito/ha_state.toml
    ```
@@ -1083,8 +1114,8 @@ slave rejects the new signature and keeps its last applied configuration.
    ```
    The command refuses without `--confirm`, refuses while the service is
    running, and refuses a non-master role, a relative data directory, a missing
-   or corrupt key/state, a key/state identity mismatch, and a non-monotonic
-   term/version. It writes `<data_dir>/ha_signing.key.bak.<timestamp>` and
+   or corrupt key/state, a key/state identity mismatch, an unreconciled
+   pending/publishing bundle, and a non-monotonic term/version. It writes `<data_dir>/ha_signing.key.bak.<timestamp>` and
    `<data_dir>/ha_state.toml.bak.<timestamp>` (both `0600`), generates a new
    `ha_signing.key` (`0600`), and re-seals `ha_state.toml` with:
    - the new `signing_key_pubkey` and signed-bundle fingerprint;
@@ -1171,11 +1202,30 @@ slave rejects the new signature and keeps its last applied configuration.
   `--allow-equal-version` is required in the normal steady state because the
   witness already records the published version; it accepts the unchanged
   version only with the identical hash. The strict path still refuses an equal
-  version and remains the default for ordinary recovery.
+  version and remains the default for ordinary recovery. `lease-admin set` only
+  raises, so `<TERM>` must also be strictly greater than the existing witness
+  record; if that record is already at or above the rotated term, skip this
+  step and start the master.
 
   Follow the [witness runbook](runbook-witness.md#5-offline-recovery-lease-admin-set);
   a master whose state term is above the witness record stays read-only and
-  reports the reason in `GET /api/v2/ha/status`.
+  reports the reason in `GET /api/v2/ha/status`. If the witness record is
+  already **above** the rotated term/version, `lease-admin set` cannot lower it:
+  restore the witness state backup taken before the earlier attempt, or rotate
+  again at a term/version above the record. Never hand-edit `lease.json`.
+
+- **Rolling back a completed rotation:** stop the master, restore
+  `ha_signing.key.bak.<timestamp>` and `ha_state.toml.bak.<timestamp>` to their
+  original paths (mode `0600`, same owner), restore the previous
+  `master_pubkey` on every slave and in the master's own `[ha]`, then restart.
+  This is only a clean rewind if no slave applied the rotated bundle; once a
+  slave has persisted the higher term/version, its watermark rejects the old
+  bundle and the cluster must move forward with a new explicit promotion
+  instead. On a promotion-enabled cluster `lease-admin set` only raises, so a
+  witness record already raised for the rotation cannot be lowered: restore the
+  witness state backup taken before the rotation
+  ([witness runbook §3](runbook-witness.md#3-state-files-and-backuprestore)) or
+  keep the new key.
 
 - **Library/API callers:** only the `sito ha rotate-signing-key` CLI enforces
   `--confirm` and the service lease. A direct caller of

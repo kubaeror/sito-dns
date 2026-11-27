@@ -870,8 +870,11 @@ itself; the startup exposure warning will say that DNS is open.
   shared-projection digest diverges, the node is marked `Degraded`, and a full
   apply from the master is required before it reports `Synced` again. This is
   the existing divergence rule, not a new ACL-specific mechanism.
-- Edit-time read-only enforcement for shared configuration remains deferred;
-  this ADR does not add it.
+- Edit-time read-only enforcement for shared configuration was deferred by
+  this ADR and later delivered for the API/UI apply path: `PUT /api/v2/config`
+  returns `409` `urn:sito:ha:shared_config_read_only` with
+  `shared_config_fields` for a shared-field change, while node-local edits are
+  applied locally. The direct `config.toml` rule above is unchanged.
 - Node-local listener identity still differs: a master may bind
   `["0.0.0.0", "::"]` and a slave `["0.0.0.0"]`. The ACL is evaluated against
   the peer address observed by each node, which is the correct per-node
@@ -1185,7 +1188,7 @@ missing map entry, an unknown-key rejection, or a `check-config` regression.
     and downgrade), `docs/installation.md`, `docs/runbook-ha.md` (fresh slave,
     mixed versions, multi-site, ACL metrics/logs as the discovery surface) and
     `README.md` (wizard behavior), and `docs/2.0-claim-matrix.md`
-    (deferred → delivered/release-gated). Add the keys to
+    (deferred → delivered). Add the keys to
     `docs/policy-matrix.md` so admission is documented before policy, and
     document that denied clients are absent from the query log and
     `unidentified_clients` by design.

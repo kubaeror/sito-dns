@@ -861,6 +861,13 @@ readiness; the slave role ignores them and does not change its own readiness.
 With `replication_port = 0` no slave can connect, so setting either requirement
 keeps readiness not-ready (the listener itself remains intentionally disabled).
 
+`GET /api/v2/ha/slaves` reports each connected replica with `synced_version`,
+`lag`, `diverged`, `bundle_hash_known` and a bounded `recent_acks` history. The
+history keeps the newest eight ACK records per peer, oldest first; each record
+carries `version`, `term`, `applied`, optional `conflict`/`error` and `at`. It
+is in-memory master state, not a durable audit log. `bundle_hash_known` is true
+only when that peer advertised `have_bundle_hash` in its HA `Hello`.
+
 #### DNS client ACL in HA
 
 `clients.default_policy` and every `[clients.acl]` key are **shared
@@ -894,8 +901,9 @@ per-node ACL override and no node-local allow file.
   automatic promotion is enabled, a peer that omits `have_bundle_hash` makes
   readiness report `promotion_peer_capability_missing`; `/api/v2/ha/slaves`
   shows `bundle_hash_known: false`. Upgrade every DNS-serving node before
-  enabling deny or promotion; a mixed-version cluster must stay on allow and
-  leave promotion disabled.
+  enabling deny, and upgrade every peer before enabling promotion. Until then a
+  mixed-version cluster must stay on `default_policy = "allow"` and leave
+  promotion disabled.
 - **Promotion:** automatic promotion is governed by ADR-0010. A promoted node
   keeps the shared ACL it last applied and requires that a candidate has applied
   a valid bundle (an unprovisioned or diverged slave reports not-ready and is
@@ -1013,7 +1021,8 @@ With promotion enabled, `state` is one of `disabled`,
 `master_state_behind`, `master_state_forked`, `master_term_ahead`,
 `manual_confirmation_required`, `lease_lost`, `lease_version_regression`,
 `clock_step`, `state_write_failed`, `role_switch_failed`, `fenced`,
-`fenced_until_reconciled`, `v1_state`, `promotion_interrupted` or
+`fenced_until_reconciled`, `v1_state`, `promotion_interrupted`,
+`promotion_config_invalid`, `witness_config_invalid` or
 `endpoint_is_ip_literal`.
 
 `version`/`bundle_hash` are the active bundle (which may be pending during a
@@ -1151,8 +1160,9 @@ the new `master_pubkey` plus the restart/verification steps. A requested
 default term is `current + 1` and the default version is
 `max(active bundle version, published baseline version) + 1`. Choose explicit
 values above every slave's applied term/version when the master's state is
-behind a replica. Ownership of the old key/state is preserved across a
-root-run rotation.
+behind a replica. The command refuses an unreconciled pending/publishing
+bundle, a missing/corrupt key or state, and a key/state identity mismatch.
+Ownership of the old key/state is preserved across a root-run rotation.
 
 It does not contact the witness, acquire a witness lease or publish a bundle.
 On a promotion-enabled cluster the witness record term must be at least the
@@ -1170,6 +1180,20 @@ Only the CLI enforces `--confirm` and the service lease. A direct caller of
 `sito_ha::rotate_master_signing_key` must stop the master and exclude every
 server from the data directory for the whole call; the library validates the
 key/state identity but does not inspect the service lease.
+
+The master's `ha_state.toml` is JSON behind the historical name and uses the
+v2 wrapper (`protocol_version` plus a nested `bundle`). A corrupt, v1, partial
+or identity-mismatched file fails the state load closed instead of resetting
+the configuration sequence to 0; with promotion enabled, a file recorded for
+another cluster/node is also refused as a data-dir mix-up. On the
+non-promotion coordinator path, an unrecognized corrupt file is renamed to
+`ha_state.corrupt.<unix-timestamp>` and retained, the error names the backup
+path, and the process exits non-zero; stop the service manager's restart loop
+before retrying, because a later start with no `ha_state.toml` deliberately
+begins a fresh sequence. With promotion enabled the engine refuses the corrupt
+file in place and stays read-only. Restore a backup or explicitly re-seed the
+state; deleting the file is not a recovery step and loses the replay guard.
+See [HA runbook §2](runbook-ha.md#2-manual-slave---master-promotion-procedure).
 
 Slaves persist the last successfully applied bundle identity to
 `<data_dir>/ha_watermark.toml` (JSON, mode `0600`, written atomically, wrapped
@@ -1192,9 +1216,10 @@ last applied configuration. The watermark also records a BLAKE3 digest of the
 **shared projection** of the applied `config.toml` and the master signing-key
 fingerprint; a local edit to a shared field marks the node `Degraded` and forces
 a full apply before it can report `Synced` again, while node-local edits do not.
-The same projection backs the edit-time read-only gate: `PUT /api/v2/config`
-and every UI apply path compare the candidate with the running document and
-reject a shared-field change with `409 Conflict`,
+The same projection backs the edit-time read-only gate: the `PUT /api/v2/config`
+handler and the shared config-apply path used by the UI handlers compare the
+candidate with the running document and reject a shared-field change with
+`409 Conflict`,
 `type = "urn:sito:ha:shared_config_read_only"`, and a `shared_config_fields`
 array of the changed dotted paths. A hot-applied node-local-only edit is
 applied and persisted locally; a slave never publishes to the master and the
@@ -1251,8 +1276,10 @@ require a restart; `api_rate_limit_per_minute` is the exception and is
 hot-applied.
 
 Cluster terms are node-persisted, not configuration keys: the master stores the
-current term inside `ha_state.toml` and only an explicit promotion (editing the
-state file and restarting, see `docs/runbook-ha.md`) raises it. A promotion must
+current term inside `ha_state.toml` and only an explicit promotion raises it —
+automatic promotion acquires `term + 1` through the witness, while a manual
+promotion edits the nested `bundle.term`/`bundle.version` and restarts (see
+[`docs/runbook-ha.md`](runbook-ha.md#2-manual-slave---master-promotion-procedure)). A promotion must
 raise both the term and the version above the cluster high-water mark: a higher
 term alone does not bypass version continuity, so a promoted node with a stale
 state file cannot roll the cluster back. Upgrade every slave before promoting a

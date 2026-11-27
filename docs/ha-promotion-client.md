@@ -152,7 +152,11 @@ needs to contact the engine or the witness. An enabled master looks like:
 
 The top-level `ready` and `readiness_reason` stay authoritative: a witness
 failure or a fence is not-ready, while a candidate that is merely waiting is
-not. The object contains no tokens, keys, certificate material or witness URLs.
+not. `lease_expires_in_secs` is **display-only**: it is computed from the
+node's local wall clock against the last witness-reported expiry and is never
+used as a safety input. `witness_reachable` is a last-probe observation, also
+not a safety input. The object contains no tokens, keys, certificate material
+or witness URLs.
 
 ## Metrics
 
@@ -229,7 +233,13 @@ request is sent.
 
 The optional `have_bundle_hash` Hello field is additive: older v2 peers omit it,
 which means "unknown"; a malformed present value is rejected. No
-`PROTOCOL_VERSION` bump is required.
+`PROTOCOL_VERSION` bump is required. A promotion-enabled master treats an
+unknown hash as a missing capability: readiness reports
+`promotion_peer_capability_missing`, `/api/v2/ha/slaves` shows
+`bundle_hash_known: false`, and reconciliation aborts with
+`candidate_hash_unknown` rather than risk overwriting a possible fork. Upgrade
+every peer before enabling promotion; a promotion-disabled cluster may keep
+such a peer.
 
 ## Operational caveats
 
