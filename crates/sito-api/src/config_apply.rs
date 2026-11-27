@@ -495,8 +495,78 @@ pub async fn apply_and_persist_config(
     // instead of a 409 that tells the operator to restart into a config the
     // binary will refuse to load.
     validate_full_config(candidate)?;
+    // The shared gate wins over `restart_required`: a slave edit that changes
+    // master-managed configuration must be reported as read-only, even when
+    // the same field is also restart-only.
+    ensure_slave_shared_config_unchanged(ctx, &previous, candidate)?;
     ensure_no_restart_required(&previous, candidate)?;
     apply_and_persist_config_locked(ctx, candidate, filter_apply, hooks).await
+}
+
+/// Rejects a local configuration write that changes HA-shared configuration on
+/// a replica slave.
+///
+/// The shared boundary is [`sito_ha::shared_config_diff`]: both the running
+/// document and the candidate are sanitized with the HA bundle sanitizer and
+/// compared semantically. An empty diff is a node-local-only edit and is
+/// allowed; any shared path returns `409 Conflict`
+/// (`urn:sito:ha:shared_config_read_only`) with the changed paths and persists
+/// nothing. A promoted effective master is no longer a replica and is
+/// unaffected. A no-HA build has no replica workers and always allows the
+/// write (validation still rejects `role = "slave"`).
+// The no-HA branch is deliberately infallible while the callers stay generic.
+#[cfg_attr(not(feature = "ha"), allow(clippy::unnecessary_wraps))]
+fn ensure_slave_shared_config_unchanged(
+    ctx: &ServerContext,
+    current: &Config,
+    candidate: &Config,
+) -> Result<(), ProblemDetails> {
+    #[cfg(feature = "ha")]
+    {
+        if ctx.config.load().server.role != "slave" || ctx.ha_write_gate.is_effective_master() {
+            return Ok(());
+        }
+        let current_document = toml::to_string_pretty(current).map_err(|e| {
+            ProblemDetails::internal_error(format!(
+                "Failed to serialize the running configuration for the HA shared-diff check: {e}"
+            ))
+        })?;
+        let candidate_document = toml::to_string_pretty(candidate).map_err(|e| {
+            ProblemDetails::internal_error(format!(
+                "Failed to serialize the candidate configuration for the HA shared-diff check: {e}"
+            ))
+        })?;
+        let changed = sito_ha::shared_config_diff(&current_document, &candidate_document);
+        if changed.is_empty() {
+            return Ok(());
+        }
+        Err(shared_config_read_only(changed))
+    }
+    #[cfg(not(feature = "ha"))]
+    {
+        let _ = (ctx, current, candidate);
+        Ok(())
+    }
+}
+
+/// Builds the `409 Conflict` for a shared-field edit on a replica slave.
+#[cfg(feature = "ha")]
+fn shared_config_read_only(changed: Vec<String>) -> ProblemDetails {
+    let mut problem = ProblemDetails::conflict(format!(
+        "HA replica slaves cannot change master-managed (shared) configuration. Rejected fields: {}. \
+         Submit these changes to the master node. Only node-local settings (identity, logging, [ha], \
+         DNS bind/TLS, web bind/TLS/ACME, MikroTik credentials and clients.client_id_secrets) may be \
+         edited locally. Restart-only fields (server.role, server.instance_name, server.data_dir, \
+         server.log_format, auth, web enabled/bind/port, tls, acme, ha, integrations) are not \
+         hot-applied: node-local ones require editing config.toml and restarting this node, while \
+         shared ones must be changed on the master and pushed before restarting. Nothing was applied \
+         or persisted.",
+        changed.join(", ")
+    ));
+    problem.error_type = "urn:sito:ha:shared_config_read_only".to_string();
+    problem.title = "HA Shared Configuration Read-Only".to_string();
+    problem.shared_config_fields = Some(Box::new(changed));
+    problem
 }
 
 /// Rejects a candidate that changes a restart-only field (D11).
@@ -536,6 +606,11 @@ pub async fn apply_and_persist_config_locked(
     filter_apply: FilterApply,
     hooks: Option<&dyn ConfigApplyHooks>,
 ) -> Result<AppliedReport, ProblemDetails> {
+    // UI handlers acquire the lock themselves and call this variant directly.
+    // Enforce the slave shared boundary here as well so no local persist path
+    // can bypass it.
+    let previous = (**ctx.config.load()).clone();
+    ensure_slave_shared_config_unchanged(ctx, &previous, candidate)?;
     let document = toml::to_string_pretty(candidate)
         .map_err(|e| ProblemDetails::internal_error(format!("Serialization failed: {e}")))?;
     apply_and_persist_document_locked(ctx, candidate, &document, filter_apply, hooks).await

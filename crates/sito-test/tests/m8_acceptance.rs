@@ -1639,15 +1639,23 @@ async fn test_m8_push_restart_only_field_is_not_acked_as_applied() {
     let config_before = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
     let upstream_before = ctx.runtime.snapshot().config.upstream.servers.clone();
 
-    // `server.log_format` is restart-only; the same push also carries a
-    // hot-appliable upstream change that must not be applied either, because
-    // the push as a whole cannot take effect without a restart.
+    // `[auth]` policy is shared and restart-only; the same push also carries a
+    // hot-appliable upstream change and a node-local `server.log_format`. The
+    // whole push must be rejected because of the auth policy, none of it
+    // (including the hot-appliable upstream) may be applied, and the local
+    // log format must remain the slave's own value.
     let config_toml = r#"
 config_version = 2
 
 [server]
 role = "slave"
 log_format = "pretty"
+
+[auth]
+session_ttl_hours = 1
+
+[filtering]
+enabled = false
 
 [upstream]
 servers = ["9.9.9.9"]
@@ -1680,8 +1688,12 @@ servers = ["9.9.9.9"]
         "the rejection must identify the restart-only change: {message}"
     );
     assert!(
-        message.contains("server.log_format"),
+        message.contains("auth"),
         "the rejection must name the restart-only field: {message}"
+    );
+    assert!(
+        !message.contains("server.log_format"),
+        "the node-local log format must not be treated as a restart-only trigger: {message}"
     );
     assert_eq!(tracker.get_state(), SlaveState::Degraded);
     assert_eq!(
@@ -1704,6 +1716,63 @@ servers = ["9.9.9.9"]
         config_before,
         "the persisted file must be kept"
     );
+
+    // A later push with only the node-local `server.log_format` and a
+    // hot-appliable upstream change must apply: the local log format is
+    // preserved in preference to the pushed value.
+    let local_log_format_toml = r#"
+config_version = 2
+
+[server]
+role = "slave"
+log_format = "pretty"
+
+[filtering]
+enabled = false
+
+[upstream]
+servers = ["9.9.9.9"]
+"#;
+    let push = build_and_sign_push(
+        &ConfigBundle {
+            config_digest: String::new(),
+            signing_key_fingerprint: String::new(),
+            protocol_version: sito_ha::PROTOCOL_VERSION,
+            version: 3,
+            term: 0,
+            timestamp: 2,
+            config_toml: local_log_format_toml.to_string(),
+            custom_rules: vec![],
+            rewrites: None,
+            clients: None,
+            lists: vec![],
+        },
+        &signing_key,
+    )
+    .unwrap();
+    let applied =
+        sito_ha::apply_config_push(&push, &tracker, &handles, signing_key.public_key().as_ref())
+            .await
+            .expect("a node-local log format must not make a push fail");
+    assert_eq!(applied, 3);
+    assert_eq!(tracker.get_state(), SlaveState::Synced);
+    assert_eq!(
+        ctx.runtime.snapshot().config.server.log_format,
+        "json",
+        "the pushed log format must be ignored in favor of the local value"
+    );
+    assert_eq!(
+        ctx.runtime.snapshot().config.upstream.servers,
+        vec!["9.9.9.9".to_string()],
+        "the hot-appliable part of the accepted push must be applied"
+    );
+    let persisted = tokio::fs::read_to_string(&ctx.config_path).await.unwrap();
+    let persisted: Config = Config::from_toml_str(&persisted).expect("persisted document parses");
+    assert_eq!(
+        persisted.server.log_format, "json",
+        "the persisted node-local log format must be kept"
+    );
+    assert_eq!(persisted.upstream.servers, vec!["9.9.9.9".to_string()]);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

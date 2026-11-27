@@ -29,7 +29,12 @@ use crate::state::ServerContext;
 pub const SETUP_TOKEN_HEADER: &str = "x-setup-token";
 
 /// Middleware that enforces read-only access on replica slave nodes.
-/// Mutating methods (POST, PUT, DELETE, PATCH) outside auth and resync return 409 Conflict with X-Dnsd-Master header.
+///
+/// Mutating methods (POST, PUT, DELETE, PATCH) outside auth, resync and the
+/// full-config apply endpoint return 409 Conflict with the `X-Dnsd-Master`
+/// header. `PUT /config` is allowed through because it may carry node-local
+/// settings; the apply pipeline performs the semantic shared-field check and
+/// rejects master-managed changes with `urn:sito:ha:shared_config_read_only`.
 pub async fn slave_read_only_middleware(
     axum::extract::State(ctx): axum::extract::State<ServerContext>,
     request: Request,
@@ -62,12 +67,19 @@ pub async fn slave_read_only_middleware(
     // `/ha/resync` stays reachable to report a precise 409/503; the handler
     // itself refuses to broadcast on a gated effective/configured master.
     let gate_allowed = auth_allowed || path == "/api/v2/ha/resync" || path == "/ha/resync";
+    // `PUT /config` may carry node-local settings (identity, `[ha]`, DNS
+    // bind/TLS, web bind/TLS/ACME, integration credentials and per-client
+    // secrets). Let it reach the handler; the apply pipeline rejects any
+    // shared-field change with `urn:sito:ha:shared_config_read_only` before
+    // persist/apply. Every shared-resource endpoint stays blocked here.
+    let config_apply_allowed = *method == Method::PUT && path == "/config";
     let slave_allowed = path.starts_with("/api/v2/auth")
         || path == "/api/v2/ha/resync"
         || path == "/ha/resync"
         || path == "/ui/login"
         || path == "/ui/logout"
-        || path.starts_with("/auth");
+        || path.starts_with("/auth")
+        || config_apply_allowed;
 
     if is_mutating
         && !gate_allowed
@@ -552,7 +564,6 @@ fn create_router_inner(ctx: ServerContext, hooks: crate::config_apply::ApplyHook
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    #[cfg(feature = "ha")]
     use std::sync::Arc;
 
     async fn health_body(ctx: ServerContext) -> (StatusCode, serde_json::Value) {
@@ -585,6 +596,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_promoted_effective_master_is_healthy() {
         let temp_dir = crate::test_support::temp_dir("sito_health_promoted_master");
@@ -610,6 +622,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    #[cfg(feature = "ha")]
     #[tokio::test]
     async fn test_health_not_ready_while_promotion_gate_is_blocked() {
         let temp_dir = crate::test_support::temp_dir("sito_health_promotion_gate");
@@ -1319,6 +1332,112 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+    /// C1: `PUT /config` must reach the apply layer on a slave (it may carry
+    /// node-local settings), which then rejects a shared edit with
+    /// `urn:sito:ha:shared_config_read_only`; shared-resource endpoints stay
+    /// blocked by the middleware.
+    #[cfg(feature = "ha")]
+    #[tokio::test]
+    async fn test_slave_config_put_reaches_the_shared_apply_gate() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let temp_dir = crate::test_support::temp_dir("sito_slave_config_put");
+        let ctx = crate::test_support::mock_context(&temp_dir).await;
+        ctx.auth_mgr
+            .update_user_password("admin", "TestPassword123!")
+            .await;
+        ctx.set_setup_pending(false);
+        let base = "config_version = 2\n[server]\nrole = \"slave\"\ninstance_name = \"slave-a\"\nlog_level = \"info\"\n[upstream]\nservers = [\"9.9.9.9\"]\n";
+        tokio::fs::write(&ctx.config_path, base).await.unwrap();
+        ctx.set_config(sito_core::config::Config::from_toml_str(base).expect("valid base config"));
+        let token = ctx
+            .auth_mgr
+            .create_token("admin", Role::Admin, None)
+            .await
+            .expect("token")
+            .1
+            .token;
+        let app = create_router(ctx.clone());
+
+        let put_config = |document: String| {
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v2/config")
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "config_toml": document }).to_string(),
+                ))
+                .unwrap()
+        };
+
+        // A shared edit is no longer blocked by the middleware; the apply-layer
+        // shared gate produces the precise 409 and names the field.
+        let response = app
+            .clone()
+            .oneshot(put_config(base.replace("9.9.9.9", "1.1.1.1")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("problem JSON");
+        assert_eq!(json["type"], "urn:sito:ha:shared_config_read_only");
+        assert_eq!(
+            json["shared_config_fields"],
+            serde_json::json!(["upstream.servers"])
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&ctx.config_path).await.unwrap(),
+            base,
+            "the rejected shared edit must not be persisted"
+        );
+
+        // A node-local-only edit passes the middleware and the shared gate.
+        let response = app
+            .oneshot(put_config(
+                base.replace("log_level = \"info\"", "log_level = \"debug\""),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a node-local edit must be accepted on a slave"
+        );
+
+        // Other config mutations (reload/restore) remain blocked on a replica.
+        let response = app_blocked_config_reload(&ctx, &token).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("problem JSON");
+        assert_eq!(json["type"], "urn:sito:ha:read-only");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(feature = "ha")]
+    async fn app_blocked_config_reload(
+        ctx: &ServerContext,
+        token: &str,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        create_router(ctx.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v2/config/reload")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     /// ADR-0010: a promoted slave keeps `role = "slave"` in `config.toml` but
     /// the in-memory effective role is master; the slave middleware must stop
     /// rejecting its mutations.
