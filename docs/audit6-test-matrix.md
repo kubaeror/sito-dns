@@ -614,7 +614,7 @@ smoke of the attested release image to the release workflow before publication.
 | P3-23: packaged unit, installer fallback and docs snippet cannot drift on the hardening directives | `scripts/test-systemd-hardening.sh`; m9 acceptance test | `bash scripts/test-systemd-hardening.sh` |
 | P3-24: `.dockerignore` explicitly excludes `fuzz/target/` and `**/target/` | `scripts/test-compose-defaults.sh` | `bash scripts/test-compose-defaults.sh` |
 | P3-25: HA Compose no longer hardcodes the LAN topology; master/slave/slave-2 IPs, subnet, gateway and parent are `SITO_HA_*` variables with documented defaults | `scripts/test-compose-defaults.sh` | `bash scripts/test-compose-defaults.sh` |
-| P3-26: release archives are built from real binaries, contain `contrib/install.sh` and `contrib/systemd/sito.service`, and the release image runs `--version`/`check-config`; a live start/healthcheck/DNS smoke is deferred to WP-3.1 | `.github/workflows/artifact-e2e.yml` archive assertions; `.github/workflows/release.yml` image smoke | `bash scripts/test-release-workflow.sh`; artifact E2E workflow |
+| P3-26: release archives are built from real binaries, contain `contrib/install.sh` and `contrib/systemd/sito.service`, and the release image runs `--version`/`check-config`; the live start/healthcheck/DNS smoke is delivered by E8 and exercised by the tagged release workflow | `.github/workflows/artifact-e2e.yml` archive assertions; `.github/workflows/release.yml` image smoke | `bash scripts/test-release-workflow.sh`; artifact E2E workflow |
 
 ## Phase 3 — 1.9.x migration and compatibility (WP-3.2)
 

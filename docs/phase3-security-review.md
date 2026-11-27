@@ -899,7 +899,7 @@ failed / 5 ignored**; `cargo deny check`; catalog check and the
 docs/config/migration/test-matrix/fuzz/bench checks. H4 did not rerun the full
 workspace suite.
 
-Focused H4 reruns:
+Focused H4/H5 reruns:
 
 | Command | Result |
 |---|---|
