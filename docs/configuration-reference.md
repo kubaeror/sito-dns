@@ -1185,14 +1185,13 @@ The master's `ha_state.toml` is JSON behind the historical name and uses the
 v2 wrapper (`protocol_version` plus a nested `bundle`). A corrupt, v1, partial
 or identity-mismatched file fails the state load closed instead of resetting
 the configuration sequence to 0; with promotion enabled, a file recorded for
-another cluster/node is also refused as a data-dir mix-up. On the
-non-promotion coordinator path, an unrecognized corrupt file is renamed to
-`ha_state.corrupt.<unix-timestamp>` and retained, the error names the backup
-path, and the process exits non-zero; stop the service manager's restart loop
-before retrying, because a later start with no `ha_state.toml` deliberately
-begins a fresh sequence. With promotion enabled the engine refuses the corrupt
-file in place and stays read-only. Restore a backup or explicitly re-seed the
-state; deleting the file is not a recovery step and loses the replay guard.
+another cluster/node is also refused as a data-dir mix-up. The file is left
+byte-for-byte in place, the error names the path, and the process exits
+non-zero; every subsequent start keeps failing closed on the same file, so a
+service-manager restart loop cannot bypass the failure. With promotion enabled
+the engine refuses the corrupt file in place and stays read-only. Restore a
+matching backup, or explicitly move the file aside and re-seed the state;
+deleting the file is not a recovery step and loses the replay guard.
 See [HA runbook §2](runbook-ha.md#2-manual-slave---master-promotion-procedure).
 
 Slaves persist the last successfully applied bundle identity to

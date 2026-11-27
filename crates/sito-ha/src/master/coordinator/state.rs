@@ -737,9 +737,11 @@ impl MasterCoordinator {
 
     /// Restores the persisted version/bundle, if any.
     ///
-    /// Corrupt, v1, foreign or partial state fails closed. The file may be
-    /// moved aside for recovery, but it is never treated as absent: resetting
-    /// the configuration sequence would silently publish a rollback.
+    /// Corrupt, v1, foreign or partial state fails closed. The file is left
+    /// byte-for-byte in place and is never treated as absent: resetting the
+    /// configuration sequence would silently publish a rollback, and a
+    /// service-manager restart loop must keep failing on the same file until
+    /// the operator restores a backup or explicitly moves it aside.
     pub fn restore_state(&self) -> Result<Option<u64>, HaError> {
         let path = sito_core::sync::lock_or_recover(&self.state_path).clone();
         let Some(path) = path else {
@@ -783,21 +785,16 @@ impl MasterCoordinator {
                         });
                     }
                 }
-                let backup = path.with_extension(format!("corrupt.{}", Utc::now().timestamp()));
-                if let Err(rename_err) = std::fs::rename(&path, &backup) {
-                    warn!(error = %rename_err, "Failed to move corrupt HA state aside");
-                }
                 warn!(
                     error = %e,
-                    backup = %backup.display(),
-                    "Corrupt HA state detected; refusing to reset the configuration sequence"
+                    path = %path.display(),
+                    "Corrupt HA state detected; leaving it in place and refusing to reset the configuration sequence"
                 );
                 return Err(HaError::Validation {
                     field: "ha_state".to_string(),
                     reason: format!(
-                        "corrupt HA state at {}: {e}; backup at {}. Refusing to reset the configuration sequence; restore a backup or re-seed explicitly.",
-                        path.display(),
-                        backup.display()
+                        "corrupt HA state at {}: {e}; the file was left in place and every start keeps failing closed until you restore a matching backup over it or explicitly move it aside to re-seed. Refusing to reset the configuration sequence.",
+                        path.display()
                     ),
                 });
             }
