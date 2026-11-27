@@ -361,6 +361,17 @@ an environment mismatch: the baseline's `environment.description` must equal
 only escape hatch is the explicit, documented `--reference-only` flag, which
 prints a warning and must never be used by the nightly gate.
 
+`bench.yml` retries a failed comparison once (G5): a shared GitHub-hosted
+runner can make a contended benchmark swing by more than 2x between identical
+runs, while a real regression fails both attempts. The baseline's optional
+top-level `noise` map grants a larger allowed slowdown to a named benchmark
+whose measurement is dominated by scheduler noise; the global tolerance stays
+the floor for every other benchmark. The only current entry is
+`metrics_contended::observe_query_duration_4_threads`, a diagnostic
+same-label contention benchmark whose correctness is covered by the
+concurrent-update test. Do not add a noise entry to hide a real regression;
+each entry needs a measured variance rationale and a reviewed commit.
+
 `bench.yml` runs on GitHub-hosted `ubuntu-24.04` only — no self-hosted runner
 label is required. It passes `--environment "github-ubuntu-24.04"`, so a
 baseline from a different host fails immediately with an instruction to

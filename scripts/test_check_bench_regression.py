@@ -51,21 +51,20 @@ def write_baseline(
     benchmarks: dict[str, float],
     tolerance: float = 0.10,
     environment: str = "unit-test",
+    noise: dict[str, float] | None = None,
 ) -> None:
+    payload = {
+        "schema_version": 1,
+        "environment": {"description": environment},
+        "tolerance": tolerance,
+        "benchmarks": {
+            key: {"median_ns": value} for key, value in benchmarks.items()
+        },
+    }
+    if noise:
+        payload["noise"] = noise
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "environment": {"description": environment},
-                "tolerance": tolerance,
-                "benchmarks": {
-                    key: {"median_ns": value} for key, value in benchmarks.items()
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -134,6 +133,43 @@ class Compare(unittest.TestCase):
     def test_non_positive_baseline_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             gate.compare({"zero": 0.0}, {"zero": 1.0})
+
+    def test_noise_allowance_passes_known_contended_benchmark(self) -> None:
+        regressions, _, _ = gate.compare(
+            {"contended": 100.0},
+            {"contended": 220.0},
+            tolerance=0.10,
+            noise={"contended": 1.5},
+        )
+        self.assertEqual(regressions, [])
+
+    def test_noise_allowance_still_fails_beyond_its_threshold(self) -> None:
+        regressions, _, _ = gate.compare(
+            {"contended": 100.0},
+            {"contended": 260.0},
+            tolerance=0.10,
+            noise={"contended": 1.5},
+        )
+        self.assertEqual(len(regressions), 1)
+        self.assertEqual(regressions[0].benchmark, "contended")
+
+    def test_noise_allowance_does_not_relax_other_benchmarks(self) -> None:
+        regressions, _, _ = gate.compare(
+            {"contended": 100.0, "stable": 100.0},
+            {"contended": 220.0, "stable": 111.0},
+            tolerance=0.10,
+            noise={"contended": 1.5},
+        )
+        self.assertEqual([item.benchmark for item in regressions], ["stable"])
+
+    def test_negative_noise_allowance_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            gate.compare(
+                {"contended": 100.0},
+                {"contended": 100.0},
+                tolerance=0.10,
+                noise={"contended": -0.1},
+            )
 
 
 class Cli(unittest.TestCase):
@@ -231,6 +267,37 @@ class Cli(unittest.TestCase):
                 {"group::one": {"median_ns": 100.0}, "group::two": {"median_ns": 200.0}},
             )
             self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+
+    def test_noise_allowance_cli_and_save_preserves_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            estimates = root / "criterion"
+            baseline = root / "baseline.json"
+            write_estimate(estimates, "metrics_contended/bench", 220.0)
+            write_baseline(
+                baseline,
+                {"metrics_contended::bench": 100.0},
+                noise={"metrics_contended::bench": 1.5},
+            )
+
+            checked = run_cli(
+                "--estimates-dir", str(estimates), "--baseline", str(baseline)
+            )
+            self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+            self.assertIn("noise allowance metrics_contended::bench", checked.stdout)
+
+            saved = run_cli(
+                "--estimates-dir",
+                str(estimates),
+                "--baseline",
+                str(baseline),
+                "--save",
+                "--environment",
+                "unit-test",
+            )
+            self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+            payload = json.loads(baseline.read_text(encoding="utf-8"))
+            self.assertEqual(payload["noise"], {"metrics_contended::bench": 1.5})
 
     def test_save_without_estimates_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

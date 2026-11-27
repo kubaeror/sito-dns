@@ -13,13 +13,16 @@ Current performance gates:
   `cargo bench --workspace --all-features --locked --no-run`.
 - The nightly `bench.yml` workflow runs the Criterion suite on GitHub-hosted
   `ubuntu-24.04` and compares it with `benches/baseline.json`; more than 10%
-  slower fails. The committed baseline records
-  `environment: github-ubuntu-24.04` (generated 2026-11-12), so the nightly
-  thresholded gate is **active**. The checker fails closed on an environment
-  mismatch. A local comparison on different hardware must use
-  `--reference-only` and is not the release gate; regenerate the baseline only
-  through the GitHub-hosted `update_baseline=true` workflow and commit the
-  downloaded artifact. See [docs/ci.md](ci.md#benchmark-baseline).
+  slower fails, except for a named contended benchmark with a documented
+  `noise` allowance. A failed comparison is re-measured once (G5 retry-once)
+  because a shared runner can make a thread-contention benchmark swing by more
+  than 2x between identical runs. The committed baseline records
+  `environment: github-ubuntu-24.04`, so the nightly thresholded gate is
+  **active**. The checker fails closed on an environment mismatch. A local
+  comparison on different hardware must use `--reference-only` and is not the
+  release gate; regenerate the baseline only through the GitHub-hosted
+  `update_baseline=true` workflow and commit the downloaded artifact. See
+  [docs/ci.md](ci.md#benchmark-baseline).
 - The pathological wildcard-compile unit test
   (`test_pathological_wildcard_set_compiles_in_bounded_batches`) keeps the old
   60 s numeric bound but measures **thread CPU time** instead of wall time,

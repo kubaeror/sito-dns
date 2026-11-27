@@ -1,112 +1,115 @@
 {
   "benchmarks": {
     "cache::hit_lookup": {
-      "median_ns": 887.376
+      "median_ns": 674.192
     },
     "cache::insert_response": {
-      "median_ns": 2507.034
+      "median_ns": 1984.258
     },
     "cache::miss_lookup": {
-      "median_ns": 686.53
+      "median_ns": 536.966
     },
     "cache_hit_lookup": {
-      "median_ns": 806.95
+      "median_ns": 617.225
     },
     "exact_hashset_hit": {
-      "median_ns": 19.901
+      "median_ns": 13.81
     },
     "exact_hashset_miss": {
-      "median_ns": 15.249
+      "median_ns": 11.496
     },
     "filter_compile::wildcard_set_3_batches": {
-      "median_ns": 888699566.0
+      "median_ns": 609004811.0
     },
     "filter_engine::evaluate_blocked_domain": {
-      "median_ns": 660.699
+      "median_ns": 441.588
     },
     "filter_engine::evaluate_clean_domain": {
-      "median_ns": 480.167
+      "median_ns": 308.521
     },
     "metrics::inc_queries": {
-      "median_ns": 106.45
+      "median_ns": 84.9
     },
     "metrics::observe_query_duration": {
-      "median_ns": 59.39
+      "median_ns": 64.561
     },
     "metrics::observe_upstream_rtt": {
-      "median_ns": 60.11
+      "median_ns": 59.652
     },
     "metrics::render_prometheus": {
-      "median_ns": 11919.356
+      "median_ns": 7843.381
     },
     "metrics_contended::observe_query_duration_1_threads": {
-      "median_ns": 109885.108
+      "median_ns": 107081.871
     },
     "metrics_contended::observe_query_duration_4_threads": {
-      "median_ns": 570326.761
+      "median_ns": 1296041.061
     },
     "pipeline_stages::client_sni_extraction": {
-      "median_ns": 36.623
+      "median_ns": 24.284
     },
     "pipeline_stages::rewrite_wildcard_lookup": {
-      "median_ns": 658.447
+      "median_ns": 408.373
     },
     "snapshot_evaluate_allowlist_hit": {
-      "median_ns": 530.079
+      "median_ns": 343.955
     },
     "snapshot_evaluate_exact_hit": {
-      "median_ns": 249.887
+      "median_ns": 154.781
     },
     "snapshot_evaluate_miss": {
-      "median_ns": 267.507
+      "median_ns": 161.465
     },
     "snapshot_evaluate_trie_hit": {
-      "median_ns": 486.927
+      "median_ns": 312.045
     },
     "stats_querylog::insert_batch_100_fresh_db": {
-      "median_ns": 2459973.55
+      "median_ns": 1663374.8
     },
     "stats_querylog::page_50": {
-      "median_ns": 319944.338
+      "median_ns": 252084.911
     },
     "stats_querylog::page_50_filtered": {
-      "median_ns": 342858.628
+      "median_ns": 261761.756
     },
     "stats_querylog_cursor_vs_offset::keyset_first_page_50": {
-      "median_ns": 317467.927
+      "median_ns": 263735.2
     },
     "stats_querylog_cursor_vs_offset::keyset_next_page_50_deep": {
-      "median_ns": 326821.493
+      "median_ns": 280891.577
     },
     "stats_querylog_cursor_vs_offset::keyset_next_page_50_shallow": {
-      "median_ns": 327341.393
+      "median_ns": 277838.726
     },
     "stats_querylog_cursor_vs_offset::offset_page_50_at_100": {
-      "median_ns": 230241.995
+      "median_ns": 232615.772
     },
     "stats_querylog_cursor_vs_offset::offset_page_50_at_99900": {
-      "median_ns": 2502271.65
+      "median_ns": 1513474.985
     },
     "suffix_trie_exact_hit": {
-      "median_ns": 170.812
+      "median_ns": 115.894
     },
     "suffix_trie_miss": {
-      "median_ns": 84.237
+      "median_ns": 52.878
     },
     "suffix_trie_subdomain_hit": {
-      "median_ns": 254.972
+      "median_ns": 185.319
     },
     "wire_proto::decode_message": {
-      "median_ns": 175.566
+      "median_ns": 124.663
     },
     "wire_proto::encode_message": {
-      "median_ns": 273.042
+      "median_ns": 184.734
     }
   },
   "environment": {
     "description": "github-ubuntu-24.04"
   },
-  "generated_at": "2026-11-27T10:14:20Z",
+  "generated_at": "2026-11-27T11:56:30Z",
+  "noise": {
+    "metrics_contended::observe_query_duration_4_threads": 1.0
+  },
   "schema_version": 1,
   "tolerance": 0.1
 }

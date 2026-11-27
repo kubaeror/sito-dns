@@ -22,6 +22,12 @@ specific. Generate it on the dedicated benchmark runner (see
 ``.github/workflows/bench.yml``) and never compare a laptop baseline with CI.
 Record the same label in ``BENCH_ENVIRONMENT``: the checker fails closed when
 the current environment does not match the baseline.
+
+The optional top-level ``noise`` map grants a larger allowed slowdown to named
+benchmarks whose measurement is dominated by runner scheduling (for example a
+same-label contention benchmark on a shared 4-vCPU GitHub runner). The global
+tolerance remains the floor for every other benchmark; a real regression still
+fails once it exceeds the per-benchmark allowance.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ import json
 import os
 import platform
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -62,6 +68,10 @@ class Baseline:
     benchmarks: dict[str, float]
     tolerance: float
     environment: dict[str, object]
+    # Per-benchmark noise allowance (fraction). A contended benchmark that
+    # measures scheduler noise on a shared runner can opt into a larger
+    # threshold than the global tolerance; see docs/benchmarks.md.
+    noise: dict[str, float] = field(default_factory=dict)
 
     @property
     def environment_description(self) -> str:
@@ -125,6 +135,22 @@ def load_baseline(path: Path) -> Baseline:
             f"baseline {path} has an invalid tolerance: {tolerance!r}"
         )
 
+    noise_payload = payload.get("noise", {})
+    if not isinstance(noise_payload, dict):
+        raise BaselineError(f"baseline {path} noise must be an object")
+    noise: dict[str, float] = {}
+    for name, value in noise_payload.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(value, (int, float))
+            or value < 0
+        ):
+            raise BaselineError(
+                f"baseline {path} has an invalid noise allowance: {name!r}: {value!r}"
+            )
+        noise[name] = float(value)
+
     environment = payload.get("environment", {})
     if not isinstance(environment, dict):
         raise BaselineError(f"baseline {path} environment must be an object")
@@ -146,6 +172,7 @@ def load_baseline(path: Path) -> Baseline:
         benchmarks=loaded,
         tolerance=float(tolerance),
         environment=environment,
+        noise=noise,
     )
 
 
@@ -153,14 +180,25 @@ def compare(
     baseline: dict[str, float],
     current: dict[str, float],
     tolerance: float = DEFAULT_TOLERANCE,
+    noise: dict[str, float] | None = None,
 ) -> tuple[list[Regression], list[str], list[str]]:
     """Compares medians and returns ``(regressions, missing, new)``.
 
     A value exactly at ``baseline * (1 + tolerance)`` passes. A missing
     current estimate is reported separately so the caller can fail closed.
+    ``noise`` raises the allowed slowdown for named benchmarks only; the
+    stricter of the global tolerance and the per-name allowance wins.
     """
     if tolerance < 0:
         raise ValueError("tolerance must be non-negative")
+    allowances = noise or {}
+    for name, allowance in allowances.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(allowance, (int, float))
+            or allowance < 0
+        ):
+            raise ValueError(f"invalid noise allowance for {name!r}: {allowance!r}")
 
     regressions: list[Regression] = []
     missing: list[str] = []
@@ -172,7 +210,8 @@ def compare(
             missing.append(name)
             continue
         change = (current_ns - base_ns) / base_ns
-        if current_ns > base_ns * (1.0 + tolerance):
+        allowed = max(tolerance, allowances.get(name, 0.0))
+        if current_ns > base_ns * (1.0 + allowed):
             regressions.append(
                 Regression(
                     benchmark=name,
@@ -229,17 +268,31 @@ def save_baseline(
     estimates: dict[str, float],
     environment: str | None,
     tolerance: float,
+    noise: dict[str, float] | None = None,
 ) -> None:
     if not estimates:
         raise BaselineError("no Criterion estimates found; run cargo bench first")
     if tolerance < 0:
         raise BaselineError("tolerance must be non-negative")
+    allowances = noise or {}
+    for name, allowance in allowances.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(allowance, (int, float))
+            or allowance < 0
+        ):
+            raise BaselineError(
+                f"invalid noise allowance for {name!r}: {allowance!r}"
+            )
 
     payload = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "environment": environment_description(environment),
         "tolerance": tolerance,
+        "noise": {
+            name: round(value, 6) for name, value in sorted(allowances.items())
+        },
         "benchmarks": {
             name: {"median_ns": round(value, 3)}
             for name, value in sorted(estimates.items())
@@ -256,11 +309,14 @@ def _format_table(
     new: list[str],
     improvements: list[tuple[str, float, float, float]],
     tolerance: float,
+    noise: dict[str, float] | None = None,
 ) -> str:
     lines = [
         f"criterion benchmarks: {estimate_count} measured, "
         f"tolerance {tolerance * 100:.0f}%",
     ]
+    for name, allowance in sorted((noise or {}).items()):
+        lines.append(f"noise allowance {name}: +{allowance * 100:.0f}%")
     for regression in regressions:
         lines.append(
             f"REGRESSION {regression.benchmark}: "
@@ -362,12 +418,21 @@ def main(argv: list[str] | None = None) -> int:
             tolerance = (
                 DEFAULT_TOLERANCE if args.tolerance is None else args.tolerance
             )
+            noise: dict[str, float] = {}
+            if args.baseline.exists():
+                try:
+                    noise = load_baseline(args.baseline).noise
+                except BaselineError:
+                    # A missing/invalid old baseline must not block the
+                    # documented regeneration path.
+                    noise = {}
             environment = current_environment_label(args.environment)
-            save_baseline(args.baseline, estimates, environment, tolerance)
+            save_baseline(args.baseline, estimates, environment, tolerance, noise)
             print(
                 f"saved {len(estimates)} benchmark(s) to {args.baseline} "
                 f"(tolerance {tolerance * 100:.0f}%, "
-                f"environment {environment!r})"
+                f"environment {environment!r}, "
+                f"noise allowances {len(noise)})"
             )
             return 0
 
@@ -391,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"{current_environment!r}); do not use this result as a gate"
             )
         regressions, missing, new = compare(
-            baseline.benchmarks, estimates, tolerance
+            baseline.benchmarks, estimates, tolerance, baseline.noise
         )
         faster = improvements(baseline.benchmarks, estimates)
     except (BaselineError, ValueError) as exc:
@@ -403,7 +468,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         _format_table(
-            len(estimates), regressions, missing, new, faster, tolerance
+            len(estimates), regressions, missing, new, faster, tolerance, baseline.noise
         )
     )
 
